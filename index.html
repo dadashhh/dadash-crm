@@ -2721,14 +2721,19 @@ const SpenderFullProfile = ({handle, txs, models, profiles, lang, onClose, spend
 const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) => {
   const addToast = useToast();
   const {openEntity} = useNav();
-  const [activeSection, setActiveSection] = useState("quick");
+
+  // State
+  const [importedContacts, setImportedContacts] = useState([]);
   const [importing, setImporting] = useState(false);
   const [importLog, setImportLog] = useState([]);
-  const [scanData, setScanData] = useState(null);
-  const [recentAdded, setRecentAdded] = useState([]);
-  const [selectedSpender, setSelectedSpender] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [filterModel, setFilterModel] = useState("all");
+  const [selectedContact, setSelectedContact] = useState(null);
+  const [activeView, setActiveView] = useState("fiches");
+  const [diagLog, setDiagLog] = useState([]);
 
-  // Find Mala chatter + Leo provider (defaults for all transactions)
+  // Find Mala chatter + Leo provider (defaults)
   const malaChatter = profiles.find(p=>p.role==="chatter" && (p.name||"").toLowerCase().includes("mala"));
   const leoProvider = profiles.find(p=>p.role==="provider" && (p.name||"").toLowerCase().includes("leo"));
   const defaultChatterId = malaChatter?.id || (profiles.find(p=>p.role==="chatter")?.id) || user.id;
@@ -2736,105 +2741,73 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
   const defaultProviderId = leoProvider?.id || (profiles.find(p=>p.role==="provider")?.id) || "";
   const defaultProviderName = leoProvider?.name || "Leo";
 
-  // Compute spender metrics from txs
-  const spenderMetrics = useMemo(()=>{
-    const map = {};
-    txs.forEach(tx=>{
-      const h = tx.spender_handle;
-      if(!h) return;
-      if(!map[h]) map[h] = {name:h, totalCA:0, txCount:0, models:new Set(), lastDate:null, firstDate:null, validated:0, pending:0, types:{}};
-      map[h].totalCA += Number(tx.amount);
-      map[h].txCount++;
-      if(tx.model_id) map[h].models.add(tx.model_id);
-      if(tx.status==="validated") map[h].validated += Number(tx.amount);
-      if(tx.status==="pending") map[h].pending += Number(tx.amount);
-      const tp = tx.type||tx.product||"autre";
-      map[h].types[tp] = (map[h].types[tp]||0) + Number(tx.amount);
-      const d = tx.date;
-      if(!map[h].firstDate || d < map[h].firstDate) map[h].firstDate = d;
-      if(!map[h].lastDate || d > map[h].lastDate) map[h].lastDate = d;
-    });
-    return Object.values(map).map(s=>({...s, models:Array.from(s.models), segment:getSpenderSegment(s.totalCA)})).sort((a,b)=>b.totalCA-a.totalCA);
-  },[txs]);
+  // Helper: randomize date between Feb 13-19, 2026
+  const randomizeDate = () => {
+    const minDate = new Date(2026, 1, 13);
+    const maxDate = new Date(2026, 1, 19);
+    const time = minDate.getTime() + Math.random() * (maxDate.getTime() - minDate.getTime());
+    return new Date(time).toISOString();
+  };
 
-  // Model metrics
-  const modelMetrics = useMemo(()=>{
-    return models.map(m=>{
-      const mTxs = txs.filter(tx=>tx.model_id===m.id);
-      const ca = mTxs.reduce((s,tx)=>s+Number(tx.amount),0);
-      const spenderSet = new Set(mTxs.map(tx=>tx.spender_handle).filter(Boolean));
-      const todayTxs = mTxs.filter(tx=>tx.date&&tx.date.startsWith(new Date().toISOString().split("T")[0]));
-      const todayCA = todayTxs.reduce((s,tx)=>s+Number(tx.amount),0);
-      return {...m, ca, txCount:mTxs.length, spenderCount:spenderSet.size, todayCA, todayTxCount:todayTxs.length};
-    }).sort((a,b)=>b.ca-a.ca);
-  },[txs, models]);
+  // Helper: alternate provider
+  const getProvider = (index) => {
+    return index % 2 === 0 ? {id: defaultProviderId, name: defaultProviderName} : {id: defaultProviderId || "", name: "Mala"};
+  };
 
-  // Today stats
-  const todayStr = new Date().toISOString().split("T")[0];
-  const todayTxs = txs.filter(tx=>tx.date&&tx.date.startsWith(todayStr));
-  const todayCA = todayTxs.reduce((s,tx)=>s+Number(tx.amount),0);
-
-  // ============ OFM SCAN FORMAT PARSER ============
-  // JSON format: { "telegramId": { depense, spender, tw, contenu, transactions, resume, info } }
-  // Each file = one model (filename = model name)
+  // OFM Parser
   const extractBestName = (entry, telegramId) => {
-    // Try info.prenom first
     if(entry.info && entry.info.prenom && entry.info.prenom !== "?") return entry.info.prenom;
-    // Try "new" field: "Name / 100E / ..."
     if(entry.new) {
       const parts = entry.new.split("/").map(s=>s.trim());
       if(parts[0] && parts[0] !== "?" && !parts[0].match(/^\d/)) return parts[0];
     }
-    // Try "orig" field
     if(entry.orig) {
       const parts = entry.orig.split("/").map(s=>s.trim());
-      // Remove amounts like "17E"
       const cleaned = (parts[0]||"").replace(/\s*\d+E\b/gi,"").trim();
       if(cleaned && cleaned !== "?" && cleaned.length > 1) return cleaned;
     }
-    // Fallback: Telegram ID
     return "tg_" + telegramId;
   };
 
   const modelNameFromFile = (filename) => {
-    // carla.json → Carla, carlaa.json → Carlaa, sophie.json → Sophie
     const base = filename.replace(/\.json$/i,"").replace(/[_-]/g," ");
     return base.charAt(0).toUpperCase() + base.slice(1).toLowerCase();
   };
 
-  // Parse imported JSON (OFM scan format)
   const handleImportJSON = async (e) => {
     const files = Array.from(e.target.files);
     if(!files.length) return;
     setImporting(true);
     setImportLog([{type:"info",msg:lang==="fr"?`${files.length} fichier(s) détecté(s)...`:`${files.length} file(s) detected...`}]);
 
-    try {
-      let totalSpenders = 0, totalTW = 0, totalTX = 0, totalCA = 0;
+    const newContacts = [];
+    let totalSpenders = 0, totalTW = 0, totalTX = 0, totalCA = 0;
 
-      for(const file of files) {
+    try {
+      for(let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+        const file = files[fileIdx];
         const modelName = modelNameFromFile(file.name);
         setImportLog(prev=>[...prev,{type:"info",msg:`📂 ${file.name} → Modèle: ${modelName}`}]);
 
         const text = await file.text();
         const data = JSON.parse(text);
-        setScanData(data);
 
-        // Find matching model in Supabase (or use first model)
         const matchedModel = models.find(m=>m.name.toLowerCase()===modelName.toLowerCase())
           || models.find(m=>m.name.toLowerCase().includes(modelName.toLowerCase().substring(0,4)))
           || null;
         const modelId = matchedModel?.id || models[0]?.id || null;
+
         if(matchedModel) {
           setImportLog(prev=>[...prev,{type:"info",msg:`✅ Modèle trouvé: ${matchedModel.name}`}]);
         } else {
-          setImportLog(prev=>[...prev,{type:"info",msg:`⚠️ Modèle "${modelName}" non trouvé en base, assigné à ${models[0]?.name||"défaut"}`}]);
+          setImportLog(prev=>[...prev,{type:"info",msg:`⚠️ Modèle "${modelName}" non trouvé, assigné à ${models[0]?.name||"défaut"}`}]);
         }
 
         const entries = Object.entries(data);
         let fileSpenders = 0, fileTW = 0, fileTX = 0, fileCA = 0;
 
-        for(const [telegramId, entry] of entries) {
+        for(let entryIdx = 0; entryIdx < entries.length; entryIdx++) {
+          const [telegramId, entry] = entries[entryIdx];
           if(!entry || typeof entry !== "object") continue;
 
           const handle = extractBestName(entry, telegramId);
@@ -2845,17 +2818,34 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
           const transactions = Array.isArray(entry.transactions) ? entry.transactions : [];
           const resume = entry.resume || "";
           const info = entry.info || {};
-          const now = new Date().toISOString();
 
-          // Build tags array
+          // Build tags
           const tags = [];
           if(isTW) tags.push("timewaster");
           if(isSpender) tags.push("spender");
           if(depense >= 500) tags.push("whale");
           else if(depense >= 200) tags.push("vip");
-          if(contenu.length > 0) tags.push(...contenu.slice(0,3));
 
-          // UPSERT spender into Supabase (idempotent: uses handle as conflict key)
+          // Build contact object for LOCAL state (regardless of Supabase success)
+          const contact = {
+            handle: handle,
+            name: handle,
+            telegramId: telegramId,
+            modelId: modelId,
+            modelName: matchedModel?.name || modelName,
+            depense: depense,
+            isSpender: isSpender,
+            isTW: isTW,
+            contenu: contenu,
+            resume: resume,
+            info: info,
+            tags: tags,
+            sourceType: "telegram_import",
+            insertedAt: new Date().toISOString(),
+            importedTransactions: []
+          };
+
+          // Try Supabase insert (gracefully handle failures)
           const spenderPayload = {
             handle: handle,
             name: handle,
@@ -2871,8 +2861,8 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
             metier: info.metier || "?",
             contenu: contenu.join(", "),
             tags: tags.join(", "),
-            last_seen: now,
-            first_seen: now,
+            last_seen: new Date().toISOString(),
+            first_seen: new Date().toISOString(),
           };
 
           const {error: spErr} = await sb.from("spenders").upsert(spenderPayload, {onConflict:"handle"});
@@ -2881,28 +2871,22 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
             if(isTW) fileTW++;
           }
 
-          // Create transactions from entry.transactions array
-          if(transactions.length > 0) {
-            for(const tx of transactions) {
+          // Process transactions - randomize dates and alternate provider
+          if(transactions && transactions.length > 0) {
+            for(let txIdx = 0; txIdx < transactions.length; txIdx++) {
+              const tx = transactions[txIdx];
               const montant = Number(tx.montant) || 0;
               if(montant <= 0) continue;
 
-              // Idempotent: check if similar TX already exists (same handle + amount + description + model)
-              const {data: existing} = await sb.from("transactions").select("id")
-                .eq("spender_handle", handle)
-                .eq("amount", montant)
-                .eq("model_id", modelId)
-                .eq("source", "telegram_scan")
-                .limit(1);
-
-              if(existing && existing.length > 0) continue; // skip duplicate
+              const txDate = randomizeDate();
+              const provider = getProvider(txIdx);
 
               const txPayload = {
                 spender_handle: handle,
                 amount: montant,
-                date: now,
+                date: txDate,
                 chatter_id: defaultChatterId,
-                provider_id: defaultProviderId,
+                provider_id: provider.id,
                 model_id: modelId,
                 status: "pending",
                 type: contenu[0] || "telegram_import",
@@ -2915,35 +2899,36 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
               if(!txErr) {
                 fileTX++;
                 fileCA += montant;
+                contact.importedTransactions.push({amount: montant, date: txDate, provider: provider.name});
               }
             }
-          }
-          // If no transactions array but depense > 0, create a single aggregate TX
-          else if(depense > 0 && isSpender) {
-            const {data: existing} = await sb.from("transactions").select("id")
-              .eq("spender_handle", handle)
-              .eq("amount", depense)
-              .eq("model_id", modelId)
-              .eq("source", "telegram_scan")
-              .limit(1);
+          } else if(depense > 0 && isSpender) {
+            const txDate = randomizeDate();
+            const provider = getProvider(0);
 
-            if(!existing || existing.length === 0) {
-              const {error: txErr} = await sb.from("transactions").insert({
-                spender_handle: handle,
-                amount: depense,
-                date: now,
-                chatter_id: defaultChatterId,
-                provider_id: defaultProviderId,
-                model_id: modelId,
-                status: "pending",
-                type: contenu[0] || "telegram_import",
-                notes: resume ? resume.substring(0,200) : "",
-                source: "telegram_scan",
-                product: contenu[0] || "",
-              });
-              if(!txErr) { fileTX++; fileCA += depense; }
+            const txPayload = {
+              spender_handle: handle,
+              amount: depense,
+              date: txDate,
+              chatter_id: defaultChatterId,
+              provider_id: provider.id,
+              model_id: modelId,
+              status: "pending",
+              type: contenu[0] || "telegram_import",
+              notes: resume ? resume.substring(0,200) : "",
+              source: "telegram_scan",
+              product: contenu[0] || "",
+            };
+
+            const {error: txErr} = await sb.from("transactions").insert(txPayload);
+            if(!txErr) {
+              fileTX++;
+              fileCA += depense;
+              contact.importedTransactions.push({amount: depense, date: txDate, provider: provider.name});
             }
           }
+
+          newContacts.push(contact);
         }
 
         totalSpenders += fileSpenders;
@@ -2956,7 +2941,6 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
         ]);
       }
 
-      // Final summary
       setImportLog(prev=>[...prev,
         {type:"success",msg:`━━━ RÉSUMÉ FINAL ━━━`},
         {type:"success",msg:`${totalSpenders} contacts importés (${totalTW} timewasters)`},
@@ -2965,367 +2949,732 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
         {type:"success",msg:lang==="fr"?"✅ Import terminé ! App en cours de refresh...":"✅ Import complete! Refreshing app..."},
       ]);
 
+      // Store in local state
+      setImportedContacts(prev => [...prev, ...newContacts]);
       setImporting(false);
-      // AUTO-REFRESH toute l'app (Dashboard, Spenders, TX, Compta... tout se met à jour)
+
       await onRefresh();
       addToast(lang==="fr"?`Import terminé: ${totalTX} TX, ${totalCA.toFixed(0)}€ ✓`:`Import done: ${totalTX} TX, ${totalCA.toFixed(0)}€ ✓`,"success");
     } catch(err) {
       setImportLog(prev=>[...prev,{type:"error",msg:`❌ Erreur: ${err.message}`}]);
       setImporting(false);
     }
-    // Reset file input so same file can be re-imported
+
     e.target.value = "";
   };
 
-  // Quick-add form with Mala + Leo defaults
-  const [quickForm, setQuickForm] = useState({spender:"",amount:"",model_id:"",type:"",notes:""});
-  const [saving, setSaving] = useState(false);
-  const handleQuickAdd = async () => {
-    if(!quickForm.spender||!quickForm.amount) return;
-    setSaving(true);
-    const now = new Date().toISOString();
-    // Upsert spender -> auto-registered in Spenders page
-    await sb.from("spenders").upsert({handle:quickForm.spender,name:quickForm.spender,source:"manual",last_seen:now},{onConflict:"handle"});
-    // Create transaction: Mala chatter + Leo provider + exact datetime
-    const {error}=await sb.from("transactions").insert({
-      spender_handle:quickForm.spender,
-      amount:Number(quickForm.amount),
-      date:now,
-      chatter_id:defaultChatterId,
-      provider_id:defaultProviderId,
-      model_id:quickForm.model_id||models[0]?.id||null,
-      status:"pending",
-      type:quickForm.type||"manual",
-      notes:quickForm.notes,
-      source:"manual",
+  // Unified spender list (from local imports + Supabase txs)
+  const unifiedContacts = useMemo(() => {
+    const map = {};
+
+    // Add imported contacts
+    importedContacts.forEach(contact => {
+      const key = contact.handle.toLowerCase();
+      map[key] = {
+        ...contact,
+        txs: contact.importedTransactions || [],
+        nbTx: (contact.importedTransactions || []).length,
+        ltv: contact.depense,
+        avgTicket: (contact.importedTransactions || []).length > 0
+          ? contact.depense / (contact.importedTransactions || []).length
+          : contact.depense,
+        maxTicket: contact.depense,
+        messagesCount: 0,
+      };
     });
-    if(!error){
-      const entry = {spender:quickForm.spender, amount:quickForm.amount, model:models.find(m=>m.id===quickForm.model_id)?.name||"?", type:quickForm.type||"-", time:new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})};
-      setRecentAdded(prev=>[entry,...prev].slice(0,20));
-      addToast(`${quickForm.spender} — ${quickForm.amount}€ ✓`,"success");
-      setQuickForm({spender:"",amount:"",model_id:quickForm.model_id,type:"",notes:""});
-      // AUTO-REFRESH toute l'app (Dashboard, Spenders, Transactions, Compta... tout se met à jour)
+
+    // Add/merge Supabase transactions
+    const txBySpender = {};
+    txs.forEach(tx => {
+      const handle = tx.spender_handle;
+      if(!handle) return;
+      if(!txBySpender[handle.toLowerCase()]) {
+        txBySpender[handle.toLowerCase()] = [];
+      }
+      txBySpender[handle.toLowerCase()].push(tx);
+    });
+
+    Object.entries(txBySpender).forEach(([handleKey, txList]) => {
+      const ltv = txList.reduce((s, tx) => s + Number(tx.amount), 0);
+      const maxTicket = Math.max(...txList.map(tx => Number(tx.amount)), 0);
+      const avgTicket = txList.length > 0 ? ltv / txList.length : 0;
+
+      const now = new Date();
+      const lastTxDate = txList[txList.length - 1]?.date ? new Date(txList[txList.length - 1].date) : null;
+      const recencyDays = lastTxDate ? Math.floor((now - lastTxDate) / 86400000) : 999;
+
+      const topModelsSet = new Set();
+      const spending30d = txList
+        .filter(tx => {
+          if(!tx.date) return false;
+          const txDate = new Date(tx.date);
+          const days = Math.floor((now - txDate) / 86400000);
+          return days <= 30;
+        })
+        .reduce((s, tx) => { if(tx.model_id) topModelsSet.add(tx.model_id); return s + Number(tx.amount); }, 0);
+
+      const spending7d = txList
+        .filter(tx => {
+          if(!tx.date) return false;
+          const txDate = new Date(tx.date);
+          const days = Math.floor((now - txDate) / 86400000);
+          return days <= 7;
+        })
+        .reduce((s, tx) => s + Number(tx.amount), 0);
+
+      const topModels = Array.from(topModelsSet).map(mid => ({
+        modelId: mid,
+        name: models.find(m => m.id === mid)?.name || "?",
+        count: txList.filter(tx => tx.model_id === mid).length,
+        ca: txList.filter(tx => tx.model_id === mid).reduce((s, tx) => s + Number(tx.amount), 0)
+      })).sort((a, b) => b.ca - a.ca);
+
+      const existing = map[handleKey];
+      map[handleKey] = {
+        ...existing,
+        handle: txList[0].spender_handle,
+        name: existing?.name || txList[0].spender_handle,
+        telegramId: existing?.telegramId || "?",
+        modelId: existing?.modelId || txList[0].model_id,
+        modelName: existing?.modelName || models.find(m => m.id === txList[0].model_id)?.name || "?",
+        depense: existing?.depense || ltv,
+        isSpender: existing?.isSpender || true,
+        isTW: existing?.isTW || false,
+        contenu: existing?.contenu || [],
+        resume: existing?.resume || "",
+        info: existing?.info || {},
+        ltv: ltv,
+        nbTx: txList.length,
+        avgTicket: avgTicket,
+        maxTicket: maxTicket,
+        spending7d: spending7d,
+        spending30d: spending30d,
+        recencyDays: recencyDays,
+        txs: txList,
+        topModels: topModels,
+        messagesCount: 0,
+      };
+    });
+
+    // Compute segment + silentWhaleScore + tags for each
+    return Object.values(map).map(contact => {
+      const segment = getSpenderSegment(contact.ltv);
+      const silentWhaleScore = contact.messagesCount > 0 ? contact.ltv / contact.messagesCount : contact.ltv;
+      const tags = [];
+
+      if(contact.isTW) tags.push("timewaster");
+      if(segment === "whale") tags.push("vip");
+      if(segment === "whale") tags.push("silent_whale");
+      if(contact.recencyDays > 14) tags.push("cold");
+      if(contact.ltv >= 100 && (!contact.info || !contact.info.prenom || contact.info.prenom === "?")) tags.push("silent_whale");
+
+      return {
+        ...contact,
+        segment: segment,
+        silentWhaleScore: silentWhaleScore,
+        tags: [...new Set(tags)],
+      };
+    }).sort((a, b) => b.ltv - a.ltv);
+  }, [importedContacts, txs, models]);
+
+  // Apply filters
+  const filteredContacts = useMemo(() => {
+    return unifiedContacts.filter(c => {
+      const matchSearch = !searchQuery ||
+        c.handle.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (c.info?.prenom && c.info.prenom.toLowerCase().includes(searchQuery.toLowerCase()));
+
+      const matchFilter = activeFilter === "all" ||
+        (activeFilter === "spenders" && c.isSpender) ||
+        (activeFilter === "vip" && c.ltv >= 200) ||
+        (activeFilter === "tw" && c.isTW) ||
+        (activeFilter === "silent_whale" && c.ltv >= 100 && (!c.info?.prenom || c.info.prenom === "?")) ||
+        (activeFilter === "cold" && c.recencyDays > 14);
+
+      const matchModel = filterModel === "all" || c.modelId === filterModel;
+
+      return matchSearch && matchFilter && matchModel;
+    });
+  }, [unifiedContacts, searchQuery, activeFilter, filterModel]);
+
+  // Quick add
+  const [quickForm, setQuickForm] = useState({spender:"", amount:"", model_id:"", type:""});
+  const [saving, setSaving] = useState(false);
+
+  const handleQuickAdd = async () => {
+    if(!quickForm.spender || !quickForm.amount) return;
+    setSaving(true);
+
+    const now = new Date().toISOString();
+    await sb.from("spenders").upsert(
+      {handle: quickForm.spender, name: quickForm.spender, source: "manual", last_seen: now},
+      {onConflict: "handle"}
+    );
+
+    const {error} = await sb.from("transactions").insert({
+      spender_handle: quickForm.spender,
+      amount: Number(quickForm.amount),
+      date: now,
+      chatter_id: defaultChatterId,
+      provider_id: defaultProviderId,
+      model_id: quickForm.model_id || models[0]?.id || null,
+      status: "pending",
+      type: quickForm.type || "manual",
+      source: "manual",
+    });
+
+    if(!error) {
+      addToast(`${quickForm.spender} — ${quickForm.amount}€ ✓`, "success");
+      setQuickForm({spender:"", amount:"", model_id: quickForm.model_id, type:""});
       await onRefresh();
     } else {
-      addToast("Erreur: "+error.message,"error");
+      addToast("Erreur: " + error.message, "error");
     }
     setSaving(false);
   };
 
-  // Bulk add multiple transactions
-  const [bulkMode, setBulkMode] = useState(false);
-  const [bulkText, setBulkText] = useState("");
-  const handleBulkAdd = async () => {
-    // Format: "pseudo montant" per line, or "pseudo montant modele"
-    const lines = bulkText.trim().split("\n").filter(Boolean);
-    let created = 0;
-    for(const line of lines){
-      const parts = line.trim().split(/\s+/);
-      if(parts.length<2) continue;
-      const spender = parts[0];
-      const amount = Number(parts[1]);
-      if(!amount || amount<=0) continue;
-      const modelName = parts.slice(2).join(" ");
-      const modelMatch = modelName ? models.find(m=>m.name.toLowerCase().includes(modelName.toLowerCase())) : null;
-      const now = new Date().toISOString();
-      await sb.from("spenders").upsert({handle:spender,name:spender,source:"bulk",last_seen:now},{onConflict:"handle"});
-      const {error}=await sb.from("transactions").insert({
-        spender_handle:spender, amount, date:now,
-        chatter_id:defaultChatterId, provider_id:defaultProviderId,
-        model_id:modelMatch?.id||models[0]?.id||null, status:"pending", type:"bulk", source:"bulk",
-      });
-      if(!error) created++;
-    }
-    if(created>0){
-      addToast(`${created} ${lang==="fr"?"transactions créées":"transactions created"} ✓`,"success");
-      setBulkText("");
-      await onRefresh();
-    }
-  };
+  // Diagnostic
+  const diagnostic = useMemo(() => ({
+    nbImported: importedContacts.length,
+    nbTxSupabase: txs.length,
+    nbCardsRendered: filteredContacts.length,
+    lastRefresh: new Date().toLocaleTimeString("fr-FR"),
+  }), [importedContacts.length, txs.length, filteredContacts.length]);
+
+  // ── Metrics computed ──
+  const metricsData = useMemo(() => {
+    const spendersOnly = unifiedContacts.filter(c => c.ltv > 0);
+    const twOnly = unifiedContacts.filter(c => c.isTW);
+    const totalCA = spendersOnly.reduce((s,c) => s + c.ltv, 0);
+    const avgTicket = spendersOnly.length > 0 ? totalCA / spendersOnly.reduce((s,c) => s + c.nbTx, 0) : 0;
+    const whales = spendersOnly.filter(c => c.ltv >= 200);
+    const silentWhales = unifiedContacts.filter(c => c.ltv >= 100 && (!c.info?.prenom || c.info.prenom === "?"));
+    // Hour heatmap from Supabase txs
+    const hourMap = Array(24).fill(0);
+    txs.forEach(tx => { if(tx.date) { const h = new Date(tx.date).getHours(); hourMap[h]++; } });
+    const maxH = Math.max(...hourMap, 1);
+    return { spendersOnly, twOnly, totalCA, avgTicket, whales, silentWhales, hourMap, maxH };
+  }, [unifiedContacts, txs]);
+
+  // ── By model grouping ──
+  const byModelData = useMemo(() => {
+    const modelMap = {};
+    unifiedContacts.forEach(c => {
+      const mName = c.modelName || "?";
+      if(!modelMap[mName]) modelMap[mName] = { name: mName, contacts: [], totalCA: 0, nbTx: 0 };
+      modelMap[mName].contacts.push(c);
+      modelMap[mName].totalCA += c.ltv;
+      modelMap[mName].nbTx += c.nbTx;
+    });
+    return Object.values(modelMap).sort((a,b) => b.totalCA - a.totalCA);
+  }, [unifiedContacts]);
+
+  const fr = lang === "fr";
 
   return (
     <div>
-      {/* Section tabs */}
-      <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
-        <button className={`filter-chip ${activeSection==="quick"?"active":""}`} onClick={()=>setActiveSection("quick")}>⚡ {lang==="fr"?"Ajout Rapide":"Quick Add"}</button>
-        <button className={`filter-chip ${activeSection==="bulk"?"active":""}`} onClick={()=>setActiveSection("bulk")}>📋 {lang==="fr"?"Ajout en Masse":"Bulk Add"}</button>
-        <button className={`filter-chip ${activeSection==="scan"?"active":""}`} onClick={()=>setActiveSection("scan")}>📥 {lang==="fr"?"Import Telegram":"Telegram Import"}</button>
-        <button className={`filter-chip ${activeSection==="metrics"?"active":""}`} onClick={()=>setActiveSection("metrics")}>📊 {lang==="fr"?"Métriques":"Metrics"}</button>
-        <button className={`filter-chip ${activeSection==="models"?"active":""}`} onClick={()=>setActiveSection("models")}>🎭 {lang==="fr"?"Par Modèle":"By Model"}</button>
-        {selectedSpender && <button className={`filter-chip ${activeSection==="profile"?"active":""}`} onClick={()=>setActiveSection("profile")}>👤 {selectedSpender}</button>}
+      {/* ═══ NAVIGATION TABS ═══ */}
+      <div style={{display:"flex", gap:6, marginBottom:20, flexWrap:"wrap"}}>
+        {[
+          {key:"import", icon:"📥", label:fr?"Import Telegram":"Import Telegram"},
+          {key:"metrics", icon:"📊", label:fr?"Métriques":"Metrics"},
+          {key:"by_model", icon:"👩", label:fr?"Par Modèle":"By Model"},
+          {key:"fiches", icon:"📇", label:fr?"Fiches Spenders":"Spender Files"},
+        ].map(tab => (
+          <button key={tab.key}
+            className={`filter-chip ${activeView===tab.key?"active":""}`}
+            onClick={()=>{setActiveView(tab.key); if(tab.key!=="detail") setSelectedContact(null);}}
+            style={{fontSize:13, padding:"8px 16px"}}
+          >
+            {tab.icon} {tab.label}
+            {tab.key==="fiches" && ` (${filteredContacts.length})`}
+          </button>
+        ))}
+        {selectedContact && (
+          <button className={`filter-chip ${activeView==="detail"?"active":""}`}
+            onClick={()=>setActiveView("detail")} style={{fontSize:13, padding:"8px 16px"}}>
+            👤 {selectedContact}
+          </button>
+        )}
       </div>
 
-      {/* KPIs */}
-      <div className="kpi-grid">
-        <KPICard label={lang==="fr"?"CA Aujourd'hui":"Today Revenue"} value={`${todayCA.toFixed(0)}`} />
-        <KPICard label={lang==="fr"?"TX Aujourd'hui":"Today TX"} value={`${todayTxs.length}`} />
-        <KPICard label={lang==="fr"?"Clients actifs":"Active Spenders"} value={`${spenderMetrics.length}`} />
-        <KPICard label={lang==="fr"?"CA Total":"Total Revenue"} value={`${spenderMetrics.reduce((s,x)=>s+x.totalCA,0).toFixed(0)}`} />
-      </div>
-
-      {/* Defaults info bar */}
-      <div style={{background:"rgba(139,92,246,0.08)",borderRadius:10,padding:"8px 16px",marginBottom:16,display:"flex",gap:16,alignItems:"center",flexWrap:"wrap",fontSize:12}}>
-        <span style={{fontWeight:600,color:"var(--accent)"}}>Defaults:</span>
-        <span>💬 Chatter: <strong>{defaultChatterName}</strong></span>
-        <span>👤 Provider: <strong>{defaultProviderName}</strong></span>
-        <span>📅 {new Date().toLocaleDateString("fr-FR",{weekday:"long",day:"numeric",month:"long"})}</span>
-        <span>⏰ {new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}</span>
-      </div>
-
-      {/* ===== QUICK ADD ===== */}
-      {activeSection==="quick" && (
+      {/* ═══════════════════════════════════════════ */}
+      {/* 1) IMPORT TELEGRAM                         */}
+      {/* ═══════════════════════════════════════════ */}
+      {activeView === "import" && (
         <div>
+          {/* Import JSON */}
           <div className="card" style={{marginBottom:16}}>
-            <div className="section-title"><div className="section-bar"></div>⚡ {lang==="fr"?"Nouvelle vente":"New Sale"}</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
-              <input placeholder={lang==="fr"?"Pseudo client":"Spender handle"} value={quickForm.spender} onChange={e=>setQuickForm({...quickForm,spender:e.target.value})} className="filter-select" style={{fontSize:14,padding:"10px 12px"}} autoFocus />
-              <input type="number" placeholder={t(lang,"amount")+" (€)"} value={quickForm.amount} onChange={e=>setQuickForm({...quickForm,amount:e.target.value})} className="filter-select" style={{fontSize:14,padding:"10px 12px"}} />
-              <select className="filter-select" value={quickForm.model_id} onChange={e=>setQuickForm({...quickForm,model_id:e.target.value})} style={{fontSize:14,padding:"10px 12px"}}>
-                <option value="">{lang==="fr"?"Modèle":"Model"}</option>
+            <div className="section-title"><div className="section-bar"></div>📥 Import JSON (Scan OFM)</div>
+            <p style={{color:"var(--text2)", fontSize:13, marginBottom:12}}>
+              {fr?"Importe tes fichiers JSON de scan OFM. 1 fichier = 1 modèle (nom du fichier = nom du modèle).":"Import OFM scan JSON files. 1 file = 1 model (filename = model name)."}
+            </p>
+            <div style={{background:"rgba(139,92,246,0.06)", borderRadius:8, padding:"8px 12px", marginBottom:12, fontSize:11, color:"var(--text2)"}}>
+              <strong style={{color:"var(--accent)"}}>Format:</strong> {`{telegramId: {depense, spender, tw, contenu, transactions, resume, info}}`}<br/>
+              <strong style={{color:"var(--accent)"}}>Multi-fichier:</strong> {fr?"sélectionne carla.json + sophie.json etc. d'un coup":"select carla.json + sophie.json etc. at once"}
+            </div>
+            <div style={{display:"flex", gap:12, alignItems:"center", marginBottom:16}}>
+              <label style={{background:"var(--grad)", color:"#fff", padding:"10px 24px", borderRadius:8, cursor:"pointer", fontSize:13, fontWeight:600}}>
+                📂 {fr?"Choisir fichier(s)":"Choose file(s)"}
+                <input type="file" accept=".json" multiple onChange={handleImportJSON} style={{display:"none"}} />
+              </label>
+              {importing && <span className="ai-loading"></span>}
+            </div>
+            {importLog.length > 0 && (
+              <div style={{background:"rgba(0,0,0,0.2)", borderRadius:8, padding:12, maxHeight:250, overflow:"auto"}}>
+                {importLog.map((log, i) => (
+                  <div key={i} style={{fontSize:12, padding:"3px 0", color:log.type==="error"?"var(--danger)":log.type==="success"?"var(--success)":"var(--text2)"}}>
+                    {log.type==="error"?"❌":log.type==="success"?"✅":"ℹ️"} {log.msg}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Quick Add intégré */}
+          <div className="card">
+            <div className="section-title"><div className="section-bar"></div>⚡ {fr?"Ajout Rapide (Vente Manuelle)":"Quick Add (Manual Sale)"}</div>
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:12}}>
+              <input placeholder={fr?"Pseudo client":"Spender handle"} value={quickForm.spender}
+                onChange={e=>setQuickForm({...quickForm, spender:e.target.value})} className="filter-select" />
+              <input type="number" placeholder={fr?"Montant (€)":"Amount (€)"} value={quickForm.amount}
+                onChange={e=>setQuickForm({...quickForm, amount:e.target.value})} className="filter-select" />
+            </div>
+            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:12}}>
+              <select className="filter-select" value={quickForm.model_id}
+                onChange={e=>setQuickForm({...quickForm, model_id:e.target.value})}>
+                <option value="">{fr?"Modèle":"Model"}</option>
                 {models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
               </select>
-            </div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
-              <select className="filter-select" value={quickForm.type} onChange={e=>setQuickForm({...quickForm,type:e.target.value})}>
-                <option value="">{lang==="fr"?"Type de contenu":"Content type"}</option>
+              <select className="filter-select" value={quickForm.type}
+                onChange={e=>setQuickForm({...quickForm, type:e.target.value})}>
+                <option value="">{fr?"Type":"Type"}</option>
                 {PRODUCTS.map(p=><option key={p} value={p}>{p}</option>)}
-                {TAGS.map(tg=><option key={tg} value={tg}>{tg}</option>)}
               </select>
-              <input placeholder={t(lang,"notes")} value={quickForm.notes} onChange={e=>setQuickForm({...quickForm,notes:e.target.value})} className="filter-select" />
             </div>
             <button onClick={handleQuickAdd} disabled={saving||!quickForm.spender||!quickForm.amount}
-              style={{background:(!quickForm.spender||!quickForm.amount)?"rgba(139,92,246,0.3)":"var(--grad)",color:"#fff",border:"none",borderRadius:10,padding:"12px 32px",cursor:saving?"wait":"pointer",fontWeight:700,fontSize:15,width:"100%",transition:"all 0.2s"}}>
-              {saving?"⏳ ...":"✅ "+(lang==="fr"?"ENREGISTRER LA VENTE":"SAVE SALE")}
+              style={{background:(!quickForm.spender||!quickForm.amount)?"rgba(139,92,246,0.3)":"var(--grad)",
+                color:"#fff", border:"none", borderRadius:8, padding:"12px 32px", cursor:saving?"wait":"pointer", fontWeight:700, width:"100%"}}>
+              {saving?"⏳ ...":"✅ "+(fr?"AJOUTER":"ADD")}
             </button>
-          </div>
-
-          {/* Recently added - live feed */}
-          {recentAdded.length>0 && (
-            <div className="card">
-              <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Ventes ajoutées ce soir":"Sales added tonight"} ({recentAdded.length})</div>
-              <div className="table-wrap">
-                <table className="table" style={{fontSize:12}}>
-                  <thead><tr><th>⏰</th><th>{lang==="fr"?"Client":"Spender"}</th><th>{t(lang,"amount")}</th><th>{t(lang,"model")}</th><th>Type</th></tr></thead>
-                  <tbody>
-                    {recentAdded.map((r,i)=>(
-                      <tr key={i}>
-                        <td>{r.time}</td>
-                        <td><Tag type="spender" label={r.spender} id={r.spender}/></td>
-                        <td style={{fontWeight:700}}>{r.amount}€</td>
-                        <td><span style={{color:"var(--accent)"}}>{r.model}</span></td>
-                        <td>{r.type}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div style={{marginTop:8,fontSize:12,color:"var(--text2)"}}>
-                Total: <strong style={{color:"var(--success)"}}>{recentAdded.reduce((s,r)=>s+Number(r.amount),0)}€</strong> | {recentAdded.length} TX
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ===== BULK ADD ===== */}
-      {activeSection==="bulk" && (
-        <div className="card" style={{marginTop:16}}>
-          <div className="section-title"><div className="section-bar"></div>📋 {lang==="fr"?"Ajout en masse":"Bulk Add"}</div>
-          <p style={{color:"var(--text2)",fontSize:12,marginBottom:8}}>{lang==="fr"
-            ?"Une ligne par vente. Format: pseudo montant (optionnel: nom du modèle)"
-            :"One line per sale. Format: handle amount (optional: model name)"}</p>
-          <p style={{color:"var(--text2)",fontSize:11,marginBottom:12,fontStyle:"italic"}}>{lang==="fr"?"Exemple:":"Example:"} jean45 150 luna<br/>dark_knight 80<br/>sexy_bob 200 emma</p>
-          <textarea value={bulkText} onChange={e=>setBulkText(e.target.value)}
-            style={{width:"100%",minHeight:150,background:"rgba(0,0,0,0.2)",border:"1px solid rgba(139,92,246,0.2)",borderRadius:8,padding:12,color:"var(--text)",fontSize:13,fontFamily:"monospace",resize:"vertical"}}
-            placeholder={lang==="fr"?"pseudo montant modele\npseudo montant modele\n...":"handle amount model\nhandle amount model\n..."} />
-          <div style={{display:"flex",gap:12,marginTop:12,alignItems:"center"}}>
-            <button onClick={handleBulkAdd} disabled={!bulkText.trim()}
-              style={{background:!bulkText.trim()?"rgba(139,92,246,0.3)":"var(--grad)",color:"#fff",border:"none",borderRadius:8,padding:"10px 24px",cursor:"pointer",fontWeight:600}}>
-              ✅ {lang==="fr"?"Créer tout":"Create all"}
-            </button>
-            <span style={{fontSize:11,color:"var(--text2)"}}>{bulkText.trim().split("\n").filter(Boolean).length} {lang==="fr"?"lignes":"lines"}</span>
           </div>
         </div>
       )}
 
-      {/* ===== SCAN / IMPORT ===== */}
-      {activeSection==="scan" && (
-        <div className="card" style={{marginTop:16}}>
-          <div className="section-title"><div className="section-bar"></div>📥 {lang==="fr"?"Import JSON Telegram":"Telegram JSON Import"}</div>
-          <p style={{color:"var(--text2)",fontSize:13,marginBottom:12}}>{lang==="fr"
-            ?"Importe tes fichiers JSON de scan OFM. 1 fichier = 1 modèle (nom du fichier = nom du modèle). Clients, timewasters et transactions détectés automatiquement."
-            :"Import your OFM scan JSON files. 1 file = 1 model (filename = model name). Spenders, timewasters and transactions auto-detected."}</p>
-          <div style={{background:"rgba(139,92,246,0.06)",borderRadius:8,padding:"8px 12px",marginBottom:12,fontSize:11,color:"var(--text2)"}}>
-            <strong style={{color:"var(--accent)"}}>Format:</strong> carla.json, sophie.json... | Champs: depense, spender, tw, contenu, transactions, resume, info<br/>
-            <strong style={{color:"var(--accent)"}}>Multi-fichier:</strong> sélectionne plusieurs fichiers d'un coup (1 par modèle)
+      {/* ═══════════════════════════════════════════ */}
+      {/* 2) MÉTRIQUES                               */}
+      {/* ═══════════════════════════════════════════ */}
+      {activeView === "metrics" && (
+        <div>
+          {/* KPI row */}
+          <div className="kpi-grid" style={{marginBottom:16}}>
+            <div className="kpi"><div className="kpi-value">{metricsData.totalCA.toFixed(0)}€</div><div className="kpi-label">CA Total</div></div>
+            <div className="kpi"><div className="kpi-value">{metricsData.spendersOnly.length}</div><div className="kpi-label">Spenders</div></div>
+            <div className="kpi"><div className="kpi-value">{metricsData.twOnly.length}</div><div className="kpi-label">Timewasters</div></div>
+            <div className="kpi"><div className="kpi-value">{metricsData.whales.length}</div><div className="kpi-label">VIP/Whales</div></div>
+            <div className="kpi"><div className="kpi-value">{metricsData.silentWhales.length}</div><div className="kpi-label">🐋 Silent</div></div>
+            <div className="kpi"><div className="kpi-value">{metricsData.avgTicket.toFixed(0)}€</div><div className="kpi-label">AOV</div></div>
           </div>
-          <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16}}>
-            <label style={{background:"var(--grad)",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600}}>
-              📂 {lang==="fr"?"Choisir fichier(s) JSON":"Choose JSON file(s)"}
-              <input type="file" accept=".json" multiple onChange={handleImportJSON} style={{display:"none"}} />
-            </label>
-            {importing && <span className="ai-loading"></span>}
-          </div>
-          {importLog.length>0 && (
-            <div style={{background:"rgba(0,0,0,0.2)",borderRadius:8,padding:12,maxHeight:250,overflow:"auto"}}>
-              {importLog.map((log,i)=>(
-                <div key={i} style={{fontSize:12,padding:"3px 0",color:log.type==="error"?"var(--danger)":log.type==="success"?"var(--success)":"var(--text2)"}}>
-                  {log.type==="error"?"❌":log.type==="success"?"✅":"ℹ️"} {log.msg}
+
+          {/* Heatmap 24h */}
+          <div className="card" style={{marginBottom:16}}>
+            <div className="section-title"><div className="section-bar"></div>🕐 {fr?"Heatmap Horaire (Transactions)":"Hourly Heatmap (Transactions)"}</div>
+            <div style={{display:"flex", gap:2, alignItems:"flex-end", height:80, marginTop:12}}>
+              {metricsData.hourMap.map((count, hour) => (
+                <div key={hour} style={{flex:1, display:"flex", flexDirection:"column", alignItems:"center"}}>
+                  <div style={{
+                    width:"100%", minHeight:4,
+                    height: `${Math.max(4, (count / metricsData.maxH) * 60)}px`,
+                    background: count === 0 ? "rgba(139,92,246,0.08)" :
+                      count < metricsData.maxH * 0.3 ? "rgba(139,92,246,0.25)" :
+                      count < metricsData.maxH * 0.6 ? "rgba(139,92,246,0.5)" : "var(--accent)",
+                    borderRadius:"3px 3px 0 0", transition:"height 0.3s"
+                  }} title={`${hour}h: ${count} TX`} />
+                  <span style={{fontSize:8, color:"var(--text2)", marginTop:2}}>{hour}</span>
                 </div>
               ))}
             </div>
-          )}
-          {scanData && (
-            <div style={{marginTop:16}}>
-              <div className="section-title" style={{fontSize:13}}><div className="section-bar"></div>{lang==="fr"?"Aperçu du dernier scan":"Last Scan Preview"}</div>
-              <div style={{fontSize:12,color:"var(--text2)",lineHeight:1.8}}>
-                <div style={{marginBottom:8}}>{Object.keys(scanData).length} contacts | {Object.values(scanData).filter(v=>v&&v.spender).length} spenders | {Object.values(scanData).filter(v=>v&&v.tw).length} TW | {Object.values(scanData).reduce((s,v)=>s+(Number(v?.depense)||0),0).toFixed(0)}€ total</div>
-                {Object.entries(scanData).filter(([k,v])=>v&&v.spender&&v.depense>0).slice(0,8).map(([k,v])=>(
-                  <div key={k} style={{padding:"6px 10px",margin:"4px 0",background:"rgba(139,92,246,0.05)",borderRadius:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                    <div>
-                      <span style={{color:"var(--accent)",fontWeight:600}}>{v.info?.prenom!=="?"?v.info.prenom:"#"+k.slice(-4)}</span>
-                      <span style={{marginLeft:8,fontSize:10,color:"var(--text2)"}}>{(v.contenu||[]).join(", ").substring(0,40)}</span>
-                    </div>
-                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                      <strong style={{color:"var(--success)"}}>{v.depense}€</strong>
-                      <span style={{fontSize:10}}>{(v.transactions||[]).length} TX</span>
-                      {v.tw && <span style={{fontSize:9,padding:"1px 5px",borderRadius:4,background:"rgba(239,68,68,0.15)",color:"var(--danger)"}}>TW</span>}
-                    </div>
-                  </div>
-                ))}
-                {Object.entries(scanData).filter(([k,v])=>v&&v.tw).length > 0 && (
-                  <div style={{marginTop:8,fontSize:11,color:"var(--danger)"}}>
-                    ⚠️ {Object.entries(scanData).filter(([k,v])=>v&&v.tw).length} timewasters {lang==="fr"?"détectés et taggés":"detected and tagged"}
-                  </div>
-                )}
-              </div>
+            <div style={{fontSize:10, color:"var(--text2)", marginTop:8, textAlign:"center"}}>
+              {fr?"Heures d'achat (0-23h) — intensité = nombre de transactions":"Purchase hours (0-23h) — intensity = transaction count"}
             </div>
-          )}
-        </div>
-      )}
+          </div>
 
-      {/* ===== METRICS ===== */}
-      {activeSection==="metrics" && (
-        <div style={{marginTop:16}}>
+          {/* Top 5 spenders */}
           <div className="card" style={{marginBottom:16}}>
-            <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Tous les clients (lié à la page Clients)":"All Spenders (linked to Spenders page)"}</div>
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr><th>{lang==="fr"?"Client":"Spender"}</th><th>CA</th><th>TX</th><th>Segment</th><th>{lang==="fr"?"Modèles":"Models"}</th><th>{lang==="fr"?"Dernière activité":"Last Activity"}</th></tr>
-                </thead>
-                <tbody>
-                  {spenderMetrics.map(sp=>(
-                    <tr key={sp.name} style={{cursor:"pointer"}} onClick={()=>openEntity("spender",sp.name)}>
-                      <td><Tag type="spender" label={sp.name} id={sp.name}/></td>
-                      <td style={{fontWeight:700}}>{sp.totalCA.toFixed(0)}€</td>
-                      <td>{sp.txCount}</td>
-                      <td><span className={`badge badge-${sp.segment}`}>{sp.segment}</span></td>
-                      <td><div style={{display:"flex",gap:3,flexWrap:"wrap"}}>{sp.models.map(mid=><Tag key={mid} type="model" label={models.find(m=>m.id===mid)?.name||"?"} id={mid}/>)}</div></td>
-                      <td style={{fontSize:11}}>{sp.lastDate?fmtDate(sp.lastDate)+" "+fmtDayTime(sp.lastDate):"-"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Day/Hour heatmaps */}
-          <div className="grid-2">
-            <div className="card">
-              <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Ventes par jour":"Sales by Day"}</div>
-              {(()=>{
-                const days={0:lang==="fr"?"Dim":"Sun",1:lang==="fr"?"Lun":"Mon",2:lang==="fr"?"Mar":"Tue",3:lang==="fr"?"Mer":"Wed",4:lang==="fr"?"Jeu":"Thu",5:lang==="fr"?"Ven":"Fri",6:lang==="fr"?"Sam":"Sat"};
-                const dayData={};
-                txs.forEach(tx=>{if(!tx.date)return;const d=new Date(tx.date).getDay();if(!dayData[d])dayData[d]={count:0,ca:0};dayData[d].count++;dayData[d].ca+=Number(tx.amount);});
-                const maxCA=Math.max(...Object.values(dayData).map(d=>d.ca),1);
-                return Object.entries(days).map(([k,v])=>{const dd=dayData[k]||{count:0,ca:0};return(
-                  <div key={k} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-                    <span style={{width:35,fontSize:12,fontWeight:600}}>{v}</span>
-                    <div style={{flex:1,background:"rgba(139,92,246,0.1)",borderRadius:4,height:20,overflow:"hidden"}}><div style={{background:"var(--accent)",height:"100%",width:`${(dd.ca/maxCA)*100}%`,borderRadius:4}}></div></div>
-                    <span style={{fontSize:11,minWidth:60,textAlign:"right"}}>{dd.ca.toFixed(0)}€ ({dd.count})</span>
-                  </div>);});
-              })()}
-            </div>
-            <div className="card">
-              <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Ventes par heure":"Sales by Hour"}</div>
-              {(()=>{
-                const hourData={};
-                txs.forEach(tx=>{if(!tx.date)return;const h=new Date(tx.date).getHours();if(!hourData[h])hourData[h]={count:0,ca:0};hourData[h].count++;hourData[h].ca+=Number(tx.amount);});
-                const maxCA=Math.max(...Object.values(hourData).map(d=>d.ca),1);
-                return [9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,0,1,2].filter(h=>hourData[h]).map(h=>{const dd=hourData[h];return(
-                  <div key={h} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-                    <span style={{width:35,fontSize:11,fontWeight:600}}>{String(h).padStart(2,"0")}h</span>
-                    <div style={{flex:1,background:"rgba(236,72,153,0.1)",borderRadius:4,height:16,overflow:"hidden"}}><div style={{background:"var(--pink)",height:"100%",width:`${(dd.ca/maxCA)*100}%`,borderRadius:4}}></div></div>
-                    <span style={{fontSize:10,minWidth:60,textAlign:"right"}}>{dd.ca.toFixed(0)}€ ({dd.count})</span>
-                  </div>);});
-              })()}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ===== BY MODEL ===== */}
-      {activeSection==="models" && (
-        <div style={{marginTop:16}}>
-          <div className="grid-2">
-            {modelMetrics.map(m=>(
-              <div key={m.id} className="card" style={{cursor:"pointer"}} onClick={()=>openEntity("model",m.id)}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                  <Tag type="model" label={m.name} id={m.id}/>
-                  <span style={{fontSize:20,fontWeight:700}}>{m.ca.toFixed(0)}€</span>
-                </div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,fontSize:12}}>
-                  <div><span style={{color:"var(--text2)"}}>TX total</span><br/><strong>{m.txCount}</strong></div>
-                  <div><span style={{color:"var(--text2)"}}>{lang==="fr"?"Clients":"Spenders"}</span><br/><strong>{m.spenderCount}</strong></div>
-                  <div><span style={{color:"var(--text2)"}}>{lang==="fr"?"AOV":"AOV"}</span><br/><strong>{m.txCount>0?(m.ca/m.txCount).toFixed(0):0}€</strong></div>
-                </div>
-                {m.todayCA>0 && (
-                  <div style={{marginTop:10,padding:"6px 10px",background:"rgba(16,185,129,0.1)",borderRadius:6,fontSize:11,color:"var(--success)"}}>
-                    {lang==="fr"?"Aujourd'hui":"Today"}: <strong>{m.todayCA.toFixed(0)}€</strong> ({m.todayTxCount} TX)
-                  </div>
-                )}
-                <div style={{marginTop:10}}>
-                  <div style={{fontSize:11,color:"var(--text2)",marginBottom:4}}>Top {lang==="fr"?"clients":"spenders"}:</div>
-                  <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-                    {(()=>{
-                      const mSpenders={};
-                      txs.filter(tx=>tx.model_id===m.id).forEach(tx=>{
-                        if(!tx.spender_handle)return;
-                        if(!mSpenders[tx.spender_handle]) mSpenders[tx.spender_handle]=0;
-                        mSpenders[tx.spender_handle]+=Number(tx.amount);
-                      });
-                      return Object.entries(mSpenders).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([name,ca])=>(
-                        <span key={name} onClick={(e)=>{e.stopPropagation();setSelectedSpender(name);setActiveSection("profile");}} style={{fontSize:10,padding:"2px 8px",borderRadius:8,background:"rgba(236,72,153,0.08)",color:"var(--text)",cursor:"pointer"}}>
-                          <span style={{color:"var(--pink)",fontWeight:600}}>{name}</span> {ca.toFixed(0)}€
-                        </span>
-                      ));
-                    })()}
+            <div className="section-title"><div className="section-bar"></div>🏆 Top 5 Spenders</div>
+            {metricsData.spendersOnly.slice(0,5).map((c, i) => (
+              <div key={c.handle} style={{display:"flex", justifyContent:"space-between", alignItems:"center", padding:"8px 0",
+                borderBottom:i<4?"1px solid rgba(139,92,246,0.08)":"none", cursor:"pointer"}}
+                onClick={()=>{setSelectedContact(c.handle); setActiveView("detail");}}>
+                <div style={{display:"flex", alignItems:"center", gap:10}}>
+                  <span style={{fontSize:16, fontWeight:700, color:"var(--accent)", width:24}}>{i+1}</span>
+                  <div>
+                    <div style={{fontWeight:600, textTransform:"uppercase"}}>{c.name}</div>
+                    <div style={{fontSize:11, color:"var(--text2)"}}>{c.modelName} · {c.nbTx} TX</div>
                   </div>
                 </div>
+                <div style={{fontWeight:700, fontSize:16, color:"var(--success)"}}>{c.ltv.toFixed(0)}€</div>
               </div>
             ))}
           </div>
+
+          {/* Silent Whales highlight */}
+          {metricsData.silentWhales.length > 0 && (
+            <div className="card" style={{background:"rgba(168,85,247,0.06)", border:"1px solid rgba(168,85,247,0.15)"}}>
+              <div className="section-title"><div className="section-bar" style={{background:"var(--pink)"}}></div>🐋 Silent Whales ({metricsData.silentWhales.length})</div>
+              <p style={{fontSize:12, color:"var(--text2)", marginBottom:10}}>{fr?"Dépensent sans se faire connaître — identité inconnue":"Spend without revealing identity — unknown identity"}</p>
+              <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+                {metricsData.silentWhales.map(c => (
+                  <div key={c.handle} onClick={()=>{setSelectedContact(c.handle); setActiveView("detail");}}
+                    style={{padding:"6px 12px", background:"rgba(168,85,247,0.15)", borderRadius:8, cursor:"pointer", fontSize:12}}>
+                    <strong>{c.name}</strong> — <span style={{color:"var(--success)"}}>{c.ltv.toFixed(0)}€</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Diagnostic */}
+          <div style={{marginTop:16, padding:"10px 16px",
+            background:filteredContacts.length>0?"rgba(16,185,129,0.1)":"rgba(239,68,68,0.1)",
+            borderRadius:8, fontSize:11, color:filteredContacts.length>0?"var(--success)":"var(--danger)",
+            display:"flex", justifyContent:"space-between", gap:16, flexWrap:"wrap"}}>
+            <span>📊 {fr?"Importés":"Imported"}: {diagnostic.nbImported}</span>
+            <span>📈 TX Supabase: {diagnostic.nbTxSupabase}</span>
+            <span>🎫 {fr?"Contacts":"Contacts"}: {unifiedContacts.length}</span>
+            <span>🕐 {diagnostic.lastRefresh}</span>
+          </div>
         </div>
       )}
 
-      {/* ===== SPENDER PROFILE (full CRM view) ===== */}
-      {activeSection==="profile" && selectedSpender && (
-        <div style={{marginTop:16}}>
-          <SpenderFullProfile handle={selectedSpender} txs={txs} models={models} profiles={profiles} spenders={spenders} lang={lang} onClose={()=>{setSelectedSpender(null);setActiveSection("metrics");}} />
+      {/* ═══════════════════════════════════════════ */}
+      {/* 3) PAR MODÈLE                              */}
+      {/* ═══════════════════════════════════════════ */}
+      {activeView === "by_model" && (
+        <div>
+          {byModelData.length === 0 && (
+            <div style={{textAlign:"center", padding:40, color:"var(--text2)"}}>
+              {fr?"Aucune donnée — importe des JSON d'abord":"No data — import JSON first"}
+            </div>
+          )}
+          {byModelData.map(modelGroup => (
+            <div key={modelGroup.name} className="card" style={{marginBottom:16}}>
+              <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12}}>
+                <div>
+                  <div style={{fontSize:18, fontWeight:700, textTransform:"uppercase"}}>{modelGroup.name}</div>
+                  <div style={{fontSize:12, color:"var(--text2)"}}>{modelGroup.contacts.length} contacts · {modelGroup.nbTx} TX</div>
+                </div>
+                <div style={{fontSize:24, fontWeight:700, color:"var(--success)"}}>{modelGroup.totalCA.toFixed(0)}€</div>
+              </div>
+
+              {/* Spenders de ce modèle */}
+              <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(220px,1fr))", gap:8}}>
+                {modelGroup.contacts.filter(c=>c.ltv>0).sort((a,b)=>b.ltv-a.ltv).slice(0,10).map(c => (
+                  <div key={c.handle} onClick={()=>{setSelectedContact(c.handle); setActiveView("detail");}}
+                    style={{padding:"10px 14px", background:"rgba(139,92,246,0.04)", borderRadius:8, cursor:"pointer",
+                      border:"1px solid rgba(139,92,246,0.08)", transition:"all 0.2s"}}>
+                    <div style={{display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+                      <span style={{fontWeight:600, textTransform:"uppercase", fontSize:13}}>{c.name}</span>
+                      <span style={{fontWeight:700, color:"var(--success)"}}>{c.ltv.toFixed(0)}€</span>
+                    </div>
+                    <div style={{fontSize:10, color:"var(--text2)", marginTop:4}}>
+                      {c.nbTx} TX · AOV {c.avgTicket.toFixed(0)}€
+                      {c.isTW && <span style={{marginLeft:6, color:"var(--danger)"}}>⚠ TW</span>}
+                      {c.tags?.includes("silent_whale") && <span style={{marginLeft:6}}>🐋</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* TW count */}
+              {modelGroup.contacts.filter(c=>c.isTW).length > 0 && (
+                <div style={{marginTop:10, fontSize:11, color:"var(--danger)"}}>
+                  ⚠ {modelGroup.contacts.filter(c=>c.isTW).length} timewasters {fr?"sur ce modèle":"on this model"}
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
 
-      {/* SpenderQuickCard preview when typing in quick add */}
-      {activeSection==="quick" && quickForm.spender && quickForm.spender.length>=2 && txs.some(tx=>tx.spender_handle&&tx.spender_handle.toLowerCase().includes(quickForm.spender.toLowerCase())) && (
-        <div style={{marginTop:16}}>
-          <div className="section-title" style={{fontSize:12}}><div className="section-bar"></div>{lang==="fr"?"Client existant détecté":"Existing spender detected"}</div>
-          {(()=>{
-            const matches = [...new Set(txs.filter(tx=>tx.spender_handle&&tx.spender_handle.toLowerCase().includes(quickForm.spender.toLowerCase())).map(tx=>tx.spender_handle))].slice(0,3);
-            return matches.map(h=><SpenderQuickCard key={h} handle={h} txs={txs} models={models} profiles={profiles} spenders={spenders} lang={lang} onOpenFull={(name)=>{setSelectedSpender(name);setActiveSection("profile");}} />);
-          })()}
+      {/* ═══════════════════════════════════════════ */}
+      {/* 4) FICHES SPENDERS                         */}
+      {/* ═══════════════════════════════════════════ */}
+      {activeView === "fiches" && (
+        <div>
+          {/* Search + Filters */}
+          <div style={{marginBottom:16}}>
+            <input type="text" placeholder={fr?"Rechercher par pseudo ou prénom...":"Search handle/name..."}
+              value={searchQuery} onChange={e=>setSearchQuery(e.target.value)}
+              className="filter-select" style={{width:"100%", marginBottom:12}} />
+            <div style={{display:"flex", gap:8, marginBottom:12, flexWrap:"wrap"}}>
+              {[
+                {key:"all", label:"Tous"},
+                {key:"spenders", label:"Spenders"},
+                {key:"vip", label:"VIP"},
+                {key:"tw", label:"TW"},
+                {key:"silent_whale", label:"🐋 Silent Whale"},
+                {key:"cold", label:"Cold"},
+              ].map(f => (
+                <button key={f.key} className={`filter-chip ${activeFilter===f.key?"active":""}`}
+                  onClick={()=>setActiveFilter(f.key)} style={{fontSize:12}}>
+                  {f.label} {f.key==="all"?`(${unifiedContacts.length})`:
+                    f.key==="spenders"?`(${unifiedContacts.filter(c=>c.ltv>0).length})`:
+                    f.key==="tw"?`(${unifiedContacts.filter(c=>c.isTW).length})`:
+                    f.key==="vip"?`(${unifiedContacts.filter(c=>c.ltv>=200).length})`:
+                    f.key==="silent_whale"?`(${unifiedContacts.filter(c=>c.ltv>=100&&(!c.info?.prenom||c.info.prenom==="?")).length})`:
+                    f.key==="cold"?`(${unifiedContacts.filter(c=>c.recencyDays>14).length})`:""
+                  }
+                </button>
+              ))}
+            </div>
+            <select className="filter-select" value={filterModel} onChange={e=>setFilterModel(e.target.value)}>
+              <option value="all">{fr?"Tous les modèles":"All Models"}</option>
+              {models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </div>
+
+          {/* Cards grid */}
+          <div style={{display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(300px,1fr))", gap:12}}>
+            {filteredContacts.map(contact => (
+              <div key={contact.handle} className="card" onClick={()=>{setSelectedContact(contact.handle); setActiveView("detail");}}
+                style={{cursor:"pointer", transition:"all 0.2s", borderLeft:contact.isTW?"3px solid var(--danger)":contact.ltv>=200?"3px solid var(--success)":"3px solid transparent"}}>
+                {/* Header row */}
+                <div style={{display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:8}}>
+                  <div>
+                    <div style={{fontWeight:700, fontSize:15, textTransform:"uppercase"}}>{contact.name}</div>
+                    <div style={{fontSize:11, color:"var(--text2)", marginTop:2}}>
+                      <span className={`badge badge-${contact.segment}`}>{contact.segment}</span>
+                      <span style={{marginLeft:6}}>{contact.modelName}</span>
+                    </div>
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:22, fontWeight:700, color:contact.ltv>0?"var(--success)":"var(--text2)"}}>{contact.ltv.toFixed(0)}€</div>
+                  </div>
+                </div>
+
+                {/* Tags */}
+                {contact.tags && contact.tags.length > 0 && (
+                  <div style={{display:"flex", gap:4, flexWrap:"wrap", marginBottom:8}}>
+                    {contact.tags.map(tag => (
+                      <span key={tag} style={{fontSize:10, padding:"2px 7px", borderRadius:4,
+                        background:tag==="silent_whale"?"rgba(168,85,247,0.2)":tag==="vip"?"rgba(236,72,153,0.2)":
+                          tag==="timewaster"?"rgba(239,68,68,0.15)":tag==="cold"?"rgba(107,114,128,0.2)":"rgba(139,92,246,0.15)",
+                        color:tag==="timewaster"?"var(--danger)":tag==="silent_whale"?"var(--pink)":"var(--text)"}}>
+                        {tag==="silent_whale"?"🐋 ":tag==="timewaster"?"⚠ ":""}{tag.toUpperCase()}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {/* KPI line */}
+                <div style={{fontSize:12, color:"var(--text2)", marginBottom:6}}>
+                  <strong>{contact.nbTx}</strong> TX · AOV <strong>{contact.avgTicket.toFixed(0)}€</strong> · Max <strong>{contact.maxTicket.toFixed(0)}€</strong>
+                  {contact.recencyDays < 999 && <span> · {contact.recencyDays}j</span>}
+                </div>
+
+                {/* Info perso */}
+                {(contact.info?.prenom && contact.info.prenom !== "?" || contact.info?.age && contact.info.age !== "?" || contact.info?.metier && contact.info.metier !== "?") && (
+                  <div style={{fontSize:11, color:"var(--text2)", marginBottom:6}}>
+                    {contact.info.prenom && contact.info.prenom !== "?" && <span>{contact.info.prenom}</span>}
+                    {contact.info.age && contact.info.age !== "?" && <span> · {contact.info.age} ans</span>}
+                    {contact.info.metier && contact.info.metier !== "?" && <span> · {contact.info.metier}</span>}
+                  </div>
+                )}
+
+                {/* Contenu badges */}
+                {contact.contenu && contact.contenu.length > 0 && (
+                  <div style={{display:"flex", gap:4, flexWrap:"wrap", marginBottom:6}}>
+                    {contact.contenu.slice(0,3).map((c,i)=>(
+                      <span key={i} style={{fontSize:9, padding:"2px 6px", borderRadius:4, background:"rgba(139,92,246,0.1)", color:"var(--accent)"}}>{c}</span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Resume */}
+                {contact.resume && (
+                  <div style={{fontSize:11, color:"var(--text2)", fontStyle:"italic", lineHeight:1.4}}>
+                    "{contact.resume.substring(0,100)}{contact.resume.length>100?"...":""}"
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          {filteredContacts.length === 0 && (
+            <div style={{textAlign:"center", padding:40, color:"var(--text2)"}}>
+              <div style={{fontSize:32, marginBottom:12}}>📭</div>
+              {fr?"Aucun spender trouvé — va dans Import Telegram pour importer tes JSON":"No spenders found — go to Import Telegram to import your JSON files"}
+            </div>
+          )}
         </div>
       )}
+
+      {/* ═══════════════════════════════════════════ */}
+      {/* DETAIL VIEW (from any tab click)           */}
+      {/* ═══════════════════════════════════════════ */}
+      {activeView === "detail" && selectedContact && (() => {
+        const contact = unifiedContacts.find(c => c.handle === selectedContact);
+        if(!contact) return (
+          <div style={{textAlign:"center", padding:40, color:"var(--text2)"}}>
+            {fr?"Contact non trouvé":"Contact not found"}
+            <br/><button className="filter-chip" onClick={()=>setActiveView("fiches")} style={{marginTop:12}}>← Retour</button>
+          </div>
+        );
+
+        return (
+          <div>
+            {/* Back button */}
+            <button className="filter-chip" onClick={()=>setActiveView("fiches")} style={{marginBottom:16}}>
+              ← {fr?"Retour aux fiches":"Back to files"}
+            </button>
+
+            {/* Profile Header */}
+            <div className="card" style={{marginBottom:16, borderLeft:contact.isTW?"3px solid var(--danger)":"3px solid var(--accent)"}}>
+              <div style={{display:"flex", justifyContent:"space-between", alignItems:"flex-start"}}>
+                <div>
+                  <div style={{fontSize:24, fontWeight:700, textTransform:"uppercase"}}>{contact.name}</div>
+                  <div style={{fontSize:12, color:"var(--text2)", marginTop:4}}>
+                    <span className={`badge badge-${contact.segment}`}>{contact.segment}</span>
+                    <span style={{marginLeft:8}}>Modèle: <strong>{contact.modelName}</strong></span>
+                    <span style={{marginLeft:8}}>TG: #{contact.telegramId}</span>
+                  </div>
+                  {contact.isTW && (
+                    <div style={{marginTop:8, padding:"4px 12px", background:"rgba(239,68,68,0.12)", borderRadius:6, display:"inline-block",
+                      fontSize:12, color:"var(--danger)", fontWeight:700}}>⚠ TIMEWASTER</div>
+                  )}
+                  {contact.tags?.includes("silent_whale") && (
+                    <div style={{marginTop:8, marginLeft:contact.isTW?8:0, padding:"4px 12px", background:"rgba(168,85,247,0.12)", borderRadius:6,
+                      display:"inline-block", fontSize:12, color:"var(--pink)", fontWeight:700}}>🐋 SILENT WHALE</div>
+                  )}
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <div style={{fontSize:36, fontWeight:700, color:contact.ltv>0?"var(--success)":"var(--text2)"}}>{contact.ltv.toFixed(0)}€</div>
+                  <div style={{fontSize:11, color:"var(--text2)"}}>LTV</div>
+                </div>
+              </div>
+
+              {/* Info perso */}
+              <div style={{marginTop:16, display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(120px,1fr))", gap:10, fontSize:12}}>
+                {contact.info?.prenom && contact.info.prenom !== "?" && (
+                  <div><span style={{color:"var(--text2)"}}>Prénom</span><br/><strong>{contact.info.prenom}</strong></div>
+                )}
+                {contact.info?.age && contact.info.age !== "?" && (
+                  <div><span style={{color:"var(--text2)"}}>Age</span><br/><strong>{contact.info.age}</strong></div>
+                )}
+                {contact.info?.metier && contact.info.metier !== "?" && (
+                  <div><span style={{color:"var(--text2)"}}>Métier</span><br/><strong>{contact.info.metier}</strong></div>
+                )}
+                <div><span style={{color:"var(--text2)"}}>Segment</span><br/><strong>{contact.segment}</strong></div>
+              </div>
+            </div>
+
+            {/* KPIs */}
+            <div className="kpi-grid" style={{marginBottom:16}}>
+              <div className="kpi"><div className="kpi-value">{contact.ltv.toFixed(0)}€</div><div className="kpi-label">LTV</div></div>
+              <div className="kpi"><div className="kpi-value">{contact.nbTx}</div><div className="kpi-label">TX</div></div>
+              <div className="kpi"><div className="kpi-value">{contact.avgTicket.toFixed(0)}€</div><div className="kpi-label">AOV</div></div>
+              <div className="kpi"><div className="kpi-value">{contact.maxTicket.toFixed(0)}€</div><div className="kpi-label">Max Ticket</div></div>
+            </div>
+
+            {/* Resume */}
+            {contact.resume && (
+              <div className="card" style={{marginBottom:16}}>
+                <div className="section-title"><div className="section-bar"></div>{fr?"Résumé IA":"AI Summary"}</div>
+                <div style={{fontSize:13, lineHeight:1.6, fontStyle:"italic"}}>"{contact.resume}"</div>
+              </div>
+            )}
+
+            {/* Contenu acheté */}
+            {contact.contenu && contact.contenu.length > 0 && (
+              <div className="card" style={{marginBottom:16}}>
+                <div className="section-title"><div className="section-bar"></div>{fr?"Contenus achetés":"Purchased Content"}</div>
+                <div style={{display:"flex", gap:8, flexWrap:"wrap"}}>
+                  {contact.contenu.map((c,i) => (
+                    <span key={i} style={{fontSize:12, padding:"6px 14px", borderRadius:8, background:"rgba(139,92,246,0.12)", color:"var(--accent)", fontWeight:600}}>{c}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Top Models */}
+            {contact.topModels && contact.topModels.length > 0 && (
+              <div className="card" style={{marginBottom:16}}>
+                <div className="section-title"><div className="section-bar"></div>{fr?"Répartition par modèle":"Model Breakdown"}</div>
+                {contact.topModels.map(m => (
+                  <div key={m.modelId} style={{marginBottom:12}}>
+                    <div style={{display:"flex", justifyContent:"space-between", fontSize:12, fontWeight:600, marginBottom:4}}>
+                      <span>{m.name} ({m.count} TX)</span>
+                      <span style={{color:"var(--success)"}}>{m.ca.toFixed(0)}€ ({contact.ltv>0?((m.ca/contact.ltv)*100).toFixed(0):0}%)</span>
+                    </div>
+                    <div style={{background:"rgba(139,92,246,0.1)", borderRadius:4, height:14, overflow:"hidden"}}>
+                      <div style={{background:"var(--accent)", height:"100%", width:`${contact.ltv>0?(m.ca/contact.ltv)*100:0}%`, borderRadius:4, transition:"width 0.3s"}} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Heatmap mini */}
+            {contact.txs && contact.txs.length > 0 && (
+              <div className="card" style={{marginBottom:16}}>
+                <div className="section-title"><div className="section-bar"></div>🕐 {fr?"Heures d'achat":"Purchase Hours"}</div>
+                {(() => {
+                  const hm = Array(24).fill(0);
+                  contact.txs.forEach(tx => { if(tx.date) { hm[new Date(tx.date).getHours()]++; } });
+                  const mx = Math.max(...hm, 1);
+                  return (
+                    <div style={{display:"flex", gap:1, alignItems:"flex-end", height:40}}>
+                      {hm.map((count, h) => (
+                        <div key={h} style={{flex:1, display:"flex", flexDirection:"column", alignItems:"center"}}>
+                          <div style={{width:"100%", minHeight:2,
+                            height:`${Math.max(2, (count/mx)*32)}px`,
+                            background:count===0?"rgba(139,92,246,0.06)":count<mx*0.5?"rgba(139,92,246,0.3)":"var(--accent)",
+                            borderRadius:"2px 2px 0 0"}} title={`${h}h: ${count}`} />
+                          {h%4===0 && <span style={{fontSize:7, color:"var(--text2)"}}>{h}h</span>}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Transactions table */}
+            {contact.txs && contact.txs.length > 0 && (
+              <div className="card">
+                <div className="section-title"><div className="section-bar"></div>{fr?"Historique Transactions":"Transaction History"} ({contact.txs.length})</div>
+                <div className="table-wrap">
+                  <table className="table" style={{fontSize:11}}>
+                    <thead>
+                      <tr>
+                        <th>{fr?"Date":"Date"}</th>
+                        <th>{fr?"Jour/Heure":"Day/Time"}</th>
+                        <th>{fr?"Modèle":"Model"}</th>
+                        <th>{fr?"Montant":"Amount"}</th>
+                        <th>{fr?"Statut":"Status"}</th>
+                        <th>{fr?"Notes":"Notes"}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {contact.txs.sort((a,b)=>new Date(b.date)-new Date(a.date)).map((tx,i) => (
+                        <tr key={i}>
+                          <td>{tx.date ? fmtDate(tx.date) : "-"}</td>
+                          <td>{tx.date ? fmtDayTime(tx.date) : "-"}</td>
+                          <td><Tag type="model" label={models.find(m=>m.id===tx.model_id)?.name||"?"} id={tx.model_id} /></td>
+                          <td style={{fontWeight:600, color:"var(--success)"}}>{tx.amount}€</td>
+                          <td><StatusPill status={tx.status} lang={lang} /></td>
+                          <td style={{maxWidth:150, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{tx.notes||"-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 };
