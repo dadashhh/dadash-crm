@@ -2415,36 +2415,59 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, onRefresh}) => 
 const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) => {
   const addToast = useToast();
   const {openEntity} = useNav();
-  const [activeSection, setActiveSection] = useState("scan");
+  const [activeSection, setActiveSection] = useState("quick");
   const [importing, setImporting] = useState(false);
   const [importLog, setImportLog] = useState([]);
   const [scanData, setScanData] = useState(null);
+  const [recentAdded, setRecentAdded] = useState([]);
 
-  // Find Mala chatter (default for all sales)
+  // Find Mala chatter + Leo provider (defaults for all transactions)
   const malaChatter = profiles.find(p=>p.role==="chatter" && (p.name||"").toLowerCase().includes("mala"));
+  const leoProvider = profiles.find(p=>p.role==="provider" && (p.name||"").toLowerCase().includes("leo"));
   const defaultChatterId = malaChatter?.id || (profiles.find(p=>p.role==="chatter")?.id) || user.id;
   const defaultChatterName = malaChatter?.name || "Mala";
+  const defaultProviderId = leoProvider?.id || (profiles.find(p=>p.role==="provider")?.id) || "";
+  const defaultProviderName = leoProvider?.name || "Leo";
 
-  // Compute spender metrics from txs (linked with Telegram data)
+  // Compute spender metrics from txs
   const spenderMetrics = useMemo(()=>{
     const map = {};
     txs.forEach(tx=>{
       const h = tx.spender_handle;
       if(!h) return;
-      if(!map[h]) map[h] = {name:h, totalCA:0, txCount:0, models:new Set(), lastDate:null, firstDate:null, validated:0, pending:0};
+      if(!map[h]) map[h] = {name:h, totalCA:0, txCount:0, models:new Set(), lastDate:null, firstDate:null, validated:0, pending:0, types:{}};
       map[h].totalCA += Number(tx.amount);
       map[h].txCount++;
       if(tx.model_id) map[h].models.add(tx.model_id);
       if(tx.status==="validated") map[h].validated += Number(tx.amount);
       if(tx.status==="pending") map[h].pending += Number(tx.amount);
+      const tp = tx.type||tx.product||"autre";
+      map[h].types[tp] = (map[h].types[tp]||0) + Number(tx.amount);
       const d = tx.date;
       if(!map[h].firstDate || d < map[h].firstDate) map[h].firstDate = d;
       if(!map[h].lastDate || d > map[h].lastDate) map[h].lastDate = d;
     });
-    return Object.values(map).map(s=>({...s, models:Array.from(s.models)})).sort((a,b)=>b.totalCA-a.totalCA);
+    return Object.values(map).map(s=>({...s, models:Array.from(s.models), segment:getSpenderSegment(s.totalCA)})).sort((a,b)=>b.totalCA-a.totalCA);
   },[txs]);
 
-  // Parse imported JSON and extract spenders + transactions
+  // Model metrics
+  const modelMetrics = useMemo(()=>{
+    return models.map(m=>{
+      const mTxs = txs.filter(tx=>tx.model_id===m.id);
+      const ca = mTxs.reduce((s,tx)=>s+Number(tx.amount),0);
+      const spenderSet = new Set(mTxs.map(tx=>tx.spender_handle).filter(Boolean));
+      const todayTxs = mTxs.filter(tx=>tx.date&&tx.date.startsWith(new Date().toISOString().split("T")[0]));
+      const todayCA = todayTxs.reduce((s,tx)=>s+Number(tx.amount),0);
+      return {...m, ca, txCount:mTxs.length, spenderCount:spenderSet.size, todayCA, todayTxCount:todayTxs.length};
+    }).sort((a,b)=>b.ca-a.ca);
+  },[txs, models]);
+
+  // Today stats
+  const todayStr = new Date().toISOString().split("T")[0];
+  const todayTxs = txs.filter(tx=>tx.date&&tx.date.startsWith(todayStr));
+  const todayCA = todayTxs.reduce((s,tx)=>s+Number(tx.amount),0);
+
+  // Parse imported JSON
   const handleImportJSON = async (e) => {
     const file = e.target.files[0];
     if(!file) return;
@@ -2455,157 +2478,280 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
       const data = JSON.parse(text);
       setScanData(data);
 
-      // Extract messages - support multiple Telegram export formats
+      // Extract messages - support ALL Telegram export formats
       let messages = [];
       if(Array.isArray(data.messages)) messages = data.messages;
       else if(Array.isArray(data)) messages = data;
       else if(data.chats?.list) {
-        data.chats.list.forEach(chat => {
-          if(chat.messages) messages = messages.concat(chat.messages);
+        data.chats.list.forEach(chat=>{if(chat.messages) messages=messages.concat(chat.messages);});
+      } else {
+        Object.entries(data).forEach(([key, val])=>{
+          if(Array.isArray(val)) messages=messages.concat(val);
+          else if(val && typeof val==="object") {
+            if(Array.isArray(val.messages)) {
+              const chatName=val.name||val.title||val.from||key;
+              val.messages.forEach(msg=>messages.push({...msg,_chatName:chatName,_chatId:key}));
+            } else {
+              if(val.text||val.message||val.date) messages.push({...val,_chatId:key});
+              Object.values(val).forEach(subVal=>{
+                if(Array.isArray(subVal)) subVal.forEach(item=>{
+                  if(item&&typeof item==="object"&&(item.text||item.message||item.date||item.from)) messages.push({...item,_chatId:key});
+                });
+              });
+            }
+          }
         });
       }
 
       setImportLog(prev=>[...prev,{type:"info",msg:`${messages.length} messages ${lang==="fr"?"trouvés":"found"}`}]);
 
-      // Extract unique spenders from messages
       const spenderMap = {};
       const txCandidates = [];
-      messages.forEach(msg => {
-        const from = msg.from || msg.sender_name || msg.actor || "Unknown";
-        const date = msg.date || msg.date_unixtime ? new Date((msg.date_unixtime||0)*1000).toISOString() : msg.date;
-        const msgText = typeof msg.text === "string" ? msg.text : (Array.isArray(msg.text) ? msg.text.map(t=>typeof t==="string"?t:t.text||"").join("") : "");
+      messages.forEach(msg=>{
+        const from=msg.from||msg.from_name||msg.sender_name||msg.actor||msg.user||msg.username||msg._chatName||"Unknown";
+        let date;
+        if(msg.date&&typeof msg.date==="string") date=msg.date;
+        else if(msg.date_unixtime) date=new Date(Number(msg.date_unixtime)*1000).toISOString();
+        else if(msg.timestamp) date=new Date(Number(msg.timestamp)*1000).toISOString();
+        else if(msg.date&&typeof msg.date==="number") date=new Date(msg.date*1000).toISOString();
+        else date=new Date().toISOString();
+        const msgText=typeof msg.text==="string"?msg.text:typeof msg.message==="string"?msg.message:(Array.isArray(msg.text)?msg.text.map(t=>typeof t==="string"?t:(t&&t.text)||"").join(""):"");
 
-        // Track all senders as potential spenders
-        if(from && from !== "Unknown" && !from.toLowerCase().includes("mala") && !from.toLowerCase().includes("dadash")) {
-          if(!spenderMap[from]) spenderMap[from] = {name:from, msgCount:0, firstSeen:date, lastSeen:date, messages:[]};
+        if(from&&from!=="Unknown"&&!from.toLowerCase().includes("mala")&&!from.toLowerCase().includes("dadash")){
+          if(!spenderMap[from]) spenderMap[from]={name:from,msgCount:0,firstSeen:date,lastSeen:date,messages:[]};
           spenderMap[from].msgCount++;
-          if(date && date < spenderMap[from].firstSeen) spenderMap[from].firstSeen = date;
-          if(date && date > spenderMap[from].lastSeen) spenderMap[from].lastSeen = date;
-          spenderMap[from].messages.push({date, text:msgText.substring(0,200)});
+          if(date&&date<spenderMap[from].firstSeen) spenderMap[from].firstSeen=date;
+          if(date&&date>spenderMap[from].lastSeen) spenderMap[from].lastSeen=date;
+          spenderMap[from].messages.push({date,text:msgText.substring(0,200)});
         }
 
-        // Detect potential transactions (messages mentioning amounts/payments)
-        const amountMatch = msgText.match(/(\d+)\s*[\$€£]|[\$€£]\s*(\d+)|(\d+)\s*(usd|eur|dollars?|euros?)/i);
-        if(amountMatch && from) {
-          const amount = Number(amountMatch[1]||amountMatch[2]||amountMatch[3]);
-          if(amount > 0 && amount < 50000) {
-            txCandidates.push({spender:from, amount, date, text:msgText.substring(0,100)});
-          }
+        const amountMatch=msgText.match(/(\d+)\s*[\$€£]|[\$€£]\s*(\d+)|(\d+)\s*(usd|eur|dollars?|euros?)/i);
+        if(amountMatch&&from){
+          const amount=Number(amountMatch[1]||amountMatch[2]||amountMatch[3]);
+          if(amount>0&&amount<50000) txCandidates.push({spender:from,amount,date,text:msgText.substring(0,100)});
         }
       });
 
-      const spenderList = Object.values(spenderMap).sort((a,b)=>b.msgCount-a.msgCount);
+      const spenderList=Object.values(spenderMap).sort((a,b)=>b.msgCount-a.msgCount);
       setImportLog(prev=>[...prev,{type:"success",msg:`${spenderList.length} ${lang==="fr"?"clients détectés":"spenders detected"}`}]);
       if(txCandidates.length>0) setImportLog(prev=>[...prev,{type:"info",msg:`${txCandidates.length} ${lang==="fr"?"transactions potentielles":"potential transactions"}`}]);
 
-      // Auto-register spenders in Supabase
-      let registered = 0;
-      for(const sp of spenderList) {
-        const existing = spenders.find(s=>(s.handle||s.name||"").toLowerCase()===sp.name.toLowerCase());
-        if(!existing) {
-          const {error} = await sb.from("spenders").upsert({
-            handle: sp.name,
-            name: sp.name,
-            source: "telegram",
-            first_seen: sp.firstSeen,
-            last_seen: sp.lastSeen,
-            msg_count: sp.msgCount,
-          }, {onConflict:"handle"});
+      let registered=0;
+      for(const sp of spenderList){
+        const existing=spenders.find(s=>(s.handle||s.name||"").toLowerCase()===sp.name.toLowerCase());
+        if(!existing){
+          const {error}=await sb.from("spenders").upsert({handle:sp.name,name:sp.name,source:"telegram",first_seen:sp.firstSeen,last_seen:sp.lastSeen,msg_count:sp.msgCount},{onConflict:"handle"});
           if(!error) registered++;
         }
       }
       if(registered>0) setImportLog(prev=>[...prev,{type:"success",msg:`${registered} ${lang==="fr"?"nouveaux clients enregistrés":"new spenders registered"}`}]);
 
-      // Auto-create transactions for detected amounts (chatter = Mala)
-      let txCreated = 0;
-      for(const txC of txCandidates) {
-        const {error} = await sb.from("transactions").insert({
-          spender_handle: txC.spender,
-          amount: txC.amount,
-          date: txC.date || new Date().toISOString(),
-          chatter_id: defaultChatterId,
-          model_id: models[0]?.id || null,
-          status: "pending",
-          type: "telegram_import",
-          notes: txC.text,
-          source: "telegram",
+      let txCreated=0;
+      for(const txC of txCandidates){
+        const {error}=await sb.from("transactions").insert({
+          spender_handle:txC.spender, amount:txC.amount, date:txC.date||new Date().toISOString(),
+          chatter_id:defaultChatterId, provider_id:defaultProviderId,
+          model_id:models[0]?.id||null, status:"pending", type:"telegram_import", notes:txC.text, source:"telegram",
         });
         if(!error) txCreated++;
       }
-      if(txCreated>0) setImportLog(prev=>[...prev,{type:"success",msg:`${txCreated} ${lang==="fr"?"transactions créées (chatter: "+defaultChatterName+")":"transactions created (chatter: "+defaultChatterName+")"}`}]);
+      if(txCreated>0) setImportLog(prev=>[...prev,{type:"success",msg:`${txCreated} TX ${lang==="fr"?"créées":"created"} (${defaultChatterName} / ${defaultProviderName})`}]);
 
-      setImportLog(prev=>[...prev,{type:"success",msg:lang==="fr"?"Import terminé ! Actualise pour voir les données.":"Import complete! Refresh to see data."}]);
+      setImportLog(prev=>[...prev,{type:"success",msg:lang==="fr"?"Import terminé !":"Import complete!"}]);
       setImporting(false);
-    } catch(err) {
+      // AUTO-REFRESH toute l'app
+      await onRefresh();
+      addToast(lang==="fr"?"Import terminé - app actualisée ✓":"Import done - app refreshed ✓","success");
+    } catch(err){
       setImportLog(prev=>[...prev,{type:"error",msg:`Erreur: ${err.message}`}]);
       setImporting(false);
     }
   };
 
-  // Manual quick-add transaction
+  // Quick-add form with Mala + Leo defaults
   const [quickForm, setQuickForm] = useState({spender:"",amount:"",model_id:"",type:"",notes:""});
+  const [saving, setSaving] = useState(false);
   const handleQuickAdd = async () => {
-    if(!quickForm.spender || !quickForm.amount) return;
+    if(!quickForm.spender||!quickForm.amount) return;
+    setSaving(true);
     const now = new Date().toISOString();
-    // Upsert spender
-    await sb.from("spenders").upsert({
-      handle: quickForm.spender,
-      name: quickForm.spender,
-      source: "manual",
-      last_seen: now,
-    }, {onConflict:"handle"});
-    // Create transaction with exact date/time
-    const {error} = await sb.from("transactions").insert({
-      spender_handle: quickForm.spender,
-      amount: Number(quickForm.amount),
-      date: now,
-      chatter_id: defaultChatterId,
-      model_id: quickForm.model_id || models[0]?.id || null,
-      status: "pending",
-      type: quickForm.type || "manual",
-      notes: quickForm.notes,
-      source: "manual",
+    // Upsert spender -> auto-registered in Spenders page
+    await sb.from("spenders").upsert({handle:quickForm.spender,name:quickForm.spender,source:"manual",last_seen:now},{onConflict:"handle"});
+    // Create transaction: Mala chatter + Leo provider + exact datetime
+    const {error}=await sb.from("transactions").insert({
+      spender_handle:quickForm.spender,
+      amount:Number(quickForm.amount),
+      date:now,
+      chatter_id:defaultChatterId,
+      provider_id:defaultProviderId,
+      model_id:quickForm.model_id||models[0]?.id||null,
+      status:"pending",
+      type:quickForm.type||"manual",
+      notes:quickForm.notes,
+      source:"manual",
     });
-    if(!error) {
-      addToast(t(lang,"tx_created"));
-      setQuickForm({spender:"",amount:"",model_id:"",type:"",notes:""});
-      onRefresh();
+    if(!error){
+      const entry = {spender:quickForm.spender, amount:quickForm.amount, model:models.find(m=>m.id===quickForm.model_id)?.name||"?", type:quickForm.type||"-", time:new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})};
+      setRecentAdded(prev=>[entry,...prev].slice(0,20));
+      addToast(`${quickForm.spender} — ${quickForm.amount}€ ✓`,"success");
+      setQuickForm({spender:"",amount:"",model_id:quickForm.model_id,type:"",notes:""});
+      // AUTO-REFRESH toute l'app (Dashboard, Spenders, Transactions, Compta... tout se met à jour)
+      await onRefresh();
+    } else {
+      addToast("Erreur: "+error.message,"error");
+    }
+    setSaving(false);
+  };
+
+  // Bulk add multiple transactions
+  const [bulkMode, setBulkMode] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+  const handleBulkAdd = async () => {
+    // Format: "pseudo montant" per line, or "pseudo montant modele"
+    const lines = bulkText.trim().split("\n").filter(Boolean);
+    let created = 0;
+    for(const line of lines){
+      const parts = line.trim().split(/\s+/);
+      if(parts.length<2) continue;
+      const spender = parts[0];
+      const amount = Number(parts[1]);
+      if(!amount || amount<=0) continue;
+      const modelName = parts.slice(2).join(" ");
+      const modelMatch = modelName ? models.find(m=>m.name.toLowerCase().includes(modelName.toLowerCase())) : null;
+      const now = new Date().toISOString();
+      await sb.from("spenders").upsert({handle:spender,name:spender,source:"bulk",last_seen:now},{onConflict:"handle"});
+      const {error}=await sb.from("transactions").insert({
+        spender_handle:spender, amount, date:now,
+        chatter_id:defaultChatterId, provider_id:defaultProviderId,
+        model_id:modelMatch?.id||models[0]?.id||null, status:"pending", type:"bulk", source:"bulk",
+      });
+      if(!error) created++;
+    }
+    if(created>0){
+      addToast(`${created} ${lang==="fr"?"transactions créées":"transactions created"} ✓`,"success");
+      setBulkText("");
+      await onRefresh();
     }
   };
 
   return (
     <div>
       {/* Section tabs */}
-      <div style={{display:"flex",gap:8,marginBottom:16}}>
-        <button className={`filter-chip ${activeSection==="scan"?"active":""}`} onClick={()=>setActiveSection("scan")}>📥 {lang==="fr"?"Import Telegram":"Telegram Import"}</button>
+      <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap"}}>
         <button className={`filter-chip ${activeSection==="quick"?"active":""}`} onClick={()=>setActiveSection("quick")}>⚡ {lang==="fr"?"Ajout Rapide":"Quick Add"}</button>
-        <button className={`filter-chip ${activeSection==="metrics"?"active":""}`} onClick={()=>setActiveSection("metrics")}>📊 {lang==="fr"?"Métriques Clients":"Spender Metrics"}</button>
+        <button className={`filter-chip ${activeSection==="bulk"?"active":""}`} onClick={()=>setActiveSection("bulk")}>📋 {lang==="fr"?"Ajout en Masse":"Bulk Add"}</button>
+        <button className={`filter-chip ${activeSection==="scan"?"active":""}`} onClick={()=>setActiveSection("scan")}>📥 {lang==="fr"?"Import Telegram":"Telegram Import"}</button>
+        <button className={`filter-chip ${activeSection==="metrics"?"active":""}`} onClick={()=>setActiveSection("metrics")}>📊 {lang==="fr"?"Métriques":"Metrics"}</button>
+        <button className={`filter-chip ${activeSection==="models"?"active":""}`} onClick={()=>setActiveSection("models")}>🎭 {lang==="fr"?"Par Modèle":"By Model"}</button>
       </div>
 
-      {/* KPIs linking Telegram <> Spenders */}
+      {/* KPIs */}
       <div className="kpi-grid">
-        <KPICard label={lang==="fr"?"Clients détectés":"Spenders Detected"} value={`${spenderMetrics.length}`} />
+        <KPICard label={lang==="fr"?"CA Aujourd'hui":"Today Revenue"} value={`${todayCA.toFixed(0)}`} />
+        <KPICard label={lang==="fr"?"TX Aujourd'hui":"Today TX"} value={`${todayTxs.length}`} />
+        <KPICard label={lang==="fr"?"Clients actifs":"Active Spenders"} value={`${spenderMetrics.length}`} />
         <KPICard label={lang==="fr"?"CA Total":"Total Revenue"} value={`${spenderMetrics.reduce((s,x)=>s+x.totalCA,0).toFixed(0)}`} />
-        <KPICard label={lang==="fr"?"Chatter actif":"Active Chatter"} value={defaultChatterName} />
-        <KPICard label={lang==="fr"?"TX aujourd'hui":"Today TX"} value={`${txs.filter(tx=>tx.date&&tx.date.startsWith(new Date().toISOString().split("T")[0])).length}`} />
       </div>
 
-      {/* SCAN / IMPORT SECTION */}
+      {/* Defaults info bar */}
+      <div style={{background:"rgba(139,92,246,0.08)",borderRadius:10,padding:"8px 16px",marginBottom:16,display:"flex",gap:16,alignItems:"center",flexWrap:"wrap",fontSize:12}}>
+        <span style={{fontWeight:600,color:"var(--accent)"}}>Defaults:</span>
+        <span>💬 Chatter: <strong>{defaultChatterName}</strong></span>
+        <span>👤 Provider: <strong>{defaultProviderName}</strong></span>
+        <span>📅 {new Date().toLocaleDateString("fr-FR",{weekday:"long",day:"numeric",month:"long"})}</span>
+        <span>⏰ {new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}</span>
+      </div>
+
+      {/* ===== QUICK ADD ===== */}
+      {activeSection==="quick" && (
+        <div>
+          <div className="card" style={{marginBottom:16}}>
+            <div className="section-title"><div className="section-bar"></div>⚡ {lang==="fr"?"Nouvelle vente":"New Sale"}</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
+              <input placeholder={lang==="fr"?"Pseudo client":"Spender handle"} value={quickForm.spender} onChange={e=>setQuickForm({...quickForm,spender:e.target.value})} className="filter-select" style={{fontSize:14,padding:"10px 12px"}} autoFocus />
+              <input type="number" placeholder={t(lang,"amount")+" (€)"} value={quickForm.amount} onChange={e=>setQuickForm({...quickForm,amount:e.target.value})} className="filter-select" style={{fontSize:14,padding:"10px 12px"}} />
+              <select className="filter-select" value={quickForm.model_id} onChange={e=>setQuickForm({...quickForm,model_id:e.target.value})} style={{fontSize:14,padding:"10px 12px"}}>
+                <option value="">{lang==="fr"?"Modèle":"Model"}</option>
+                {models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+              <select className="filter-select" value={quickForm.type} onChange={e=>setQuickForm({...quickForm,type:e.target.value})}>
+                <option value="">{lang==="fr"?"Type de contenu":"Content type"}</option>
+                {PRODUCTS.map(p=><option key={p} value={p}>{p}</option>)}
+                {TAGS.map(tg=><option key={tg} value={tg}>{tg}</option>)}
+              </select>
+              <input placeholder={t(lang,"notes")} value={quickForm.notes} onChange={e=>setQuickForm({...quickForm,notes:e.target.value})} className="filter-select" />
+            </div>
+            <button onClick={handleQuickAdd} disabled={saving||!quickForm.spender||!quickForm.amount}
+              style={{background:(!quickForm.spender||!quickForm.amount)?"rgba(139,92,246,0.3)":"var(--grad)",color:"#fff",border:"none",borderRadius:10,padding:"12px 32px",cursor:saving?"wait":"pointer",fontWeight:700,fontSize:15,width:"100%",transition:"all 0.2s"}}>
+              {saving?"⏳ ...":"✅ "+(lang==="fr"?"ENREGISTRER LA VENTE":"SAVE SALE")}
+            </button>
+          </div>
+
+          {/* Recently added - live feed */}
+          {recentAdded.length>0 && (
+            <div className="card">
+              <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Ventes ajoutées ce soir":"Sales added tonight"} ({recentAdded.length})</div>
+              <div className="table-wrap">
+                <table className="table" style={{fontSize:12}}>
+                  <thead><tr><th>⏰</th><th>{lang==="fr"?"Client":"Spender"}</th><th>{t(lang,"amount")}</th><th>{t(lang,"model")}</th><th>Type</th></tr></thead>
+                  <tbody>
+                    {recentAdded.map((r,i)=>(
+                      <tr key={i}>
+                        <td>{r.time}</td>
+                        <td><Tag type="spender" label={r.spender} id={r.spender}/></td>
+                        <td style={{fontWeight:700}}>{r.amount}€</td>
+                        <td><span style={{color:"var(--accent)"}}>{r.model}</span></td>
+                        <td>{r.type}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div style={{marginTop:8,fontSize:12,color:"var(--text2)"}}>
+                Total: <strong style={{color:"var(--success)"}}>{recentAdded.reduce((s,r)=>s+Number(r.amount),0)}€</strong> | {recentAdded.length} TX
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ===== BULK ADD ===== */}
+      {activeSection==="bulk" && (
+        <div className="card" style={{marginTop:16}}>
+          <div className="section-title"><div className="section-bar"></div>📋 {lang==="fr"?"Ajout en masse":"Bulk Add"}</div>
+          <p style={{color:"var(--text2)",fontSize:12,marginBottom:8}}>{lang==="fr"
+            ?"Une ligne par vente. Format: pseudo montant (optionnel: nom du modèle)"
+            :"One line per sale. Format: handle amount (optional: model name)"}</p>
+          <p style={{color:"var(--text2)",fontSize:11,marginBottom:12,fontStyle:"italic"}}>{lang==="fr"?"Exemple:":"Example:"} jean45 150 luna<br/>dark_knight 80<br/>sexy_bob 200 emma</p>
+          <textarea value={bulkText} onChange={e=>setBulkText(e.target.value)}
+            style={{width:"100%",minHeight:150,background:"rgba(0,0,0,0.2)",border:"1px solid rgba(139,92,246,0.2)",borderRadius:8,padding:12,color:"var(--text)",fontSize:13,fontFamily:"monospace",resize:"vertical"}}
+            placeholder={lang==="fr"?"pseudo montant modele\npseudo montant modele\n...":"handle amount model\nhandle amount model\n..."} />
+          <div style={{display:"flex",gap:12,marginTop:12,alignItems:"center"}}>
+            <button onClick={handleBulkAdd} disabled={!bulkText.trim()}
+              style={{background:!bulkText.trim()?"rgba(139,92,246,0.3)":"var(--grad)",color:"#fff",border:"none",borderRadius:8,padding:"10px 24px",cursor:"pointer",fontWeight:600}}>
+              ✅ {lang==="fr"?"Créer tout":"Create all"}
+            </button>
+            <span style={{fontSize:11,color:"var(--text2)"}}>{bulkText.trim().split("\n").filter(Boolean).length} {lang==="fr"?"lignes":"lines"}</span>
+          </div>
+        </div>
+      )}
+
+      {/* ===== SCAN / IMPORT ===== */}
       {activeSection==="scan" && (
         <div className="card" style={{marginTop:16}}>
-          <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Import JSON Telegram":"Telegram JSON Import"}</div>
+          <div className="section-title"><div className="section-bar"></div>📥 {lang==="fr"?"Import JSON Telegram":"Telegram JSON Import"}</div>
           <p style={{color:"var(--text2)",fontSize:13,marginBottom:12}}>{lang==="fr"
-            ?"Exporte ta conversation Telegram en JSON et importe-la ici. Les clients seront automatiquement détectés et enregistrés dans la page Clients."
-            :"Export your Telegram conversation as JSON and import it here. Spenders will be auto-detected and registered in the Spenders page."}</p>
+            ?"Exporte ta conversation Telegram en JSON et importe-la ici. Clients + transactions détectés automatiquement."
+            :"Export your Telegram conversation as JSON and import it here. Spenders + transactions auto-detected."}</p>
           <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16}}>
-            <label style={{background:"var(--grad)",color:"#fff",padding:"8px 20px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600}}>
+            <label style={{background:"var(--grad)",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600}}>
               📂 {lang==="fr"?"Choisir fichier JSON":"Choose JSON file"}
               <input type="file" accept=".json" onChange={handleImportJSON} style={{display:"none"}} />
             </label>
             {importing && <span className="ai-loading"></span>}
-            <button onClick={onRefresh} style={{background:"rgba(139,92,246,0.1)",color:"var(--accent)",border:"none",borderRadius:8,padding:"8px 16px",cursor:"pointer",fontSize:13,fontWeight:600}}>🔄 {t(lang,"refresh")}</button>
           </div>
-          {/* Import log */}
           {importLog.length>0 && (
             <div style={{background:"rgba(0,0,0,0.2)",borderRadius:8,padding:12,maxHeight:250,overflow:"auto"}}>
               {importLog.map((log,i)=>(
@@ -2615,83 +2761,41 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
               ))}
             </div>
           )}
-
-          {/* Scan preview */}
           {scanData && (
             <div style={{marginTop:16}}>
               <div className="section-title" style={{fontSize:13}}><div className="section-bar"></div>{lang==="fr"?"Aperçu du scan":"Scan Preview"}</div>
-              <div style={{fontSize:12,color:"var(--text2)"}}>
-                {lang==="fr"?"Format":"Format"}: {Array.isArray(scanData)?"Array":typeof scanData==="object"?"Object":"?"} |
-                {lang==="fr"?" Clés":"Keys"}: {Object.keys(scanData).slice(0,5).join(", ")}
+              <div style={{fontSize:12,color:"var(--text2)",lineHeight:1.8}}>
+                <div>Format: {Array.isArray(scanData)?"Array":"Object"} | {Object.keys(scanData).length} {lang==="fr"?"clés":"keys"}</div>
+                {Object.entries(scanData).slice(0,5).map(([k,v])=>(
+                  <div key={k} style={{padding:"4px 8px",margin:"4px 0",background:"rgba(139,92,246,0.05)",borderRadius:6}}>
+                    <span style={{color:"var(--accent)",fontWeight:600}}>{k}</span>: {Array.isArray(v)?`[${v.length}]`:typeof v==="object"&&v?`{${Object.keys(v).length} keys}`:String(v).substring(0,50)}
+                  </div>
+                ))}
               </div>
             </div>
           )}
         </div>
       )}
 
-      {/* QUICK ADD SECTION */}
-      {activeSection==="quick" && (
-        <div className="card" style={{marginTop:16}}>
-          <div className="section-title"><div className="section-bar"></div>⚡ {lang==="fr"?"Ajout rapide de vente":"Quick Sale Entry"}</div>
-          <p style={{color:"var(--text2)",fontSize:12,marginBottom:12}}>{lang==="fr"
-            ?`Chatter par défaut : ${defaultChatterName}. Le jour et l'heure sont enregistrés automatiquement.`
-            :`Default chatter: ${defaultChatterName}. Date and time are recorded automatically.`}</p>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
-            <input placeholder={lang==="fr"?"Pseudo client":"Spender handle"} value={quickForm.spender} onChange={e=>setQuickForm({...quickForm,spender:e.target.value})} className="filter-select" />
-            <input type="number" placeholder={t(lang,"amount")} value={quickForm.amount} onChange={e=>setQuickForm({...quickForm,amount:e.target.value})} className="filter-select" />
-            <select className="filter-select" value={quickForm.model_id} onChange={e=>setQuickForm({...quickForm,model_id:e.target.value})}>
-              <option value="">{lang==="fr"?"Choisir modèle":"Choose model"}</option>
-              {models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
-            </select>
-            <select className="filter-select" value={quickForm.type} onChange={e=>setQuickForm({...quickForm,type:e.target.value})}>
-              <option value="">{lang==="fr"?"Type de contenu":"Content type"}</option>
-              {PRODUCTS.map(p=><option key={p} value={p}>{p}</option>)}
-              {TAGS.map(tg=><option key={tg} value={tg}>{tg}</option>)}
-            </select>
-          </div>
-          <input placeholder={t(lang,"notes")} value={quickForm.notes} onChange={e=>setQuickForm({...quickForm,notes:e.target.value})} className="filter-select" style={{width:"100%",marginBottom:12}} />
-          <div style={{display:"flex",gap:8,alignItems:"center"}}>
-            <button onClick={handleQuickAdd} style={{background:"var(--grad)",color:"#fff",border:"none",borderRadius:8,padding:"10px 24px",cursor:"pointer",fontWeight:600}}>
-              ✅ {t(lang,"create")}
-            </button>
-            <span style={{fontSize:11,color:"var(--text2)"}}>📅 {new Date().toLocaleDateString("fr-FR")} ⏰ {new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}</span>
-          </div>
-        </div>
-      )}
-
-      {/* METRICS SECTION - linked to Spenders page */}
+      {/* ===== METRICS ===== */}
       {activeSection==="metrics" && (
         <div style={{marginTop:16}}>
           <div className="card" style={{marginBottom:16}}>
-            <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Clients détectés (liés à la page Clients)":"Detected Spenders (linked to Spenders page)"}</div>
+            <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Tous les clients (lié à la page Clients)":"All Spenders (linked to Spenders page)"}</div>
             <div className="table-wrap">
               <table className="table">
                 <thead>
-                  <tr>
-                    <th>{lang==="fr"?"Client":"Spender"}</th>
-                    <th>CA</th>
-                    <th>TX</th>
-                    <th>{lang==="fr"?"Modèles":"Models"}</th>
-                    <th>{lang==="fr"?"Dernière activité":"Last Activity"}</th>
-                    <th>{lang==="fr"?"Jour & Heure":"Day & Time"}</th>
-                  </tr>
+                  <tr><th>{lang==="fr"?"Client":"Spender"}</th><th>CA</th><th>TX</th><th>Segment</th><th>{lang==="fr"?"Modèles":"Models"}</th><th>{lang==="fr"?"Dernière activité":"Last Activity"}</th></tr>
                 </thead>
                 <tbody>
                   {spenderMetrics.map(sp=>(
                     <tr key={sp.name} style={{cursor:"pointer"}} onClick={()=>openEntity("spender",sp.name)}>
                       <td><Tag type="spender" label={sp.name} id={sp.name}/></td>
-                      <td style={{fontWeight:600}}>{sp.totalCA.toFixed(0)}</td>
+                      <td style={{fontWeight:700}}>{sp.totalCA.toFixed(0)}€</td>
                       <td>{sp.txCount}</td>
-                      <td>
-                        <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
-                          {sp.models.map(mid=>{
-                            const mName = models.find(m=>m.id===mid)?.name||"?";
-                            return <Tag key={mid} type="model" label={mName} id={mid}/>;
-                          })}
-                        </div>
-                      </td>
-                      <td>{sp.lastDate ? fmtDate(sp.lastDate) : "-"}</td>
-                      <td style={{fontSize:11}}>{sp.lastDate ? new Date(sp.lastDate).toLocaleDateString("fr-FR",{weekday:"short"})+" "+fmtTime(sp.lastDate) : "-"}</td>
+                      <td><span className={`badge badge-${sp.segment}`}>{sp.segment}</span></td>
+                      <td><div style={{display:"flex",gap:3,flexWrap:"wrap"}}>{sp.models.map(mid=><Tag key={mid} type="model" label={models.find(m=>m.id===mid)?.name||"?"} id={mid}/>)}</div></td>
+                      <td style={{fontSize:11}}>{sp.lastDate?fmtDate(sp.lastDate)+" "+fmtDayTime(sp.lastDate):"-"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -2699,62 +2803,82 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh}) =
             </div>
           </div>
 
-          {/* Revenue by day/time heatmap summary */}
+          {/* Day/Hour heatmaps */}
           <div className="grid-2">
             <div className="card">
               <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Ventes par jour":"Sales by Day"}</div>
               {(()=>{
-                const days = {0:lang==="fr"?"Dim":"Sun",1:lang==="fr"?"Lun":"Mon",2:lang==="fr"?"Mar":"Tue",3:lang==="fr"?"Mer":"Wed",4:lang==="fr"?"Jeu":"Thu",5:lang==="fr"?"Ven":"Fri",6:lang==="fr"?"Sam":"Sat"};
-                const dayData = {};
-                txs.forEach(tx=>{
-                  if(!tx.date) return;
-                  const d = new Date(tx.date).getDay();
-                  if(!dayData[d]) dayData[d] = {count:0,ca:0};
-                  dayData[d].count++;
-                  dayData[d].ca += Number(tx.amount);
-                });
-                const maxCA = Math.max(...Object.values(dayData).map(d=>d.ca),1);
-                return Object.entries(days).map(([k,v])=>{
-                  const dd = dayData[k]||{count:0,ca:0};
-                  return (
-                    <div key={k} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
-                      <span style={{width:35,fontSize:12,fontWeight:600}}>{v}</span>
-                      <div style={{flex:1,background:"rgba(139,92,246,0.1)",borderRadius:4,height:20,overflow:"hidden"}}>
-                        <div style={{background:"var(--accent)",height:"100%",width:`${(dd.ca/maxCA)*100}%`,borderRadius:4,transition:"width 0.3s"}}></div>
-                      </div>
-                      <span style={{fontSize:11,minWidth:50,textAlign:"right"}}>{dd.ca.toFixed(0)} ({dd.count})</span>
-                    </div>
-                  );
-                });
+                const days={0:lang==="fr"?"Dim":"Sun",1:lang==="fr"?"Lun":"Mon",2:lang==="fr"?"Mar":"Tue",3:lang==="fr"?"Mer":"Wed",4:lang==="fr"?"Jeu":"Thu",5:lang==="fr"?"Ven":"Fri",6:lang==="fr"?"Sam":"Sat"};
+                const dayData={};
+                txs.forEach(tx=>{if(!tx.date)return;const d=new Date(tx.date).getDay();if(!dayData[d])dayData[d]={count:0,ca:0};dayData[d].count++;dayData[d].ca+=Number(tx.amount);});
+                const maxCA=Math.max(...Object.values(dayData).map(d=>d.ca),1);
+                return Object.entries(days).map(([k,v])=>{const dd=dayData[k]||{count:0,ca:0};return(
+                  <div key={k} style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+                    <span style={{width:35,fontSize:12,fontWeight:600}}>{v}</span>
+                    <div style={{flex:1,background:"rgba(139,92,246,0.1)",borderRadius:4,height:20,overflow:"hidden"}}><div style={{background:"var(--accent)",height:"100%",width:`${(dd.ca/maxCA)*100}%`,borderRadius:4}}></div></div>
+                    <span style={{fontSize:11,minWidth:60,textAlign:"right"}}>{dd.ca.toFixed(0)}€ ({dd.count})</span>
+                  </div>);});
               })()}
             </div>
             <div className="card">
               <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Ventes par heure":"Sales by Hour"}</div>
               {(()=>{
-                const hourData = {};
-                txs.forEach(tx=>{
-                  if(!tx.date) return;
-                  const h = new Date(tx.date).getHours();
-                  if(!hourData[h]) hourData[h] = {count:0,ca:0};
-                  hourData[h].count++;
-                  hourData[h].ca += Number(tx.amount);
-                });
-                const maxCA = Math.max(...Object.values(hourData).map(d=>d.ca),1);
-                const hours = [9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,0,1,2];
-                return hours.filter(h=>hourData[h]).map(h=>{
-                  const dd = hourData[h];
-                  return (
-                    <div key={h} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-                      <span style={{width:35,fontSize:11,fontWeight:600}}>{String(h).padStart(2,"0")}h</span>
-                      <div style={{flex:1,background:"rgba(236,72,153,0.1)",borderRadius:4,height:16,overflow:"hidden"}}>
-                        <div style={{background:"var(--pink)",height:"100%",width:`${(dd.ca/maxCA)*100}%`,borderRadius:4}}></div>
-                      </div>
-                      <span style={{fontSize:10,minWidth:50,textAlign:"right"}}>{dd.ca.toFixed(0)} ({dd.count})</span>
-                    </div>
-                  );
-                });
+                const hourData={};
+                txs.forEach(tx=>{if(!tx.date)return;const h=new Date(tx.date).getHours();if(!hourData[h])hourData[h]={count:0,ca:0};hourData[h].count++;hourData[h].ca+=Number(tx.amount);});
+                const maxCA=Math.max(...Object.values(hourData).map(d=>d.ca),1);
+                return [9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,0,1,2].filter(h=>hourData[h]).map(h=>{const dd=hourData[h];return(
+                  <div key={h} style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <span style={{width:35,fontSize:11,fontWeight:600}}>{String(h).padStart(2,"0")}h</span>
+                    <div style={{flex:1,background:"rgba(236,72,153,0.1)",borderRadius:4,height:16,overflow:"hidden"}}><div style={{background:"var(--pink)",height:"100%",width:`${(dd.ca/maxCA)*100}%`,borderRadius:4}}></div></div>
+                    <span style={{fontSize:10,minWidth:60,textAlign:"right"}}>{dd.ca.toFixed(0)}€ ({dd.count})</span>
+                  </div>);});
               })()}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== BY MODEL ===== */}
+      {activeSection==="models" && (
+        <div style={{marginTop:16}}>
+          <div className="grid-2">
+            {modelMetrics.map(m=>(
+              <div key={m.id} className="card" style={{cursor:"pointer"}} onClick={()=>openEntity("model",m.id)}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <Tag type="model" label={m.name} id={m.id}/>
+                  <span style={{fontSize:20,fontWeight:700}}>{m.ca.toFixed(0)}€</span>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,fontSize:12}}>
+                  <div><span style={{color:"var(--text2)"}}>TX total</span><br/><strong>{m.txCount}</strong></div>
+                  <div><span style={{color:"var(--text2)"}}>{lang==="fr"?"Clients":"Spenders"}</span><br/><strong>{m.spenderCount}</strong></div>
+                  <div><span style={{color:"var(--text2)"}}>{lang==="fr"?"AOV":"AOV"}</span><br/><strong>{m.txCount>0?(m.ca/m.txCount).toFixed(0):0}€</strong></div>
+                </div>
+                {m.todayCA>0 && (
+                  <div style={{marginTop:10,padding:"6px 10px",background:"rgba(16,185,129,0.1)",borderRadius:6,fontSize:11,color:"var(--success)"}}>
+                    {lang==="fr"?"Aujourd'hui":"Today"}: <strong>{m.todayCA.toFixed(0)}€</strong> ({m.todayTxCount} TX)
+                  </div>
+                )}
+                {/* Top spenders for this model */}
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:11,color:"var(--text2)",marginBottom:4}}>Top {lang==="fr"?"clients":"spenders"}:</div>
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                    {(()=>{
+                      const mSpenders={};
+                      txs.filter(tx=>tx.model_id===m.id).forEach(tx=>{
+                        if(!tx.spender_handle)return;
+                        if(!mSpenders[tx.spender_handle]) mSpenders[tx.spender_handle]=0;
+                        mSpenders[tx.spender_handle]+=Number(tx.amount);
+                      });
+                      return Object.entries(mSpenders).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([name,ca])=>(
+                        <span key={name} style={{fontSize:10,padding:"2px 8px",borderRadius:8,background:"rgba(236,72,153,0.08)",color:"var(--text)"}}>
+                          <span style={{color:"var(--pink)",fontWeight:600}}>{name}</span> {ca.toFixed(0)}€
+                        </span>
+                      ));
+                    })()}
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}
