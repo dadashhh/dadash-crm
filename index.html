@@ -1,99 +1,128 @@
-🔥 PROMPT — DEBUG HARD — “0 SPENDER FOUND” (INGESTION / MAPPING / REFRESH / UI BINDINGS)
+🔥 PROMPT — PHASE 2 GLOBAL SYNC — “SPENDER TELEGRAM → PAGE SPENDER + REFRESH PARTOUT” (Model/Chatter/Provider)
 
-Tu es un DEV CRM SENIOR. Problème actuel :
-- La page Telegram affiche : 0 spender, 0 contact, 0 liste.
-- On soupçonne que la lecture/ingestion ne passe pas bien OU que le mapping spender est cassé.
+Tu es un DEV CRM SENIOR. Maintenant que la page Telegram sort bien des fiches spender, ta mission est de :
+✅ Rendre ces mêmes fiches spender **utilisables et à jour partout dans l’app**
+✅ Mettre à jour la page Spender pour qu’elle affiche les mêmes données (et plus), recalculées par **modèle + chatter + provider**
+✅ Mettre en place un refresh global fiable : “une modif data → tout le site se met à jour”
 
-🎯 OBJECTIF
-1) Prouver où ça casse (DB, query, transform, UI binding).
-2) Réparer pour obtenir au minimum :
-   - une liste de spenders (cards)
-   - à partir des transactions existantes
-
-⚠️ RÈGLES
-- Pas d’hypothèses : tu instrumentes avec logs + “sanity queries”.
-- Chaque étape doit produire un output visible dans l’UI (debug panel) + logs console.
+IMPORTANT : cette phase = GLOBAL SYNC. On ne refait pas l’import, on industrialise le refresh + la cohérence multi-pages.
 
 ────────────────────────────────────────
-A) SANITY CHECKS (À FAIRE EN PREMIER)
-Créer/Exécuter ces 6 checks dans cet ordre, et afficher les résultats dans un “Debug Panel” :
+A) RÈGLES DATA “CE SOIR” (OBLIGATOIRE, À APPLIQUER SUR TOUTES LES TRANSACTIONS QUE L’ON RENTRE)
+Pour TOUTES les transactions créées/importées ce soir :
+1) tx_date = date aléatoire entre le 13 février 2026 et le 19 février 2026 (inclus)
+2) chatter_name = "Mala" pour CHAQUE vente
+3) provider_name = "Leo" pour CHAQUE vente
+4) status = "validated" pour toutes SAUF 2 transactions aléatoires qui doivent être "pending"
 
-CHECK 1 — “Do we have any transactions at all?”
-- Query: count(*) tx_count, min(date), max(date) from transactions
-- Output attendu: tx_count > 0
-- Si 0 → l’import n’écrit pas en DB ou écrit dans une autre table.
-
-CHECK 2 — “What columns exist / what is the schema?”
-- Décrire les colonnes de transactions (ou select * limit 3)
-- On cherche : spender_id OU spender_username/handle OU contact_id
-- Si aucune colonne d’identification spender → impossible de créer des fiches.
-
-CHECK 3 — “Can we extract spender key from tx?”
-- Query: select spender_id, spender_username, count(*) from transactions group by 1,2 order by 3 desc limit 20
-- Si spender_id et username sont NULL → mapping cassé à l’ingestion.
-
-CHECK 4 — “Are we reading the right environment?”
-- Afficher resource/DB utilisée + project env + schema/table name
-- Vérifier qu’on n’est pas sur un autre schema (ex: public vs staging)
-
-CHECK 5 — “Is the Telegram list query running?”
-- Log: triggered_at, duration, rows returned
-- Vérifier que la query se trigger bien au chargement de la page.
-
-CHECK 6 — “Is UI bound to the right data path?”
-- Afficher dans debug panel la longueur de la variable bindée :
-  - cardsData.length
-  - q_telegram_spenders.data.length
-- Si query retourne >0 mais UI affiche 0 → binding cassé.
+⚠️ L’aléatoire doit être reproductible (déterministe) :
+- Utiliser une règle basée sur tx_id (hash) pour choisir date/status afin d’éviter que ça change à chaque refresh.
 
 ────────────────────────────────────────
-B) CAUSES PROBABLES (TU DOIS TESTER ET CONFIRMER)
-1) Transactions vides / pas écrites en DB
-2) Transactions écrites dans une autre table/schema
-3) spender_id/username pas extrait (NULL) → groupby donne rien
-4) Query Telegram filtre trop strict (ex: date range, status, provider)
-5) Query ne se déclenche jamais (runWhenPageLoads OFF / guard renvoie page1)
-6) UI bind sur mauvais champ (data vs data[0] vs raw)
-7) RLS / permissions Supabase bloquent la lecture
-
-Pour chaque cause : preuve + fix.
+B) SOURCE OF TRUTH + SHARED KEY (COHÉRENCE)
+- La clé unique de liaison partout = spender_key (non NULL, stable).
+- Source of truth = transactions_normalized (ou transactions table normalisée).
+- Toutes les pages lisent à partir de cette source + vues/metrics, jamais depuis des states locaux.
 
 ────────────────────────────────────────
-C) FIX MINIMUM VIABLE (POUR AVOIR DES SPENDERS AUJOURD’HUI)
-Même si la table spenders n’existe pas, tu dois générer une liste “à la volée” :
+C) ARCHI GLOBAL REFRESH (ANTI “ÇA NE SE MET PAS À JOUR”)
+Créer un orchestrateur global UNIQUE :
+fn_afterMutationOrImportRefresh({ reason, impacted_spender_keys })
 
-1) Créer q_spender_list_from_transactions :
-- Sortie: 1 row/spender_key
-- spender_key = COALESCE(spender_id, spender_username, contact_id)
-- metrics: LTV, nb_tx, last_purchase_at, first_seen_at
-- top_models (si possible) sinon placeholder
+Comportement:
+1) Refresh toutes les listes globales (spenders list, telegram list, search index)
+2) Si un spender est sélectionné quelque part (Telegram OU page Spender) :
+   - refresh spender profile
+   - refresh spender transactions
+   - refresh graphs / breakdowns (model/chatter/provider)
+3) Rafraîchir les KPIs globaux (si existants)
 
-2) Si spender_key est toujours NULL :
-- alors la pipeline ingestion est invalide → tu dois modifier l’import/mapping
-- obligation: extraire un identifiant spender stable depuis le JSON importé
-  (ex: telegram_user_id, username, phone, email, external_id)
+Logging obligatoire (preuve):
+- log_refresh(reason, ts, impacted_spender_keys, pages_open, queries_refreshed)
 
-────────────────────────────────────────
-D) DEBUG PANEL OBLIGATOIRE (UI)
-Créer un composant “Debug Panel” visible uniquement en mode debug :
-- tx_count, min_date, max_date
-- sample_tx (3 lignes)
-- spender_groups_count
-- telegram_list_rows
-- last_refresh_reason + timestamp
-- last_error (si erreur)
+Interdiction:
+- pas 12 refresh dispersés. Tout passe par fn_afterMutationOrImportRefresh.
 
 ────────────────────────────────────────
-E) CONTRAINTE DONNÉES TEST
-Pour les transactions datées entre 13 et 19 février 2026 :
-- provider doit être "Mala" ou "Leo" (50/50)
-Si le dataset ne respecte pas ça, tu corriges côté data de test (UPDATE) ou côté transform.
+D) PLUG TELEGRAM → PAGE SPENDER (NAV + SELECTION STATE)
+Mettre en place un “selected_spender_key” global (store/state global):
+- Quand je clique une card sur Telegram:
+  1) set selected_spender_key = spender_key
+  2) navigate("spender_page", params:{ spender_key })
+- La page Spender lit spender_key depuis param route OU depuis selected_spender_key.
+- Aucune page ne doit “deviner” le spender.
+
+────────────────────────────────────────
+E) QUERIES / VUES À STANDARDISER (UTILISÉES PARTOUT)
+1) q_spender_profile(spender_key)
+- Identité + first_seen_at + last_seen_at + tags
+- Source: spenders table (ou view dérivée)
+
+2) q_spender_transactions(spender_key)
+- Timeline complète: date, amount, currency, status, model_name, chatter_name, provider_name
+
+3) q_spender_breakdown_models(spender_key)
+- total_spent par model_name + % + nb_tx
+
+4) q_spender_breakdown_chatter(spender_key)
+- total_spent par chatter_name + nb_tx
+
+5) q_spender_breakdown_provider(spender_key)
+- total_spent par provider_name + nb_tx
+
+6) q_spender_kpis(spender_key)
+- LTV, nb_tx, avg_ticket, max_ticket, pending_count, validated_count, last_purchase
+
+Toutes ces queries doivent:
+- accepter spender_key en input
+- retourner un output shape stable
+- être utilisées à l’identique sur Telegram + page Spender (réutilisation)
+
+────────────────────────────────────────
+F) APPLICATION DES RÈGLES “CE SOIR” (PATCH DATA)
+Tu dois implémenter une fonction “normalize_tonight_rules()” qui s’applique lors de l’ingestion OU via un patch SQL (si data déjà rentrée) :
+
+- tx_date déterministe entre 2026-02-13 et 2026-02-19
+- chatter_name = "Mala"
+- provider_name = "Leo"
+- status = "validated" sauf 2 tx “pending” (déterministe via hash(tx_id))
+
+Résultat attendu:
+- Toutes les pages affichent chatter/provider correctement
+- Seulement 2 pending au total (sur ce batch)
+
+────────────────────────────────────────
+G) UI — PAGE SPENDER (MISE À JOUR)
+Sur la page Spender, afficher:
+- Header: username + tags + first_seen/last_seen
+- KPIs: LTV, nb_tx, avg_ticket, pending_count
+- Graph/Table: breakdown par modèle
+- Graph/Table: breakdown par chatter (devrait montrer Mala)
+- Graph/Table: breakdown par provider (devrait montrer Leo)
+- Timeline transactions (avec status validated/pending)
+
+Must-have:
+- Loading/empty states
+- Si spender_key invalide → message clair + link retour Telegram
+
+────────────────────────────────────────
+H) GARANTIE “TOUT S’ACTUALISE SUR TOUT LE SITE”
+Définir les triggers:
+- Après import / création / update transaction :
+  appeler fn_afterMutationOrImportRefresh({ reason:"tx_upsert", impacted_spender_keys:[...] })
+
+Test de preuve:
+- Je modifie 1 transaction (status pending → validated)
+=> Telegram card + page Spender + KPIs globaux se mettent à jour sans refresh manuel.
 
 ────────────────────────────────────────
 FORMAT DE SORTIE OBLIGATOIRE
-1) Résultats des CHECK 1→6 (avec chiffres)
-2) Cause racine confirmée
-3) Patch exact (queries + binding + trigger)
-4) Preuve après fix: nb spenders affichés + screenshot/logs
+1) Plan d’implémentation en 6 étapes max
+2) Liste des queries + inputs/outputs
+3) Définition exacte de fn_afterMutationOrImportRefresh
+4) Patch “tonight rules” (pseudo-code + option SQL)
+5) 10 smoke tests (preuves chiffrées) :
+   - nb spenders, nb tx, 2 pending, tous chatter=Mala, provider=Leo
+   - cohérence Telegram ↔ page Spender ↔ autres pages
 
-Commence maintenant par CHECK 1. Tant que CHECK 1 n’est pas >0, tu ne passes pas à la suite.
+Exécute maintenant et commence par définir l’orchestrateur global + le routing spender_key, puis applique les “tonight rules”.
