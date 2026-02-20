@@ -1089,67 +1089,135 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // =============================================
-// BULLETPROOF DB HELPERS
+// SCHEMA-AWARE DB LAYER
 // =============================================
-// safeInsertTx: ULTRA-BULLETPROOF transaction insert with try-catch at EVERY level
+// Discovered at startup — contains Set of column names for each table
+let _txCols = null;   // Set<string> | null
+let _spCols = null;   // Set<string> | null
+
+// Discover actual DB schema by probing Supabase
+const discoverSchema = async () => {
+  // 1) Try to get columns from an existing row
+  try {
+    const { data } = await sb.from("transactions").select("*").limit(1);
+    if (data && data.length > 0) {
+      _txCols = new Set(Object.keys(data[0]));
+    }
+  } catch(e) { /* ignore */ }
+
+  try {
+    const { data } = await sb.from("spenders").select("*").limit(1);
+    if (data && data.length > 0) {
+      _spCols = new Set(Object.keys(data[0]));
+    }
+  } catch(e) { /* ignore */ }
+
+  // 2) If tables were empty, probe columns individually via select().limit(0)
+  //    PostgREST validates column names even on empty tables
+  if (!_txCols) {
+    const base = ["id","date","spender_handle","amount","status","notes","model_id","chatter_id","provider_id"];
+    const maybe = ["currency","product","tag","source","type","spender_id","provider_fee","dada_fee","net_amount","chatter_commission"];
+    const confirmed = new Set(base);
+    for (const col of maybe) {
+      try {
+        const { error } = await sb.from("transactions").select(col).limit(0);
+        if (!error) confirmed.add(col);
+      } catch(e) { /* column doesn't exist */ }
+    }
+    _txCols = confirmed;
+  }
+
+  if (!_spCols) {
+    const base = ["handle","name"];
+    const maybe = ["id","telegram_id","model_id","total_spent","status","notes","source","last_seen","contact_info"];
+    const confirmed = new Set(base);
+    for (const col of maybe) {
+      try {
+        const { error } = await sb.from("spenders").select(col).limit(0);
+        if (!error) confirmed.add(col);
+      } catch(e) { /* column doesn't exist */ }
+    }
+    _spCols = confirmed;
+  }
+
+  console.log("[Schema] TX cols:", _txCols ? [..._txCols].join(", ") : "?");
+  console.log("[Schema] SP cols:", _spCols ? [..._spCols].join(", ") : "?");
+};
+
+// Filter an object to only include keys present in the discovered schema
+const filterCols = (obj, knownCols) => {
+  if (!knownCols) return obj;
+  const out = {};
+  for (const k of Object.keys(obj)) {
+    if (knownCols.has(k) && obj[k] !== undefined) out[k] = obj[k];
+  }
+  return out;
+};
+
+// Schema-aware transaction insert with FK fallback
 const safeInsertTx = async (txData) => {
-  // Level 1: try full insert
-  try {
-    const res = await sb.from("transactions").insert(txData);
-    if (!res.error) { console.log("[safeInsertTx] L1 OK"); return res; }
-    console.warn("[safeInsertTx] L1 fail:", res.error.message);
-  } catch(e) { console.warn("[safeInsertTx] L1 threw:", e.message); }
+  const row = filterCols(txData, _txCols);
+  const isFKErr = (e) => e && String(e.message||e.code||"").match(/foreign.key|fkey|23503/i);
 
-  // Level 2: strip optional columns (currency, product, tag)
   try {
-    const l2 = {...txData};
-    delete l2.currency; delete l2.product; delete l2.tag;
-    const res = await sb.from("transactions").insert(l2);
-    if (!res.error) { console.log("[safeInsertTx] L2 OK"); return res; }
-    console.warn("[safeInsertTx] L2 fail:", res.error.message);
-  } catch(e) { console.warn("[safeInsertTx] L2 threw:", e.message); }
+    // L1: all schema-valid columns
+    let res = await sb.from("transactions").insert(row);
+    if (!res.error) { console.log("[TX] OK"); return res; }
+    console.warn("[TX] L1:", res.error.message);
 
-  // Level 3: strip ALL FK columns
-  try {
-    const l3 = {
-      date: txData.date,
-      spender_handle: txData.spender_handle,
-      amount: txData.amount,
-      status: txData.status || "pending",
-      notes: txData.notes || null,
-    };
-    const res = await sb.from("transactions").insert(l3);
-    if (!res.error) { console.log("[safeInsertTx] L3 OK (no FKs)"); return res; }
-    console.warn("[safeInsertTx] L3 fail:", res.error.message);
-  } catch(e) { console.warn("[safeInsertTx] L3 threw:", e.message); }
+    // L2: if FK error, strip FK columns one by one
+    if (isFKErr(res.error)) {
+      const stripped = {...row};
+      for (const fk of ["provider_id","chatter_id","model_id"]) {
+        if (!stripped[fk]) continue;
+        delete stripped[fk];
+        res = await sb.from("transactions").insert(stripped);
+        if (!res.error) { console.log("[TX] OK sans", fk); return res; }
+        if (!isFKErr(res.error)) break;
+      }
+    }
 
-  // Level 4: absolute minimum — only required columns
-  try {
-    const res = await sb.from("transactions").insert({
+    // L3: absolute minimum
+    console.warn("[TX] Fallback minimum, err:", res.error?.message);
+    const min = {
       date: txData.date || new Date().toISOString(),
       spender_handle: txData.spender_handle || "unknown",
       amount: parseFloat(txData.amount) || 0,
-      status: "pending",
-    });
-    if (!res.error) { console.log("[safeInsertTx] L4 OK (minimum)"); return res; }
-    console.warn("[safeInsertTx] L4 fail:", res.error.message);
+      status: txData.status || "pending",
+    };
+    if (txData.notes) min.notes = txData.notes;
+    res = await sb.from("transactions").insert(min);
+    if (!res.error) console.log("[TX] OK minimum");
+    else console.error("[TX] All levels failed:", res.error.message);
     return res;
   } catch(e) {
-    console.error("[safeInsertTx] L4 threw:", e.message);
-    return { data: null, error: { message: "All 4 insert levels failed: " + e.message } };
+    return { data: null, error: { message: "Insert failed: " + e.message } };
   }
 };
 
-// safeUpsertSpender: Fallback for spender upserts
+// Schema-aware spender upsert with fallback
 const safeUpsertSpender = async (spenderData) => {
-  let res = await sb.from("spenders").upsert(spenderData, {onConflict: "handle"});
-  if (!res.error) return res;
-  console.warn("[safeUpsertSpender] Full failed:", res.error.message);
-  // Fallback: minimal
-  return await sb.from("spenders").upsert(
-    {handle: spenderData.handle, name: spenderData.name || spenderData.handle},
-    {onConflict: "handle"}
-  );
+  try {
+    const row = filterCols(spenderData, _spCols);
+    let res = await sb.from("spenders").upsert(row, {onConflict: "handle"});
+    if (!res.error) return res;
+    console.warn("[Spender] Full:", res.error.message);
+    // Fallback: handle + name only
+    res = await sb.from("spenders").upsert(
+      {handle: spenderData.handle, name: spenderData.name || spenderData.handle},
+      {onConflict: "handle"}
+    );
+    return res;
+  } catch(e) {
+    try {
+      return await sb.from("spenders").upsert(
+        {handle: spenderData.handle, name: spenderData.name || spenderData.handle},
+        {onConflict: "handle"}
+      );
+    } catch(e2) {
+      return { data: null, error: { message: e2.message } };
+    }
+  }
 };
 
 // =============================================
@@ -1764,7 +1832,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
       if(!res.error) {
         setForm({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",notes:""});
         setShowForm(false);
-        onRefresh();
+        await onRefresh();
         addToast(t(lang,"tx_created")||"Transaction créée ✓","success");
       } else {
         console.error("TX insert final error:", res.error);
@@ -1780,7 +1848,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
     try {
       const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
       if(error) { addToast("Erreur: " + error.message, "error"); return; }
-      onRefresh();
+      await onRefresh();
       addToast(newStatus==="validated"?(t(lang,"tx_validated")||"Validée ✓"):(t(lang,"tx_refused")||"Refusée"), newStatus==="validated"?"success":"error");
     } catch(e) { addToast("Erreur: " + e.message, "error"); }
   };
@@ -2408,7 +2476,7 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh}) => {
       if(error) { addToast("Erreur payout: " + error.message, "error"); setSaving(false); return; }
       setForm({user_id:chatters[0]?.id||"",amount:"",method:"Virement",date:""});
       setShowForm(false);
-      onRefresh();
+      await onRefresh();
       addToast(t(lang,"payout_added")||"Payout ajouté ✓","success");
     } catch(e) { addToast("Erreur payout: " + e.message, "error"); }
     setSaving(false);
@@ -2596,7 +2664,7 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, onRefresh}) => 
       if(error) { addToast("Erreur dépense: " + error.message, "error"); setSaving(false); return; }
       setForm({name:"",amount:"",category:"ops"});
       setShowForm(false);
-      onRefresh();
+      await onRefresh();
       addToast(t(lang,"expense_added")||"Dépense ajoutée ✓","success");
     } catch(e) { addToast("Erreur dépense: " + e.message, "error"); }
     setSaving(false);
@@ -3949,7 +4017,7 @@ const AdminTab = ({lang, profiles, models, onRefresh}) => {
       }).eq("id", selectedUser);
       if(error) { addToast("Erreur profil: " + error.message, "error"); setSaving(false); return; }
       setSelectedUser(null);
-      onRefresh();
+      await onRefresh();
       addToast(t(lang,"settings_saved")||"Sauvegardé ✓","success");
     } catch(e) { addToast("Erreur profil: " + e.message, "error"); }
     setSaving(false);
@@ -4497,6 +4565,8 @@ const App = () => {
     const init = async () => {
       const {data:{session}} = await sb.auth.getSession();
       if(session) {
+        // Discover DB schema before any writes can happen
+        await discoverSchema();
         const {data:profile} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
         if(profile) {
           const fullUser = {...profile, email:session.user.email};
@@ -4512,6 +4582,7 @@ const App = () => {
   const handleLogin = async (u) => {
     setUser(u);
     setLoading(true);
+    if (!_txCols) await discoverSchema();
     await loadData(u);
     setLoading(false);
   };
