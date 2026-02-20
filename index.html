@@ -1091,40 +1091,53 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // =============================================
 // BULLETPROOF DB HELPERS
 // =============================================
-// safeInsertTx: Progressive fallback for transaction inserts
-// Level 1: full row (all columns)
-// Level 2: without optional columns (currency, product, tag)
-// Level 3: without FK columns (model_id, provider_id, chatter_id)
-// Level 4: absolute minimum (date, spender_handle, amount, status, notes)
+// safeInsertTx: ULTRA-BULLETPROOF transaction insert with try-catch at EVERY level
 const safeInsertTx = async (txData) => {
   // Level 1: try full insert
-  let res = await sb.from("transactions").insert(txData);
-  if (!res.error) return res;
-  console.warn("[safeInsertTx] L1 failed:", res.error.message);
+  try {
+    const res = await sb.from("transactions").insert(txData);
+    if (!res.error) { console.log("[safeInsertTx] L1 OK"); return res; }
+    console.warn("[safeInsertTx] L1 fail:", res.error.message);
+  } catch(e) { console.warn("[safeInsertTx] L1 threw:", e.message); }
 
   // Level 2: strip optional columns (currency, product, tag)
-  const l2 = {...txData};
-  delete l2.currency; delete l2.product; delete l2.tag;
-  res = await sb.from("transactions").insert(l2);
-  if (!res.error) return res;
-  console.warn("[safeInsertTx] L2 failed:", res.error.message);
+  try {
+    const l2 = {...txData};
+    delete l2.currency; delete l2.product; delete l2.tag;
+    const res = await sb.from("transactions").insert(l2);
+    if (!res.error) { console.log("[safeInsertTx] L2 OK"); return res; }
+    console.warn("[safeInsertTx] L2 fail:", res.error.message);
+  } catch(e) { console.warn("[safeInsertTx] L2 threw:", e.message); }
 
-  // Level 3: strip FK columns too
-  const l3 = {...l2};
-  delete l3.model_id; delete l3.provider_id; delete l3.chatter_id;
-  delete l3.chatter_commission; delete l3.provider_fee; delete l3.dada_fee; delete l3.net_amount;
-  res = await sb.from("transactions").insert(l3);
-  if (!res.error) return res;
-  console.warn("[safeInsertTx] L3 failed:", res.error.message);
+  // Level 3: strip ALL FK columns
+  try {
+    const l3 = {
+      date: txData.date,
+      spender_handle: txData.spender_handle,
+      amount: txData.amount,
+      status: txData.status || "pending",
+      notes: txData.notes || null,
+    };
+    const res = await sb.from("transactions").insert(l3);
+    if (!res.error) { console.log("[safeInsertTx] L3 OK (no FKs)"); return res; }
+    console.warn("[safeInsertTx] L3 fail:", res.error.message);
+  } catch(e) { console.warn("[safeInsertTx] L3 threw:", e.message); }
 
-  // Level 4: absolute minimum
-  return await sb.from("transactions").insert({
-    date: txData.date,
-    spender_handle: txData.spender_handle,
-    amount: txData.amount,
-    status: txData.status || "pending",
-    notes: txData.notes || null,
-  });
+  // Level 4: absolute minimum — only required columns
+  try {
+    const res = await sb.from("transactions").insert({
+      date: txData.date || new Date().toISOString(),
+      spender_handle: txData.spender_handle || "unknown",
+      amount: parseFloat(txData.amount) || 0,
+      status: "pending",
+    });
+    if (!res.error) { console.log("[safeInsertTx] L4 OK (minimum)"); return res; }
+    console.warn("[safeInsertTx] L4 fail:", res.error.message);
+    return res;
+  } catch(e) {
+    console.error("[safeInsertTx] L4 threw:", e.message);
+    return { data: null, error: { message: "All 4 insert levels failed: " + e.message } };
+  }
 };
 
 // safeUpsertSpender: Fallback for spender upserts
@@ -1698,7 +1711,7 @@ const DashboardTab = ({user, lang, txs, models, profiles}) => {
 // =============================================
 // TRANSACTIONS TAB
 // =============================================
-const TransactionsTab = ({user, lang, txs, models, profiles, onRefresh}) => {
+const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefresh}) => {
   const addToast = useToast();
   const dr = useDateRange("7d");
   const [model, setModel] = useState("");
@@ -1712,41 +1725,55 @@ const TransactionsTab = ({user, lang, txs, models, profiles, onRefresh}) => {
   if(status) filtered = filtered.filter(tx=>tx.status===status);
   if(chatter) filtered = filtered.filter(tx=>tx.chatter_id===chatter);
 
+  // Build spender list for autocomplete
+  const spenderOptions = React.useMemo(() => {
+    const set = new Set();
+    (dbSpenders || []).forEach(s => set.add(s.handle || s.name));
+    txs.forEach(tx => { if(tx.spender_handle) set.add(tx.spender_handle); });
+    return [...set].sort();
+  }, [dbSpenders, txs]);
+
   const handleCreate = async () => {
     if(!form.spender_handle||!form.amount) return;
     setSaving(true);
-
-    // 1) UPSERT le Spender en DB (jamais de TX orpheline)
-    const handle = form.spender_handle.replace(/^@/, "").trim();
     try {
-      await safeUpsertSpender({handle, name: handle, status: "active", last_seen: new Date().toISOString()});
-    } catch(e) { /* best effort */ }
+      // Step 1: UPSERT le Spender en DB
+      const handle = form.spender_handle.replace(/^@/, "").trim();
+      try {
+        await safeUpsertSpender({handle, name: handle, status: "active", last_seen: new Date().toISOString()});
+      } catch(e) { console.warn("Spender upsert best-effort fail:", e); }
 
-    // 2) INSERT transaction via bulletproof helper
-    const txRow = {
-      date: new Date().toISOString(),
-      spender_handle: handle,
-      amount: parseFloat(form.amount),
-      status: "pending",
-      notes: form.notes || null,
-    };
-    if(form.model_id) txRow.model_id = form.model_id;
-    if(form.provider_id) txRow.provider_id = form.provider_id;
-    if(form.chatter_id) txRow.chatter_id = form.chatter_id;
-    if(form.currency) txRow.currency = form.currency;
-    if(form.product) txRow.product = form.product;
-    if(form.tag) txRow.tag = form.tag;
+      // Step 2: INSERT transaction — only include FK fields if they look like valid UUIDs
+      const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+      const txRow = {
+        date: new Date().toISOString(),
+        spender_handle: handle,
+        amount: parseFloat(form.amount),
+        status: "pending",
+        notes: form.notes || null,
+      };
+      if(isUUID(form.model_id)) txRow.model_id = form.model_id;
+      if(isUUID(form.provider_id)) txRow.provider_id = form.provider_id;
+      if(isUUID(form.chatter_id)) txRow.chatter_id = form.chatter_id;
+      if(form.currency && form.currency !== "EUR") txRow.currency = form.currency;
+      if(form.product) txRow.product = form.product;
+      if(form.tag) txRow.tag = form.tag;
 
-    const res = await safeInsertTx(txRow);
-    setSaving(false);
-    if(!res.error) {
-      setForm({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",notes:""});
-      setShowForm(false);
-      onRefresh();
-      addToast(t(lang,"tx_created")||"Transaction créée ✓","success");
-    } else {
-      console.error("TX insert error:", res.error);
-      addToast("Erreur: " + (res.error.message || "insert failed"),"error");
+      const res = await safeInsertTx(txRow);
+      setSaving(false);
+      if(!res.error) {
+        setForm({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",notes:""});
+        setShowForm(false);
+        onRefresh();
+        addToast(t(lang,"tx_created")||"Transaction créée ✓","success");
+      } else {
+        console.error("TX insert final error:", res.error);
+        addToast("Erreur: " + (res.error.message || "insert failed"),"error");
+      }
+    } catch(e) {
+      setSaving(false);
+      console.error("handleCreate threw:", e);
+      addToast("Erreur: " + e.message, "error");
     }
   };
   const handleStatus = async (txId, newStatus) => {
@@ -1786,7 +1813,8 @@ const TransactionsTab = ({user, lang, txs, models, profiles, onRefresh}) => {
           <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12}}>
             <div className="form-group-modal">
               <label className="form-label">{t(lang,"spender")}</label>
-              <input className="form-input" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle" />
+              <input className="form-input" list="spender-list" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle ou choisir existant" autoComplete="off" />
+              <datalist id="spender-list">{spenderOptions.map(s=><option key={s} value={s}/>)}</datalist>
             </div>
             <div className="form-group-modal">
               <label className="form-label">{t(lang,"amount")}</label>
@@ -3327,19 +3355,17 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
         for (const tw of txToWrite) {
           try {
             const txId = telegramId + "_" + tw.idx;
+            const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
             const txRow = {
               date: tonightDate(txId),
               spender_handle: handle,
               amount: tw.montant,
               status: "validated",
               notes: tw.desc || null,
-              currency: "EUR",
-              product: contenu[0] || "telegram_import",
-              tag: null,
             };
-            if(modelId) txRow.model_id = modelId;
-            if(leoProfile?.id) txRow.provider_id = leoProfile.id;
-            if(defaultChatterId) txRow.chatter_id = defaultChatterId;
+            if(isUUID(modelId)) txRow.model_id = modelId;
+            if(isUUID(leoProfile?.id)) txRow.provider_id = leoProfile.id;
+            if(isUUID(defaultChatterId)) txRow.chatter_id = defaultChatterId;
             const res = await safeInsertTx(txRow);
             if (res.error) { dbTxFail++; lastDbErr = res.error.message; } else { dbTxOk++; }
           } catch (e) { dbTxFail++; lastDbErr = e.message; }
@@ -3376,31 +3402,35 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
   const handleQuickAdd = async () => {
     if (!quickForm.spender || !quickForm.amount) return;
     setSaving(true);
-    const now = new Date().toISOString();
+    const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     try {
-      await safeUpsertSpender({handle: quickForm.spender, name: quickForm.spender, status: "active", last_seen: now});
-    } catch(e) { /* best effort */ }
-    const txRow = {
-      date: now,
-      spender_handle: quickForm.spender,
-      amount: Number(quickForm.amount),
-      status: "pending",
-      notes: null,
-      currency: "EUR",
-      product: quickForm.type || null,
-      tag: null,
-    };
-    const mid = quickForm.model_id || models[0]?.id || null;
-    if(mid) txRow.model_id = mid;
-    if(leoProfile?.id) txRow.provider_id = leoProfile.id;
-    if(defaultChatterId) txRow.chatter_id = defaultChatterId;
-    const res = await safeInsertTx(txRow);
-    if (!res.error) {
-      addToast(`${quickForm.spender} — ${quickForm.amount}€ ✓`, "success");
-      setQuickForm({spender: "", amount: "", model_id: quickForm.model_id, type: ""});
-      await onRefresh();
-    } else {
-      addToast("Erreur: " + res.error.message, "error");
+      const now = new Date().toISOString();
+      try {
+        await safeUpsertSpender({handle: quickForm.spender, name: quickForm.spender, status: "active", last_seen: now});
+      } catch(e) { console.warn("QA spender upsert fail:", e); }
+      const txRow = {
+        date: now,
+        spender_handle: quickForm.spender,
+        amount: Number(quickForm.amount),
+        status: "pending",
+        notes: null,
+      };
+      const mid = quickForm.model_id || models[0]?.id || null;
+      if(isUUID(mid)) txRow.model_id = mid;
+      if(isUUID(leoProfile?.id)) txRow.provider_id = leoProfile.id;
+      if(isUUID(defaultChatterId)) txRow.chatter_id = defaultChatterId;
+      if(quickForm.type) txRow.product = quickForm.type;
+      const res = await safeInsertTx(txRow);
+      if (!res.error) {
+        addToast(`${quickForm.spender} — ${quickForm.amount}€ ✓`, "success");
+        setQuickForm({spender: "", amount: "", model_id: quickForm.model_id, type: ""});
+        await onRefresh();
+      } else {
+        addToast("Erreur: " + res.error.message, "error");
+      }
+    } catch(e) {
+      console.error("handleQuickAdd threw:", e);
+      addToast("Erreur: " + e.message, "error");
     }
     setSaving(false);
   };
@@ -3472,7 +3502,8 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
           <div className="card">
             <div className="section-title"><div className="section-bar"></div>⚡ {fr ? "Ajout Rapide" : "Quick Add"}</div>
             <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12}}>
-              <input placeholder={fr ? "Pseudo spender" : "Handle"} value={quickForm.spender} onChange={e => setQuickForm({...quickForm, spender: e.target.value})} className="filter-select" />
+              <input list="qa-spender-list" placeholder={fr ? "Pseudo spender" : "Handle"} value={quickForm.spender} onChange={e => setQuickForm({...quickForm, spender: e.target.value})} className="filter-select" autoComplete="off" />
+              <datalist id="qa-spender-list">{(spenders||[]).map(s=><option key={s.handle||s.name} value={s.handle||s.name}/>)}</datalist>
               <input type="number" placeholder={fr ? "Montant" : "Amount"} value={quickForm.amount} onChange={e => setQuickForm({...quickForm, amount: e.target.value})} className="filter-select" />
             </div>
             <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12}}>
@@ -4556,7 +4587,7 @@ const App = () => {
             <DrillDownView drillDown={drillDown} user={user} txs={txs} models={models} profiles={profiles} payouts={payouts} lang={lang} />
           ) : (<>
           {tab==="dashboard"&&user.role!=="provider"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} />}
-          {tab==="transactions"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="transactions"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} />}
           {tab==="spenders"&&user.role!=="provider"&&<SpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} />}
           {tab==="objectifs"&&user.role!=="provider"&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} />}
           {tab==="competition"&&user.role!=="provider"&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
