@@ -607,6 +607,8 @@
     .loading-wrap { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg); }
     .spinner { width: 40px; height: 40px; border: 4px solid rgba(139,92,246,0.2); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes breathe { 0%, 100% { opacity: 0.3; transform: translateX(-50%) scale(1); } 50% { opacity: 0.6; transform: translateX(-50%) scale(1.1); } }
+    @keyframes wave { 0%, 100% { opacity: 0.3; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-4px); } }
     .info-box { background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); border-radius: 8px; padding: 12px; font-size: 12px; color: var(--text2); margin-bottom: 16px; }
     /* ============================================= */
     /* TABLET (max 1200px)                           */
@@ -4587,28 +4589,189 @@ const ProviderComptaTab = ({user, lang, txs, payouts, profiles, models}) => {
 };
 
 // =============================================
-// AGENTS IA · AUDIT MANAGER
+// AGENTS IA · CENTRE DE COMMANDE
 // =============================================
-const AgentsAuditTab = ({lang}) => {
-  const fr = lang === "fr";
-  const cardStyle = {background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:16,padding:"20px 22px"};
-  const kpiHeaderStyle = {display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8};
-  const kpiLabelStyle = {fontSize:11,color:"rgba(255,255,255,0.5)",textTransform:"uppercase",fontWeight:600,letterSpacing:0.5};
-  const agentRowStyle = {display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 16px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:12};
-  const agentAvatarStyle = (dot) => ({width:38,height:38,borderRadius:10,background:"linear-gradient(135deg, rgba(129,140,248,0.15), rgba(244,114,182,0.1))",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:14,color:"#818cf8",position:"relative"});
-  const agentBadgeStyle = (color) => ({fontSize:9,padding:"2px 8px",borderRadius:20,background:`${color}22`,color:color,fontWeight:700,marginLeft:8,textTransform:"uppercase",letterSpacing:0.5});
-  const thStyle = {textAlign:"left",padding:"8px 12px",fontSize:10,textTransform:"uppercase",color:"rgba(255,255,255,0.4)",fontWeight:600,letterSpacing:0.5,borderBottom:"1px solid rgba(255,255,255,0.06)"};
-  const tdStyle = {padding:"10px 12px",fontSize:12,borderBottom:"1px solid rgba(255,255,255,0.04)"};
-  const tdTimeStyle = {...tdStyle,fontFamily:"monospace",fontSize:11,color:"rgba(255,255,255,0.5)"};
-  const trStyle = {transition:"background 0.2s"};
-  const detailBadgeStyle = {fontSize:10,padding:"2px 8px",borderRadius:6,background:"rgba(129,140,248,0.1)",color:"#a5b4fc"};
+function useCountUp(target, duration) {
+  const d = duration || 1000;
+  const [value, setValue] = useState(0);
+  const prev = useRef(0);
+  useEffect(() => {
+    if (target === prev.current) return;
+    prev.current = target;
+    let start = 0;
+    const step = target / (d / 16);
+    const timer = setInterval(() => {
+      start += step;
+      if (start >= target) { setValue(target); clearInterval(timer); }
+      else setValue(Math.round(start));
+    }, 16);
+    return () => clearInterval(timer);
+  }, [target, d]);
+  return value;
+}
 
+const GradientCard = ({children, style}) => (
+  <div style={{background:"linear-gradient(135deg, rgba(129,140,248,0.3), rgba(244,114,182,0.15))",borderRadius:21,padding:1,...(style||{})}}>
+    <div style={{background:"rgba(10,10,26,0.95)",borderRadius:20,padding:"20px 24px",backdropFilter:"blur(10px)",height:"100%"}}>
+      {children}
+    </div>
+  </div>
+);
+
+const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
+  const fr = lang === "fr";
+  const { currencySymbol, convertAmount, fmtAmount } = useCurrency();
+  const addToast = useToast();
+  const [todoDone, setTodoDone] = useState({});
+  const toggleTodo = (i) => setTodoDone(prev => ({...prev,[i]:!prev[i]}));
+
+  // ── SHARED STYLES ──
+  const sectionTitle = (icon, title, sub) => (
+    <div style={{marginBottom:20}}>
+      <h3 style={{fontSize:16,fontWeight:800,margin:0}}>{icon} {title}</h3>
+      {sub && <p style={{fontSize:11,color:"rgba(255,255,255,0.35)",margin:"4px 0 0"}}>{sub}</p>}
+    </div>
+  );
+  const cardS = {background:"rgba(255,255,255,0.03)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:16,padding:"20px 22px"};
+  const thS = {textAlign:"left",padding:"8px 12px",fontSize:10,textTransform:"uppercase",color:"rgba(255,255,255,0.4)",fontWeight:600,letterSpacing:0.5,borderBottom:"1px solid rgba(255,255,255,0.06)"};
+  const tdS = {padding:"10px 12px",fontSize:12,borderBottom:"1px solid rgba(255,255,255,0.04)"};
+
+  // ── DATE FILTERS ──
+  const now = new Date();
+  const last7d = useMemo(() => txs.filter(tx => (now - new Date(tx.date)) < 7*86400000), [txs]);
+  const last30d = useMemo(() => txs.filter(tx => (now - new Date(tx.date)) < 30*86400000), [txs]);
+  const pending = useMemo(() => txs.filter(tx => tx.status==="pending"||tx.status==="en_attente"), [txs]);
+  const validated = useMemo(() => txs.filter(tx => tx.status==="validated"||tx.status==="confirmee"), [txs]);
+
+  // ── SECTION 1: ALERTES & RECOMMANDATIONS ──
+  const recommendations = useMemo(() => {
+    const recs = [];
+    // Old pending (>48h)
+    const oldPending = pending.filter(tx => (now - new Date(tx.date)) > 48*3600000);
+    if (oldPending.length > 0) {
+      recs.push({level:"urgent",icon:"🔴",title:fr?`${oldPending.length} transaction(s) en attente depuis +48h`:`${oldPending.length} transaction(s) pending for 48h+`,desc:fr?"Ces transactions risquent d'expirer. Validez ou refusez-les rapidement.":"These transactions may expire. Validate or refuse them quickly.",action:fr?"Voir les transactions":"View transactions",actionTab:"transactions"});
+    }
+    // Inactive whales
+    const spenderTotals30d = {};
+    last30d.forEach(tx => { spenderTotals30d[tx.spender_handle] = (spenderTotals30d[tx.spender_handle]||0) + Number(tx.amount||0); });
+    const topSpenders = Object.entries(spenderTotals30d).sort((a,b) => b[1]-a[1]).slice(0,5);
+    const spender7d = new Set(last7d.map(tx => tx.spender_handle));
+    const inactiveWhales = topSpenders.filter(([name]) => !spender7d.has(name));
+    if (inactiveWhales.length > 0) {
+      recs.push({level:"warning",icon:"🟡",title:fr?`${inactiveWhales.length} top spender(s) inactif(s) cette semaine`:`${inactiveWhales.length} top spender(s) inactive this week`,desc:`${inactiveWhales.map(([n])=>n).join(", ")} — ${fr?"relancez-les avant qu'ils partent.":"re-engage them before they leave."}`,action:fr?"Voir les spenders":"View spenders",actionTab:"spenders"});
+    }
+    // Best day of week
+    const dayTotals = [0,0,0,0,0,0,0];
+    const dayCounts = [0,0,0,0,0,0,0];
+    last30d.forEach(tx => { const d = new Date(tx.date).getDay(); dayTotals[d]+=Number(tx.amount||0); dayCounts[d]++; });
+    const bestDay = dayTotals.indexOf(Math.max(...dayTotals));
+    const dayNamesFr = ["Dimanche","Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"];
+    const dayNamesEn = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    const dn = fr?dayNamesFr:dayNamesEn;
+    const avgBest = Math.round(dayTotals[bestDay]/Math.max(dayCounts[bestDay],1));
+    if (last30d.length > 0) {
+      recs.push({level:"info",icon:"🟢",title:fr?`Meilleur jour : ${dn[bestDay]}`:`Best day: ${dn[bestDay]}`,desc:fr?`Le ${dn[bestDay].toLowerCase()} génère en moyenne ${avgBest}${currencySymbol} de CA. Concentrez vos efforts ce jour-là.`:`${dn[bestDay]} generates an average of ${avgBest}${currencySymbol} revenue. Focus efforts on that day.`});
+    }
+    // Conversion rate
+    const convRate = txs.length > 0 ? Math.round((validated.length/txs.length)*100) : 0;
+    recs.push({level:convRate<50?"warning":"info",icon:convRate<50?"🟡":"🟢",title:fr?`Taux de validation : ${convRate}%`:`Validation rate: ${convRate}%`,desc:convRate<50?(fr?"Moins de la moitié des TX sont validées. Vérifiez la qualité des leads.":"Less than half of TX are validated. Check lead quality."):(fr?"Bon taux de validation. Continuez comme ça.":"Good validation rate. Keep it up.")});
+    // Top model recommendation
+    const modelPerf = {};
+    validated.forEach(tx => { const mid = tx.model_id; if(!mid) return; if(!modelPerf[mid]) modelPerf[mid]={total:0,count:0}; modelPerf[mid].total+=Number(tx.amount||0); modelPerf[mid].count++; });
+    const topModel = Object.entries(modelPerf).sort((a,b)=>b[1].total-a[1].total)[0];
+    if (topModel) {
+      const mName = (models||[]).find(m=>m.id===topModel[0])?.name||topModel[0];
+      recs.push({level:"info",icon:"🟢",title:fr?`Top modèle : ${mName}`:`Top model: ${mName}`,desc:fr?`${Math.round(topModel[1].total)}${currencySymbol} de CA validé (${topModel[1].count} TX). Investissez plus sur ce profil.`:`${Math.round(topModel[1].total)}${currencySymbol} validated revenue (${topModel[1].count} TX). Invest more in this profile.`});
+    }
+    return recs;
+  }, [txs, models, pending, validated, last7d, last30d, currencySymbol, fr]);
+
+  // ── SECTION 2: ANALYSE SPENDERS ──
+  const spenderAnalysis = useMemo(() => {
+    const map = {};
+    txs.forEach(tx => {
+      const h = tx.spender_handle||"unknown";
+      if(!map[h]) map[h] = {handle:h,total:0,count:0,last7d:0,byDay:{}};
+      const amt = Number(tx.amount||0);
+      map[h].total += amt;
+      map[h].count++;
+      if ((now - new Date(tx.date)) < 7*86400000) map[h].last7d += amt;
+      const dayKey = new Date(tx.date).toISOString().slice(0,10);
+      map[h].byDay[dayKey] = (map[h].byDay[dayKey]||0) + amt;
+    });
+    const all = Object.values(map);
+    const whales = all.filter(s => s.total >= 500);
+    const vips = all.filter(s => s.total >= 200 && s.total < 500);
+    const regulars = all.filter(s => s.total < 200);
+    const top5 = all.sort((a,b) => b.total - a.total).slice(0,5);
+    const totalSpenders = all.length;
+    const avgBasket = txs.length > 0 ? Math.round(txs.reduce((s,tx)=>s+Number(tx.amount||0),0)/txs.length) : 0;
+    const avgLTV = totalSpenders > 0 ? Math.round(all.reduce((s,sp)=>s+sp.total,0)/totalSpenders) : 0;
+    return {whales,vips,regulars,top5,totalSpenders,avgBasket,avgLTV,whaleTotal:whales.reduce((s,w)=>s+w.total,0),vipTotal:vips.reduce((s,v)=>s+v.total,0),regTotal:regulars.reduce((s,r)=>s+r.total,0)};
+  }, [txs]);
+
+  // ── SECTION 3: ANALYSE MODELES ──
+  const modelAnalysis = useMemo(() => {
+    const map = {};
+    txs.forEach(tx => {
+      const mid = tx.model_id; if(!mid) return;
+      if(!map[mid]) map[mid]={id:mid,total:0,count:0,validated:0,last7dTotal:0,last30dTotal:0};
+      map[mid].total += Number(tx.amount||0);
+      map[mid].count++;
+      if(tx.status==="validated"||tx.status==="confirmee") map[mid].validated++;
+      if((now-new Date(tx.date))<7*86400000) map[mid].last7dTotal+=Number(tx.amount||0);
+      if((now-new Date(tx.date))<30*86400000) map[mid].last30dTotal+=Number(tx.amount||0);
+    });
+    return Object.values(map).map(m => {
+      const mod = (models||[]).find(x=>x.id===m.id);
+      return {...m,name:mod?.name||m.id,validRate:m.count>0?Math.round(m.validated/m.count*100):0,avgBasket:m.count>0?Math.round(m.total/m.count):0};
+    }).sort((a,b)=>b.total-a.total);
+  }, [txs, models]);
+
+  // ── SECTION 4: ANALYSE CHATTERS ──
+  const chatterAnalysis = useMemo(() => {
+    const chatters = (profiles||[]).filter(p=>p.role==="chatter");
+    const map = {};
+    txs.forEach(tx => {
+      const cid = tx.chatter_id; if(!cid) return;
+      if(!map[cid]) map[cid]={id:cid,total:0,count:0,validated:0,commission:0,pendingCount:0};
+      map[cid].total += Number(tx.amount||0);
+      map[cid].count++;
+      map[cid].commission += Number(tx.chatter_commission||0);
+      if(tx.status==="validated"||tx.status==="confirmee") map[cid].validated++;
+      if(tx.status==="pending"||tx.status==="en_attente") map[cid].pendingCount++;
+    });
+    const maxCA = Math.max(...Object.values(map).map(c=>c.total),1);
+    return chatters.map(c => {
+      const d = map[c.id]||{total:0,count:0,validated:0,commission:0,pendingCount:0};
+      return {...d,name:c.name||c.email,convRate:d.count>0?Math.round(d.validated/d.count*100):0,pct:Math.round(d.total/maxCA*100)};
+    }).sort((a,b)=>b.total-a.total);
+  }, [txs, profiles]);
+
+  // ── SECTION 5: TODOS ──
+  const todos = useMemo(() => {
+    const list = [];
+    const pendingCount = pending.length;
+    if(pendingCount>0) list.push({priority:"high",text:fr?`Valider ${pendingCount} transaction(s) en attente`:`Validate ${pendingCount} pending transaction(s)`,tab:"transactions"});
+    const spenderTotals30d = {};
+    last30d.forEach(tx => { spenderTotals30d[tx.spender_handle]=(spenderTotals30d[tx.spender_handle]||0)+Number(tx.amount||0); });
+    const topSp = Object.entries(spenderTotals30d).sort((a,b)=>b[1]-a[1]).slice(0,5);
+    const sp7d = new Set(last7d.map(tx=>tx.spender_handle));
+    const inactiveW = topSp.filter(([n])=>!sp7d.has(n));
+    if(inactiveW.length>0) list.push({priority:"medium",text:fr?`Relancer ${inactiveW.length} top spender(s) inactif(s)`:`Re-engage ${inactiveW.length} inactive top spender(s)`,tab:"spenders"});
+    const zeroModels = modelAnalysis.filter(m=>m.last7dTotal===0);
+    if(zeroModels.length>0) list.push({priority:"medium",text:fr?`${zeroModels.length} modèle(s) sans TX cette semaine`:`${zeroModels.length} model(s) with 0 TX this week`,tab:"modeles"});
+    const lowConvChatters = chatterAnalysis.filter(c=>c.count>=5&&c.convRate<50);
+    if(lowConvChatters.length>0) list.push({priority:"low",text:fr?`${lowConvChatters.length} chatter(s) sous 50% de conversion`:`${lowConvChatters.length} chatter(s) under 50% conversion`,tab:"chatters"});
+    return list;
+  }, [pending, last7d, last30d, modelAnalysis, chatterAnalysis, fr]);
+
+  // ── SECTION 6: AGENTS & LOGS ──
   const agents = [
     {name:"Karim",initials:"K",role:fr?"Senior Dev · Claude Code":"Senior Dev · Claude Code",badge:fr?"ACTIF":"ACTIVE",badgeColor:"#34d399",lastAction:fr?"il y a 3min":"3min ago",stat:"156 actions",statLabel:fr?"ce mois":"this month",statColor:"#34d399"},
     {name:"Jean-Marie",initials:"JM",role:fr?"Manager · Prompts & UX":"Manager · Prompts & UX",badge:"MANAGER",badgeColor:"#818cf8",lastAction:fr?"il y a 12min":"12min ago",stat:"89 prompts",statLabel:fr?"ce mois":"this month",statColor:"#818cf8"},
-    {name:"Telegram Bot",initials:"TB",role:fr?"Import auto · Scans OFM":"Auto import · OFM Scans",badge:"STANDBY",badgeColor:"#fbbf24",lastAction:fr?"il y a 2h":"2h ago",stat:"34 imports",statLabel:fr?"ce mois":"this month",statColor:"#fbbf24"},
+    {name:"Telegram Bot",initials:"TB",role:fr?"Import auto · Scans":"Auto import · Scans",badge:"STANDBY",badgeColor:"#fbbf24",lastAction:fr?"il y a 2h":"2h ago",stat:"34 imports",statLabel:fr?"ce mois":"this month",statColor:"#fbbf24"},
   ];
-
   const logs = [
     {time:"14:32",agent:"Karim",agentColor:"#818cf8",action:fr?"PR créée":"PR created",detail:"+370 lignes · immutable-transactions",status:"validated"},
     {time:"14:18",agent:"Jean-Marie",agentColor:"#818cf8",action:fr?"Prompt envoyé":"Prompt sent",detail:"PROMPT_KARIM_DEFINITIF.md",status:"validated"},
@@ -4617,82 +4780,277 @@ const AgentsAuditTab = ({lang}) => {
     {time:"12:48",agent:"Karim",agentColor:"#818cf8",action:fr?"Feature ajoutée":"Feature added",detail:fr?"ModelesTab — page complète":"ModelesTab — full page",status:"validated"},
   ];
 
+  // ── COUNT-UP KPIs ──
+  const animSpenders = useCountUp(spenderAnalysis.totalSpenders, 800);
+  const animBasket = useCountUp(spenderAnalysis.avgBasket, 800);
+  const animLTV = useCountUp(spenderAnalysis.avgLTV, 800);
+  const animWhales = useCountUp(spenderAnalysis.whales.length, 600);
+
+  // ── Sparkline helper (SVG) ──
+  const Sparkline = ({data, color, width, height}) => {
+    const w = width||80; const h = height||24;
+    if(!data||data.length<2) return <svg width={w} height={h}/>;
+    const max = Math.max(...data,1);
+    const pts = data.map((v,i) => `${(i/(data.length-1))*w},${h - (v/max)*h}`).join(" ");
+    return <svg width={w} height={h} style={{display:"block"}}><polyline points={pts} fill="none" stroke={color||"#818cf8"} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>;
+  };
+
+  // ── Bar helper ──
+  const SegmentBar = ({pct, color, label, count, total}) => (
+    <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:8}}>
+      <span style={{fontSize:16,width:24,textAlign:"center"}}>{label}</span>
+      <div style={{flex:1,height:28,background:"rgba(255,255,255,0.03)",borderRadius:8,overflow:"hidden",position:"relative"}}>
+        <div style={{height:"100%",width:`${Math.max(pct,2)}%`,background:`linear-gradient(90deg, ${color}44, ${color})`,borderRadius:8,transition:"width 0.8s ease"}}/>
+        <span style={{position:"absolute",right:8,top:"50%",transform:"translateY(-50%)",fontSize:10,fontWeight:600,color:"rgba(255,255,255,0.6)"}}>{count} spenders</span>
+      </div>
+      <span style={{fontSize:12,fontWeight:700,minWidth:70,textAlign:"right"}}>{Math.round(total)}{currencySymbol}</span>
+    </div>
+  );
+
+  // ── MODEL RECS ──
+  const modelRecs = useMemo(() => {
+    return modelAnalysis.slice(0,5).map(m => {
+      const refuseRate = m.count>0?Math.round((m.count-m.validated)/m.count*100):0;
+      if(m.last7dTotal===0) return {level:"urgent",icon:"🔴",name:m.name,text:fr?`0 TX cette semaine. Relancer ou créer du contenu frais.`:`0 TX this week. Re-engage or create fresh content.`};
+      if(refuseRate>20) return {level:"warning",icon:"🟡",name:m.name,text:fr?`Taux de refus élevé (${refuseRate}%). Vérifier la qualité des contenus.`:`High refuse rate (${refuseRate}%). Check content quality.`};
+      return {level:"info",icon:"🟢",name:m.name,text:fr?`CA: ${Math.round(m.total)}${currencySymbol}, ${m.validRate}% validé. Bonne performance.`:`Revenue: ${Math.round(m.total)}${currencySymbol}, ${m.validRate}% validated. Good performance.`};
+    });
+  }, [modelAnalysis, currencySymbol, fr]);
+
+  // ── CHATTER RECS ──
+  const chatterRecs = useMemo(() => {
+    return chatterAnalysis.slice(0,5).map(c => {
+      if(c.convRate>=80&&c.count>=5) return {icon:"🟢",name:c.name,text:fr?`Taux de conversion ${c.convRate}%. Top performer.`:`Conversion rate ${c.convRate}%. Top performer.`};
+      if(c.pendingCount>10) return {icon:"🟡",name:c.name,text:fr?`${c.pendingCount} TX pending. Besoin de validation.`:`${c.pendingCount} TX pending. Needs validation.`};
+      if(c.convRate<50&&c.count>=5) return {icon:"🔴",name:c.name,text:fr?`Conversion faible (${c.convRate}%). Coaching recommandé.`:`Low conversion (${c.convRate}%). Coaching recommended.`};
+      return {icon:"🟢",name:c.name,text:fr?`${c.count} TX, ${c.convRate}% conversion.`:`${c.count} TX, ${c.convRate}% conversion.`};
+    });
+  }, [chatterAnalysis, fr]);
+
+  const maxModelCA = modelAnalysis.length>0?modelAnalysis[0].total:1;
+
   return (
-    <div>
-      <div style={{marginBottom:24}}>
-        <h2 style={{fontSize:17,fontWeight:700,margin:0}}>{fr?"Agents IA · Audit Manager":"AI Agents · Audit Manager"}</h2>
-        <p style={{fontSize:12,color:"rgba(255,255,255,0.4)",margin:"3px 0 0"}}>{fr?"Suivi des actions automatisées et des agents":"Tracking automated actions and agents"}</p>
-      </div>
-      {/* KPIs */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(4, 1fr)",gap:14,marginBottom:24}}>
-        <div style={cardStyle}>
-          <div style={kpiHeaderStyle}><span style={kpiLabelStyle}>{fr?"Agents Actifs":"Active Agents"}</span><span style={{fontSize:18}}>🤖</span></div>
-          <div style={{fontSize:26,fontWeight:800}}>3</div>
-          <div style={{fontSize:12,marginTop:6,color:"#34d399",fontWeight:600}}>{fr?"En ligne":"Online"}</div>
+    <div style={{position:"relative"}}>
+      {/* Ambient glow */}
+      <div style={{position:"absolute",top:"30%",left:"50%",transform:"translateX(-50%)",width:800,height:400,background:"radial-gradient(circle, rgba(129,140,248,0.04) 0%, transparent 60%)",animation:"breathe 8s ease-in-out infinite",pointerEvents:"none"}}/>
+
+      {/* HEADER */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:28}}>
+        <div>
+          <h2 style={{fontSize:20,fontWeight:800,margin:0,background:"linear-gradient(135deg, #818cf8, #f472b6)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>
+            {fr?"Agents IA · Centre de Commande":"AI Agents · Command Center"}
+          </h2>
+          <p style={{fontSize:12,color:"rgba(255,255,255,0.4)",margin:"4px 0 0"}}>{fr?"Analyses temps réel · Recommandations · Alertes":"Real-time analytics · Recommendations · Alerts"}</p>
         </div>
-        <div style={cardStyle}>
-          <div style={kpiHeaderStyle}><span style={kpiLabelStyle}>Actions 24h</span><span style={{fontSize:18}}>⚡</span></div>
-          <div style={{fontSize:26,fontWeight:800}}>47</div>
-          <div style={{fontSize:12,marginTop:6,color:"#34d399",fontWeight:600}}>+12 vs {fr?"hier":"yesterday"}</div>
-        </div>
-        <div style={cardStyle}>
-          <div style={kpiHeaderStyle}><span style={kpiLabelStyle}>{fr?"TX Auto-validées":"Auto-validated TX"}</span><span style={{fontSize:18}}>✅</span></div>
-          <div style={{fontSize:26,fontWeight:800}}>12</div>
-          <div style={{fontSize:12,marginTop:6,color:"#fbbf24",fontWeight:600}}>{fr?"ce mois":"this month"}</div>
-        </div>
-        <div style={cardStyle}>
-          <div style={kpiHeaderStyle}><span style={kpiLabelStyle}>{fr?"Erreurs":"Errors"}</span><span style={{fontSize:18}}>🚨</span></div>
-          <div style={{fontSize:26,fontWeight:800}}>0</div>
-          <div style={{fontSize:12,marginTop:6,color:"#34d399",fontWeight:600}}>{fr?"Aucune erreur":"No errors"}</div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{display:"flex",gap:3}}>
+            <span style={{width:4,height:4,borderRadius:"50%",background:"#818cf8",animation:"wave 1.4s ease-in-out infinite",animationDelay:"0s"}}/>
+            <span style={{width:4,height:4,borderRadius:"50%",background:"#818cf8",animation:"wave 1.4s ease-in-out infinite",animationDelay:"0.2s"}}/>
+            <span style={{width:4,height:4,borderRadius:"50%",background:"#818cf8",animation:"wave 1.4s ease-in-out infinite",animationDelay:"0.4s"}}/>
+          </div>
+          <span style={{fontSize:11,color:"#818cf8",fontWeight:600,letterSpacing:0.5}}>IA ACTIVE</span>
         </div>
       </div>
-      {/* Agents List */}
-      <div style={cardStyle}>
-        <h3 style={{fontSize:15,fontWeight:700,marginBottom:18}}>{fr?"Agents enregistrés":"Registered Agents"}</h3>
+
+      {/* ── SECTION 1: ALERTES & RECOMMANDATIONS ── */}
+      <div style={{marginBottom:32}}>
+        {sectionTitle("🔥",fr?"Alertes & Recommandations":"Alerts & Recommendations",fr?"Générées automatiquement à partir de vos données":"Auto-generated from your data")}
         <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          {agents.map((a,i) => (
-            <div key={i} style={agentRowStyle}>
-              <div style={{display:"flex",alignItems:"center",gap:12}}>
-                <div style={agentAvatarStyle()}>{a.initials}</div>
-                <div>
-                  <div style={{fontSize:13,fontWeight:700}}>{a.name}<span style={agentBadgeStyle(a.badgeColor)}>{a.badge}</span></div>
-                  <div style={{fontSize:10,color:"rgba(255,255,255,0.35)"}}>{a.role} · {fr?"Dernière action":"Last action"}: {a.lastAction}</div>
-                </div>
+          {recommendations.map((r,i) => (
+            <div key={i} style={{display:"flex",alignItems:"center",gap:16,padding:"16px 20px",background:r.level==="urgent"?"rgba(239,68,68,0.06)":r.level==="warning"?"rgba(251,191,36,0.06)":"rgba(129,140,248,0.06)",border:"1px solid "+(r.level==="urgent"?"rgba(239,68,68,0.15)":r.level==="warning"?"rgba(251,191,36,0.15)":"rgba(129,140,248,0.15)"),borderRadius:16,borderLeft:"4px solid "+(r.level==="urgent"?"#ef4444":r.level==="warning"?"#fbbf24":"#818cf8")}}>
+              <span style={{fontSize:28}}>{r.icon}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,fontWeight:700,marginBottom:3}}>{r.title}</div>
+                <div style={{fontSize:12,color:"rgba(255,255,255,0.45)"}}>{r.desc}</div>
               </div>
-              <div style={{textAlign:"right"}}>
-                <div style={{fontSize:14,fontWeight:800}}>{a.stat}</div>
-                <div style={{fontSize:10,color:a.statColor,fontWeight:600}}>{a.statLabel}</div>
-              </div>
+              {r.action&&onNavigate&&(
+                <button onClick={()=>onNavigate(r.actionTab)} style={{padding:"7px 16px",borderRadius:12,border:"1px solid rgba(129,140,248,0.3)",background:"rgba(129,140,248,0.1)",color:"#818cf8",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",fontFamily:"'DM Sans',sans-serif"}}>{r.action} →</button>
+              )}
             </div>
           ))}
+          {recommendations.length===0&&<div style={{textAlign:"center",padding:30,color:"rgba(255,255,255,0.25)",fontSize:13}}>{fr?"Aucune alerte":"No alerts"}</div>}
         </div>
       </div>
-      {/* Activity Log */}
-      <div style={{...cardStyle,marginTop:20}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
-          <h3 style={{fontSize:15,fontWeight:700,margin:0}}>{fr?"Journal d'activité":"Activity Log"}</h3>
-          <span style={{fontSize:10,padding:"3px 10px",borderRadius:20,background:"rgba(34,197,94,0.15)",color:"#34d399",fontWeight:700,textTransform:"uppercase"}}>Live</span>
+
+      {/* ── SECTION 2: ANALYSE SPENDERS ── */}
+      <div style={{marginBottom:32}}>
+        {sectionTitle("📊",fr?"Analyse Spenders":"Spenders Analysis",fr?"Segmentation, LTV et tendances":"Segmentation, LTV and trends")}
+        {/* KPIs */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4, 1fr)",gap:14,marginBottom:20}}>
+          <GradientCard><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><span style={{fontSize:10,textTransform:"uppercase",color:"rgba(255,255,255,0.5)",fontWeight:600,letterSpacing:0.5}}>Spenders</span><span style={{fontSize:16}}>👥</span></div><div style={{fontSize:26,fontWeight:800}}>{animSpenders}</div></GradientCard>
+          <GradientCard><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><span style={{fontSize:10,textTransform:"uppercase",color:"rgba(255,255,255,0.5)",fontWeight:600,letterSpacing:0.5}}>{fr?"Panier moyen":"Avg basket"}</span><span style={{fontSize:16}}>🛒</span></div><div style={{fontSize:26,fontWeight:800}}>{animBasket}{currencySymbol}</div></GradientCard>
+          <GradientCard><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><span style={{fontSize:10,textTransform:"uppercase",color:"rgba(255,255,255,0.5)",fontWeight:600,letterSpacing:0.5}}>{fr?"LTV moyen":"Avg LTV"}</span><span style={{fontSize:16}}>💎</span></div><div style={{fontSize:26,fontWeight:800}}>{animLTV}{currencySymbol}</div></GradientCard>
+          <GradientCard><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}><span style={{fontSize:10,textTransform:"uppercase",color:"rgba(255,255,255,0.5)",fontWeight:600,letterSpacing:0.5}}>Whales</span><span style={{fontSize:16}}>🐋</span></div><div style={{fontSize:26,fontWeight:800}}>{animWhales}</div></GradientCard>
         </div>
-        <table style={{width:"100%",borderCollapse:"separate",borderSpacing:"0 4px"}}>
-          <thead>
-            <tr>
-              {[fr?"Heure":"Time","Agent","Action",fr?"Détail":"Detail",fr?"Statut":"Status"].map(h=>(
-                <th key={h} style={thStyle}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {logs.map((log,i) => (
-              <tr key={i} style={trStyle}>
-                <td style={tdTimeStyle}>{log.time}</td>
-                <td style={tdStyle}><span style={{color:log.agentColor,fontWeight:600}}>{log.agent}</span></td>
-                <td style={tdStyle}>{log.action}</td>
-                <td style={tdStyle}><span style={detailBadgeStyle}>{log.detail}</span></td>
-                <td style={tdStyle}><StatusPill status={log.status} lang={lang}/></td>
-              </tr>
+        {/* Segmentation */}
+        <div style={cardS}>
+          <h4 style={{fontSize:13,fontWeight:700,marginBottom:14}}>{fr?"Segmentation":"Segmentation"}</h4>
+          <SegmentBar label="🐋" pct={spenderAnalysis.totalSpenders>0?Math.round(spenderAnalysis.whales.length/spenderAnalysis.totalSpenders*100):0} color="#818cf8" count={spenderAnalysis.whales.length} total={spenderAnalysis.whaleTotal}/>
+          <SegmentBar label="⭐" pct={spenderAnalysis.totalSpenders>0?Math.round(spenderAnalysis.vips.length/spenderAnalysis.totalSpenders*100):0} color="#fbbf24" count={spenderAnalysis.vips.length} total={spenderAnalysis.vipTotal}/>
+          <SegmentBar label="👤" pct={spenderAnalysis.totalSpenders>0?Math.round(spenderAnalysis.regulars.length/spenderAnalysis.totalSpenders*100):0} color="#34d399" count={spenderAnalysis.regulars.length} total={spenderAnalysis.regTotal}/>
+          <div style={{display:"flex",gap:16,marginTop:10,fontSize:10,color:"rgba(255,255,255,0.35)"}}>
+            <span>🐋 WHALE {">"}500{currencySymbol}</span><span>⭐ VIP 200-500{currencySymbol}</span><span>👤 REGULAR {"<"}200{currencySymbol}</span>
+          </div>
+        </div>
+        {/* Top 5 */}
+        <div style={{...cardS,marginTop:14}}>
+          <h4 style={{fontSize:13,fontWeight:700,marginBottom:14}}>Top 5 Spenders</h4>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {spenderAnalysis.top5.map((sp,i) => {
+              const days = [];
+              for(let d=6;d>=0;d--) { const dk = new Date(now.getTime()-d*86400000).toISOString().slice(0,10); days.push(sp.byDay[dk]||0); }
+              const trend = days[6]>=(days[0]||1);
+              return (
+                <div key={sp.handle} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",background:"rgba(255,255,255,0.02)",borderRadius:12,border:"1px solid rgba(255,255,255,0.04)"}}>
+                  <span style={{fontSize:14,fontWeight:800,color:"#818cf8",width:20,textAlign:"center"}}>#{i+1}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:13,fontWeight:700}}>{sp.handle}</div>
+                    <div style={{fontSize:10,color:"rgba(255,255,255,0.35)"}}>{sp.count} TX · {Math.round(sp.total)}{currencySymbol}</div>
+                  </div>
+                  <Sparkline data={days} color={trend?"#34d399":"#ef4444"} width={80} height={24}/>
+                  <span style={{fontSize:11,color:trend?"#34d399":"#ef4444",fontWeight:700}}>{trend?"↑":"↓"}</span>
+                </div>
+              );
+            })}
+            {spenderAnalysis.top5.length===0&&<div style={{textAlign:"center",padding:20,color:"rgba(255,255,255,0.25)",fontSize:12}}>{fr?"Aucune donnée":"No data"}</div>}
+          </div>
+        </div>
+      </div>
+
+      {/* ── SECTION 3: ANALYSE MODELES ── */}
+      <div style={{marginBottom:32}}>
+        {sectionTitle("👩‍💼",fr?"Analyse Modèles":"Models Analysis",fr?"Performance et recommandations":"Performance and recommendations")}
+        {/* Horizontal bar chart */}
+        <div style={cardS}>
+          <h4 style={{fontSize:13,fontWeight:700,marginBottom:14}}>{fr?"Comparaison CA":"Revenue Comparison"}</h4>
+          {modelAnalysis.slice(0,6).map((m,i) => (
+            <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,marginBottom:10}}>
+              <span style={{fontSize:12,fontWeight:700,minWidth:80,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.name}</span>
+              <div style={{flex:1,height:24,background:"rgba(255,255,255,0.03)",borderRadius:6,overflow:"hidden",position:"relative"}}>
+                <div style={{height:"100%",width:`${Math.max(m.total/maxModelCA*100,2)}%`,background:"linear-gradient(90deg, #818cf844, #818cf8)",borderRadius:6,transition:"width 0.8s ease"}}/>
+              </div>
+              <span style={{fontSize:11,fontWeight:700,minWidth:60,textAlign:"right"}}>{Math.round(m.total)}{currencySymbol}</span>
+              <span style={{fontSize:10,color:m.validRate>=70?"#34d399":m.validRate>=50?"#fbbf24":"#ef4444",fontWeight:600,minWidth:35}}>{m.validRate}%</span>
+            </div>
+          ))}
+          {modelAnalysis.length===0&&<div style={{textAlign:"center",padding:20,color:"rgba(255,255,255,0.25)",fontSize:12}}>{fr?"Aucune donnée":"No data"}</div>}
+        </div>
+        {/* Model recs */}
+        <div style={{...cardS,marginTop:14}}>
+          <h4 style={{fontSize:13,fontWeight:700,marginBottom:14}}>{fr?"Recommandations IA":"AI Recommendations"}</h4>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {modelRecs.map((r,i) => (
+              <div key={i} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 14px",background:r.level==="urgent"?"rgba(239,68,68,0.04)":r.level==="warning"?"rgba(251,191,36,0.04)":"rgba(129,140,248,0.04)",borderRadius:10,border:"1px solid rgba(255,255,255,0.04)"}}>
+                <span style={{fontSize:14}}>{r.icon}</span>
+                <div><span style={{fontWeight:700,fontSize:12}}>{r.name}</span><span style={{fontSize:12,color:"rgba(255,255,255,0.5)",marginLeft:6}}>— {r.text}</span></div>
+              </div>
             ))}
-          </tbody>
-        </table>
+          </div>
+        </div>
+      </div>
+
+      {/* ── SECTION 4: ANALYSE CHATTERS ── */}
+      <div style={{marginBottom:32}}>
+        {sectionTitle("💬",fr?"Analyse Chatters":"Chatters Analysis",fr?"Conversion, efficacité et ranking":"Conversion, efficiency and ranking")}
+        <div style={cardS}>
+          <h4 style={{fontSize:13,fontWeight:700,marginBottom:14}}>{fr?"Ranking Chatters":"Chatters Ranking"}</h4>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {chatterAnalysis.map((c,i) => (
+              <div key={c.id||i} style={{padding:"14px 16px",background:"rgba(255,255,255,0.02)",borderRadius:12,border:"1px solid rgba(255,255,255,0.04)"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:14,fontWeight:800,color:"#818cf8"}}>#{i+1}</span>
+                    <span style={{fontSize:13,fontWeight:700}}>{c.name}</span>
+                    <span style={{fontSize:10,padding:"2px 8px",borderRadius:20,background:c.convRate>=80?"rgba(52,211,153,0.15)":c.convRate>=50?"rgba(251,191,36,0.15)":"rgba(239,68,68,0.15)",color:c.convRate>=80?"#34d399":c.convRate>=50?"#fbbf24":"#ef4444",fontWeight:600}}>{c.convRate}%</span>
+                  </div>
+                  <div style={{display:"flex",gap:16,fontSize:11,color:"rgba(255,255,255,0.5)"}}>
+                    <span>{c.count} TX</span>
+                    <span style={{fontWeight:700,color:"var(--text)"}}>{Math.round(c.total)}{currencySymbol}</span>
+                    <span style={{color:"#fbbf24"}}>{Math.round(c.commission)}{currencySymbol} com.</span>
+                  </div>
+                </div>
+                <div style={{height:6,background:"rgba(255,255,255,0.04)",borderRadius:3,overflow:"hidden"}}>
+                  <div style={{height:"100%",width:`${c.pct}%`,background:"linear-gradient(90deg, #818cf8, #a78bfa)",borderRadius:3,transition:"width 0.8s ease"}}/>
+                </div>
+              </div>
+            ))}
+            {chatterAnalysis.length===0&&<div style={{textAlign:"center",padding:20,color:"rgba(255,255,255,0.25)",fontSize:12}}>{fr?"Aucune donnée":"No data"}</div>}
+          </div>
+        </div>
+        {/* Chatter recs */}
+        <div style={{...cardS,marginTop:14}}>
+          <h4 style={{fontSize:13,fontWeight:700,marginBottom:14}}>{fr?"Recommandations IA":"AI Recommendations"}</h4>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {chatterRecs.map((r,i) => (
+              <div key={i} style={{display:"flex",alignItems:"flex-start",gap:10,padding:"10px 14px",background:"rgba(129,140,248,0.04)",borderRadius:10,border:"1px solid rgba(255,255,255,0.04)"}}>
+                <span style={{fontSize:14}}>{r.icon}</span>
+                <div><span style={{fontWeight:700,fontSize:12}}>💬 {r.name}</span><span style={{fontSize:12,color:"rgba(255,255,255,0.5)",marginLeft:6}}>— {r.text}</span></div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── SECTION 5: TO-DO ── */}
+      <div style={{marginBottom:32}}>
+        {sectionTitle("✅",fr?"Actions Suggérées":"Suggested Actions",fr?"Tâches prioritaires générées par l'IA":"Priority tasks generated by AI")}
+        <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {todos.map((td,i) => (
+            <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",borderRadius:14}}>
+              <input type="checkbox" checked={!!todoDone[i]} onChange={()=>toggleTodo(i)} style={{accentColor:"#818cf8",width:16,height:16,cursor:"pointer"}}/>
+              <span style={{width:8,height:8,borderRadius:"50%",background:td.priority==="high"?"#ef4444":td.priority==="medium"?"#fbbf24":"#34d399",flexShrink:0}}/>
+              <span style={{flex:1,fontSize:13,fontWeight:500,textDecoration:todoDone[i]?"line-through":"none",opacity:todoDone[i]?0.4:1}}>{td.text}</span>
+              {td.tab&&onNavigate&&<button onClick={()=>onNavigate(td.tab)} style={{fontSize:10,color:"#818cf8",fontWeight:600,cursor:"pointer",background:"none",border:"none",fontFamily:"'DM Sans',sans-serif",whiteSpace:"nowrap"}}>{fr?"Aller":"Go"} →</button>}
+            </div>
+          ))}
+          {todos.length===0&&<div style={{textAlign:"center",padding:30,color:"rgba(255,255,255,0.25)",fontSize:13}}>{fr?"Aucune action en attente. Tout est en ordre !":"No pending actions. Everything looks good!"}</div>}
+        </div>
+      </div>
+
+      {/* ── SECTION 6: JOURNAL D'ACTIVITÉ AGENTS ── */}
+      <div>
+        {sectionTitle("📋",fr?"Journal d'Activité Agents":"Agent Activity Log")}
+        {/* Agent cards */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:20}}>
+          {agents.map((a,i) => (
+            <GradientCard key={i}>
+              <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:10}}>
+                <div style={{width:38,height:38,borderRadius:10,background:"linear-gradient(135deg, rgba(129,140,248,0.2), rgba(244,114,182,0.1))",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:14,color:"#818cf8"}}>{a.initials}</div>
+                <div>
+                  <div style={{fontSize:13,fontWeight:700}}>{a.name}<span style={{fontSize:9,padding:"2px 8px",borderRadius:20,background:`${a.badgeColor}22`,color:a.badgeColor,fontWeight:700,marginLeft:8,textTransform:"uppercase",letterSpacing:0.5}}>{a.badge}</span></div>
+                  <div style={{fontSize:10,color:"rgba(255,255,255,0.35)"}}>{a.role}</div>
+                </div>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:10,color:"rgba(255,255,255,0.35)"}}>{fr?"Dernière action":"Last action"}: {a.lastAction}</span>
+                <span style={{fontSize:13,fontWeight:800,color:a.statColor}}>{a.stat}</span>
+              </div>
+            </GradientCard>
+          ))}
+        </div>
+        {/* Log table */}
+        <div style={cardS}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
+            <h4 style={{fontSize:13,fontWeight:700,margin:0}}>{fr?"Historique":"History"}</h4>
+            <span style={{fontSize:10,padding:"3px 10px",borderRadius:20,background:"rgba(34,197,94,0.15)",color:"#34d399",fontWeight:700,textTransform:"uppercase"}}>Live</span>
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"separate",borderSpacing:"0 4px"}}>
+              <thead><tr>{[fr?"Heure":"Time","Agent","Action",fr?"Détail":"Detail",fr?"Statut":"Status"].map(h=><th key={h} style={thS}>{h}</th>)}</tr></thead>
+              <tbody>
+                {logs.map((log,i) => (
+                  <tr key={i} style={{transition:"background 0.2s"}}>
+                    <td style={{...tdS,fontFamily:"monospace",fontSize:11,color:"rgba(255,255,255,0.5)"}}>{log.time}</td>
+                    <td style={tdS}><span style={{color:log.agentColor,fontWeight:600}}>{log.agent}</span></td>
+                    <td style={tdS}>{log.action}</td>
+                    <td style={tdS}><span style={{fontSize:10,padding:"2px 8px",borderRadius:6,background:"rgba(129,140,248,0.1)",color:"#a5b4fc"}}>{log.detail}</span></td>
+                    <td style={tdS}><StatusPill status={log.status} lang={lang}/></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -5383,7 +5741,7 @@ const App = () => {
     {id:"compta",icon:"📈",label:t(lang,"compta"),show:user.role==="gerant"},
     {id:"provider_compta",icon:"💰",label:"Provider Compta",show:user.role==="provider"},
     {id:"telegram",icon:"📲",label:"Telegram",show:user.role!=="provider"},
-    {id:"agents",icon:"🤖",label:"Agents IA",show:user.role!=="provider"},
+    {id:"agents",icon:"🤖",label:"Agents IA",show:user.role==="gerant"},
     {id:"admin",icon:"⚙",label:t(lang,"admin"),show:user.role==="gerant"},
   ];
 
@@ -5456,7 +5814,7 @@ const App = () => {
           {tab==="compta"&&user.role==="gerant"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} models={models} />}
           {tab==="telegram"&&user.role!=="provider"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
-          {tab==="agents"&&user.role!=="provider"&&<AgentsAuditTab lang={lang} />}
+          {tab==="agents"&&user.role==="gerant"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
           {tab==="admin"&&user.role==="gerant"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
           </>)}
         </div>
