@@ -20,6 +20,7 @@
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html { scroll-behavior: smooth; }
@@ -1098,6 +1099,7 @@
   <div id="root"></div>
   <script type="text/babel">
 const {useState, useEffect, useMemo, useCallback, useContext, createContext, useRef} = React;
+const {ResponsiveContainer, AreaChart, Area, CartesianGrid, XAxis, YAxis, Tooltip: RechartsTooltip} = Recharts;
 
 // =============================================
 // TOAST NOTIFICATION SYSTEM
@@ -1732,6 +1734,10 @@ const DashboardTab = ({user, lang, txs, models, profiles, onRefresh}) => {
   const [chatter, setChatter] = useState("");
   const [editingTx, setEditingTx] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [activeMetrics, setActiveMetrics] = useState(["brut", "valide"]);
+  const toggleMetric = (key) => {
+    setActiveMetrics(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]);
+  };
   const handleDashStatus = async (txId, newStatus) => {
     try {
       const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
@@ -1763,6 +1769,30 @@ const DashboardTab = ({user, lang, txs, models, profiles, onRefresh}) => {
   const caNet = filtered.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
   const caPending = pending.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
   const caValidated = validated.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+  const tz = useTimezone() || "Europe/Paris";
+  const chartData = useMemo(() => {
+    const byDay = {};
+    filtered.forEach(tx => {
+      const d = new Date(tx.date);
+      const key = d.toLocaleDateString("fr-FR", { timeZone: tz, day: "2-digit", month: "short" });
+      const sortKey = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+      if (!byDay[sortKey]) byDay[sortKey] = { name: key, sortKey, brut: 0, valide: 0, pending: 0, refuse: 0 };
+      byDay[sortKey].brut += convertAmount(Number(tx.amount), tx.currency);
+      if (tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee") {
+        byDay[sortKey].valide += convertAmount(Number(tx.amount), tx.currency);
+      }
+      if (tx.status === "pending" || tx.status === "en_attente") {
+        byDay[sortKey].pending += convertAmount(Number(tx.amount), tx.currency);
+      }
+      if (tx.status === "refused" || tx.status === "refusee" || tx.status === "annulee") {
+        byDay[sortKey].refuse += convertAmount(Number(tx.amount), tx.currency);
+      }
+    });
+    return Object.values(byDay).sort((a, b) => a.sortKey.localeCompare(b.sortKey));
+  }, [filtered, tz, convertAmount]);
+  const totalBrut = chartData.reduce((s, d) => s + d.brut, 0);
+  const totalValide = chartData.reduce((s, d) => s + d.valide, 0);
+  const totalPending = chartData.reduce((s, d) => s + d.pending, 0);
   return (
     <div>
       <DateRangeFilter lang={lang} {...dr} />
@@ -1798,6 +1828,145 @@ const DashboardTab = ({user, lang, txs, models, profiles, onRefresh}) => {
         <KPICard label={t(lang,"ca_validated")} value={`${caValidated.toFixed(0)}${currencySymbol}`} icon="✅" className="warning" />
         <KPICard label={t(lang,"nb_validated")} value={`${validated.length}`} icon="🎯" className="warning" />
       </div>
+      {/* ═══════════════════════════════════════════
+          GRAPHE CA BRUT DYNAMIQUE
+          ═══════════════════════════════════════════ */}
+      {user.role==="gerant" && (
+      <div style={{
+        background: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.06)",
+        borderRadius: 20,
+        padding: "24px 24px 16px",
+        backdropFilter: "blur(10px)",
+        marginBottom: 24,
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
+          <div>
+            <h2 style={{ fontSize: 17, fontWeight: 700, margin: 0, color: "var(--text)" }}>📈 CA Brut Agence</h2>
+            <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", margin: "3px 0 0" }}>
+              {lang==="fr"?"Évolution jour par jour — réagit aux filtres":"Day by day evolution — reacts to filters"}
+            </p>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 28, fontWeight: 800, letterSpacing: -0.5, background: "linear-gradient(135deg, #818cf8, #f472b6)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+              {totalBrut.toLocaleString("fr-FR", {maximumFractionDigits:0})}{currencySymbol}
+            </div>
+            <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", marginTop: 2 }}>
+              CA brut {lang==="fr"?"période":"period"} · {totalValide.toLocaleString("fr-FR", {maximumFractionDigits:0})}{currencySymbol} {lang==="fr"?"validé":"validated"} · {totalPending.toLocaleString("fr-FR", {maximumFractionDigits:0})}{currencySymbol} pending
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
+          {[
+            { key: "brut", label: "CA Brut", color: "#818cf8" },
+            { key: "valide", label: lang==="fr"?"Validé":"Validated", color: "#34d399" },
+            { key: "pending", label: "Pending", color: "#fbbf24" },
+            { key: "refuse", label: lang==="fr"?"Refusé":"Refused", color: "#ef4444" },
+          ].map(m => (
+            <button
+              key={m.key}
+              onClick={() => toggleMetric(m.key)}
+              style={{
+                padding: "6px 14px",
+                borderRadius: 20,
+                border: activeMetrics.includes(m.key) ? `1px solid ${m.color}66` : "1px solid rgba(255,255,255,0.08)",
+                background: activeMetrics.includes(m.key) ? `${m.color}20` : "transparent",
+                color: activeMetrics.includes(m.key) ? m.color : "rgba(255,255,255,0.35)",
+                fontSize: 11,
+                fontWeight: 600,
+                cursor: "pointer",
+                transition: "all 0.2s",
+                fontFamily: "'DM Sans', sans-serif",
+              }}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+        {chartData.length > 0 ? (
+          <ResponsiveContainer width="100%" height={300}>
+            <AreaChart data={chartData}>
+              <defs>
+                <linearGradient id="gradBrut" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#818cf8" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#818cf8" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="gradValide" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#34d399" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="gradPending" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#fbbf24" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#fbbf24" stopOpacity={0} />
+                </linearGradient>
+                <linearGradient id="gradRefuse" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#ef4444" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#ef4444" stopOpacity={0} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+              <XAxis
+                dataKey="name"
+                axisLine={false}
+                tickLine={false}
+                tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11, fontFamily: "'DM Sans', sans-serif" }}
+              />
+              <YAxis
+                axisLine={false}
+                tickLine={false}
+                tick={{ fill: "rgba(255,255,255,0.35)", fontSize: 11 }}
+                tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(1) + "K" : v}
+              />
+              <RechartsTooltip
+                contentStyle={{
+                  background: "rgba(15,15,30,0.95)",
+                  backdropFilter: "blur(12px)",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  borderRadius: 12,
+                  padding: "14px 18px",
+                  boxShadow: "0 20px 40px rgba(0,0,0,0.4)",
+                  fontFamily: "'DM Sans', sans-serif",
+                  fontSize: 12,
+                }}
+                formatter={(value) => [value.toLocaleString("fr-FR", {maximumFractionDigits:0}) + (currencySymbol === "€" ? "€" : " CHF")]}
+                labelStyle={{ color: "rgba(255,255,255,0.5)", marginBottom: 6 }}
+              />
+              {activeMetrics.includes("brut") && (
+                <Area type="monotone" dataKey="brut" stroke="#818cf8" strokeWidth={3} fill="url(#gradBrut)"
+                  dot={{ fill: "#818cf8", stroke: "#0f0f2e", strokeWidth: 3, r: 5 }}
+                  activeDot={{ r: 7, stroke: "#818cf8", strokeWidth: 2, fill: "#0f0f2e" }}
+                  name="CA Brut" animationDuration={600} />
+              )}
+              {activeMetrics.includes("valide") && (
+                <Area type="monotone" dataKey="valide" stroke="#34d399" strokeWidth={2} fill="url(#gradValide)"
+                  dot={{ fill: "#34d399", stroke: "#0f0f2e", strokeWidth: 2, r: 3 }}
+                  activeDot={{ r: 6, stroke: "#34d399", strokeWidth: 2, fill: "#0f0f2e" }}
+                  name={lang==="fr"?"Validé":"Validated"} animationDuration={600} />
+              )}
+              {activeMetrics.includes("pending") && (
+                <Area type="monotone" dataKey="pending" stroke="#fbbf24" strokeWidth={2} fill="url(#gradPending)"
+                  dot={{ fill: "#fbbf24", stroke: "#0f0f2e", strokeWidth: 2, r: 3 }}
+                  activeDot={{ r: 6, stroke: "#fbbf24", strokeWidth: 2, fill: "#0f0f2e" }}
+                  name="Pending" animationDuration={600} />
+              )}
+              {activeMetrics.includes("refuse") && (
+                <Area type="monotone" dataKey="refuse" stroke="#ef4444" strokeWidth={2} fill="url(#gradRefuse)"
+                  dot={{ fill: "#ef4444", stroke: "#0f0f2e", strokeWidth: 2, r: 3 }}
+                  activeDot={{ r: 6, stroke: "#ef4444", strokeWidth: 2, fill: "#0f0f2e" }}
+                  name={lang==="fr"?"Refusé":"Refused"} animationDuration={600} />
+              )}
+            </AreaChart>
+          </ResponsiveContainer>
+        ) : (
+          <div style={{ height: 300, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 8 }}>
+            <span style={{ fontSize: 40 }}>📭</span>
+            <span style={{ fontSize: 13, color: "rgba(255,255,255,0.3)" }}>
+              {lang==="fr"?"Aucune transaction sur cette période":"No transactions for this period"}
+            </span>
+          </div>
+        )}
+      </div>
+      )}
       <div className="grid-2">
         <div className="card">
           <div className="section-title"><div className="section-bar"></div>{t(lang,"revenue_by_model")}</div>
