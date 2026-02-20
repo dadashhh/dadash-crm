@@ -1103,17 +1103,19 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const safeInsertTx = async (txData) => {
   // Level 1: try full insert
   try {
-    const res = await sb.from("transactions").insert(txData);
-    if (!res.error) { return res; }
-  } catch(e) { /* L1 fallback */ }
+    const res = await sb.from("transactions").insert(txData).select();
+    if (!res.error) { console.log("[safeInsertTx] L1 OK, returned:", res.data); return res; }
+    console.warn("[safeInsertTx] L1 fail:", res.error.message);
+  } catch(e) { console.warn("[safeInsertTx] L1 threw:", e.message); }
 
   // Level 2: strip optional columns (currency, product, tag)
   try {
     const l2 = {...txData};
     delete l2.currency; delete l2.product; delete l2.tag;
-    const res = await sb.from("transactions").insert(l2);
-    if (!res.error) { return res; }
-  } catch(e) { /* L2 fallback */ }
+    const res = await sb.from("transactions").insert(l2).select();
+    if (!res.error) { console.log("[safeInsertTx] L2 OK, returned:", res.data); return res; }
+    console.warn("[safeInsertTx] L2 fail:", res.error.message);
+  } catch(e) { console.warn("[safeInsertTx] L2 threw:", e.message); }
 
   // Level 3: strip ALL FK columns
   try {
@@ -1124,9 +1126,10 @@ const safeInsertTx = async (txData) => {
       status: txData.status || "pending",
       notes: txData.notes || null,
     };
-    const res = await sb.from("transactions").insert(l3);
-    if (!res.error) { return res; }
-  } catch(e) { /* L3 fallback */ }
+    const res = await sb.from("transactions").insert(l3).select();
+    if (!res.error) { console.log("[safeInsertTx] L3 OK (no FKs), returned:", res.data); return res; }
+    console.warn("[safeInsertTx] L3 fail:", res.error.message);
+  } catch(e) { console.warn("[safeInsertTx] L3 threw:", e.message); }
 
   // Level 4: absolute minimum — only required columns
   try {
@@ -1135,8 +1138,9 @@ const safeInsertTx = async (txData) => {
       spender_handle: txData.spender_handle || "unknown",
       amount: parseFloat(txData.amount) || 0,
       status: "pending",
-    });
-    if (!res.error) { return res; }
+    }).select();
+    if (!res.error) { console.log("[safeInsertTx] L4 OK (minimum), returned:", res.data); return res; }
+    console.warn("[safeInsertTx] L4 fail:", res.error.message);
     return res;
   } catch(e) {
     return { data: null, error: { message: "All 4 insert levels failed: " + e.message } };
@@ -2027,13 +2031,15 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
 
   const handleCreate = async () => {
     if(!form.spender_handle||!form.amount) return;
+    console.log("[handleCreate] START — form:", JSON.stringify(form));
     setSaving(true);
     try {
       // Step 1: UPSERT le Spender en DB
       const handle = form.spender_handle.replace(/^@/, "").trim();
       try {
         await safeUpsertSpender({handle, name: handle, status: "active", last_seen: new Date().toISOString()});
-      } catch(e) { /* spender upsert best-effort */ }
+        console.log("[handleCreate] Spender upsert OK for:", handle);
+      } catch(e) { console.warn("Spender upsert best-effort fail:", e); }
 
       // Step 2: INSERT transaction — only include FK fields if they look like valid UUIDs
       const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
@@ -2050,19 +2056,27 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
       if(form.currency && form.currency !== "EUR") txRow.currency = form.currency;
       if(form.product) txRow.product = form.product;
       if(form.tag) txRow.tag = form.tag;
+      console.log("[handleCreate] txRow to insert:", JSON.stringify(txRow));
 
       const res = await safeInsertTx(txRow);
-      setSaving(false);
+      console.log("[handleCreate] safeInsertTx result — data:", res.data, "error:", res.error);
+
       if(!res.error) {
+        console.log("[handleCreate] Insert OK — calling onRefresh()...");
         setForm({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",notes:""});
         setShowForm(false);
+        setSaving(false);
         await onRefresh();
+        console.log("[handleCreate] onRefresh() DONE — UI should be updated");
         addToast(t(lang,"tx_created")||"Transaction créée ✓","success");
       } else {
+        setSaving(false);
+        console.error("[handleCreate] TX insert final error:", res.error);
         addToast("Erreur: " + (res.error.message || "insert failed"),"error");
       }
     } catch(e) {
       setSaving(false);
+      console.error("[handleCreate] threw:", e);
       addToast("Erreur: " + e.message, "error");
     }
   };
@@ -4811,6 +4825,7 @@ const App = () => {
 
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
+    console.log("[loadData] START — role:", currentUser?.role, "id:", currentUser?.id);
     let txR, spR, prR, moR, paR, exR;
     try {
       [txR, spR, prR, moR, paR, exR] = await Promise.all([
@@ -4821,28 +4836,35 @@ const App = () => {
         sb.from("payouts").select("*").order("date",{ascending:false}),
         sb.from("expenses").select("*"),
       ]);
-    } catch(e) { return; }
+    } catch(e) { console.error("[loadData] Promise.all error:", e); return; }
     let txData = txR.data||[];
     let modelData = moR.data||[];
+    console.log("[loadData] fetched", txData.length, "transactions,", modelData.length, "models");
 
     // Filter data based on user role
     if(currentUser) {
       if(currentUser.role==="chatter" && currentUser.assigned_models && currentUser.assigned_models.length>0) {
-        txData = txData.filter(tx=>currentUser.assigned_models.includes(tx.model_id));
+        // Include TXs where model_id matches OR where chatter_id matches current user
+        // (handles case where safeInsertTx fell back to Level 3+ and model_id is null)
+        txData = txData.filter(tx=>currentUser.assigned_models.includes(tx.model_id) || tx.chatter_id===currentUser.id);
         modelData = modelData.filter(m=>currentUser.assigned_models.includes(m.id));
+        console.log("[loadData] chatter filter: assigned_models=", currentUser.assigned_models, "→", txData.length, "txs");
       } else if(currentUser.role==="provider") {
         txData = txData.filter(tx=>tx.provider_id===currentUser.id);
         const modelIds = new Set(txData.map(tx=>tx.model_id));
         modelData = modelData.filter(m=>modelIds.has(m.id));
+        console.log("[loadData] provider filter →", txData.length, "txs");
       }
     }
 
+    console.log("[loadData] SETTING STATE — txs:", txData.length, "spenders:", (spR.data||[]).length);
     setTxs(txData);
     setSpenders(spR.data||[]);
     setProfiles(prR.data||[]);
     setModels(modelData);
     setPayouts(paR.data||[]);
     setExpenses(exR.data||[]);
+    console.log("[loadData] DONE");
   };
 
   useEffect(()=>{
