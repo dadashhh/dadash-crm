@@ -609,6 +609,8 @@
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes breathe { 0%, 100% { opacity: 0.3; transform: translateX(-50%) scale(1); } 50% { opacity: 0.6; transform: translateX(-50%) scale(1.1); } }
     @keyframes wave { 0%, 100% { opacity: 0.3; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-4px); } }
+    @keyframes confettiFall { 0% { transform: translateY(0) rotate(0deg); opacity: 1; } 100% { transform: translateY(100vh) rotate(720deg); opacity: 0; } }
+    @keyframes glowPulse { 0%, 100% { box-shadow: 0 0 8px rgba(251,191,36,0.3); } 50% { box-shadow: 0 0 20px rgba(251,191,36,0.6); } }
     .info-box { background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); border-radius: 8px; padding: 12px; font-size: 12px; color: var(--text2); margin-bottom: 16px; }
     /* ============================================= */
     /* TABLET (max 1200px)                           */
@@ -2129,6 +2131,27 @@ const DashboardTab = ({user, lang, txs, models, profiles, onRefresh, onNotify}) 
           </table>
         </div>
       </div>
+      {/* ── GÉRANT GAMIFICATION SECTION ── */}
+      {user.role === "gerant" && (
+        <div style={{ marginTop: 24 }}>
+          {/* Health Score + Achievements */}
+          <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 20, marginBottom: 20 }}>
+            <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20, display: "flex", alignItems: "center" }}>
+              <AgencyHealthScore txs={txs} profiles={profiles} />
+            </div>
+            <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20 }}>
+              <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{"\u{1F3C6}"} Achievements Agence</h3>
+              <AgencyAchievements txs={txs} profiles={profiles} models={models} expenses={[]} convertAmount={convertAmount} />
+            </div>
+          </div>
+          {/* Heatmap */}
+          <div style={{ marginBottom: 20 }}>
+            <ActivityHeatmap txs={txs} convertAmount={convertAmount} currencySymbol={currencySymbol} />
+          </div>
+          {/* Challenges */}
+          <ChallengesSection user={user} lang={lang} txs={txs} profiles={profiles} convertAmount={convertAmount} currencySymbol={currencySymbol} />
+        </div>
+      )}
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleDashEditSave} onCancel={() => setEditingTx(null)} saving={saving} models={models} profiles={profiles} />}
     </div>
   );
@@ -2432,6 +2455,10 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
                 ))}
               </div>}
             </div>
+          </div>
+          {/* Content Task Manager — gérant assigns tasks to model */}
+          <div className="card" style={{ marginTop: 16 }}>
+            <ContentTaskManager modelId={selectedModel} lang={lang} onRefresh={onRefresh} />
           </div>
         </>}
         {!sel&&<div className="card" style={{textAlign:"center",padding:40,color:"rgba(255,255,255,0.25)"}}>{fr?"Sélectionnez un modèle ci-dessus":"Select a model above"}</div>}
@@ -3767,79 +3794,158 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, onRefres
 // =============================================
 // OBJECTIFS TAB
 // =============================================
-const ObjectifsTab = ({user, lang, txs, profiles}) => {
+const ObjectifsTab = ({user, lang, txs, profiles, onRefresh}) => {
   const { convertAmount, currencySymbol } = useCurrency();
-  const today = new Date();
-  const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,"0")}-${String(today.getDate()).padStart(2,"0")}`;
-  const getStats = (chatterId) => {
-    const chTx = txs.filter(tx=>tx.chatter_id===chatterId);
-    const todayTx = chTx.filter(tx=>tx.date&&tx.date.startsWith(todayStr));
-    const weekStart = new Date(today.getTime()-7*24*60*60*1000);
-    const weekTx = chTx.filter(tx=>new Date(tx.date)>=weekStart);
-    return {dailyCA:todayTx.reduce((s,tx)=>s+Number(tx.amount),0), weeklyCA:weekTx.reduce((s,tx)=>s+Number(tx.amount),0)};
-  };
-  const getHeatmap = (chatterId) => {
-    return Array(7).fill(0).map((_,idx)=>{
-      const d = new Date();
-      d.setDate(d.getDate()-idx);
-      const dStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-      return txs.filter(tx=>tx.chatter_id===chatterId&&tx.date&&tx.date.startsWith(dStr)).length;
-    });
-  };
-  if(user.role==="chatter") {
-    const stats = getStats(user.id);
-    const dGoal = Number(user.daily_goal)||1;
-    const wGoal = Number(user.weekly_goal)||1;
-    const hm = getHeatmap(user.id);
-    const {badges} = getBadges(txs, user.id);
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [confettiShown, setConfettiShown] = useState({});
+
+  const renderChatterObjectifs = (ch, isOwn) => {
+    const xp = calculateXP(ch.id, txs, convertAmount);
+    const level = getLevel(xp);
+    const streak = calculateStreak(ch.id, txs);
+    const streakBadges = getStreakBadges(streak);
+    const dailyCA = getDailyProgress(ch.id, txs, convertAmount);
+    const weeklyCA = getWeeklyProgress(ch.id, txs, convertAmount);
+    const dGoal = Number(ch.daily_goal) || 500;
+    const wGoal = Number(ch.weekly_goal) || 3000;
+    const dailyPct = Math.min(Math.round((dailyCA / dGoal) * 100), 200);
+    const weeklyPct = Math.min(Math.round((weeklyCA / wGoal) * 100), 200);
+    const isMultiplier = dailyCA >= dGoal * 1.5;
+
+    // Confetti on goal reached
+    if (dailyCA >= dGoal && !confettiShown[ch.id]) {
+      setConfettiShown(prev => ({ ...prev, [ch.id]: true }));
+      if (isOwn) setTimeout(launchConfetti, 300);
+    }
+
     return (
-      <div className="card">
-        <div className="section-title"><div className="section-bar"></div>{t(lang,"objectives")} - {user.name}</div>
-        <BadgeBar badges={badges}/>
-        <div style={{marginBottom:20}}>
-          <div style={{marginBottom:8}}>
-            <span>{t(lang,"daily_goal")}: {stats.dailyCA}/{dGoal}</span>
-            <div className="progress"><div className="progress-bar" style={{width:`${Math.min(100,stats.dailyCA/dGoal*100)}%`}}></div></div>
+      <div key={ch.id} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20, marginBottom: 14 }}>
+        {/* Header: name + level + streak */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {!isOwn && <Tag type="chatter" label={ch.name} id={ch.id}/>}
+            {isOwn && <span style={{ fontSize: 15, fontWeight: 800 }}>{ch.name}</span>}
+            <LevelBadge xp={xp} />
           </div>
-          <div>
-            <span>{t(lang,"weekly_goal")}: {stats.weeklyCA}/{wGoal}</span>
-            <div className="progress"><div className="progress-bar" style={{width:`${Math.min(100,stats.weeklyCA/wGoal*100)}%`}}></div></div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <StreakBadge streak={streak} />
+            {isMultiplier && (
+              <div style={{ padding: "4px 12px", borderRadius: 12, background: "linear-gradient(135deg, rgba(251,191,36,0.15), rgba(244,114,182,0.15))", border: "1px solid rgba(251,191,36,0.3)", animation: "glowPulse 2s infinite" }}>
+                <span style={{ fontSize: 12, fontWeight: 800, color: "#fbbf24" }}>{"\u26A1"} XP x2</span>
+              </div>
+            )}
           </div>
         </div>
-        <div className="section-title"><div className="section-bar"></div>Activity Heatmap</div>
-        <div className="heatmap-grid">
-          {hm.map((cnt,idx)=><div key={idx} className={`heatmap-cell ${cnt>0?"active":""}`}>{cnt}</div>)}
+        {/* XP Progress */}
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 4 }}>
+            <span>{level.icon} {level.name}</span>
+            <span>{level.nextLevel ? `${xp.toLocaleString()} / ${level.nextLevel.min.toLocaleString()} XP` : "MAX LEVEL"}</span>
+          </div>
+          <XPProgressBar xp={xp} />
         </div>
+        {/* Daily Goal */}
+        <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 14, padding: 14, marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+            <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", fontWeight: 600 }}>
+              {fr ? "OBJECTIF DAILY" : "DAILY GOAL"} {isMultiplier && "\u26A1 BONUS x2 ACTIF"}
+            </span>
+            <span style={{ fontSize: 12, fontWeight: 800, color: dailyPct >= 100 ? "#34d399" : "#fff" }}>
+              {Math.round(dailyCA).toLocaleString()} / {dGoal.toLocaleString()}{currencySymbol}
+            </span>
+          </div>
+          <div style={{ width: "100%", height: 10, borderRadius: 10, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+            <div style={{
+              width: Math.min(dailyPct, 100) + "%", height: "100%", borderRadius: 10,
+              background: dailyPct >= 150 ? "linear-gradient(90deg, #34d399, #fbbf24, #f472b6)" : dailyPct >= 100 ? "linear-gradient(90deg, #34d399, #818cf8)" : "linear-gradient(90deg, #818cf8, #818cf8)",
+              transition: "width 0.8s ease",
+              boxShadow: dailyPct >= 100 ? "0 0 12px rgba(52,211,153,0.4)" : "none",
+            }} />
+          </div>
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", marginTop: 4 }}>
+            {dailyPct}% \u2014 {dailyPct >= 150 ? "\u{1F525} BONUS MULTIPLICATEUR x2 !" : dailyPct >= 100 ? "\u2705 Objectif atteint !" : `${fr ? "Encore" : "Still"} ${Math.round(dGoal - dailyCA).toLocaleString()}${currencySymbol}`}
+          </div>
+        </div>
+        {/* Weekly Goal */}
+        <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 14, padding: 14, marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+            <span style={{ fontSize: 11, color: "rgba(255,255,255,0.45)", fontWeight: 600 }}>{fr ? "OBJECTIF WEEKLY" : "WEEKLY GOAL"}</span>
+            <span style={{ fontSize: 12, fontWeight: 800, color: weeklyPct >= 100 ? "#34d399" : "#fff" }}>
+              {Math.round(weeklyCA).toLocaleString()} / {wGoal.toLocaleString()}{currencySymbol}
+            </span>
+          </div>
+          <div style={{ width: "100%", height: 10, borderRadius: 10, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+            <div style={{ width: Math.min(weeklyPct, 100) + "%", height: "100%", borderRadius: 10, background: weeklyPct >= 100 ? "linear-gradient(90deg, #34d399, #818cf8)" : "#818cf8", transition: "width 0.8s ease" }} />
+          </div>
+          <div style={{ fontSize: 10, color: "rgba(255,255,255,0.25)", marginTop: 4 }}>{weeklyPct}%</div>
+        </div>
+        {/* Streak badges */}
+        {streakBadges.length > 0 && (
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            {streakBadges.map(b => (
+              <span key={b.name} style={{ padding: "3px 10px", borderRadius: 10, background: b.color + "15", border: "1px solid " + b.color + "30", color: b.color, fontSize: 10, fontWeight: 700 }}>{b.icon} {b.name}</span>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  if (user.role === "chatter") {
+    return (
+      <div>
+        <div style={{ marginBottom: 20 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>{"\u{1F3AF}"} {fr ? "Mes Objectifs" : "My Goals"}</h2>
+          <p style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", margin: "3px 0 0" }}>{fr ? "XP, niveaux, streaks et objectifs" : "XP, levels, streaks and goals"}</p>
+        </div>
+        {renderChatterObjectifs(user, true)}
       </div>
     );
   }
-  const chatters = profiles.filter(u=>u.role==="chatter");
+
+  // Gérant view: all chatters + goal config
+  const chatters = profiles.filter(u => u.role === "chatter");
+  const [editGoals, setEditGoals] = useState(null);
+  const [goalForm, setGoalForm] = useState({ daily_goal: 0, weekly_goal: 0 });
+  const saveGoals = async () => {
+    if (!editGoals) return;
+    await sb.from("profiles").update({ daily_goal: Number(goalForm.daily_goal), weekly_goal: Number(goalForm.weekly_goal) }).eq("id", editGoals);
+    addToast(fr ? "Objectifs mis \u00E0 jour" : "Goals updated", "success");
+    setEditGoals(null);
+    if (onRefresh) await onRefresh();
+  };
+
   return (
     <div>
-      {chatters.map(ch=>{
-        const stats = getStats(ch.id);
-        const dGoal = Number(ch.daily_goal)||1;
-        const wGoal = Number(ch.weekly_goal)||1;
-        const hm = getHeatmap(ch.id);
-        return (
-          <div key={ch.id} className="card" style={{marginBottom:20}}>
-            <div className="section-title"><div className="section-bar"></div><Tag type="chatter" label={ch.name} id={ch.id}/></div>
-            <div style={{marginBottom:16}}>
-              <div style={{marginBottom:8}}>
-                <span>{t(lang,"daily_goal")}: {stats.dailyCA}/{dGoal}</span>
-                <div className="progress"><div className="progress-bar" style={{width:`${Math.min(100,stats.dailyCA/dGoal*100)}%`}}></div></div>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>{"\u{1F3AF}"} {fr ? "Objectifs \u00E9quipe" : "Team Goals"}</h2>
+        <p style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", margin: "3px 0 0" }}>{fr ? "Suivi des objectifs de chaque chatter" : "Track each chatter's goals"}</p>
+      </div>
+      {chatters.map(ch => (
+        <div key={ch.id}>
+          {renderChatterObjectifs(ch, false)}
+          {/* Goal edit button */}
+          <div style={{ display: "flex", gap: 8, marginTop: -8, marginBottom: 14, paddingLeft: 8 }}>
+            {editGoals === ch.id ? (
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Daily:</span>
+                <input type="number" value={goalForm.daily_goal} onChange={e => setGoalForm({ ...goalForm, daily_goal: e.target.value })} className="input" style={{ width: 80, fontSize: 11, padding: "4px 8px" }} />
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>Weekly:</span>
+                <input type="number" value={goalForm.weekly_goal} onChange={e => setGoalForm({ ...goalForm, weekly_goal: e.target.value })} className="input" style={{ width: 80, fontSize: 11, padding: "4px 8px" }} />
+                <span style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>{currencySymbol}</span>
+                <button onClick={saveGoals} className="btn btn-primary" style={{ fontSize: 10, padding: "4px 10px" }}>{"\u2705"}</button>
+                <button onClick={() => setEditGoals(null)} style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", background: "none", border: "none", cursor: "pointer" }}>{"\u2715"}</button>
               </div>
-              <div>
-                <span>{t(lang,"weekly_goal")}: {stats.weeklyCA}/{wGoal}</span>
-                <div className="progress"><div className="progress-bar" style={{width:`${Math.min(100,stats.weeklyCA/wGoal*100)}%`}}></div></div>
-              </div>
-            </div>
-            <div className="heatmap-grid">
-              {hm.map((cnt,idx)=><div key={idx} className={`heatmap-cell ${cnt>0?"active":""}`}>{cnt}</div>)}
-            </div>
+            ) : (
+              <button onClick={() => { setEditGoals(ch.id); setGoalForm({ daily_goal: ch.daily_goal || 0, weekly_goal: ch.weekly_goal || 0 }); }}
+                style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", background: "none", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "3px 10px", cursor: "pointer" }}>
+                {"\u2699\uFE0F"} {fr ? "Configurer objectifs" : "Configure goals"}
+              </button>
+            )}
           </div>
-        );
-      })}
+        </div>
+      ))}
     </div>
   );
 };
@@ -3849,37 +3955,92 @@ const ObjectifsTab = ({user, lang, txs, profiles}) => {
 // =============================================
 const CompetitionTab = ({user, lang, txs, profiles}) => {
   const { convertAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
   const dr = useDateRange("7d");
+  const [leaderMetric, setLeaderMetric] = useState("ca");
   const chatters = profiles.filter(u=>u.role==="chatter");
   const compFiltered = dr.filterByDate(txs, "date");
-  const ranking = chatters.map(ch=>{
-    const chTx = compFiltered.filter(tx=>tx.chatter_id===ch.id);
-    return {user:ch, ca:chTx.reduce((s,tx)=>s+Number(tx.amount),0), cnt:chTx.length};
-  }).sort((a,b)=>b.ca-a.ca);
-  const top3 = ranking.slice(0,3);
-  const maxCA = top3.length>0?top3[0].ca:1;
-  const medals = ["🥇","🥈","🥉"];
+
+  const ranking = useMemo(() => {
+    return chatters.map(ch => {
+      const chTx = compFiltered.filter(tx => tx.chatter_id === ch.id && (tx.status === "validated" || tx.status === "confirmee"));
+      const ca = chTx.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const allChTx = compFiltered.filter(tx => tx.chatter_id === ch.id);
+      const convRate = allChTx.length > 0 ? Math.round((chTx.length / allChTx.length) * 100) : 0;
+      const avgTicket = chTx.length > 0 ? Math.round(ca / chTx.length) : 0;
+      const xp = calculateXP(ch.id, txs, convertAmount);
+      const streak = calculateStreak(ch.id, txs);
+      return { user: ch, ca, cnt: allChTx.length, validCnt: chTx.length, convRate, avgTicket, xp, streak };
+    }).sort((a, b) => {
+      if (leaderMetric === "ca") return b.ca - a.ca;
+      if (leaderMetric === "txCount") return b.validCnt - a.validCnt;
+      if (leaderMetric === "convRate") return b.convRate - a.convRate;
+      if (leaderMetric === "avgTicket") return b.avgTicket - a.avgTicket;
+      return b.ca - a.ca;
+    });
+  }, [compFiltered, chatters, leaderMetric, txs, convertAmount]);
+
+  const top3 = ranking.slice(0, 3);
+  const maxCA = top3.length > 0 ? top3[0].ca : 1;
+  const medals = ["\u{1F947}", "\u{1F948}", "\u{1F949}"];
+
+  const getMetricValue = (r) => {
+    if (leaderMetric === "ca") return Math.round(r.ca).toLocaleString() + currencySymbol;
+    if (leaderMetric === "txCount") return r.validCnt + " TX";
+    if (leaderMetric === "convRate") return r.convRate + "%";
+    if (leaderMetric === "avgTicket") return Math.round(r.avgTicket).toLocaleString() + currencySymbol;
+    return Math.round(r.ca).toLocaleString() + currencySymbol;
+  };
+
   return (
     <div>
       <GlobalFilterBar lang={lang} dr={dr} />
-      <div className="trophy">🏆</div>
+
+      {/* Metric selector */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
+        {[{k:"ca",l:"CA Brut"},{k:"txCount",l:"Nombre TX"},{k:"convRate",l:"Taux Conv."},{k:"avgTicket",l:"Panier Moyen"}].map(m => (
+          <button key={m.k} onClick={() => setLeaderMetric(m.k)} className={`filter-chip ${leaderMetric===m.k?"active":""}`}>{m.l}</button>
+        ))}
+      </div>
+
+      <div className="trophy">{"\u{1F3C6}"}</div>
+
+      {/* Podium */}
       <div className="podium">
-        {top3.map((r,idx)=>(
+        {top3.map((r, idx) => (
           <div key={r.user.id} className="podium-step">
             <div className="podium-rank">{medals[idx]}</div>
-            <div className="podium-bar" style={{height:`${(r.ca/maxCA)*200}px`}}></div>
+            <LevelBadge xp={r.xp} />
+            <div className="podium-bar" style={{ height: `${(r.ca / maxCA) * 200}px` }}></div>
             <div className="podium-name">{r.user.name}</div>
-            <div className="podium-ca">{r.ca}</div>
+            <div className="podium-ca">{getMetricValue(r)}</div>
+            <StreakBadge streak={r.streak} />
           </div>
         ))}
       </div>
-      <div className="card">
-        <div className="table-wrap">
+
+      {/* Full table */}
+      <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, overflow: "hidden", marginBottom: 20 }}>
+        <div style={{ overflowX: "auto" }}>
           <table className="table">
-            <thead><tr><th>#</th><th>Name</th><th>CA</th><th>Tx</th></tr></thead>
+            <thead><tr>
+              <th>#</th><th>Chatter</th><th>{fr ? "Niveau" : "Level"}</th><th>CA</th><th>TX</th><th>{fr ? "Taux Conv." : "Conv. Rate"}</th><th>{fr ? "Panier Moyen" : "Avg Ticket"}</th><th>Streak</th><th>XP</th>
+            </tr></thead>
             <tbody>
-              {ranking.map((r,idx)=>(
-                <tr key={r.user.id}><td>{idx+1}</td><td><Tag type="chatter" label={r.user.name} id={r.user.id}/> {user.id===r.user.id&&t(lang,"you")}</td><td>{r.ca}</td><td>{r.cnt}</td></tr>
+              {ranking.map((r, idx) => (
+                <tr key={r.user.id} style={{ background: user.id === r.user.id ? "rgba(129,140,248,0.06)" : "" }}>
+                  <td style={{ fontWeight: 700 }}>{idx < 3 ? medals[idx] : (idx + 1)}</td>
+                  <td><Tag type="chatter" label={r.user.name} id={r.user.id}/> {user.id === r.user.id && <span style={{ fontSize: 9, color: "#818cf8" }}>({t(lang, "you")})</span>}</td>
+                  <td><LevelBadge xp={r.xp} /></td>
+                  <td style={{ fontWeight: 700 }}>{Math.round(r.ca).toLocaleString()}{currencySymbol}</td>
+                  <td>{r.validCnt}</td>
+                  <td>
+                    <span style={{ padding: "2px 8px", borderRadius: 10, background: r.convRate >= 80 ? "rgba(52,211,153,0.1)" : r.convRate >= 50 ? "rgba(251,191,36,0.1)" : "rgba(239,68,68,0.1)", color: r.convRate >= 80 ? "#34d399" : r.convRate >= 50 ? "#fbbf24" : "#ef4444", fontSize: 11, fontWeight: 700 }}>{r.convRate}%</span>
+                  </td>
+                  <td>{Math.round(r.avgTicket).toLocaleString()}{currencySymbol}</td>
+                  <td><StreakBadge streak={r.streak} /></td>
+                  <td style={{ fontSize: 11, color: "rgba(255,255,255,0.4)" }}>{r.xp.toLocaleString()}</td>
+                </tr>
               ))}
             </tbody>
           </table>
@@ -4025,6 +4186,8 @@ const ChattersTab = ({user, lang, txs, profiles, models}) => {
         <div>
           {chatters.map((ch,i)=>{
             const stats = getStats(ch.id);
+            const chXP = calculateXP(ch.id, txs, convertAmount);
+            const chStreak = calculateStreak(ch.id, txs);
             return (
               <div key={ch.id} className="spender-card" onClick={()=>setSelectedId(selectedId===ch.id?null:ch.id)}
                 style={{border:selectedId===ch.id?"1px solid var(--accent)":""}}>
@@ -4033,7 +4196,10 @@ const ChattersTab = ({user, lang, txs, profiles, models}) => {
                     <span style={{fontSize:20}}>{medals[i]||("#"+(i+1))}</span>
                     <div>
                       <div className="spender-name"><Tag type="chatter" label={ch.name} id={ch.id}/></div>
-                      <div style={{fontSize:11,color:"var(--text2)"}}>{ch.commission_pct}%</div>
+                      <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
+                        <LevelBadge xp={chXP} />
+                        {chStreak > 0 && <StreakBadge streak={chStreak} />}
+                      </div>
                     </div>
                   </div>
                   <div style={{textAlign:"right"}}>
@@ -4041,6 +4207,7 @@ const ChattersTab = ({user, lang, txs, profiles, models}) => {
                     <div style={{fontSize:10,color:"var(--text2)"}}>{stats.validCount} ventes</div>
                   </div>
                 </div>
+                <XPProgressBar xp={chXP} />
               </div>
             );
           })}
@@ -4051,7 +4218,17 @@ const ChattersTab = ({user, lang, txs, profiles, models}) => {
               <div className="profile-name">{selected.name}</div>
               <button className="profile-close" onClick={()=>setSelectedId(null)}>X</button>
             </div>
-            <div style={{fontSize:12,color:"var(--text2)",marginBottom:12}}>Commission: {selected.commission_pct}%</div>
+            <div style={{fontSize:12,color:"var(--text2)",marginBottom:8}}>Commission: {selected.commission_pct}%</div>
+            <div style={{marginBottom:12}}>
+              <LevelBadge xp={calculateXP(selected.id, txs, convertAmount)} />
+              <XPProgressBar xp={calculateXP(selected.id, txs, convertAmount)} />
+              <div style={{display:"flex",gap:8,marginTop:6}}>
+                <StreakBadge streak={calculateStreak(selected.id, txs)} />
+                {getStreakBadges(calculateStreak(selected.id, txs)).map(b => (
+                  <span key={b.name} style={{padding:"2px 8px",borderRadius:8,background:b.color+"15",color:b.color,fontSize:10,fontWeight:600}}>{b.icon} {b.name}</span>
+                ))}
+              </div>
+            </div>
             <BadgeBar badges={getBadges(txs, selected.id).badges}/>
             <div className="profile-section">
               <div className="profile-section-title">KPIs</div>
@@ -6694,6 +6871,739 @@ const q_spender_breakdown_provider = (spender) => {
 };
 
 // =============================================
+// GAMIFICATION — CONSTANTS & UTILITIES
+// =============================================
+const XP_LEVELS = [
+  { name: "Rookie",  icon: "\u{1F331}", min: 0,     color: "#94a3b8" },
+  { name: "Hustler", icon: "\u{1F4AA}", min: 1000,  color: "#34d399" },
+  { name: "Closer",  icon: "\u{1F3AF}", min: 5000,  color: "#818cf8" },
+  { name: "Elite",   icon: "\u26A1",    min: 15000, color: "#fbbf24" },
+  { name: "Legend",  icon: "\u{1F451}", min: 50000, color: "#f472b6" },
+];
+const getLevel = (xp) => {
+  let level = XP_LEVELS[0];
+  for (const l of XP_LEVELS) { if (xp >= l.min) level = l; }
+  const idx = XP_LEVELS.indexOf(level);
+  const next = XP_LEVELS[idx + 1] || null;
+  const progress = next ? Math.min(100, ((xp - level.min) / (next.min - level.min)) * 100) : 100;
+  return { ...level, xp, progress, nextLevel: next };
+};
+const calculateXP = (chatterId, txs, convertAmount) => {
+  return txs
+    .filter(tx => tx.chatter_id === chatterId && (tx.status === "validated" || tx.status === "confirmee"))
+    .reduce((s, tx) => s + Math.round(convertAmount(Number(tx.amount), tx.currency)), 0);
+};
+const calculateStreak = (chatterId, txs) => {
+  const dates = txs
+    .filter(tx => tx.chatter_id === chatterId && (tx.status === "validated" || tx.status === "confirmee"))
+    .map(tx => new Date(tx.date).toISOString().slice(0, 10))
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .sort().reverse();
+  if (!dates.length) return 0;
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  if (dates[0] !== today && dates[0] !== yesterday) return 0;
+  let streak = 1;
+  for (let i = 0; i < dates.length - 1; i++) {
+    const diff = (new Date(dates[i]) - new Date(dates[i + 1])) / 86400000;
+    if (diff === 1) streak++; else break;
+  }
+  return streak;
+};
+const STREAK_BADGES = [
+  { min: 7,  name: "On Fire",     icon: "\u{1F525}", color: "#fbbf24" },
+  { min: 14, name: "Unstoppable", icon: "\u26A1",    color: "#818cf8" },
+  { min: 30, name: "Machine",     icon: "\u{1F916}", color: "#f472b6" },
+];
+const getStreakBadges = (streak) => STREAK_BADGES.filter(b => streak >= b.min);
+
+const getDailyProgress = (chatterId, txs, convertAmount) => {
+  const today = new Date().toISOString().slice(0, 10);
+  return txs
+    .filter(tx => tx.chatter_id === chatterId && (tx.status === "validated" || tx.status === "confirmee") && tx.date && tx.date.startsWith(today))
+    .reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+};
+const getWeeklyProgress = (chatterId, txs, convertAmount) => {
+  const now = new Date();
+  const monday = new Date(now);
+  monday.setDate(now.getDate() - ((now.getDay() + 6) % 7));
+  monday.setHours(0, 0, 0, 0);
+  return txs
+    .filter(tx => tx.chatter_id === chatterId && (tx.status === "validated" || tx.status === "confirmee") && new Date(tx.date) >= monday)
+    .reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+};
+
+const launchConfetti = () => {
+  const colors = ["#818cf8", "#34d399", "#fbbf24", "#f472b6", "#ef4444"];
+  for (let i = 0; i < 50; i++) {
+    const el = document.createElement("div");
+    el.style.cssText = `position:fixed;top:-10px;left:${Math.random()*100}vw;width:${4+Math.random()*6}px;height:${4+Math.random()*6}px;background:${colors[Math.floor(Math.random()*colors.length)]};border-radius:${Math.random()>0.5?"50%":"2px"};pointer-events:none;z-index:9999;animation:confettiFall ${1.5+Math.random()*2}s ease-in forwards;animation-delay:${Math.random()*0.5}s;`;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 4000);
+  }
+};
+
+const AGENCY_ACHIEVEMENTS = [
+  { id: "first_10k", icon: "\u{1F4B0}", name: "Premier 10K\u20AC", desc: "10,000\u20AC de CA mensuel", check: (s) => s.monthlyCA >= 10000 },
+  { id: "first_50k", icon: "\u{1F3E6}", name: "50K Club", desc: "50,000\u20AC de CA mensuel", check: (s) => s.monthlyCA >= 50000 },
+  { id: "100_tx_week", icon: "\u26A1", name: "Cent TX", desc: "100 TX en une semaine", check: (s) => s.weeklyTxCount >= 100 },
+  { id: "high_margin", icon: "\u{1F4C8}", name: "Cash Machine", desc: "3 mod\u00E8les au-dessus de 80% marge", check: (s) => s.highMarginModels >= 3 },
+  { id: "zero_pending", icon: "\u2728", name: "Clean Desk", desc: "0 TX pending depuis 48h", check: (s) => s.oldPending === 0 },
+  { id: "all_goals", icon: "\u{1F3AF}", name: "Full House", desc: "Tous les chatters ont atteint leur objectif daily", check: (s) => s.allGoalsMet },
+  { id: "streak_team", icon: "\u{1F525}", name: "Team Fire", desc: "Tous les chatters ont un streak > 7j", check: (s) => s.allStreaks7 },
+  { id: "whale_hunter", icon: "\u{1F40B}", name: "Whale Hunter", desc: "Un spender a d\u00E9pens\u00E9 +1,000\u20AC en une semaine", check: (s) => s.topWeeklySpender >= 1000 },
+];
+
+// ── Level Badge inline component ──
+const LevelBadge = ({ xp }) => {
+  const lvl = getLevel(xp);
+  return (
+    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6 } },
+      React.createElement("span", { style: { fontSize: 16 } }, lvl.icon),
+      React.createElement("span", { style: { padding: "2px 10px", borderRadius: 8, background: lvl.color + "20", border: "1px solid " + lvl.color + "40", color: lvl.color, fontSize: 10, fontWeight: 700 } }, lvl.name),
+      React.createElement("span", { style: { fontSize: 10, color: "rgba(255,255,255,0.3)" } }, xp.toLocaleString() + " XP")
+    )
+  );
+};
+
+const XPProgressBar = ({ xp }) => {
+  const lvl = getLevel(xp);
+  return (
+    React.createElement("div", { style: { width: "100%", height: 4, borderRadius: 4, background: "rgba(255,255,255,0.06)", marginTop: 6 } },
+      React.createElement("div", { style: { width: lvl.progress + "%", height: "100%", borderRadius: 4, background: `linear-gradient(90deg, ${lvl.color}, ${lvl.nextLevel?.color || lvl.color})`, transition: "width 0.6s ease" } })
+    )
+  );
+};
+
+const StreakBadge = ({ streak }) => {
+  if (streak <= 0) return null;
+  return React.createElement("div", { style: { display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 12px", borderRadius: 12, background: "rgba(251,191,36,0.1)", border: "1px solid rgba(251,191,36,0.2)" } },
+    React.createElement("span", { style: { fontSize: 14 } }, "\u{1F525}"),
+    React.createElement("span", { style: { fontSize: 12, fontWeight: 800, color: "#fbbf24" } }, streak + "j")
+  );
+};
+
+// =============================================
+// MODEL ROLE — CONTENT LIST TAB
+// =============================================
+const ModelContentTab = ({user, lang, onRefresh}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const { currencySymbol } = useCurrency();
+  const [tasks, setTasks] = useState([]);
+  const [filter, setFilter] = useState("tout");
+  const [loadingTasks, setLoadingTasks] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      const { data } = await sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false });
+      setTasks(data || []);
+      setLoadingTasks(false);
+    };
+    load();
+  }, [user.id]);
+
+  const updateStatus = async (taskId, newStatus) => {
+    const updates = { status: newStatus };
+    if (newStatus === "done") updates.completed_at = new Date().toISOString();
+    const { error } = await sb.from("content_tasks").update(updates).eq("id", taskId);
+    if (error) { addToast("Erreur: " + error.message, "error"); return; }
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...updates } : t));
+    if (newStatus === "done") addToast(fr ? "T\u00E2che termin\u00E9e \u2705" : "Task completed \u2705", "success");
+  };
+
+  const toggleTask = (task) => {
+    updateStatus(task.id, task.status === "done" ? "todo" : "done");
+  };
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const todoCount = tasks.filter(t => t.status === "todo").length;
+  const inProgressCount = tasks.filter(t => t.status === "in_progress").length;
+  const doneThisMonth = tasks.filter(t => t.status === "done" && t.completed_at && new Date(t.completed_at) >= monthStart).length;
+  const totalBonus = tasks.filter(t => t.status === "done").reduce((s, t) => s + Number(t.bonus_amount || 0), 0);
+
+  const filtered = filter === "tout" ? tasks : tasks.filter(t => t.status === filter);
+  const isOverdue = (d) => d && new Date(d) < new Date(new Date().toISOString().slice(0, 10));
+
+  const catIcon = (c) => c === "photo" ? "\u{1F4F8}" : c === "video" ? "\u{1F3A5}" : c === "live" ? "\u{1F534}" : "\u{1F4E6}";
+
+  return (
+    <div>
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>{"\u{1F4CB}"} {fr ? "Ma Content List" : "My Content List"}</h2>
+        <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", margin: "3px 0 0" }}>
+          {fr ? "Contenus \u00E0 produire" : "Content to produce"} \u2014 {todoCount} {fr ? "\u00E0 faire" : "to do"} {"\u00B7"} {doneThisMonth} {fr ? "termin\u00E9s" : "done"}
+        </p>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 24 }}>
+        {[
+          { label: fr ? "\u00C0 faire" : "To do", value: todoCount, icon: "\u{1F4DD}", color: "#fbbf24" },
+          { label: fr ? "En cours" : "In progress", value: inProgressCount, icon: "\u{1F504}", color: "#818cf8" },
+          { label: fr ? "Termin\u00E9s ce mois" : "Done this month", value: doneThisMonth, icon: "\u2705", color: "#34d399" },
+          { label: fr ? "Bonus accumul\u00E9" : "Bonus earned", value: totalBonus + currencySymbol, icon: "\u{1F4B0}", color: "#f472b6" },
+        ].map((k, i) => (
+          <div key={i} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 18, padding: "14px 16px" }}>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: k.color }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
+        {[{k:"tout",l:fr?"Tout":"All"},{k:"todo",l:fr?"\u00C0 faire":"To do"},{k:"in_progress",l:fr?"En cours":"In progress"},{k:"review",l:fr?"En review":"In review"},{k:"done",l:fr?"Fait":"Done"}].map(f => (
+          <button key={f.k} onClick={() => setFilter(f.k)} className={`filter-chip ${filter===f.k?"active":""}`}>{f.l}</button>
+        ))}
+      </div>
+      {loadingTasks && <div style={{ textAlign: "center", color: "rgba(255,255,255,0.3)", padding: 40 }}>Chargement...</div>}
+      {!loadingTasks && filtered.length === 0 && <div style={{ textAlign: "center", color: "rgba(255,255,255,0.2)", padding: 40 }}>{fr ? "Aucune t\u00E2che" : "No tasks"}</div>}
+      {filtered.map(task => (
+        <div key={task.id} style={{
+          display: "flex", alignItems: "center", gap: 16, padding: "16px 20px",
+          background: "rgba(255,255,255,0.03)",
+          border: "1px solid " + (task.priority === "urgent" ? "rgba(239,68,68,0.2)" : task.priority === "high" ? "rgba(251,191,36,0.15)" : "rgba(255,255,255,0.06)"),
+          borderRadius: 16, marginBottom: 8,
+          borderLeft: "4px solid " + (task.status === "done" ? "#34d399" : task.status === "in_progress" ? "#818cf8" : task.status === "review" ? "#f472b6" : "#fbbf24"),
+        }}>
+          <input type="checkbox" checked={task.status === "done"} onChange={() => toggleTask(task)}
+            style={{ width: 20, height: 20, accentColor: "#34d399", cursor: "pointer", flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, textDecoration: task.status === "done" ? "line-through" : "none", opacity: task.status === "done" ? 0.5 : 1 }}>{task.title}</div>
+            {task.description && <div style={{ fontSize: 11, color: "rgba(255,255,255,0.35)", marginTop: 3 }}>{task.description}</div>}
+            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+              <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 6, background: "rgba(129,140,248,0.08)", color: "#818cf8", fontWeight: 600 }}>{catIcon(task.category)} {task.category}</span>
+              {task.due_date && <span style={{ fontSize: 10, color: isOverdue(task.due_date) && task.status !== "done" ? "#ef4444" : "rgba(255,255,255,0.3)" }}>{"\u{1F4C5}"} {fmtDate(task.due_date)}</span>}
+              {task.bonus_amount > 0 && <span style={{ fontSize: 10, color: "#34d399", fontWeight: 600 }}>{"\u{1F4B0}"} +{task.bonus_amount}{task.bonus_currency === "EUR" ? "\u20AC" : " CHF"}</span>}
+              {task.priority === "urgent" && <span style={{ fontSize: 10, color: "#ef4444", fontWeight: 700 }}>{"\u{1F6A8}"} URGENT</span>}
+              {task.priority === "high" && <span style={{ fontSize: 10, color: "#fbbf24", fontWeight: 600 }}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
+            </div>
+          </div>
+          <select value={task.status} onChange={e => updateStatus(task.id, e.target.value)} className="filter-select" style={{ fontSize: 11, padding: "5px 8px" }}>
+            <option value="todo">{fr ? "\u00C0 faire" : "To do"}</option>
+            <option value="in_progress">{fr ? "En cours" : "In progress"}</option>
+            <option value="review">{fr ? "En review" : "In review"}</option>
+            <option value="done">{fr ? "Fait \u2705" : "Done \u2705"}</option>
+          </select>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// =============================================
+// MODEL ROLE — MON ESPACE (DASHBOARD)
+// =============================================
+const ModelDashboardTab = ({user, lang}) => {
+  const fr = lang === "fr";
+  const { currencySymbol } = useCurrency();
+  const [tasks, setTasks] = useState([]);
+  const [payments, setPayments] = useState([]);
+
+  useEffect(() => {
+    const load = async () => {
+      const [tR, pR] = await Promise.all([
+        sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false }),
+        sb.from("model_payments").select("*").eq("model_id", user.id).order("date", { ascending: false }),
+      ]);
+      setTasks(tR.data || []);
+      setPayments(pR.data || []);
+    };
+    load();
+  }, [user.id]);
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const doneThisMonth = tasks.filter(t => t.status === "done" && t.completed_at && new Date(t.completed_at) >= monthStart).length;
+  const totalBonus = tasks.filter(t => t.status === "done").reduce((s, t) => s + Number(t.bonus_amount || 0), 0);
+
+  // Streak: consecutive days with a completed task
+  const doneDates = tasks.filter(t => t.status === "done" && t.completed_at).map(t => new Date(t.completed_at).toISOString().slice(0, 10)).filter((v, i, a) => a.indexOf(v) === i).sort().reverse();
+  let streak = 0;
+  if (doneDates.length) {
+    const today = new Date().toISOString().slice(0, 10);
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    if (doneDates[0] === today || doneDates[0] === yesterday) {
+      streak = 1;
+      for (let i = 0; i < doneDates.length - 1; i++) {
+        if ((new Date(doneDates[i]) - new Date(doneDates[i + 1])) / 86400000 === 1) streak++; else break;
+      }
+    }
+  }
+
+  // Badges
+  const MODEL_BADGES = [
+    { icon: "\u{1F4F8}", name: "First Shot", desc: "1 contenu termin\u00E9", unlocked: tasks.filter(t=>t.status==="done").length >= 1 },
+    { icon: "\u{1F3AC}", name: "Productrice", desc: "10 contenus termin\u00E9s", unlocked: tasks.filter(t=>t.status==="done").length >= 10 },
+    { icon: "\u{1F31F}", name: "Star", desc: "25 contenus termin\u00E9s", unlocked: tasks.filter(t=>t.status==="done").length >= 25 },
+    { icon: "\u{1F525}", name: "On Fire", desc: "7j streak", unlocked: streak >= 7 },
+    { icon: "\u{1F4B0}", name: "Bonus Queen", desc: "500\u20AC de bonus", unlocked: totalBonus >= 500 },
+    { icon: "\u{1F451}", name: "Legend", desc: "50 contenus + 1000\u20AC bonus", unlocked: tasks.filter(t=>t.status==="done").length >= 50 && totalBonus >= 1000 },
+  ];
+
+  const upcomingTasks = tasks.filter(t => t.status !== "done").sort((a, b) => (a.due_date || "9999") < (b.due_date || "9999") ? -1 : 1).slice(0, 5);
+
+  return (
+    <div>
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F469}\u200D\u{1F4BC}"} {fr ? "Mon Espace" : "My Space"} \u2014 {user.name}</h2>
+        <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", margin: "3px 0 0", fontStyle: "italic" }}>{fr ? "Ton tableau de bord personnel" : "Your personal dashboard"}</p>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
+        {[
+          { label: fr ? "Contenus ce mois" : "Done this month", value: doneThisMonth, icon: "\u2705", color: "#34d399" },
+          { label: "Streak \u{1F525}", value: streak + (fr ? " jours" : " days"), icon: "\u{1F525}", color: "#fbbf24" },
+          { label: fr ? "Bonus accumul\u00E9" : "Bonus earned", value: totalBonus + currencySymbol, icon: "\u{1F4B0}", color: "#f472b6" },
+        ].map((k, i) => (
+          <div key={i} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 18, padding: "18px 20px" }}>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: 26, fontWeight: 800, color: k.color }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20, marginBottom: 20 }}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{"\u{1F3C6}"} {fr ? "Mes Badges" : "My Badges"}</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
+          {MODEL_BADGES.map((b, i) => (
+            <div key={i} style={{
+              padding: "14px 12px", borderRadius: 14, textAlign: "center",
+              background: b.unlocked ? "rgba(129,140,248,0.08)" : "rgba(255,255,255,0.02)",
+              border: "1px solid " + (b.unlocked ? "rgba(129,140,248,0.2)" : "rgba(255,255,255,0.04)"),
+              opacity: b.unlocked ? 1 : 0.3,
+            }}>
+              <div style={{ fontSize: 28 }}>{b.icon}</div>
+              <div style={{ fontSize: 11, fontWeight: 700, marginTop: 6 }}>{b.name}</div>
+              <div style={{ fontSize: 9, color: "rgba(255,255,255,0.35)", marginTop: 2 }}>{b.desc}</div>
+              {b.unlocked && <div style={{ fontSize: 9, color: "#34d399", marginTop: 4, fontWeight: 600 }}>{"\u2705"} {fr ? "D\u00C9BLOQU\u00C9" : "UNLOCKED"}</div>}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20 }}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{"\u{1F4CB}"} {fr ? "Prochaines t\u00E2ches" : "Upcoming tasks"}</h3>
+        {upcomingTasks.length === 0 && <div style={{ color: "rgba(255,255,255,0.2)", textAlign: "center", padding: 20 }}>{fr ? "Aucune t\u00E2che en attente \u{1F389}" : "No pending tasks \u{1F389}"}</div>}
+        {upcomingTasks.map(task => (
+          <div key={task.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: task.status === "in_progress" ? "#818cf8" : task.status === "review" ? "#f472b6" : "#fbbf24", flexShrink: 0 }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{task.title}</div>
+              <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)" }}>{task.category} {task.due_date ? "\u00B7 " + fmtDate(task.due_date) : ""}</div>
+            </div>
+            {task.bonus_amount > 0 && <span style={{ fontSize: 10, color: "#34d399", fontWeight: 600 }}>{"\u{1F4B0}"} +{task.bonus_amount}\u20AC</span>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// MODEL ROLE — MES PAIES
+// =============================================
+const ModelPaymentsTab = ({user, lang}) => {
+  const fr = lang === "fr";
+  const { currencySymbol } = useCurrency();
+  const [payments, setPayments] = useState([]);
+  const [loadingP, setLoadingP] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      const { data } = await sb.from("model_payments").select("*").eq("model_id", user.id).order("date", { ascending: false });
+      setPayments(data || []);
+      setLoadingP(false);
+    };
+    load();
+  }, [user.id]);
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const salaryThisMonth = payments.filter(p => p.type === "salary" && p.status === "paid" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount), 0);
+  const bonusThisMonth = payments.filter(p => p.type === "bonus" && p.status === "paid" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount), 0);
+  const totalPaid = payments.filter(p => p.status === "paid").reduce((s, p) => s + Number(p.amount), 0);
+
+  const typeLabel = (t) => t === "salary" ? (fr ? "\u{1F4B5} Salaire" : "\u{1F4B5} Salary") : t === "bonus" ? (fr ? "\u{1F381} Bonus" : "\u{1F381} Bonus") : (fr ? "\u{1F4B8} Autre" : "\u{1F4B8} Other");
+  const statusColor = (s) => s === "paid" ? "#34d399" : s === "cancelled" ? "#ef4444" : "#fbbf24";
+  const statusLabel = (s) => s === "paid" ? (fr ? "Pay\u00E9" : "Paid") : s === "cancelled" ? (fr ? "Annul\u00E9" : "Cancelled") : "Pending";
+
+  return (
+    <div>
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F4B0}"} {fr ? "Mes Paies" : "My Payments"}</h2>
+        <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", margin: "3px 0 0", fontStyle: "italic" }}>{fr ? "Historique de tes paiements" : "Your payment history"}</p>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
+        {[
+          { label: fr ? "Salaire ce mois" : "Salary this month", value: salaryThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B5}", color: "#818cf8" },
+          { label: fr ? "Bonus ce mois" : "Bonus this month", value: bonusThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F381}", color: "#34d399" },
+          { label: fr ? "Total vers\u00E9" : "Total paid", value: totalPaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B0}", color: "#f472b6" },
+        ].map((k, i) => (
+          <div key={i} style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 18, padding: "18px 20px" }}>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: 26, fontWeight: 800, color: k.color }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, overflow: "hidden" }}>
+        <div style={{ padding: "14px 20px", borderBottom: "1px solid rgba(255,255,255,0.06)", fontSize: 13, fontWeight: 700 }}>{"\u{1F4CA}"} {fr ? "Historique des paiements" : "Payment history"}</div>
+        {loadingP && <div style={{ textAlign: "center", color: "rgba(255,255,255,0.3)", padding: 40 }}>Chargement...</div>}
+        {!loadingP && payments.length === 0 && <div style={{ textAlign: "center", color: "rgba(255,255,255,0.2)", padding: 40 }}>{fr ? "Aucun paiement" : "No payments"}</div>}
+        {!loadingP && payments.length > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <table className="table" style={{ fontSize: 12 }}>
+              <thead><tr>
+                <th>Date</th><th>Type</th><th>{fr ? "Montant" : "Amount"}</th><th>{fr ? "Devise" : "Currency"}</th><th>Notes</th><th>{fr ? "Statut" : "Status"}</th>
+              </tr></thead>
+              <tbody>
+                {payments.map(p => (
+                  <tr key={p.id}>
+                    <td>{fmtDate(p.date)}</td>
+                    <td>{typeLabel(p.type)}</td>
+                    <td style={{ fontWeight: 800, color: "#34d399" }}>+{Number(p.amount).toLocaleString("fr-FR", { maximumFractionDigits: 0 })}{p.currency === "EUR" ? "\u20AC" : " CHF"}</td>
+                    <td>{p.currency}</td>
+                    <td style={{ color: "rgba(255,255,255,0.5)" }}>{p.notes || "\u2014"}</td>
+                    <td><span style={{ padding: "2px 8px", borderRadius: 10, background: statusColor(p.status) + "15", color: statusColor(p.status), fontSize: 10, fontWeight: 700 }}>{statusLabel(p.status)}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// GÉRANT — CONTENT TASK MANAGER (used inside ModelesTab)
+// =============================================
+const ContentTaskManager = ({modelId, lang, onRefresh}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [tasks, setTasks] = useState([]);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ title: "", description: "", category: "photo", priority: "medium", due_date: "", bonus_amount: 0 });
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      const { data } = await sb.from("content_tasks").select("*").eq("model_id", modelId).order("created_at", { ascending: false });
+      setTasks(data || []);
+    };
+    load();
+  }, [modelId]);
+
+  const handleAdd = async () => {
+    if (!form.title) return;
+    setSaving(true);
+    const { error } = await sb.from("content_tasks").insert({
+      model_id: modelId, title: form.title, description: form.description,
+      category: form.category, priority: form.priority,
+      due_date: form.due_date || null, bonus_amount: Number(form.bonus_amount) || 0,
+    });
+    setSaving(false);
+    if (error) { addToast("Erreur: " + error.message, "error"); return; }
+    setForm({ title: "", description: "", category: "photo", priority: "medium", due_date: "", bonus_amount: 0 });
+    setShowForm(false);
+    const { data } = await sb.from("content_tasks").select("*").eq("model_id", modelId).order("created_at", { ascending: false });
+    setTasks(data || []);
+    addToast(fr ? "T\u00E2che ajout\u00E9e \u2705" : "Task added \u2705", "success");
+  };
+
+  const updateStatus = async (taskId, newStatus) => {
+    await sb.from("content_tasks").update({ status: newStatus, completed_at: newStatus === "done" ? new Date().toISOString() : null }).eq("id", taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: newStatus } : t));
+  };
+
+  const catIcon = (c) => c === "photo" ? "\u{1F4F8}" : c === "video" ? "\u{1F3A5}" : c === "live" ? "\u{1F534}" : "\u{1F4E6}";
+  const stColor = (s) => s === "done" ? "#34d399" : s === "in_progress" ? "#818cf8" : s === "review" ? "#f472b6" : "#fbbf24";
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+        <span style={{ fontSize: 13, fontWeight: 700 }}>{"\u{1F4CB}"} Content List ({tasks.length})</span>
+        <button onClick={() => setShowForm(!showForm)} className="btn btn-primary" style={{ fontSize: 11, padding: "5px 14px" }}>+ {fr ? "Ajouter" : "Add"}</button>
+      </div>
+      {showForm && (
+        <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: 16, marginBottom: 12 }}>
+          <input placeholder={fr ? "Titre de la t\u00E2che" : "Task title"} value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} className="input" style={{ marginBottom: 8, width: "100%" }} />
+          <input placeholder="Description" value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} className="input" style={{ marginBottom: 8, width: "100%" }} />
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <select value={form.category} onChange={e => setForm({ ...form, category: e.target.value })} className="filter-select">
+              <option value="photo">{"\u{1F4F8}"} Photo</option><option value="video">{"\u{1F3A5}"} Vid\u00E9o</option><option value="live">{"\u{1F534}"} Live</option><option value="custom">{"\u{1F4E6}"} Custom</option>
+            </select>
+            <select value={form.priority} onChange={e => setForm({ ...form, priority: e.target.value })} className="filter-select">
+              <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="urgent">Urgent</option>
+            </select>
+            <input type="date" value={form.due_date} onChange={e => setForm({ ...form, due_date: e.target.value })} className="filter-date" />
+            <input type="number" placeholder="Bonus \u20AC" value={form.bonus_amount} onChange={e => setForm({ ...form, bonus_amount: e.target.value })} className="input" style={{ width: 80 }} />
+          </div>
+          <button onClick={handleAdd} disabled={saving} className="btn btn-primary" style={{ fontSize: 11 }}>{saving ? "..." : (fr ? "Ajouter" : "Add")}</button>
+        </div>
+      )}
+      {tasks.map(task => (
+        <div key={task.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+          <div style={{ width: 6, height: 6, borderRadius: "50%", background: stColor(task.status), flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, textDecoration: task.status === "done" ? "line-through" : "none", opacity: task.status === "done" ? 0.5 : 1 }}>{task.title}</span>
+            <div style={{ fontSize: 9, color: "rgba(255,255,255,0.3)" }}>{catIcon(task.category)} {task.category} {task.due_date ? "\u00B7 " + fmtDate(task.due_date) : ""} {task.bonus_amount > 0 ? "\u00B7 +" + task.bonus_amount + "\u20AC" : ""}</div>
+          </div>
+          <select value={task.status} onChange={e => updateStatus(task.id, e.target.value)} className="filter-select" style={{ fontSize: 10, padding: "3px 6px" }}>
+            <option value="todo">Todo</option><option value="in_progress">En cours</option><option value="review">Review</option><option value="done">Done</option>
+          </select>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// =============================================
+// GÉRANT — AGENCY HEALTH SCORE
+// =============================================
+const AgencyHealthScore = ({txs, profiles}) => {
+  const score = useMemo(() => {
+    let s = 100;
+    const now = Date.now();
+    const pendingOld = txs.filter(tx => tx.status === "pending" && (now - new Date(tx.date).getTime()) > 24 * 3600000);
+    s -= Math.min(pendingOld.length * 2, 20);
+    const decided = txs.filter(tx => tx.status !== "pending");
+    const validated = txs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+    const convRate = decided.length > 0 ? (validated.length / decided.length) * 100 : 100;
+    if (convRate < 60) s -= 15; else if (convRate < 75) s -= 5;
+    const chatters = profiles.filter(p => p.role === "chatter");
+    const weekAgo = now - 7 * 86400000;
+    const inactiveChatters = chatters.filter(ch => !txs.some(tx => tx.chatter_id === ch.id && new Date(tx.date).getTime() > weekAgo));
+    s -= Math.min(inactiveChatters.length * 5, 15);
+    return Math.max(0, Math.min(100, Math.round(s)));
+  }, [txs, profiles]);
+
+  const color = score > 70 ? "#34d399" : score > 40 ? "#fbbf24" : "#ef4444";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+      <div style={{
+        width: 80, height: 80, borderRadius: "50%",
+        background: `conic-gradient(${color} ${score * 3.6}deg, rgba(255,255,255,0.04) ${score * 3.6}deg)`,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        boxShadow: `0 0 20px ${color}25`,
+      }}>
+        <div style={{ width: 64, height: 64, borderRadius: "50%", background: "#0f0f2e", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+          <span style={{ fontSize: 20, fontWeight: 800, color }}>{score}</span>
+          <span style={{ fontSize: 8, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: 1 }}>Sant\u00E9</span>
+        </div>
+      </div>
+      <div>
+        <div style={{ fontSize: 13, fontWeight: 700 }}>{score > 70 ? "\u2705 Excellente" : score > 40 ? "\u26A0\uFE0F Attention" : "\u{1F6A8} Critique"}</div>
+        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)" }}>Score de sant\u00E9 de l'agence</div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// GÉRANT — AGENCY ACHIEVEMENTS
+// =============================================
+const AgencyAchievements = ({txs, profiles, models, expenses, convertAmount}) => {
+  const stats = useMemo(() => {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monday = new Date(now); monday.setDate(now.getDate() - ((now.getDay() + 6) % 7)); monday.setHours(0, 0, 0, 0);
+    const validated = txs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+    const monthlyCA = validated.filter(tx => new Date(tx.date) >= monthStart).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+    const weeklyTxCount = txs.filter(tx => new Date(tx.date) >= monday && (tx.status === "validated" || tx.status === "confirmee")).length;
+    const modelStats = models.map(m => {
+      const mTxs = validated.filter(tx => tx.model_id === m.id);
+      const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const mExp = (expenses || []).filter(e => e.model_id === m.id).reduce((s, e) => s + Number(e.amount), 0);
+      return { margin: ca > 0 ? ((ca - mExp) / ca) * 100 : 0 };
+    });
+    const highMarginModels = modelStats.filter(m => m.margin >= 80).length;
+    const now48h = Date.now() - 48 * 3600000;
+    const oldPending = txs.filter(tx => tx.status === "pending" && new Date(tx.date).getTime() < now48h).length;
+    const chatters = profiles.filter(p => p.role === "chatter");
+    const allGoalsMet = chatters.length > 0 && chatters.every(ch => {
+      const goal = Number(ch.daily_goal) || 500;
+      const daily = getDailyProgress(ch.id, txs, convertAmount);
+      return daily >= goal;
+    });
+    const allStreaks7 = chatters.length > 0 && chatters.every(ch => calculateStreak(ch.id, txs) >= 7);
+    const spenderWeekly = {};
+    txs.filter(tx => new Date(tx.date) >= monday && (tx.status === "validated" || tx.status === "confirmee")).forEach(tx => {
+      const k = tx.spender_handle || "?";
+      spenderWeekly[k] = (spenderWeekly[k] || 0) + convertAmount(Number(tx.amount), tx.currency);
+    });
+    const topWeeklySpender = Math.max(0, ...Object.values(spenderWeekly));
+    return { monthlyCA, weeklyTxCount, highMarginModels, oldPending, allGoalsMet, allStreaks7, topWeeklySpender };
+  }, [txs, profiles, models, expenses, convertAmount]);
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+      {AGENCY_ACHIEVEMENTS.map(a => {
+        const unlocked = a.check(stats);
+        return (
+          <div key={a.id} style={{
+            padding: "18px 14px", borderRadius: 16, textAlign: "center",
+            background: unlocked ? "linear-gradient(135deg, rgba(129,140,248,0.08), rgba(244,114,182,0.08))" : "rgba(255,255,255,0.02)",
+            border: "1px solid " + (unlocked ? "rgba(129,140,248,0.2)" : "rgba(255,255,255,0.04)"),
+            opacity: unlocked ? 1 : 0.35, transition: "all 0.3s",
+          }}>
+            <div style={{ fontSize: 32 }}>{a.icon}</div>
+            <div style={{ fontSize: 12, fontWeight: 700, marginTop: 8 }}>{a.name}</div>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", marginTop: 3 }}>{a.desc}</div>
+            {unlocked && <div style={{ fontSize: 9, color: "#34d399", marginTop: 6, fontWeight: 600 }}>{"\u2705"} D\u00C9BLOQU\u00C9</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// =============================================
+// GÉRANT — ACTIVITY HEATMAP (365 days)
+// =============================================
+const ActivityHeatmap = ({txs, convertAmount, currencySymbol}) => {
+  const heatmapData = useMemo(() => {
+    const data = {};
+    txs.forEach(tx => {
+      if (tx.status === "validated" || tx.status === "confirmee") {
+        const day = new Date(tx.date).toISOString().slice(0, 10);
+        if (!data[day]) data[day] = 0;
+        data[day] += convertAmount(Number(tx.amount), tx.currency);
+      }
+    });
+    return data;
+  }, [txs, convertAmount]);
+  const maxCA = Math.max(1, ...Object.values(heatmapData));
+
+  const cells = [];
+  for (let i = 364; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400000);
+    const key = d.toISOString().slice(0, 10);
+    const ca = heatmapData[key] || 0;
+    const intensity = ca / maxCA;
+    cells.push(
+      <div key={key} title={`${key} \u2014 ${Math.round(ca).toLocaleString()}${currencySymbol}`}
+        style={{ width: 12, height: 12, borderRadius: 3, background: ca === 0 ? "rgba(255,255,255,0.03)" : `rgba(129,140,248,${0.15 + intensity * 0.85})`, cursor: "pointer" }} />
+    );
+  }
+
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20 }}>
+      <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{"\u{1F4C5}"} Activit\u00E9 de l'agence \u2014 12 derniers mois</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(53, 12px)", gridTemplateRows: "repeat(7, 12px)", gap: 2, gridAutoFlow: "column", overflowX: "auto" }}>
+        {cells}
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+        <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)" }}>Moins</span>
+        {[0.1, 0.3, 0.5, 0.7, 1].map((op, i) => (
+          <div key={i} style={{ width: 12, height: 12, borderRadius: 3, background: `rgba(129,140,248,${0.15 + op * 0.85})` }} />
+        ))}
+        <span style={{ fontSize: 10, color: "rgba(255,255,255,0.25)" }}>Plus</span>
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// GÉRANT — CHALLENGES MANAGER
+// =============================================
+const ChallengesSection = ({user, lang, txs, profiles, convertAmount, currencySymbol}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [challenges, setChallenges] = useState([]);
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ title: "", metric: "ca", start_date: "", end_date: "", reward: "" });
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const load = async () => {
+      const { data } = await sb.from("challenges").select("*").order("created_at", { ascending: false });
+      setChallenges(data || []);
+    };
+    load();
+  }, []);
+
+  const handleCreate = async () => {
+    if (!form.title || !form.start_date || !form.end_date) return;
+    setSaving(true);
+    const { error } = await sb.from("challenges").insert({ ...form, created_by: user.id });
+    setSaving(false);
+    if (error) { addToast("Erreur: " + error.message, "error"); return; }
+    setForm({ title: "", metric: "ca", start_date: "", end_date: "", reward: "" });
+    setShowForm(false);
+    const { data } = await sb.from("challenges").select("*").order("created_at", { ascending: false });
+    setChallenges(data || []);
+    addToast(fr ? "Challenge cr\u00E9\u00E9 \u{1F3C6}" : "Challenge created \u{1F3C6}", "success");
+  };
+
+  const now = new Date();
+  const active = challenges.filter(c => c.active && new Date(c.end_date) >= now);
+  const past = challenges.filter(c => !c.active || new Date(c.end_date) < now);
+
+  const getChallengeRanking = (ch) => {
+    const start = new Date(ch.start_date);
+    const end = new Date(ch.end_date);
+    const chatters = profiles.filter(p => p.role === "chatter");
+    return chatters.map(chatter => {
+      const cTxs = txs.filter(tx => tx.chatter_id === chatter.id && new Date(tx.date) >= start && new Date(tx.date) <= end && (tx.status === "validated" || tx.status === "confirmee"));
+      let val = 0;
+      if (ch.metric === "ca") val = cTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      else if (ch.metric === "tx_count") val = cTxs.length;
+      else if (ch.metric === "avg_ticket") val = cTxs.length > 0 ? cTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0) / cTxs.length : 0;
+      return { chatter, val };
+    }).sort((a, b) => b.val - a.val);
+  };
+
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 20, padding: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+        <h3 style={{ fontSize: 15, fontWeight: 700, margin: 0 }}>{"\u{1F3C6}"} Challenges</h3>
+        <button onClick={() => setShowForm(!showForm)} className="btn btn-primary" style={{ fontSize: 11, padding: "5px 14px" }}>+ {fr ? "Cr\u00E9er" : "Create"}</button>
+      </div>
+      {showForm && (
+        <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: 16, marginBottom: 14 }}>
+          <input placeholder={fr ? "Titre du challenge" : "Challenge title"} value={form.title} onChange={e => setForm({ ...form, title: e.target.value })} className="input" style={{ marginBottom: 8, width: "100%" }} />
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <select value={form.metric} onChange={e => setForm({ ...form, metric: e.target.value })} className="filter-select">
+              <option value="ca">CA Brut</option><option value="tx_count">Nombre TX</option><option value="avg_ticket">Panier Moyen</option>
+            </select>
+            <input type="datetime-local" value={form.start_date} onChange={e => setForm({ ...form, start_date: e.target.value })} className="filter-date" />
+            <input type="datetime-local" value={form.end_date} onChange={e => setForm({ ...form, end_date: e.target.value })} className="filter-date" />
+          </div>
+          <input placeholder={fr ? "R\u00E9compense (texte libre)" : "Reward"} value={form.reward} onChange={e => setForm({ ...form, reward: e.target.value })} className="input" style={{ marginBottom: 8, width: "100%" }} />
+          <button onClick={handleCreate} disabled={saving} className="btn btn-primary" style={{ fontSize: 11 }}>{saving ? "..." : (fr ? "Cr\u00E9er le challenge" : "Create challenge")}</button>
+        </div>
+      )}
+      {active.length === 0 && past.length === 0 && <div style={{ color: "rgba(255,255,255,0.2)", textAlign: "center", padding: 20 }}>{fr ? "Aucun challenge" : "No challenges"}</div>}
+      {active.map(ch => {
+        const ranking = getChallengeRanking(ch);
+        const medals = ["\u{1F947}", "\u{1F948}", "\u{1F949}"];
+        return (
+          <div key={ch.id} style={{ border: "1px solid rgba(129,140,248,0.15)", borderRadius: 14, padding: 14, marginBottom: 10, background: "rgba(129,140,248,0.03)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700 }}>{"\u{1F525}"} {ch.title}</span>
+              <span style={{ fontSize: 10, color: "#34d399", fontWeight: 600 }}>ACTIF</span>
+            </div>
+            {ch.reward && <div style={{ fontSize: 10, color: "#fbbf24", marginBottom: 8 }}>{"\u{1F381}"} {ch.reward}</div>}
+            {ranking.slice(0, 5).map((r, i) => (
+              <div key={r.chatter.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0" }}>
+                <span style={{ fontSize: 14, width: 20 }}>{medals[i] || (i + 1)}</span>
+                <span style={{ flex: 1, fontSize: 12, fontWeight: 600 }}>{r.chatter.name}</span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: "#818cf8" }}>{Math.round(r.val).toLocaleString()}{ch.metric === "ca" ? currencySymbol : ch.metric === "tx_count" ? " TX" : currencySymbol}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      {past.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", marginBottom: 6 }}>{fr ? "Challenges pass\u00E9s" : "Past challenges"}</div>
+          {past.slice(0, 3).map(ch => (
+            <div key={ch.id} style={{ fontSize: 11, color: "rgba(255,255,255,0.25)", padding: "4px 0" }}>{ch.title} \u2014 {fmtDate(ch.end_date)}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // MAIN APP
 // =============================================
 const App = () => {
@@ -6787,6 +7697,11 @@ const App = () => {
         const modelIds = new Set(txData.map(tx=>tx.model_id));
         modelData = modelData.filter(m=>modelIds.has(m.id));
         console.log("[loadData] provider filter →", txData.length, "txs");
+      } else if(currentUser.role==="modele") {
+        // Modeles see NO transaction data, spender data, or financial info
+        txData = [];
+        modelData = [];
+        console.log("[loadData] modele filter → 0 txs (isolated)");
       }
     }
 
@@ -6842,6 +7757,7 @@ const App = () => {
           const fullUser = {...profile, email:session.user.email};
           setUser(fullUser);
           if(fullUser.role === "provider") setTab("transactions");
+          if(fullUser.role === "modele") setTab("model_content");
           await loadData(fullUser);
         }
       }
@@ -6853,6 +7769,7 @@ const App = () => {
   const handleLogin = async (u) => {
     setUser(u);
     if(u.role === "provider") setTab("transactions");
+    if(u.role === "modele") setTab("model_content");
     setLoading(true);
     await loadData(u);
     setLoading(false);
@@ -6881,22 +7798,28 @@ const App = () => {
   if(loading) return <div className="loading-wrap"><div className="spinner"></div></div>;
   if(!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
 
+  const isModele = user.role === "modele";
   const tabs = [
-    {id:"dashboard",icon:"📊",label:t(lang,"dashboard"),show:user.role!=="provider"},
-    {id:"modeles",icon:"👩‍💼",label:t(lang,"modeles"),show:user.role==="gerant"},
-    {id:"transactions",icon:"📋",label:user.role==="provider"?"Mes Transactions":t(lang,"transactions"),show:true},
-    {id:"spenders",icon:"👥",label:t(lang,"spenders"),show:user.role==="gerant"},
-    {id:"mes_spenders",icon:"🎯",label:lang==="fr"?"Mes Spenders":"My Spenders",show:user.role==="chatter"||user.role==="gerant"},
-    {id:"objectifs",icon:"🎯",label:t(lang,"objectifs"),show:user.role!=="provider"},
-    {id:"competition",icon:"🏆",label:t(lang,"competition"),show:user.role!=="provider"},
-    {id:"paies",icon:"💳",label:t(lang,"paies"),show:user.role!=="provider"},
-    {id:"chatters",icon:"💬",label:t(lang,"chatters"),show:user.role==="gerant"},
+    // ── Modele-only tabs ──
+    {id:"model_content",icon:"\u{1F4CB}",label:lang==="fr"?"Ma Content List":"My Content List",show:isModele},
+    {id:"model_dashboard",icon:"\u{1F469}\u200D\u{1F4BC}",label:lang==="fr"?"Mon Espace":"My Space",show:isModele},
+    {id:"model_payments",icon:"\u{1F4B0}",label:lang==="fr"?"Mes Paies":"My Payments",show:isModele},
+    // ── Standard tabs (hidden from modele) ──
+    {id:"dashboard",icon:"\u{1F4CA}",label:t(lang,"dashboard"),show:!isModele&&user.role!=="provider"},
+    {id:"modeles",icon:"\u{1F469}\u200D\u{1F4BC}",label:t(lang,"modeles"),show:user.role==="gerant"},
+    {id:"transactions",icon:"\u{1F4CB}",label:user.role==="provider"?"Mes Transactions":t(lang,"transactions"),show:!isModele},
+    {id:"spenders",icon:"\u{1F465}",label:t(lang,"spenders"),show:user.role==="gerant"},
+    {id:"mes_spenders",icon:"\u{1F3AF}",label:lang==="fr"?"Mes Spenders":"My Spenders",show:user.role==="chatter"||user.role==="gerant"},
+    {id:"objectifs",icon:"\u{1F3AF}",label:t(lang,"objectifs"),show:!isModele&&user.role!=="provider"},
+    {id:"competition",icon:"\u{1F3C6}",label:t(lang,"competition"),show:!isModele&&user.role!=="provider"},
+    {id:"paies",icon:"\u{1F4B3}",label:t(lang,"paies"),show:!isModele&&user.role!=="provider"},
+    {id:"chatters",icon:"\u{1F4AC}",label:t(lang,"chatters"),show:user.role==="gerant"},
     {id:"providers",icon:"\u{1F4B3}",label:lang==="fr"?"Prestataires":"Providers",show:user.role==="gerant"},
-    {id:"compta",icon:"📈",label:t(lang,"compta"),show:user.role==="gerant"},
-    {id:"provider_compta",icon:"💰",label:"Provider Compta",show:user.role==="provider"},
-    {id:"telegram",icon:"📲",label:"Telegram",show:user.role!=="provider"},
-    {id:"agents",icon:"🤖",label:"Agents IA",show:user.role==="gerant"},
-    {id:"admin",icon:"⚙",label:t(lang,"admin"),show:user.role==="gerant"},
+    {id:"compta",icon:"\u{1F4C8}",label:t(lang,"compta"),show:user.role==="gerant"},
+    {id:"provider_compta",icon:"\u{1F4B0}",label:"Provider Compta",show:user.role==="provider"},
+    {id:"telegram",icon:"\u{1F4F2}",label:"Telegram",show:!isModele&&user.role!=="provider"},
+    {id:"agents",icon:"\u{1F916}",label:"Agents IA",show:user.role==="gerant"},
+    {id:"admin",icon:"\u2699",label:t(lang,"admin"),show:user.role==="gerant"},
   ];
 
   return (
@@ -6986,19 +7909,24 @@ const App = () => {
           {drillDown ? (
             <DrillDownView drillDown={drillDown} user={user} txs={txs} models={models} profiles={profiles} payouts={payouts} lang={lang} />
           ) : (<>
-          {tab==="dashboard"&&user.role!=="provider"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} />}
+          {/* ── Modele-only pages ── */}
+          {tab==="model_content"&&user.role==="modele"&&<ModelContentTab user={user} lang={lang} onRefresh={onRefresh} />}
+          {tab==="model_dashboard"&&user.role==="modele"&&<ModelDashboardTab user={user} lang={lang} />}
+          {tab==="model_payments"&&user.role==="modele"&&<ModelPaymentsTab user={user} lang={lang} />}
+          {/* ── Standard pages ── */}
+          {tab==="dashboard"&&user.role!=="provider"&&user.role!=="modele"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} />}
           {tab==="modeles"&&user.role==="gerant"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} />}
-          {tab==="transactions"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} />}
+          {tab==="transactions"&&user.role!=="modele"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} />}
           {tab==="spenders"&&user.role==="gerant"&&<SpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} />}
           {tab==="mes_spenders"&&(user.role==="chatter"||user.role==="gerant")&&<MesSpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} />}
-          {tab==="objectifs"&&user.role!=="provider"&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} />}
-          {tab==="competition"&&user.role!=="provider"&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
-          {tab==="paies"&&user.role!=="provider"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="objectifs"&&user.role!=="provider"&&user.role!=="modele"&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="competition"&&user.role!=="provider"&&user.role!=="modele"&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
+          {tab==="paies"&&user.role!=="provider"&&user.role!=="modele"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="chatters"&&user.role==="gerant"&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} />}
           {tab==="providers"&&user.role==="gerant"&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="compta"&&user.role==="gerant"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} models={models} />}
-          {tab==="telegram"&&user.role!=="provider"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
+          {tab==="telegram"&&user.role!=="provider"&&user.role!=="modele"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
           {tab==="agents"&&user.role==="gerant"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
           {tab==="admin"&&user.role==="gerant"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
           </>)}
