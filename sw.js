@@ -1,8 +1,9 @@
 // =============================================
 // DADASH — Service Worker
-// Cache-first for critical assets, network-first for API
+// Cache-first for CDN assets, network-first for app shell
+// API requests (Supabase) are NOT intercepted
 // =============================================
-const CACHE_NAME = 'dadash-v1';
+const CACHE_NAME = 'dadash-v2';
 const CRITICAL_ASSETS = [
   '/',
   '/index.html',
@@ -25,7 +26,6 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
       return cache.addAll(CRITICAL_ASSETS).catch((err) => {
-        // Don't fail install if some CDN assets fail — cache what we can
         console.warn('[SW] Some assets failed to cache:', err);
         return Promise.allSettled(
           CRITICAL_ASSETS.map((url) => cache.add(url).catch(() => {}))
@@ -55,13 +55,9 @@ self.addEventListener('fetch', (event) => {
   // Skip non-GET requests
   if (event.request.method !== 'GET') return;
 
-  // Network-first for Supabase API calls (real-time data)
-  if (url.hostname.includes('supabase')) {
-    event.respondWith(
-      fetch(event.request).catch(() => caches.match(event.request))
-    );
-    return;
-  }
+  // NEVER intercept Supabase API calls — let the browser handle them natively
+  // This prevents any SW interference with auth tokens, CORS, or response handling
+  if (url.hostname.includes('supabase')) return;
 
   // Network-first for Google Fonts CSS (may have updated font files)
   if (url.hostname === 'fonts.googleapis.com') {
@@ -98,17 +94,16 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Stale-while-revalidate for the HTML shell
+  // Network-first for the HTML shell (always serve latest code)
   if (url.pathname === '/' || url.pathname === '/index.html') {
     event.respondWith(
-      caches.match(event.request).then((cached) => {
-        const fetchPromise = fetch(event.request).then((response) => {
+      fetch(event.request)
+        .then((response) => {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
           return response;
-        });
-        return cached || fetchPromise;
-      })
+        })
+        .catch(() => caches.match(event.request))
     );
     return;
   }
