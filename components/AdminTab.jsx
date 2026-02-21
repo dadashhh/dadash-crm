@@ -60,7 +60,7 @@ const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeR
                 <tr key={u.id}>
                   <td>{u.name}</td>
                   <td>{u.role}</td>
-                  <td>{(u.role==="chatter"||u.role==="modele")?(u.assigned_models||[]).map(mid=>models.find(m=>m.id===mid)?.name).filter(Boolean).join(", ")||"none":"—"}</td>
+                  <td>{(u.role==="chatter"||u.role==="model")?(u.assigned_models||[]).map(mid=>models.find(m=>m.id===mid)?.name).filter(Boolean).join(", ")||"none":"—"}</td>
                   <td>{u.commission_pct}%</td>
                   <td><button className="btn btn-primary btn-small" onClick={()=>startEdit(u)}>{t(lang,"edit")}</button></td>
                 </tr>
@@ -73,14 +73,14 @@ const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeR
                 <label className="form-label">{t(lang,"role")}</label>
                 <select className="filter-select" value={form.role} onChange={e=>setForm({...form,role:e.target.value})}>
                   <option value="gerant">gerant</option>
-                  <option value="modele">modele</option>
+                  <option value="model">model</option>
                   <option value="chatter">chatter</option>
                   <option value="provider">provider</option>
                 </select>
               </div>
-              {(form.role==="chatter"||form.role==="modele")&&(
+              {(form.role==="chatter"||form.role==="model")&&(
                 <div className="form-group-modal">
-                  <label className="form-label">{form.role==="modele"?"Model Profile (select 1)":"Assigned Models"}</label>
+                  <label className="form-label">{form.role==="model"?"Model Profile (select 1)":"Assigned Models"}</label>
                   <div style={{display:"flex",flexDirection:"column",gap:8}}>
                     {models.map(m=>(
                       <label key={m.id} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
