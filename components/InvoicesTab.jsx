@@ -142,7 +142,7 @@ const InvoicesTab = React.memo(({ user, lang, invoices, txs, profiles, providerP
   const removeLineItem = (idx) => { if (createForm.line_items.length > 1) setCreateForm({ ...createForm, line_items: createForm.line_items.filter((_, i) => i !== idx) }); };
 
   const chatters = profiles.filter(p => p.role === "chatter");
-  const modeles = profiles.filter(p => p.role === "modele");
+  const modeles = profiles.filter(p => p.role === "model");
   const providers = profiles.filter(p => p.role === "provider");
 
   const tabs = [

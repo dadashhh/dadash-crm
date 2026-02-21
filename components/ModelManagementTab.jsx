@@ -16,7 +16,7 @@ const ModelManagementTab = ({user, lang, models, profiles, modelTasks, contentLi
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(null);
 
-  const modeleProfiles = profiles.filter(p => p.role === "modele");
+  const modeleProfiles = profiles.filter(p => p.role === "model");
   const today = new Date().toISOString().slice(0, 10);
 
   // Ensure today's checklist instances exist for all models
