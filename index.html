@@ -1195,7 +1195,7 @@
   <script type="text/babel">
 const {useState, useEffect, useMemo, useCallback, useContext, createContext, useRef} = React;
 const _Recharts = window.Recharts || {};
-const {ResponsiveContainer, AreaChart, Area, CartesianGrid, XAxis, YAxis, Tooltip: RechartsTooltip} = _Recharts;
+const {ResponsiveContainer, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, CartesianGrid, XAxis, YAxis, Tooltip: RechartsTooltip, Legend} = _Recharts;
 const rechartsReady = !!(ResponsiveContainer && AreaChart);
 
 // =============================================
@@ -7694,6 +7694,660 @@ const ChallengesSection = ({user, lang, txs, profiles, convertAmount, currencySy
 };
 
 // =============================================
+// WHATSAPP ANALYZER
+// =============================================
+const WhatsAppAnalyzerTab = ({user, lang}) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+
+  const [messages, setMessages] = useState([]);
+  const [fileName, setFileName] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [activeView, setActiveView] = useState("import");
+  const [selectedParticipant, setSelectedParticipant] = useState("all");
+
+  // ── WhatsApp export parser ──
+  // Handles formats:
+  //   [dd/mm/yyyy, hh:mm:ss] Name: msg
+  //   dd/mm/yyyy, hh:mm - Name: msg
+  //   dd/mm/yyyy hh:mm - Name: msg
+  //   mm/dd/yy, h:mm AM - Name: msg
+  const parseWhatsApp = (text) => {
+    const lines = text.split("\n");
+    const results = [];
+    // Multi-format regex
+    const datePatterns = [
+      /^\[?(\d{1,2}\/\d{1,2}\/\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\]?\s*[-–]\s*/,
+      /^(\d{1,2}\/\d{1,2}\/\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\s*[-–]\s*/,
+    ];
+
+    let currentMsg = null;
+    for (const line of lines) {
+      let matched = false;
+      for (const pat of datePatterns) {
+        const m = line.match(pat);
+        if (m) {
+          if (currentMsg) results.push(currentMsg);
+          const dateStr = m[1];
+          const timeStr = m[2];
+          const rest = line.slice(m[0].length);
+          const colonIdx = rest.indexOf(":");
+          if (colonIdx > 0 && colonIdx < 60) {
+            const sender = rest.slice(0, colonIdx).trim();
+            const body = rest.slice(colonIdx + 1).trim();
+            // Parse date
+            const dateParts = dateStr.split("/");
+            let day, month, year;
+            if (dateParts.length === 3) {
+              // Try dd/mm/yyyy first (most common in FR)
+              day = parseInt(dateParts[0], 10);
+              month = parseInt(dateParts[1], 10);
+              year = parseInt(dateParts[2], 10);
+              if (day > 12) { /* dd/mm format confirmed */ }
+              else if (month > 12) { const tmp = day; day = month; month = tmp; } // mm/dd
+              if (year < 100) year += 2000;
+            }
+            const timeParts = timeStr.replace(/\s*[APap][Mm]/, "").split(":");
+            let hour = parseInt(timeParts[0], 10);
+            const min = parseInt(timeParts[1], 10) || 0;
+            const sec = parseInt(timeParts[2], 10) || 0;
+            if (/[Pp][Mm]/i.test(timeStr) && hour < 12) hour += 12;
+            if (/[Aa][Mm]/i.test(timeStr) && hour === 12) hour = 0;
+            const date = new Date(year, month - 1, day, hour, min, sec);
+            const isMedia = /(<Media omitted>|<Médias omis>|image omitted|video omitted|audio omitted|document omitted|sticker omitted|GIF omitted)/i.test(body);
+            const isLink = /(https?:\/\/[^\s]+)/i.test(body);
+            currentMsg = { date, sender, body, isMedia, isLink, isSystem: false };
+          } else {
+            // System message (no colon = no sender)
+            if (currentMsg) results.push(currentMsg);
+            currentMsg = { date: new Date(), sender: "__system__", body: rest, isMedia: false, isLink: false, isSystem: true };
+          }
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && currentMsg && line.trim()) {
+        currentMsg.body += "\n" + line.trim();
+      }
+    }
+    if (currentMsg) results.push(currentMsg);
+    return results.filter(m => !m.isSystem && m.sender !== "__system__");
+  };
+
+  // ── Import handler ──
+  const handleImport = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setParsing(true);
+    setFileName(file.name);
+    try {
+      const text = await file.text();
+      const parsed = parseWhatsApp(text);
+      if (parsed.length === 0) {
+        addToast(fr ? "Aucun message trouvé. Vérifie le format du fichier." : "No messages found. Check file format.", "error");
+      } else {
+        setMessages(parsed);
+        addToast(fr ? `${parsed.length} messages analysés ✓` : `${parsed.length} messages analyzed ✓`, "success");
+        setTimeout(() => setActiveView("overview"), 400);
+      }
+    } catch (err) {
+      addToast(fr ? "Erreur de lecture: " + err.message : "Read error: " + err.message, "error");
+    }
+    setParsing(false);
+    e.target.value = "";
+  };
+
+  // ── Computed analytics ──
+  const participants = useMemo(() => {
+    const map = {};
+    messages.forEach(m => {
+      if (!map[m.sender]) map[m.sender] = { name: m.sender, count: 0, chars: 0, media: 0, links: 0, words: 0 };
+      map[m.sender].count++;
+      map[m.sender].chars += m.body.length;
+      map[m.sender].words += m.body.split(/\s+/).filter(Boolean).length;
+      if (m.isMedia) map[m.sender].media++;
+      if (m.isLink) map[m.sender].links++;
+    });
+    return Object.values(map).sort((a, b) => b.count - a.count);
+  }, [messages]);
+
+  const filteredMsgs = useMemo(() => {
+    if (selectedParticipant === "all") return messages;
+    return messages.filter(m => m.sender === selectedParticipant);
+  }, [messages, selectedParticipant]);
+
+  const overview = useMemo(() => {
+    if (!messages.length) return null;
+    const dates = messages.map(m => m.date).filter(d => !isNaN(d));
+    const first = new Date(Math.min(...dates));
+    const last = new Date(Math.max(...dates));
+    const days = Math.max(1, Math.ceil((last - first) / 86400000));
+    const totalWords = messages.reduce((a, m) => a + m.body.split(/\s+/).filter(Boolean).length, 0);
+    const totalMedia = messages.filter(m => m.isMedia).length;
+    const totalLinks = messages.filter(m => m.isLink).length;
+    return {
+      total: messages.length, participants: participants.length, first, last, days,
+      avgPerDay: (messages.length / days).toFixed(1), totalWords, totalMedia, totalLinks,
+      avgWordsPerMsg: messages.length ? (totalWords / messages.length).toFixed(1) : 0,
+    };
+  }, [messages, participants]);
+
+  // Hourly activity
+  const hourlyData = useMemo(() => {
+    const hours = Array(24).fill(0);
+    filteredMsgs.forEach(m => { if (!isNaN(m.date)) hours[m.date.getHours()]++; });
+    return hours.map((count, h) => ({ hour: `${h}h`, count }));
+  }, [filteredMsgs]);
+
+  // Daily activity
+  const dailyData = useMemo(() => {
+    const map = {};
+    filteredMsgs.forEach(m => {
+      if (isNaN(m.date)) return;
+      const key = m.date.toISOString().slice(0, 10);
+      map[key] = (map[key] || 0) + 1;
+    });
+    return Object.entries(map).sort().map(([date, count]) => ({ date, count }));
+  }, [filteredMsgs]);
+
+  // Day of week
+  const dowData = useMemo(() => {
+    const names = fr
+      ? ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"]
+      : ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const counts = Array(7).fill(0);
+    filteredMsgs.forEach(m => { if (!isNaN(m.date)) counts[m.date.getDay()]++; });
+    return counts.map((count, i) => ({ day: names[i], count }));
+  }, [filteredMsgs, fr]);
+
+  // Top words
+  const topWords = useMemo(() => {
+    const stopFR = new Set(["de","le","la","les","un","une","des","et","en","du","au","aux","est","a","je","tu","il","elle","on","nous","vous","ils","elles","ce","se","ne","pas","que","qui","mais","ou","dans","pour","par","sur","avec","son","sa","ses","mon","ma","mes","ton","ta","tes","plus","très","bien","tout","cette","ces","leur","leurs","fait","été","avoir","être","faire","dit","aussi","comme","quoi","moi","toi","lui","ça","là","oui","non","si","car"]);
+    const stopEN = new Set(["the","a","an","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","shall","should","may","might","can","could","i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","its","our","their","this","that","these","those","and","but","or","so","if","in","on","at","to","for","of","with","not","no","yes","from","by","up","out","just","like","what","when","how","all","very","too"]);
+    const stops = new Set([...stopFR, ...stopEN]);
+    const freq = {};
+    filteredMsgs.forEach(m => {
+      if (m.isMedia) return;
+      m.body.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").split(/\s+/).forEach(w => {
+        if (w.length < 3 || stops.has(w)) return;
+        freq[w] = (freq[w] || 0) + 1;
+      });
+    });
+    return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 30).map(([word, count]) => ({ word, count }));
+  }, [filteredMsgs]);
+
+  // Response times (per participant)
+  const responseTimes = useMemo(() => {
+    if (messages.length < 2) return [];
+    const rtMap = {};
+    for (let i = 1; i < messages.length; i++) {
+      const prev = messages[i - 1];
+      const cur = messages[i];
+      if (prev.sender === cur.sender) continue;
+      const diffMs = cur.date - prev.date;
+      if (diffMs < 0 || diffMs > 3600000 * 4) continue; // skip > 4h gaps
+      if (!rtMap[cur.sender]) rtMap[cur.sender] = [];
+      rtMap[cur.sender].push(diffMs / 60000); // minutes
+    }
+    return Object.entries(rtMap).map(([name, times]) => ({
+      name,
+      avg: (times.reduce((a, b) => a + b, 0) / times.length).toFixed(1),
+      median: times.sort((a, b) => a - b)[Math.floor(times.length / 2)]?.toFixed(1) || "0",
+      count: times.length,
+    })).sort((a, b) => parseFloat(a.avg) - parseFloat(b.avg));
+  }, [messages]);
+
+  // Messages per participant (for bar chart)
+  const participantChartData = useMemo(() => {
+    return participants.slice(0, 15).map(p => ({ name: p.name.length > 12 ? p.name.slice(0, 12) + "…" : p.name, messages: p.count, fullName: p.name }));
+  }, [participants]);
+
+  // Emoji frequency
+  const topEmojis = useMemo(() => {
+    const freq = {};
+    filteredMsgs.forEach(m => {
+      const emojis = m.body.match(/\p{Extended_Pictographic}/gu) || [];
+      emojis.forEach(e => { freq[e] = (freq[e] || 0) + 1; });
+    });
+    return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([emoji, count]) => ({ emoji, count }));
+  }, [filteredMsgs]);
+
+  const COLORS = ["#818cf8", "#34d399", "#f472b6", "#fbbf24", "#f87171", "#22d3ee", "#a78bfa", "#fb923c", "#4ade80", "#e879f9"];
+
+  // ── Card helper ──
+  const StatCard = ({icon, label, value, sub}) => (
+    <div className="card" style={{padding: "16px 20px", flex: "1 1 180px", minWidth: 160}}>
+      <div style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 6}}>
+        <span style={{fontSize: 18}}>{icon}</span>
+        <span style={{fontSize: 11, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 600}}>{label}</span>
+      </div>
+      <div style={{fontSize: 24, fontWeight: 800, color: "var(--text-primary)"}}>{value}</div>
+      {sub && <div style={{fontSize: 11, color: "var(--text-tertiary)", marginTop: 2}}>{sub}</div>}
+    </div>
+  );
+
+  // ══════════════════════════════════
+  // RENDER
+  // ══════════════════════════════════
+  return (
+    <div>
+      {/* ═══ NAV TABS ═══ */}
+      <div style={{display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap"}}>
+        {[
+          {key: "import", icon: "📱", label: fr ? "Import WhatsApp" : "Import WhatsApp"},
+          ...(messages.length > 0 ? [
+            {key: "overview", icon: "📊", label: fr ? "Vue globale" : "Overview"},
+            {key: "participants", icon: "👥", label: fr ? "Participants" : "Participants"},
+            {key: "activity", icon: "📈", label: fr ? "Activité" : "Activity"},
+            {key: "words", icon: "💬", label: fr ? "Mots & Emojis" : "Words & Emojis"},
+            {key: "response", icon: "⚡", label: fr ? "Temps de réponse" : "Response Time"},
+          ] : []),
+        ].map(tab => (
+          <button key={tab.key}
+            className={`filter-chip ${activeView === tab.key ? "active" : ""}`}
+            onClick={() => setActiveView(tab.key)}
+            style={{fontSize: 13, padding: "8px 16px"}}>
+            {tab.icon} {tab.label}
+          </button>
+        ))}
+      </div>
+
+      {/* ═══ PARTICIPANT FILTER ═══ */}
+      {messages.length > 0 && activeView !== "import" && activeView !== "participants" && (
+        <div style={{marginBottom: 16, display: "flex", gap: 6, flexWrap: "wrap"}}>
+          <button className={`filter-chip ${selectedParticipant === "all" ? "active" : ""}`}
+            onClick={() => setSelectedParticipant("all")} style={{fontSize: 12, padding: "5px 12px"}}>
+            {fr ? "Tous" : "All"}
+          </button>
+          {participants.map(p => (
+            <button key={p.name} className={`filter-chip ${selectedParticipant === p.name ? "active" : ""}`}
+              onClick={() => setSelectedParticipant(p.name)} style={{fontSize: 12, padding: "5px 12px"}}>
+              {p.name.length > 16 ? p.name.slice(0, 16) + "…" : p.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* ═══ 1) IMPORT ═══ */}
+      {activeView === "import" && (
+        <div>
+          <div className="card" style={{marginBottom: 16}}>
+            <div className="section-title"><div className="section-bar"></div>📱 WhatsApp Chat Analyzer</div>
+            <p style={{color: "var(--text-secondary)", fontSize: 13, marginBottom: 16}}>
+              {fr
+                ? "Importe un export de conversation WhatsApp (.txt). Va dans WhatsApp > Conversation > ⋮ > Exporter la discussion > Sans médias."
+                : "Import a WhatsApp chat export (.txt). Go to WhatsApp > Chat > ⋮ > Export chat > Without media."}
+            </p>
+            <label style={{
+              display: "inline-flex", alignItems: "center", gap: 8, padding: "12px 24px",
+              background: "var(--accent-muted)", color: "var(--accent)", borderRadius: "var(--radius-md)",
+              cursor: "pointer", fontWeight: 600, fontSize: 14, border: "1px solid var(--border-accent)",
+              transition: "all 0.2s",
+            }}>
+              📂 {fr ? "Choisir un fichier .txt" : "Choose a .txt file"}
+              <input type="file" accept=".txt,.text" onChange={handleImport} style={{display: "none"}} />
+            </label>
+            {parsing && <div style={{marginTop: 12, color: "var(--accent)"}}>⏳ {fr ? "Analyse en cours..." : "Analyzing..."}</div>}
+            {fileName && messages.length > 0 && (
+              <div style={{marginTop: 12, padding: "10px 16px", background: "var(--success-muted)", borderRadius: "var(--radius-sm)", color: "var(--success)", fontSize: 13}}>
+                ✅ {fileName} — {messages.length} {fr ? "messages importés" : "messages imported"}
+              </div>
+            )}
+          </div>
+
+          {/* How-to */}
+          <div className="card" style={{marginBottom: 16}}>
+            <div className="section-title"><div className="section-bar"></div>{fr ? "Comment exporter" : "How to export"}</div>
+            <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16}}>
+              {[
+                {step: "1", text: fr ? "Ouvre la conversation WhatsApp" : "Open the WhatsApp conversation"},
+                {step: "2", text: fr ? "Appuie sur ⋮ (menu) en haut" : "Tap ⋮ (menu) at the top"},
+                {step: "3", text: fr ? "\"Plus\" > \"Exporter discussion\"" : "\"More\" > \"Export chat\""},
+                {step: "4", text: fr ? "Choisis \"Sans médias\"" : "Choose \"Without media\""},
+              ].map(s => (
+                <div key={s.step} style={{display: "flex", gap: 12, alignItems: "flex-start"}}>
+                  <div style={{width: 28, height: 28, borderRadius: "50%", background: "var(--accent-muted)", color: "var(--accent)",
+                    display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 13, flexShrink: 0}}>{s.step}</div>
+                  <span style={{fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.5}}>{s.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Supported formats */}
+          <div className="card">
+            <div className="section-title"><div className="section-bar"></div>{fr ? "Formats supportés" : "Supported formats"}</div>
+            <div style={{fontFamily: "monospace", fontSize: 12, color: "var(--text-tertiary)", lineHeight: 2}}>
+              <div>21/02/2024, 14:30 - John: Hello!</div>
+              <div>[21/02/2024, 14:30:15] John: Hello!</div>
+              <div>2/21/24, 2:30 PM - John: Hello!</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ 2) OVERVIEW ═══ */}
+      {activeView === "overview" && overview && (
+        <div>
+          {/* Stats row */}
+          <div style={{display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 20}}>
+            <StatCard icon="💬" label={fr ? "Messages" : "Messages"} value={overview.total.toLocaleString()} sub={`${overview.avgPerDay}/jour`} />
+            <StatCard icon="👥" label="Participants" value={overview.participants} />
+            <StatCard icon="📅" label={fr ? "Période" : "Period"} value={`${overview.days}j`} sub={`${overview.first.toLocaleDateString()} → ${overview.last.toLocaleDateString()}`} />
+            <StatCard icon="📝" label={fr ? "Mots/msg" : "Words/msg"} value={overview.avgWordsPerMsg} sub={`${overview.totalWords.toLocaleString()} ${fr ? "mots total" : "total words"}`} />
+            <StatCard icon="📸" label={fr ? "Médias" : "Media"} value={overview.totalMedia} />
+            <StatCard icon="🔗" label="Liens" value={overview.totalLinks} />
+          </div>
+
+          {/* Participants pie */}
+          <div className="card" style={{marginBottom: 16}}>
+            <div className="section-title"><div className="section-bar"></div>{fr ? "Répartition des messages" : "Message distribution"}</div>
+            <div style={{display: "flex", flexWrap: "wrap", gap: 20, alignItems: "center"}}>
+              {rechartsReady && PieChart && Pie && Cell ? (
+                <div style={{width: 280, height: 250}}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={participantChartData} dataKey="messages" nameKey="name" cx="50%" cy="50%" outerRadius={90} innerRadius={45}
+                        stroke="var(--bg-base)" strokeWidth={2}>
+                        {participantChartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                      </Pie>
+                      <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : null}
+              <div style={{flex: 1, minWidth: 200}}>
+                {participants.slice(0, 8).map((p, i) => (
+                  <div key={p.name} style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 8}}>
+                    <div style={{width: 10, height: 10, borderRadius: "50%", background: COLORS[i % COLORS.length], flexShrink: 0}} />
+                    <span style={{fontSize: 13, color: "var(--text-primary)", flex: 1}}>{p.name}</span>
+                    <span style={{fontSize: 13, fontWeight: 700, color: "var(--text-primary)"}}>{p.count}</span>
+                    <span style={{fontSize: 11, color: "var(--text-tertiary)", minWidth: 42, textAlign: "right"}}>
+                      {(p.count / messages.length * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Daily timeline */}
+          {rechartsReady && dailyData.length > 1 && (
+            <div className="card">
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Messages par jour" : "Messages per day"}</div>
+              <div style={{width: "100%", height: 220}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={dailyData}>
+                    <defs><linearGradient id="waGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#818cf8" stopOpacity={0.3} />
+                      <stop offset="100%" stopColor="#818cf8" stopOpacity={0} />
+                    </linearGradient></defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis dataKey="date" tick={{fill: "var(--text-tertiary)", fontSize: 10}} tickFormatter={v => v.slice(5)} />
+                    <YAxis tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Area type="monotone" dataKey="count" stroke="#818cf8" fill="url(#waGrad)" strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ 3) PARTICIPANTS ═══ */}
+      {activeView === "participants" && (
+        <div>
+          {/* Bar chart */}
+          {rechartsReady && BarChart && Bar && participantChartData.length > 0 && (
+            <div className="card" style={{marginBottom: 16}}>
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Messages par participant" : "Messages per participant"}</div>
+              <div style={{width: "100%", height: 280}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={participantChartData} layout="vertical" margin={{left: 80}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis type="number" tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <YAxis type="category" dataKey="name" tick={{fill: "var(--text-secondary)", fontSize: 11}} width={75} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Bar dataKey="messages" radius={[0, 4, 4, 0]}>
+                      {participantChartData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+
+          {/* Detailed table */}
+          <div className="card">
+            <div className="section-title"><div className="section-bar"></div>{fr ? "Détail par participant" : "Participant details"}</div>
+            <div style={{overflowX: "auto"}}>
+              <table style={{width: "100%", borderCollapse: "collapse", fontSize: 13}}>
+                <thead>
+                  <tr style={{borderBottom: "1px solid var(--border-default)"}}>
+                    {[fr ? "Nom" : "Name", "Messages", fr ? "Mots" : "Words", fr ? "Mots/msg" : "Words/msg", fr ? "Médias" : "Media", "Liens", "%"].map(h => (
+                      <th key={h} style={{padding: "10px 12px", textAlign: "left", color: "var(--text-tertiary)", fontWeight: 600, fontSize: 11, textTransform: "uppercase"}}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {participants.map((p, i) => (
+                    <tr key={p.name} style={{borderBottom: "1px solid var(--border-subtle)"}}>
+                      <td style={{padding: "10px 12px", display: "flex", alignItems: "center", gap: 8}}>
+                        <div style={{width: 8, height: 8, borderRadius: "50%", background: COLORS[i % COLORS.length]}} />
+                        <span style={{fontWeight: 600, color: "var(--text-primary)"}}>{p.name}</span>
+                      </td>
+                      <td style={{padding: "10px 12px", fontWeight: 700, color: "var(--accent)"}}>{p.count.toLocaleString()}</td>
+                      <td style={{padding: "10px 12px", color: "var(--text-secondary)"}}>{p.words.toLocaleString()}</td>
+                      <td style={{padding: "10px 12px", color: "var(--text-secondary)"}}>{p.count ? (p.words / p.count).toFixed(1) : 0}</td>
+                      <td style={{padding: "10px 12px", color: "var(--text-secondary)"}}>{p.media}</td>
+                      <td style={{padding: "10px 12px", color: "var(--text-secondary)"}}>{p.links}</td>
+                      <td style={{padding: "10px 12px", color: "var(--text-tertiary)"}}>{(p.count / messages.length * 100).toFixed(1)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ 4) ACTIVITY ═══ */}
+      {activeView === "activity" && (
+        <div>
+          {/* Hourly */}
+          {rechartsReady && BarChart && Bar && (
+            <div className="card" style={{marginBottom: 16}}>
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Activité par heure" : "Hourly activity"}</div>
+              <div style={{width: "100%", height: 220}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={hourlyData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis dataKey="hour" tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <YAxis tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Bar dataKey="count" fill="#818cf8" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+
+          {/* Day of week */}
+          {rechartsReady && BarChart && Bar && (
+            <div className="card" style={{marginBottom: 16}}>
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Activité par jour de la semaine" : "Day of week activity"}</div>
+              <div style={{width: "100%", height: 220}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={dowData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis dataKey="day" tick={{fill: "var(--text-tertiary)", fontSize: 11}} />
+                    <YAxis tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Bar dataKey="count" fill="#34d399" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+
+          {/* Daily timeline */}
+          {rechartsReady && dailyData.length > 1 && (
+            <div className="card">
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Timeline quotidienne" : "Daily timeline"}</div>
+              <div style={{width: "100%", height: 220}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={dailyData}>
+                    <defs><linearGradient id="waGrad2" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#34d399" stopOpacity={0.3} />
+                      <stop offset="100%" stopColor="#34d399" stopOpacity={0} />
+                    </linearGradient></defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis dataKey="date" tick={{fill: "var(--text-tertiary)", fontSize: 10}} tickFormatter={v => v.slice(5)} />
+                    <YAxis tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Area type="monotone" dataKey="count" stroke="#34d399" fill="url(#waGrad2)" strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ 5) WORDS & EMOJIS ═══ */}
+      {activeView === "words" && (
+        <div>
+          {/* Word cloud style */}
+          <div className="card" style={{marginBottom: 16}}>
+            <div className="section-title"><div className="section-bar"></div>{fr ? "Mots les plus utilisés" : "Most used words"}</div>
+            <div style={{display: "flex", flexWrap: "wrap", gap: 8, padding: "8px 0"}}>
+              {topWords.map((w, i) => {
+                const maxCount = topWords[0]?.count || 1;
+                const ratio = w.count / maxCount;
+                const size = 12 + ratio * 20;
+                const opacity = 0.4 + ratio * 0.6;
+                return (
+                  <span key={w.word} style={{
+                    fontSize: size, fontWeight: ratio > 0.5 ? 700 : 500,
+                    color: COLORS[i % COLORS.length], opacity,
+                    padding: "4px 10px", background: "var(--bg-surface)", borderRadius: "var(--radius-sm)",
+                  }}>
+                    {w.word} <span style={{fontSize: 10, opacity: 0.6}}>({w.count})</span>
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Emojis */}
+          {topEmojis.length > 0 && (
+            <div className="card" style={{marginBottom: 16}}>
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Emojis les plus utilisés" : "Most used emojis"}</div>
+              <div style={{display: "flex", flexWrap: "wrap", gap: 12}}>
+                {topEmojis.map((e, i) => (
+                  <div key={i} style={{
+                    display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+                    padding: "10px 14px", background: "var(--bg-surface)", borderRadius: "var(--radius-md)",
+                    minWidth: 56,
+                  }}>
+                    <span style={{fontSize: 28}}>{e.emoji}</span>
+                    <span style={{fontSize: 11, fontWeight: 700, color: "var(--text-secondary)"}}>{e.count}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Top words bar chart */}
+          {rechartsReady && BarChart && Bar && topWords.length > 0 && (
+            <div className="card">
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Top 15 mots (graphique)" : "Top 15 words (chart)"}</div>
+              <div style={{width: "100%", height: 320}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={topWords.slice(0, 15)} layout="vertical" margin={{left: 80}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis type="number" tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <YAxis type="category" dataKey="word" tick={{fill: "var(--text-secondary)", fontSize: 11}} width={75} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Bar dataKey="count" fill="#f472b6" radius={[0, 4, 4, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ 6) RESPONSE TIME ═══ */}
+      {activeView === "response" && (
+        <div>
+          <div className="card" style={{marginBottom: 16}}>
+            <div className="section-title"><div className="section-bar"></div>{fr ? "Temps de réponse moyen" : "Average response time"}</div>
+            <p style={{color: "var(--text-tertiary)", fontSize: 12, marginBottom: 16}}>
+              {fr ? "Temps entre le dernier message d'une personne et la réponse d'une autre (écarts > 4h exclus)." : "Time between one person's last message and another's reply (gaps > 4h excluded)."}
+            </p>
+            {responseTimes.length === 0 ? (
+              <div style={{color: "var(--text-tertiary)", fontSize: 13, padding: 20, textAlign: "center"}}>
+                {fr ? "Pas assez de données pour calculer les temps de réponse." : "Not enough data to compute response times."}
+              </div>
+            ) : (
+              <div style={{display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12}}>
+                {responseTimes.map((rt, i) => (
+                  <div key={rt.name} style={{
+                    padding: "16px 20px", background: "var(--bg-surface)", borderRadius: "var(--radius-md)",
+                    border: "1px solid var(--border-subtle)",
+                  }}>
+                    <div style={{display: "flex", alignItems: "center", gap: 8, marginBottom: 10}}>
+                      <div style={{width: 8, height: 8, borderRadius: "50%", background: COLORS[i % COLORS.length]}} />
+                      <span style={{fontSize: 14, fontWeight: 700, color: "var(--text-primary)"}}>{rt.name}</span>
+                    </div>
+                    <div style={{display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8}}>
+                      <div>
+                        <div style={{fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", marginBottom: 2}}>{fr ? "Moyen" : "Average"}</div>
+                        <div style={{fontSize: 18, fontWeight: 800, color: "var(--accent)"}}>{rt.avg}<span style={{fontSize: 11, fontWeight: 400}}>min</span></div>
+                      </div>
+                      <div>
+                        <div style={{fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", marginBottom: 2}}>{fr ? "Médian" : "Median"}</div>
+                        <div style={{fontSize: 18, fontWeight: 800, color: "var(--success)"}}>{rt.median}<span style={{fontSize: 11, fontWeight: 400}}>min</span></div>
+                      </div>
+                      <div>
+                        <div style={{fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", marginBottom: 2}}>{fr ? "Échanges" : "Exchanges"}</div>
+                        <div style={{fontSize: 18, fontWeight: 800, color: "var(--text-primary)"}}>{rt.count}</div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Response time bar chart */}
+          {rechartsReady && BarChart && Bar && responseTimes.length > 0 && (
+            <div className="card">
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Comparaison (minutes)" : "Comparison (minutes)"}</div>
+              <div style={{width: "100%", height: 220}}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={responseTimes.map(rt => ({name: rt.name.length > 12 ? rt.name.slice(0, 12) + "…" : rt.name, avg: parseFloat(rt.avg), median: parseFloat(rt.median)}))}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                    <XAxis dataKey="name" tick={{fill: "var(--text-secondary)", fontSize: 11}} />
+                    <YAxis tick={{fill: "var(--text-tertiary)", fontSize: 10}} />
+                    <RechartsTooltip contentStyle={{background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, color: "var(--text-primary)"}} />
+                    <Bar dataKey="avg" fill="#818cf8" name={fr ? "Moyen" : "Average"} radius={[4, 4, 0, 0]} />
+                    <Bar dataKey="median" fill="#34d399" name={fr ? "Médian" : "Median"} radius={[4, 4, 0, 0]} />
+                    {Legend && <Legend wrapperStyle={{color: "var(--text-secondary)", fontSize: 12}} />}
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // MAIN APP
 // =============================================
 const App = () => {
@@ -7913,6 +8567,7 @@ const App = () => {
     {id:"compta",icon:"\u{1F4C8}",label:t(lang,"compta"),show:user.role==="gerant"},
     {id:"provider_compta",icon:"\u{1F4B0}",label:"Provider Compta",show:user.role==="provider"},
     {id:"telegram",icon:"\u{1F4F2}",label:"Telegram",show:!isModele&&user.role!=="provider"},
+    {id:"whatsapp",icon:"\u{1F4F1}",label:"WhatsApp Analyzer",show:!isModele&&user.role!=="provider"},
     {id:"agents",icon:"\u{1F916}",label:"Agents IA",show:user.role==="gerant"},
     {id:"admin",icon:"\u2699",label:t(lang,"admin"),show:user.role==="gerant"},
   ];
@@ -8016,6 +8671,7 @@ const App = () => {
           {tab==="compta"&&user.role==="gerant"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} models={models} />}
           {tab==="telegram"&&user.role!=="provider"&&user.role!=="modele"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
+          {tab==="whatsapp"&&user.role!=="provider"&&user.role!=="modele"&&<WhatsAppAnalyzerTab user={user} lang={lang} />}
           {tab==="agents"&&user.role==="gerant"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
           {tab==="admin"&&user.role==="gerant"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
           </>)}
