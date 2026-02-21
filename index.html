@@ -1377,6 +1377,28 @@ const BOT_STATS_LIMIT = 200;
 const ALERTS_LIMIT = 100;
 
 // =============================================
+// ROLE-BASED ACCESS CONTROL
+// =============================================
+const ROLE_TABS = {
+  gerant: [
+    "dashboard","transactions","spenders","modeles","model_mgmt","mes_spenders",
+    "objectifs","competition","chatters","admin","telegram","whatsapp",
+    "providers","products","agents","videos","compta","paies","invoices",
+  ],
+  modele: [
+    "model_checklist","model_content","model_tasks","model_payments",
+  ],
+  chatter: ["whatsapp","telegram","paies"],
+  provider: ["transactions","provider_compta"],
+};
+const ROLE_DEFAULT_TAB = {
+  gerant: "dashboard",
+  modele: "model_checklist",
+  chatter: "whatsapp",
+  provider: "transactions",
+};
+
+// =============================================
 // XSS SANITIZATION — escape HTML entities in user-controlled strings
 // =============================================
 const escapeHTML = (str) => {
@@ -1484,7 +1506,7 @@ const useCurrency = () => useContext(CurrencyContext);
 // =============================================
 const i18n = {
   fr: {
-    dashboard:"Tableau de bord",transactions:"Transactions",spenders:"Spenders",objectifs:"Objectifs",paies:"Paies",compta:"Compta",ia:"IA",admin:"Admin",competition:"Competition",chatters:"Chatters",
+    dashboard:"Tableau de bord",transactions:"Transactions",my_transactions:"Mes transactions",spenders:"Spenders",objectifs:"Objectifs",paies:"Paies",compta:"Compta",ia:"IA",admin:"Admin",competition:"Competition",chatters:"Chatters",unauthorized_page:"Acc\u00e8s non autoris\u00e9",redirect_msg:"Vous n'avez pas acc\u00e8s \u00e0 cette page.",
     login:"Connexion",email:"Email",password:"Mot de passe",login_btn:"Se connecter",language:"Langue",logout:"Deconnexion",
     ca_brut:"CA Brut",mon_ca:"Mon CA",net_agence:"Net Agence",nb_txs:"Nb transactions",marge_comm:"Marge / Commission",
     ca_pending:"CA en attente",nb_pending:"Ventes en attente",ca_validated:"CA valide",nb_validated:"Ventes validees",
@@ -1554,7 +1576,7 @@ const i18n = {
     just_now:"À l'instant",
   },
   en: {
-    dashboard:"Dashboard",transactions:"Transactions",spenders:"Spenders",objectifs:"Objectives",paies:"Payouts",compta:"Accounting",ia:"AI",admin:"Admin",competition:"Competition",chatters:"Chatters",
+    dashboard:"Dashboard",transactions:"Transactions",my_transactions:"My transactions",spenders:"Spenders",objectifs:"Objectives",paies:"Payouts",compta:"Accounting",ia:"AI",admin:"Admin",competition:"Competition",chatters:"Chatters",unauthorized_page:"Unauthorized",redirect_msg:"You do not have access to this page.",
     login:"Login",email:"Email",password:"Password",login_btn:"Login",language:"Language",logout:"Logout",
     ca_brut:"Gross Revenue",mon_ca:"My Revenue",net_agence:"Agency Net",nb_txs:"Transactions",marge_comm:"Margin / Commission",
     ca_pending:"Pending Revenue",nb_pending:"Pending Sales",ca_validated:"Validated Revenue",nb_validated:"Validated Sales",
@@ -3179,6 +3201,7 @@ Object.assign(window, {
   DEFAULT_EXCHANGE_RATE, DEFAULT_TIMEZONE, DEFAULT_CURRENCY,
   ANTHROPIC_API_URL, ANTHROPIC_MODEL, ANTHROPIC_API_VERSION,
   INVOICE_PREFIX, MAX_RECENT_TX_DISPLAY, NOTIFICATIONS_LIMIT, BOT_STATS_LIMIT, ALERTS_LIMIT,
+  ROLE_TABS, ROLE_DEFAULT_TAB,
   // Contexts
   TimezoneContext, CurrencyContext,
   // Detail views (used by DrillDownView)
@@ -3243,6 +3266,7 @@ const App = () => {
     try { return localStorage.getItem("dadash-theme") || "dark"; } catch { return "dark"; /* localStorage unavailable */ }
   });
   const [tab, _setTab] = useState("dashboard");
+  const [viewAsRole, setViewAsRole] = useState(null);
   const {setDrillDown} = useNav();
   // Wrap setTab with pushState for browser history
   const setTab = useCallback((newTab) => {
@@ -3336,6 +3360,18 @@ const App = () => {
     displayCurrency, exchangeRate, convertAmount, fmtAmount, currencySymbol
   }), [displayCurrency, exchangeRate, convertAmount, fmtAmount, currencySymbol]);
 
+  // ── ROLE-BASED ACCESS ──
+  const effectiveRole = viewAsRole || (user ? user.role : "gerant");
+  const allowedTabs = ROLE_TABS[effectiveRole] || ROLE_TABS.gerant;
+  // Route guard: redirect to default tab if current tab is not allowed
+  useEffect(() => {
+    if (user && !allowedTabs.includes(tab)) {
+      const def = ROLE_DEFAULT_TAB[effectiveRole] || "dashboard";
+      _setTab(def);
+      window.history.replaceState({tab:def}, "", `#${def}`);
+    }
+  }, [tab, effectiveRole, user]);
+
   // ── SHARED STATE: cross-page spender navigation ──
   const [selectedSpenderKey, setSelectedSpenderKey] = useState(null);
   const addToast = useToast();
@@ -3399,9 +3435,15 @@ const App = () => {
         const modelIds = new Set(txData.map(tx=>tx.model_id));
         modelData = modelData.filter(m=>modelIds.has(m.id));
       } else if(currentUser.role==="modele") {
-        // Modeles see NO transaction data, spender data, or financial info
-        txData = [];
-        modelData = [];
+        // Modeles see their own model's data only
+        const myModelIds = currentUser.assigned_models || [];
+        if (myModelIds.length > 0) {
+          txData = txData.filter(tx => myModelIds.includes(tx.model_id));
+          modelData = modelData.filter(m => myModelIds.includes(m.id));
+        } else {
+          txData = [];
+          modelData = [];
+        }
       }
     }
 
@@ -3432,7 +3474,9 @@ const App = () => {
         // Providers: only own provider payouts
         ppData = ppData.filter(p=>p.provider_id===currentUser.id||p.declared_by===currentUser.id);
       } else if(currentUser.role==="modele") {
-        spenderData = [];
+        // Modeles see their own spenders (from their transactions) but no financial details
+        const modelSpenderHandles = new Set(txData.map(tx=>tx.spender_handle).filter(Boolean));
+        spenderData = spenderData.filter(s=>modelSpenderHandles.has(s.handle));
         profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
         payoutData = [];
         expenseData = [];
@@ -3501,8 +3545,8 @@ const App = () => {
         if(profile) {
           const fullUser = {...profile, email:session.user.email};
           setUser(fullUser);
-          if(fullUser.role === "provider") setTab("transactions");
-          if(fullUser.role === "modele") setTab("model_checklist");
+          const defaultTab = ROLE_DEFAULT_TAB[fullUser.role];
+          if(defaultTab && defaultTab !== "dashboard") _setTab(defaultTab);
           await loadData(fullUser);
         }
       }
@@ -3513,8 +3557,8 @@ const App = () => {
 
   const handleLogin = async (u) => {
     setUser(u);
-    if(u.role === "provider") setTab("transactions");
-    if(u.role === "modele") setTab("model_checklist");
+    const defaultTab = ROLE_DEFAULT_TAB[u.role];
+    if(defaultTab) _setTab(defaultTab);
     setLoading(true);
     await loadData(u);
     setLoading(false);
@@ -3522,6 +3566,7 @@ const App = () => {
 
   const handleLogout = async () => {
     closeDrill();
+    setViewAsRole(null);
     await sb.auth.signOut();
     setUser(null);
     setTab("dashboard");
@@ -3588,31 +3633,35 @@ const App = () => {
   );
   if(!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
 
-  const isModele = user.role === "modele";
+  const isModele = effectiveRole === "modele";
+  const isChatter = effectiveRole === "chatter";
+  const isGerant = effectiveRole === "gerant";
+  const isProvider = effectiveRole === "provider";
+  const canSee = (tabId) => allowedTabs.includes(tabId);
 
   // ── Tab groups: sidebar shows one icon, content shows sub-tab bar ──
   const tabGroups = [
-    {id:"messagerie",icon:"\u{1F4E8}",label:t(lang,"messaging"),show:user.role==="gerant"||user.role==="chatter",
+    {id:"messagerie",icon:"\u{1F4E8}",label:t(lang,"messaging"),show:canSee("whatsapp")||canSee("telegram"),
       children:[
-        {id:"telegram",label:"Telegram",show:user.role==="gerant"},
-        {id:"whatsapp",label:"WhatsApp",show:user.role==="gerant"||user.role==="chatter"},
+        {id:"telegram",label:"Telegram",show:canSee("telegram")},
+        {id:"whatsapp",label:"WhatsApp",show:canSee("whatsapp")},
       ]},
-    {id:"catalogue",icon:"\u{1F6CD}\uFE0F",label:t(lang,"catalog"),show:user.role==="gerant",
+    {id:"catalogue",icon:"\u{1F6CD}\uFE0F",label:t(lang,"catalog"),show:canSee("providers"),
       children:[
-        {id:"providers",label:t(lang,"prestataires"),show:true},
-        {id:"products",label:t(lang,"produits"),show:true},
+        {id:"providers",label:t(lang,"prestataires"),show:canSee("providers")},
+        {id:"products",label:t(lang,"produits"),show:canSee("products")},
       ]},
-    {id:"ia_perf",icon:"\u{1F916}",label:t(lang,"ia_perf"),show:user.role==="gerant",
+    {id:"ia_perf",icon:"\u{1F916}",label:t(lang,"ia_perf"),show:canSee("agents")||canSee("videos"),
       children:[
-        {id:"agents",label:"Agents IA",show:true},
-        {id:"competition",label:t(lang,"competition"),show:true},
-        {id:"videos",label:t(lang,"videos"),show:true},
+        {id:"agents",label:"Agents IA",show:canSee("agents")},
+        {id:"competition",label:t(lang,"competition"),show:canSee("competition")},
+        {id:"videos",label:t(lang,"videos"),show:isGerant},
       ]},
-    {id:"comptabilite",icon:"\u{1F4D2}",label:t(lang,"accounting"),show:user.role==="gerant"||(!isModele&&user.role!=="provider"),
+    {id:"comptabilite",icon:"\u{1F4D2}",label:t(lang,"accounting"),show:isGerant,
       children:[
-        {id:"compta",label:t(lang,"compta"),show:user.role==="gerant"},
-        {id:"paies",label:t(lang,"paies"),show:!isModele&&user.role!=="provider"},
-        {id:"invoices",label:t(lang,"factures"),show:user.role==="gerant"},
+        {id:"compta",label:t(lang,"compta"),show:true},
+        {id:"paies",label:t(lang,"paies"),show:true},
+        {id:"invoices",label:t(lang,"factures"),show:true},
       ]},
   ];
 
@@ -3628,33 +3677,37 @@ const App = () => {
   const groupChildIds = new Set(Object.keys(childToGroup));
 
   const tabs = [
-    // ── Modele-only tabs ──
+    // ── Modele-only tabs (4 pages: Onboarding, Content, Tasks, Payments) ──
     {id:"model_checklist",icon:"\u2705",label:t(lang,"my_checklist"),show:isModele},
-    {id:"model_tasks",icon:"\u{1F4CB}",label:t(lang,"my_tasks"),show:isModele},
     {id:"model_content",icon:"\u{1F4F8}",label:t(lang,"my_content_list"),show:isModele},
-    {id:"model_dashboard",icon:"\u{1F469}\u200D\u{1F4BC}",label:t(lang,"my_space"),show:isModele},
+    {id:"model_tasks",icon:"\u{1F4CB}",label:t(lang,"my_tasks"),show:isModele},
     {id:"model_payments",icon:"\u{1F4B0}",label:t(lang,"my_payments"),show:isModele},
-    // ── Standard tabs (hidden from modele) ──
-    {id:"dashboard",icon:"\u{1F4CA}",label:t(lang,"dashboard"),show:!isModele&&user.role!=="provider"},
-    {id:"transactions",icon:"\u{1F4B8}",label:user.role==="provider"?"Mes Transactions":t(lang,"transactions"),show:!isModele},
-    {id:"spenders",icon:"\u{1F4B3}",label:t(lang,"spenders"),show:user.role==="gerant"},
-    {id:"modeles",icon:"\u{1F469}",label:t(lang,"modeles"),show:user.role==="gerant"},
-    {id:"model_mgmt",icon:"\u{1F4CB}",label:t(lang,"models_mgmt"),show:user.role==="gerant"},
-    {id:"mes_spenders",icon:"\u{1F465}",label:t(lang,"my_spenders"),show:user.role==="chatter"||user.role==="gerant"},
-    {id:"objectifs",icon:"\u{1F3AF}",label:t(lang,"objectifs"),show:!isModele&&user.role!=="provider"},
-    {id:"chatters",icon:"\u{1F4AC}",label:t(lang,"chatters"),show:user.role==="gerant"},
-    {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:user.role==="provider"},
-    {id:"admin",icon:"\u2699",label:t(lang,"admin"),show:user.role==="gerant"},
+    // ── Standard tabs ──
+    {id:"dashboard",icon:"\u{1F4CA}",label:t(lang,"dashboard"),show:canSee("dashboard")},
+    {id:"transactions",icon:"\u{1F4B8}",label:isProvider?"Mes Transactions":isModele?t(lang,"my_transactions"):t(lang,"transactions"),show:canSee("transactions")&&!isModele},
+    {id:"spenders",icon:"\u{1F4B3}",label:t(lang,"spenders"),show:canSee("spenders")},
+    {id:"modeles",icon:"\u{1F469}",label:t(lang,"modeles"),show:canSee("modeles")},
+    {id:"model_mgmt",icon:"\u{1F4CB}",label:t(lang,"models_mgmt"),show:canSee("model_mgmt")},
+    {id:"mes_spenders",icon:"\u{1F465}",label:t(lang,"my_spenders"),show:canSee("mes_spenders")},
+    {id:"objectifs",icon:"\u{1F3AF}",label:t(lang,"objectifs"),show:canSee("objectifs")},
+    {id:"chatters",icon:"\u{1F4AC}",label:t(lang,"chatters"),show:canSee("chatters")},
+    {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:canSee("provider_compta")},
+    {id:"admin",icon:"\u2699",label:t(lang,"admin"),show:canSee("admin")},
   ];
+
+  // For chatter: add standalone paies tab (their pay history)
+  if (isChatter && canSee("paies")) {
+    tabs.push({id:"paies",icon:"\u{1F4B0}",label:lang==="fr"?"Ma paie":"My pay",show:true});
+  }
 
   // Sidebar items = standalone tabs + groups (inserted in logical order)
   const sidebarItems = [];
-  const standaloneIds = ["model_checklist","model_tasks","model_content","model_dashboard","model_payments","dashboard","transactions","spenders","modeles","model_mgmt","mes_spenders","objectifs"];
-  standaloneIds.forEach(id => { const t = tabs.find(x=>x.id===id); if(t&&t.show) sidebarItems.push({type:"tab",...t}); });
+  const standaloneIds = ["model_dashboard","model_checklist","model_tasks","model_content","model_payments","dashboard","transactions","spenders","modeles","model_mgmt","mes_spenders","objectifs","videos","paies"];
+  standaloneIds.forEach(id => { const found = tabs.find(x=>x.id===id); if(found&&found.show) sidebarItems.push({type:"tab",...found}); });
   // Insert groups
   tabGroups.forEach(g => { if(g.show) sidebarItems.push({type:"group",...g}); });
   // Remaining standalone
-  ["chatters","provider_compta","admin"].forEach(id => { const t = tabs.find(x=>x.id===id); if(t&&t.show) sidebarItems.push({type:"tab",...t}); });
+  ["chatters","provider_compta","admin"].forEach(id => { const found = tabs.find(x=>x.id===id); if(found&&found.show) sidebarItems.push({type:"tab",...found}); });
 
   return (
     <CurrencyContext.Provider value={currencyCtx}>
@@ -3733,7 +3786,21 @@ const App = () => {
             <button onClick={()=>setLang(lang==="fr"?"en":"fr")} title="Language" style={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:12,padding:"4px 10px",cursor:"pointer",color:"var(--text-secondary)",fontSize:12,fontWeight:600}}>{lang==="fr"?"EN":"FR"}</button>
             <button onClick={toggleTheme} title="Theme" style={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:12,padding:"4px 10px",cursor:"pointer",fontSize:14}}>{theme==="dark"?"☀️":"🌙"}</button>
             <span className="user-name">{user.name}</span>
-            <span className="role-badge">{user.role}</span>
+            <span className="role-badge">{viewAsRole ? `${user.role} → ${viewAsRole}` : user.role}</span>
+            {/* ── View-as role switcher (gérant only) ── */}
+            {user.role==="gerant"&&!viewAsRole&&(
+              <select value="" onChange={(e)=>{if(e.target.value){setViewAsRole(e.target.value);}}} title={lang==="fr"?"Voir comme...":"View as..."} style={{padding:"4px 8px",borderRadius:10,border:"1px solid var(--border-default)",background:"var(--bg-overlay)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>
+                <option value="">{lang==="fr"?"Voir comme...":"View as..."}</option>
+                <option value="modele">{lang==="fr"?"Modèle":"Model"}</option>
+                <option value="chatter">Chatter</option>
+                <option value="provider">Provider</option>
+              </select>
+            )}
+            {user.role==="gerant"&&viewAsRole&&(
+              <button onClick={()=>setViewAsRole(null)} style={{background:"var(--warning-muted,var(--accent-muted))",color:"var(--warning,var(--accent))",border:"1px solid var(--warning-muted,var(--accent-muted))",borderRadius:12,padding:"4px 10px",cursor:"pointer",fontSize:11,fontWeight:700,fontFamily:"'DM Sans',sans-serif"}}>
+                {lang==="fr"?"Quitter la vue":"Exit view"} ({viewAsRole})
+              </button>
+            )}
             <button onClick={handleLogout} title={t(lang,"logout")} style={{background:"var(--danger-muted)",color:"var(--danger)",border:"1px solid var(--danger-muted)",borderRadius:12,padding:"6px 12px",cursor:"pointer",fontSize:13,fontWeight:600,display:"flex",alignItems:"center",gap:4}}>🚪 {t(lang,"logout")}</button>
           </div>
         </div>
@@ -3743,37 +3810,41 @@ const App = () => {
           ))}
         </div>}
         <div className="content fade-in" key={drillDown?`drill-${drillDown.type}-${drillDown.id}`:tab}>
+          {viewAsRole && <div style={{background:"var(--accent-muted)",border:"1px solid var(--accent)",borderRadius:10,padding:"8px 16px",marginBottom:12,display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:12,fontWeight:600}}>
+            <span>{lang==="fr"?`Vue simulée : ${viewAsRole.toUpperCase()}`:`Simulated view: ${viewAsRole.toUpperCase()}`}</span>
+            <button onClick={()=>setViewAsRole(null)} style={{background:"var(--accent)",color:"white",border:"none",borderRadius:8,padding:"4px 12px",cursor:"pointer",fontSize:11,fontWeight:700,fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Quitter":"Exit"}</button>
+          </div>}
           {apiError && <ErrorBanner message={apiError} onDismiss={() => setApiError(null)} />}
           {drillDown ? (
             <DrillDownView drillDown={drillDown} user={user} txs={txs} models={models} profiles={profiles} payouts={payouts} lang={lang} />
           ) : (<React.Suspense fallback={<TabSpinner />}>
           {/* ── Modele-only pages ── */}
-          {tab==="model_checklist"&&user.role==="modele"&&<ModelChecklistTab user={user} lang={lang} />}
-          {tab==="model_tasks"&&user.role==="modele"&&<ModelTasksTab user={user} lang={lang} />}
-          {tab==="model_content"&&user.role==="modele"&&<ModelContentTab user={user} lang={lang} onRefresh={onRefresh} />}
-          {tab==="model_dashboard"&&user.role==="modele"&&<ModelDashboardTab user={user} lang={lang} />}
-          {tab==="model_payments"&&user.role==="modele"&&<ModelPaymentsTab user={user} lang={lang} invoices={invoices} />}
-          {/* ── Standard pages ── */}
-          {tab==="dashboard"&&user.role!=="provider"&&user.role!=="modele"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} />}
-          {tab==="modeles"&&user.role==="gerant"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
-          {tab==="model_mgmt"&&user.role==="gerant"&&<ModelManagementTab user={user} lang={lang} models={models} profiles={profiles} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} onRefresh={onRefresh} />}
-          {tab==="transactions"&&user.role!=="modele"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
-          {tab==="spenders"&&user.role==="gerant"&&<SpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} />}
-          {tab==="mes_spenders"&&(user.role==="chatter"||user.role==="gerant")&&<MesSpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} products={products} productTags={productTags} onRefresh={onRefresh} />}
-          {tab==="objectifs"&&user.role!=="provider"&&user.role!=="modele"&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} onRefresh={onRefresh} />}
-          {tab==="competition"&&user.role!=="provider"&&user.role!=="modele"&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
-          {tab==="paies"&&user.role!=="provider"&&user.role!=="modele"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
-          {tab==="chatters"&&user.role==="gerant"&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} />}
-          {tab==="providers"&&user.role==="gerant"&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} />}
-          {tab==="videos"&&user.role==="gerant"&&<VideosTab user={user} lang={lang} models={models} modelVideos={modelVideos} videoSessions={videoSessions} dbSpenders={spenders} onRefresh={onRefresh} />}
-          {tab==="products"&&user.role==="gerant"&&<ProductCatalogTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} onRefresh={onRefresh} />}
-          {tab==="compta"&&user.role==="gerant"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
-          {tab==="invoices"&&user.role==="gerant"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txs} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
-          {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} />}
-          {tab==="telegram"&&user.role==="gerant"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
-          {tab==="whatsapp"&&(user.role==="gerant"||user.role==="chatter")&&<WhatsAppAnalyzerTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
-          {tab==="agents"&&user.role==="gerant"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
-          {tab==="admin"&&user.role==="gerant"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
+          {tab==="model_checklist"&&canSee("model_checklist")&&<ModelChecklistTab user={user} lang={lang} />}
+          {tab==="model_tasks"&&canSee("model_tasks")&&<ModelTasksTab user={user} lang={lang} />}
+          {tab==="model_content"&&canSee("model_content")&&<ModelContentTab user={user} lang={lang} onRefresh={onRefresh} />}
+          {tab==="model_dashboard"&&canSee("model_dashboard")&&<ModelDashboardTab user={user} lang={lang} />}
+          {tab==="model_payments"&&canSee("model_payments")&&<ModelPaymentsTab user={user} lang={lang} invoices={invoices} />}
+          {/* ── Standard pages (role-guarded via canSee) ── */}
+          {tab==="dashboard"&&canSee("dashboard")&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} />}
+          {tab==="modeles"&&canSee("modeles")&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
+          {tab==="model_mgmt"&&canSee("model_mgmt")&&<ModelManagementTab user={user} lang={lang} models={models} profiles={profiles} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} onRefresh={onRefresh} />}
+          {tab==="transactions"&&canSee("transactions")&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
+          {tab==="spenders"&&canSee("spenders")&&<SpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} />}
+          {tab==="mes_spenders"&&canSee("mes_spenders")&&<MesSpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} products={products} productTags={productTags} onRefresh={onRefresh} />}
+          {tab==="objectifs"&&canSee("objectifs")&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="competition"&&canSee("competition")&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
+          {tab==="paies"&&canSee("paies")&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
+          {tab==="chatters"&&canSee("chatters")&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} />}
+          {tab==="providers"&&canSee("providers")&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} />}
+          {tab==="videos"&&canSee("videos")&&<VideosTab user={user} lang={lang} models={models} modelVideos={modelVideos} videoSessions={videoSessions} dbSpenders={spenders} onRefresh={onRefresh} />}
+          {tab==="products"&&canSee("products")&&<ProductCatalogTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} onRefresh={onRefresh} />}
+          {tab==="compta"&&canSee("compta")&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="invoices"&&canSee("invoices")&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txs} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
+          {tab==="provider_compta"&&canSee("provider_compta")&&<ProviderComptaTab user={user} lang={lang} txs={txs} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} />}
+          {tab==="telegram"&&canSee("telegram")&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
+          {tab==="whatsapp"&&canSee("whatsapp")&&<WhatsAppAnalyzerTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="agents"&&canSee("agents")&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
+          {tab==="admin"&&canSee("admin")&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
           </React.Suspense>)}
         </div>
       </div>
