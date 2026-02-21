@@ -9746,15 +9746,24 @@ const ChallengesSection = ({user, lang, txs, profiles, convertAmount, currencySy
 // =============================================
 // WHATSAPP ANALYZER
 // =============================================
-const WhatsAppAnalyzerTab = ({user, lang}) => {
+const WhatsAppAnalyzerTab = ({user, lang, spenders, txs, models, profiles, onRefresh}) => {
   const fr = lang === "fr";
   const addToast = useToast();
+  const { convertAmount, currencySymbol } = useCurrency();
 
   const [messages, setMessages] = useState([]);
   const [fileName, setFileName] = useState(null);
   const [parsing, setParsing] = useState(false);
   const [activeView, setActiveView] = useState("import");
   const [selectedParticipant, setSelectedParticipant] = useState("all");
+
+  // ── IA Analysis state ──
+  const [claudeKey, setClaudeKey] = useState(() => localStorage.getItem("dadash_claude_key") || "");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisResults, setAnalysisResults] = useState([]); // [{waContact, _raw}]
+  const [tgMatches, setTgMatches] = useState([]); // [{waContact, tgMatch, matchScore, matchReason, confidence}]
+  const [importedMap, setImportedMap] = useState({}); // {idx: true}
+  const [importingMap, setImportingMap] = useState({});
 
   // ── WhatsApp export parser ──
   // Handles formats:
@@ -9987,6 +9996,209 @@ for (let line of lines) {
     return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([emoji, count]) => ({ emoji, count }));
   }, [filteredMsgs]);
 
+  // ══ IA ANALYSIS ══
+  const WA_ANALYSIS_PROMPT = `Tu es un analyste expert de conversations WhatsApp pour une agence de modèles. Analyse cette conversation et extrais les informations.
+CONTEXTE : C'est une conversation entre un(e) modèle (l'agence) et un client potentiel/spender.
+Retourne UNIQUEMENT un JSON valide avec cette structure :
+{
+  "contact": {"display_name":"","first_name":null,"age":null,"city":null,"country":null,"job":null,"relationship_status":"inconnu","language":"fr"},
+  "spending": {"total_detected":0,"currency":"EUR","transactions":[{"amount":0,"currency":"EUR","product":null,"date":null,"confirmed":false}],"payment_methods_mentioned":[]},
+  "classification":"lead","classification_reason":"",
+  "behavior": {"interest_level":"medium","favorite_content":null,"responsiveness":"normal","best_time":null,"personality_notes":"","preferences":null,"risk_flags":[]},
+  "telegram_clues": {"mentions_telegram":false,"telegram_username":null,"redirected_to_telegram":false},
+  "summary":"","recommended_action":""
+}
+RÈGLES :
+- total_detected = somme des montants dont on a une confirmation de paiement
+- confirmed = true si le client a dit "envoyé","payé","c'est fait" ou si le modèle a confirmé réception
+- Classification: whale(500€+), vip(200-500€), regular(50-200€), lead(intéressé pas acheté), timewaster(10+msg 0 achat)
+- Retourne UNIQUEMENT le JSON, sans backticks, sans explication.`;
+
+  const analyzeWithClaude = async () => {
+    if (!claudeKey.trim()) { addToast(fr ? "Ajoute ta clé API Claude" : "Add your Claude API key", "warning"); return; }
+    if (messages.length === 0) { addToast(fr ? "Importe d'abord une conversation" : "Import a conversation first", "warning"); return; }
+    localStorage.setItem("dadash_claude_key", claudeKey);
+    setAnalyzing(true);
+    try {
+      // Group messages by conversation (all in one for single file import)
+      const recentMsgs = messages.slice(-200);
+      const text = recentMsgs.map(m => `${m.date instanceof Date ? m.date.toLocaleString("fr-FR") : m.date} - ${m.sender}: ${m.body}`).join("\n");
+      const contactName = participants.length >= 2
+        ? participants.sort((a,b) => a.count - b.count)[0]?.name || "inconnu"
+        : participants[0]?.name || "inconnu";
+      const phone = extractPhoneFromFilename(fileName || "");
+
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": claudeKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1500,
+          system: WA_ANALYSIS_PROMPT,
+          messages: [{ role: "user", content: `Analyse cette conversation WhatsApp :\n\nContact : ${contactName}\nNuméro : ${phone || "inconnu"}\n\n--- CONVERSATION ---\n${text}\n--- FIN ---` }],
+        }),
+      });
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error?.message || `HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      const raw = (data.content?.[0]?.text || "").trim().replace(/```json|```/g, "").trim();
+      const analysis = JSON.parse(raw);
+      const result = {
+        ...analysis,
+        _raw: { filename: fileName, phone, contactName, totalMessages: messages.length, dateRange: { first: messages[0]?.date, last: messages[messages.length-1]?.date } },
+      };
+      // Cross-match with existing spenders (TG contacts)
+      const matched = crossMatchTelegram(result, spenders || []);
+      setAnalysisResults([result]);
+      setTgMatches([matched]);
+      setImportedMap({});
+      setImportingMap({});
+      addToast(fr ? "Analyse IA terminée !" : "IA analysis complete!", "success");
+      setActiveView("results");
+    } catch (err) {
+      addToast(fr ? "Erreur IA: " + err.message : "IA error: " + err.message, "error");
+    }
+    setAnalyzing(false);
+  };
+
+  const extractPhoneFromFilename = (filename) => {
+    const phoneMatch = (filename || "").match(/\+?\d[\d\s\-]{8,}/);
+    return phoneMatch ? phoneMatch[0].replace(/[\s\-]/g, "") : null;
+  };
+
+  // ── Cross-match Telegram ──
+  const crossMatchTelegram = (waResult, dbSpenders) => {
+    let bestMatch = null, matchScore = 0, matchReason = "";
+    const wa = waResult;
+    for (const sp of dbSpenders) {
+      let score = 0; const reasons = [];
+      // Match by first name
+      if (wa.contact?.first_name && sp.first_name && wa.contact.first_name.toLowerCase() === sp.first_name.toLowerCase()) {
+        score += 40; reasons.push(fr ? "même prénom" : "same first name");
+      }
+      // Match by telegram username mentioned in conversation
+      if (wa.telegram_clues?.telegram_username && sp.telegram_username && wa.telegram_clues.telegram_username.replace("@","").toLowerCase() === sp.telegram_username.replace("@","").toLowerCase()) {
+        score += 80; reasons.push("@username TG");
+      }
+      // Match by handle / display name
+      if (wa.contact?.display_name && sp.handle && wa.contact.display_name.toLowerCase() === sp.handle.toLowerCase()) {
+        score += 50; reasons.push(fr ? "même handle" : "same handle");
+      }
+      // Match by city
+      if (wa.contact?.city && sp.city && wa.contact.city.toLowerCase() === sp.city.toLowerCase()) {
+        score += 15; reasons.push(fr ? "même ville" : "same city");
+      }
+      // Match by age (±2)
+      if (wa.contact?.age && sp.age && Math.abs(wa.contact.age - sp.age) <= 2) {
+        score += 10; reasons.push(fr ? "âge similaire" : "similar age");
+      }
+      // Match by spending
+      const spTxs = (txs || []).filter(t => t.spender_handle === sp.handle);
+      const spTotal = spTxs.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+      if (wa.spending?.total_detected > 0 && spTotal > 0) {
+        const ratio = wa.spending.total_detected / spTotal;
+        if (ratio > 0.8 && ratio < 1.2) { score += 10; reasons.push(fr ? "dépenses similaires" : "similar spending"); }
+      }
+      if (wa.telegram_clues?.redirected_to_telegram && score >= 40) {
+        score += 20; reasons.push(fr ? "redirigé vers TG" : "redirected to TG");
+      }
+      if (score > matchScore) { matchScore = score; bestMatch = sp; matchReason = reasons.join(" + "); }
+    }
+    return {
+      waContact: wa,
+      tgMatch: matchScore >= 40 ? bestMatch : null,
+      matchScore,
+      matchReason,
+      confidence: matchScore >= 80 ? "high" : matchScore >= 40 ? "medium" : "low",
+    };
+  };
+
+  // ── Import to CRM ──
+  const importToCRM = async (idx, result) => {
+    setImportingMap(p => ({...p, [idx]: true}));
+    try {
+      const wa = result.waContact || result;
+      const phone = wa._raw?.phone || null;
+      const handle = wa.contact?.display_name?.replace(/\s+/g, "_").toLowerCase() || wa._raw?.contactName?.replace(/\s+/g, "_").toLowerCase() || "wa_unknown";
+      const spenderData = {
+        handle,
+        name: wa.contact?.display_name || handle,
+        first_name: wa.contact?.first_name || null,
+        age: wa.contact?.age || null,
+        city: wa.contact?.city || null,
+        job: wa.contact?.job || null,
+        relationship_status: wa.contact?.relationship_status || null,
+        whatsapp_phone: phone,
+        classification: wa.classification || "lead",
+        favorite_content: wa.behavior?.favorite_content || null,
+        best_time: wa.behavior?.best_time || null,
+        personality_notes: wa.behavior?.personality_notes || null,
+        source: "whatsapp_scan",
+        last_contact_date: new Date().toISOString(),
+        status: "active",
+      };
+      // Upsert spender
+      await safeUpsertSpender(spenderData);
+      // Create confirmed TX
+      const confirmedTx = (wa.spending?.transactions || []).filter(t => t.confirmed);
+      for (const tx of confirmedTx) {
+        await safeInsertTx({
+          amount: tx.amount,
+          currency: tx.currency || wa.spending?.currency || "EUR",
+          spender_handle: handle,
+          product: tx.product || null,
+          status: "pending",
+          notes: "Auto-detect WhatsApp Analyzer",
+          date: tx.date ? new Date(tx.date.split("/").reverse().join("-")).toISOString() : new Date().toISOString(),
+          chatter_id: user.id,
+        });
+      }
+      // Link to TG match if exists
+      const match = tgMatches[idx];
+      if (match?.tgMatch?.id) {
+        await sb.from("spenders").update({ whatsapp_phone: phone }).eq("id", match.tgMatch.id);
+      }
+      // Log analysis
+      try {
+        await sb.from("wa_analysis_logs").insert({
+          analyzed_by: user.id,
+          filename: wa._raw?.filename || null,
+          contact_phone: phone,
+          contact_name: wa.contact?.display_name || null,
+          total_messages: wa._raw?.totalMessages || 0,
+          analysis_result: wa,
+          tg_match_id: match?.tgMatch?.id || null,
+          tg_match_score: match?.matchScore || 0,
+          imported: true,
+        });
+      } catch (e) { console.warn("wa_analysis_logs insert failed:", e); }
+      setImportedMap(p => ({...p, [idx]: true}));
+      addToast(fr ? `${wa.contact?.display_name || handle} importé dans le CRM !` : `${wa.contact?.display_name || handle} imported to CRM!`, "success");
+      if (onRefresh) await onRefresh();
+    } catch (err) {
+      addToast(fr ? "Erreur import: " + err.message : "Import error: " + err.message, "error");
+    }
+    setImportingMap(p => ({...p, [idx]: false}));
+  };
+
+  // ── Analysis KPIs ──
+  const analysisKPIs = useMemo(() => {
+    if (!analysisResults.length) return null;
+    const contacts = analysisResults.length;
+    const whales = analysisResults.filter(r => r.classification === "whale").length;
+    const totalSpent = analysisResults.reduce((s, r) => s + (r.spending?.total_detected || 0), 0);
+    const tgMatchCount = tgMatches.filter(m => m.tgMatch).length;
+    const totalTx = analysisResults.reduce((s, r) => s + (r.spending?.transactions?.filter(t => t.confirmed)?.length || 0), 0);
+    return { contacts, whales, totalSpent, tgMatchCount, totalTx };
+  }, [analysisResults, tgMatches]);
+
   const COLORS = ["#818cf8", "#34d399", "#f472b6", "#fbbf24", "#f87171", "#22d3ee", "#a78bfa", "#fb923c", "#4ade80", "#e879f9"];
 
   // ── Card helper ──
@@ -10011,6 +10223,8 @@ for (let line of lines) {
         {[
           {key: "import", icon: "📱", label: fr ? "Import WhatsApp" : "Import WhatsApp"},
           ...(messages.length > 0 ? [
+            {key: "ia_analyze", icon: "🤖", label: fr ? "Analyse IA" : "IA Analysis"},
+            ...(analysisResults.length > 0 ? [{key: "results", icon: "📋", label: fr ? "Résultats" : "Results"}] : []),
             {key: "overview", icon: "📊", label: fr ? "Vue globale" : "Overview"},
             {key: "participants", icon: "👥", label: fr ? "Participants" : "Participants"},
             {key: "activity", icon: "📈", label: fr ? "Activité" : "Activity"},
@@ -10098,6 +10312,184 @@ for (let line of lines) {
               <div>2/21/24, 2:30 PM - John: Hello!</div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ═══ 1b) IA ANALYSIS ═══ */}
+      {activeView === "ia_analyze" && (
+        <div>
+          <div className="card" style={{marginBottom: 16}}>
+            <div className="section-title"><div className="section-bar"></div>{"\u{1F916}"} {fr ? "Analyse IA par Claude" : "Claude IA Analysis"}</div>
+            <p style={{color: "var(--text-secondary)", fontSize: 13, marginBottom: 16}}>
+              {fr ? "Claude analyse la conversation et extrait : infos perso, d\u00E9penses, classification, comportement, indices Telegram." : "Claude analyzes the conversation and extracts: personal info, spending, classification, behavior, Telegram clues."}
+            </p>
+            {/* API Key input */}
+            <div style={{marginBottom: 16}}>
+              <label style={{fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4}}>{fr ? "Cl\u00E9 API Claude (stock\u00E9e localement)" : "Claude API Key (stored locally)"}</label>
+              <input type="password" value={claudeKey} onChange={e => setClaudeKey(e.target.value)}
+                placeholder="sk-ant-api03-..."
+                style={{width: "100%", maxWidth: 400, padding: "10px 14px", borderRadius: 10, background: "var(--bg-overlay)", border: "1px solid var(--border-default)", color: "var(--text-primary)", fontSize: 13, fontFamily: "monospace", outline: "none", boxSizing: "border-box"}} />
+            </div>
+            <div style={{display: "flex", gap: 10, alignItems: "center"}}>
+              <button onClick={analyzeWithClaude} disabled={analyzing || !claudeKey.trim()} style={{
+                padding: "12px 28px", borderRadius: 12, background: "var(--accent-muted)", border: "1px solid var(--border-accent)",
+                color: "var(--accent)", fontSize: 14, fontWeight: 700, cursor: analyzing ? "wait" : "pointer",
+                fontFamily: "'DM Sans',sans-serif", opacity: !claudeKey.trim() ? 0.5 : 1,
+              }}>
+                {analyzing ? "\u23F3" : "\u{1F916}"} {analyzing ? (fr ? "Analyse en cours..." : "Analyzing...") : (fr ? "Analyser avec Claude" : "Analyze with Claude")}
+              </button>
+              <span style={{fontSize: 12, color: "var(--text-quaternary)"}}>{messages.length} {fr ? "messages \u00E0 analyser" : "messages to analyze"}</span>
+            </div>
+          </div>
+          {/* Preview of what will be analyzed */}
+          {messages.length > 0 && (
+            <div className="card">
+              <div className="section-title"><div className="section-bar"></div>{fr ? "Aper\u00E7u de la conversation" : "Conversation preview"}</div>
+              <div style={{fontSize: 11, color: "var(--text-tertiary)", marginBottom: 8}}>
+                {participants.length} {fr ? "participants" : "participants"} {"\u00B7"} {messages.length} messages {"\u00B7"} {fileName || ""}
+              </div>
+              <div style={{maxHeight: 200, overflowY: "auto", padding: 12, borderRadius: 10, background: "var(--bg-overlay)", border: "1px solid var(--border-subtle)", fontFamily: "monospace", fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.6}}>
+                {messages.slice(-30).map((m, i) => (
+                  <div key={i}><span style={{color: "var(--text-quaternary)"}}>{m.date instanceof Date ? m.date.toLocaleString("fr-FR",{hour:"2-digit",minute:"2-digit"}) : ""}</span> <span style={{color: "var(--accent)", fontWeight: 600}}>{m.sender}:</span> {m.body.slice(0, 100)}</div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══ 1c) RESULTS ═══ */}
+      {activeView === "results" && analysisResults.length > 0 && (
+        <div>
+          {/* KPIs */}
+          {analysisKPIs && (
+            <div style={{display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap"}}>
+              <StatCard icon={"\u{1F4AC}"} label={fr ? "Contacts analys\u00E9s" : "Contacts analyzed"} value={analysisKPIs.contacts} />
+              <StatCard icon={"\u{1F40B}"} label="Whales" value={analysisKPIs.whales} />
+              <StatCard icon={"\u{1F4B0}"} label={fr ? "D\u00E9penses d\u00E9tect\u00E9es" : "Spending detected"} value={`${analysisKPIs.totalSpent}${currencySymbol}`} />
+              <StatCard icon={"\u2708\uFE0F"} label={fr ? "Matchs TG" : "TG matches"} value={analysisKPIs.tgMatchCount} />
+              <StatCard icon={"\u{1F4B8}"} label="TX" value={analysisKPIs.totalTx} />
+            </div>
+          )}
+          {/* Result cards */}
+          {analysisResults.map((wa, idx) => {
+            const match = tgMatches[idx] || {};
+            const tg = match.tgMatch;
+            const isImported = importedMap[idx];
+            const isImporting = importingMap[idx];
+            const classCol = {whale:{bg:"var(--accent-subtle)",border:"var(--accent-muted)",text:"var(--accent)",icon:"\u{1F40B}"},vip:{bg:"var(--warning-muted)",border:"var(--warning-muted)",text:"var(--warning)",icon:"\u2B50"},regular:{bg:"var(--success-muted)",border:"var(--success-muted)",text:"var(--success)",icon:"\u{1F464}"},lead:{bg:"var(--pink-muted)",border:"var(--pink-muted)",text:"var(--pink)",icon:"\u{1F3AF}"},timewaster:{bg:"var(--danger-muted)",border:"var(--danger-muted)",text:"var(--danger)",icon:"\u23F0"}};
+            const c = classCol[wa.classification] || classCol.lead;
+            return (
+              <div key={idx} className="card" style={{marginBottom: 16, opacity: isImported ? 0.7 : 1}}>
+                {/* Header */}
+                <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14}}>
+                  <div style={{display: "flex", alignItems: "center", gap: 10}}>
+                    <div style={{width:44,height:44,borderRadius:14,background:c.bg,border:`1px solid ${c.border}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:c.text}}>
+                      {wa.contact?.first_name?.[0] || "?"}
+                    </div>
+                    <div>
+                      <div style={{fontSize:15,fontWeight:800}}>{wa.contact?.display_name || "?"}</div>
+                      <div style={{fontSize:11,color:"var(--text-tertiary)"}}>
+                        {"\u{1F4DE}"} {wa._raw?.phone || (fr ? "num\u00E9ro inconnu" : "unknown")} {"\u00B7"} {wa._raw?.totalMessages || 0} messages
+                      </div>
+                    </div>
+                  </div>
+                  <span style={{padding:"3px 10px",borderRadius:8,background:c.bg,border:`1px solid ${c.border}`,color:c.text,fontSize:10,fontWeight:700}}>{c.icon} {(wa.classification||"lead").toUpperCase()}</span>
+                </div>
+                {/* Info tags */}
+                <div style={{display:"flex",flexWrap:"wrap",gap:4,marginBottom:12}}>
+                  {wa.contact?.first_name && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u{1F464}"} {wa.contact.first_name}</span>}
+                  {wa.contact?.age && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u{1F382}"} {wa.contact.age} ans</span>}
+                  {wa.contact?.city && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u{1F4CD}"} {wa.contact.city}</span>}
+                  {wa.contact?.job && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u{1F4BC}"} {wa.contact.job}</span>}
+                  {wa.contact?.relationship_status && wa.contact.relationship_status !== "inconnu" && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u{1F48D}"} {wa.contact.relationship_status}</span>}
+                  {wa.behavior?.favorite_content && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u2764\uFE0F"} {wa.behavior.favorite_content}</span>}
+                  {wa.behavior?.best_time && <span style={{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:10,color:"var(--text-secondary)"}}>{"\u{1F550}"} {wa.behavior.best_time}</span>}
+                </div>
+                {/* Metrics row */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:12}}>
+                  <div style={{padding:"8px 12px",borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}>
+                    <div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase",letterSpacing:0.5}}>{fr?"D\u00E9pens\u00E9":"Spent"}</div>
+                    <div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{wa.spending?.total_detected || 0}{wa.spending?.currency==="USD"?"$":"\u20AC"}</div>
+                  </div>
+                  <div style={{padding:"8px 12px",borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}>
+                    <div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase",letterSpacing:0.5}}>TX</div>
+                    <div style={{fontSize:18,fontWeight:800}}>{wa.spending?.transactions?.filter(t=>t.confirmed)?.length || 0}</div>
+                  </div>
+                  <div style={{padding:"8px 12px",borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}>
+                    <div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase",letterSpacing:0.5}}>{fr?"Int\u00E9r\u00EAt":"Interest"}</div>
+                    <div style={{fontSize:14,fontWeight:700,color:wa.behavior?.interest_level==="high"?"var(--success)":wa.behavior?.interest_level==="medium"?"var(--warning)":"var(--danger)"}}>{wa.behavior?.interest_level || "?"}</div>
+                  </div>
+                </div>
+                {/* IA Analysis summary */}
+                <div style={{padding:"12px 16px",borderRadius:12,background:"var(--accent-subtle)",border:"1px solid var(--accent-muted)",marginBottom:12}}>
+                  <div style={{fontSize:10,color:"var(--accent)",fontWeight:700,marginBottom:4}}>{"\u{1F916}"} ANALYSE IA</div>
+                  <div style={{fontSize:12,color:"var(--text-secondary)",lineHeight:1.5}}>{wa.summary || ""}</div>
+                  {wa.recommended_action && <div style={{fontSize:11,color:"var(--success)",fontWeight:600,marginTop:6}}>{"\u{1F4A1}"} {wa.recommended_action}</div>}
+                </div>
+                {/* Personality */}
+                {wa.behavior?.personality_notes && (
+                  <div style={{padding:"8px 12px",borderRadius:10,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:11,color:"var(--text-tertiary)",fontStyle:"italic",marginBottom:12}}>
+                    {"\u{1F4A1}"} {wa.behavior.personality_notes}
+                  </div>
+                )}
+                {/* Detected TX */}
+                {wa.spending?.transactions?.length > 0 && (
+                  <div style={{marginBottom:12}}>
+                    <div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>{fr?"Transactions d\u00E9tect\u00E9es":"Detected transactions"}</div>
+                    {wa.spending.transactions.map((tx, ti) => (
+                      <div key={ti} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 10px",borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",marginBottom:4,fontSize:12}}>
+                        <span style={{fontWeight:700,color:tx.confirmed?"var(--success)":"var(--text-tertiary)"}}>{tx.amount}{tx.currency==="USD"?"$":"\u20AC"} {tx.confirmed?"\u2705":"\u2753"}</span>
+                        <span style={{color:"var(--text-secondary)"}}>{tx.product || "\u2014"}</span>
+                        <span style={{fontSize:10,color:"var(--text-quaternary)"}}>{tx.date || "\u2014"}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {/* Risk flags */}
+                {wa.behavior?.risk_flags?.length > 0 && (
+                  <div style={{padding:"8px 12px",borderRadius:10,background:"var(--danger-muted)",border:"1px solid var(--danger-muted)",marginBottom:12}}>
+                    <span style={{fontSize:10,color:"var(--danger)",fontWeight:700}}>{"\u26A0\uFE0F"} {wa.behavior.risk_flags.join(" \u00B7 ")}</span>
+                  </div>
+                )}
+                {/* TG Cross-match */}
+                {tg ? (
+                  <div style={{padding:"10px 14px",borderRadius:12,background:"var(--success-muted)",border:"1px solid var(--success-muted)",display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                    <div>
+                      <div style={{fontSize:11,color:"var(--success)",fontWeight:700}}>{"\u2708\uFE0F"} MATCH TELEGRAM ({match.confidence})</div>
+                      <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>@{tg.telegram_username||tg.handle} {"\u2014"} {match.matchReason}</div>
+                    </div>
+                    <span style={{padding:"3px 10px",borderRadius:8,background:"var(--success-muted)",color:"var(--success)",fontSize:10,fontWeight:700}}>{match.matchScore}%</span>
+                  </div>
+                ) : (
+                  <div style={{padding:"8px 12px",borderRadius:10,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)",fontSize:11,color:"var(--text-quaternary)",marginBottom:12}}>
+                    {"\u2708\uFE0F"} {fr ? "Pas de match Telegram trouv\u00E9" : "No Telegram match found"}
+                  </div>
+                )}
+                {/* Action buttons */}
+                <div style={{display:"flex",gap:8}}>
+                  {isImported ? (
+                    <span style={{padding:"10px 20px",borderRadius:12,background:"var(--success-muted)",color:"var(--success)",fontSize:13,fontWeight:700}}>{"\u2705"} {fr ? "Import\u00E9 dans le CRM" : "Imported to CRM"}</span>
+                  ) : (
+                    <button onClick={() => importToCRM(idx, {waContact: wa})} disabled={isImporting} style={{
+                      flex:1,padding:"10px 20px",borderRadius:12,background:"var(--accent-muted)",border:"1px solid var(--border-accent)",
+                      color:"var(--accent)",fontSize:13,fontWeight:700,cursor:isImporting?"wait":"pointer",fontFamily:"'DM Sans',sans-serif",
+                    }}>
+                      {isImporting ? "\u23F3" : "\u{1F4BE}"} {fr ? "Importer dans le CRM" : "Import to CRM"}
+                    </button>
+                  )}
+                  {tg && !isImported && (
+                    <button onClick={() => importToCRM(idx, {waContact: wa})} style={{
+                      padding:"10px 16px",borderRadius:12,background:"var(--success-muted)",border:"1px solid var(--success-muted)",
+                      color:"var(--success)",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",
+                    }}>
+                      {"\u{1F517}"} {fr ? "Lier au TG" : "Link to TG"}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -10709,7 +11101,7 @@ const App = () => {
     {id:"competition",icon:"\u{1F3C6}",label:t(lang,"competition"),show:!isModele&&user.role!=="provider"},
     {id:"chatters",icon:"\u{1F4AC}",label:t(lang,"chatters"),show:user.role==="gerant"},
     {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:user.role==="provider"},
-    {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:user.role==="gerant"},
+    {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:user.role==="gerant"||user.role==="chatter"},
     {id:"telegram",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#0088cc"},React.createElement("path",{d:"M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.479.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"})),label:"Telegram",show:user.role==="gerant"},
     {id:"agents",icon:"\u{1F916}",label:"Agents IA",show:user.role==="gerant"},
     {id:"admin",icon:"\u2699",label:t(lang,"admin"),show:user.role==="gerant"},
@@ -10818,7 +11210,7 @@ const App = () => {
           {tab==="compta"&&user.role==="gerant"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} />}
           {tab==="telegram"&&user.role==="gerant"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
-          {tab==="whatsapp"&&user.role==="gerant"&&<WhatsAppAnalyzerTab user={user} lang={lang} />}
+          {tab==="whatsapp"&&(user.role==="gerant"||user.role==="chatter")&&<WhatsAppAnalyzerTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="agents"&&user.role==="gerant"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
           {tab==="admin"&&user.role==="gerant"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
           </>)}
