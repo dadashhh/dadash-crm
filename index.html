@@ -8027,21 +8027,32 @@ const WhatsAppAnalyzerTab = ({user, lang}) => {
 
   // ── WhatsApp export parser ──
   // Handles formats:
-  //   [dd/mm/yyyy, hh:mm:ss] Name: msg
-  //   dd/mm/yyyy, hh:mm - Name: msg
+  //   [M/DD/YY, h:mm:ss AM] ~Name: msg   (US with brackets + optional tilde)
+  //   [M/DD/YY, h:mm:ss AM] Name: msg
+  //   [dd/mm/yyyy, hh:mm:ss] Name: msg    (EU with brackets)
+  //   dd/mm/yyyy, hh:mm - Name: msg       (EU without brackets)
   //   dd/mm/yyyy hh:mm - Name: msg
-  //   mm/dd/yy, h:mm AM - Name: msg
   const parseWhatsApp = (text) => {
     const lines = text.split("\n");
     const results = [];
-    // Multi-format regex
+    // Multi-format regex — order matters: bracketed first, then bare
     const datePatterns = [
-      /^\[?(\d{1,2}\/\d{1,2}\/\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\]?\s*[-–]\s*/,
-      /^(\d{1,2}\/\d{1,2}\/\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\s*[-–]\s*/,
+      // [date, time] (optional ~)Name:  — US/bracketed format (no dash after bracket)
+      /^\[(\d{1,2}\/\d{1,2}\/\d{2,4}),\s+(\d{1,2}:\d{2}(?::\d{2})?\s*[APap][Mm])\]\s+/,
+      // [date, time] Name:  — EU bracketed without AM/PM
+      /^\[(\d{1,2}\/\d{1,2}\/\d{2,4}),\s+(\d{1,2}:\d{2}(?::\d{2})?)\]\s+/,
+      // date, time - Name:  — bare with dash separator
+      /^(\d{1,2}\/\d{1,2}\/\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\s*[-–]\s+/,
+      // date time - Name:  — bare without comma
+      /^(\d{1,2}\/\d{1,2}\/\d{2,4})\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\s*[-–]\s+/,
     ];
+
+    // Skip known system/header lines
+    const skipLine = (l) => /^(Messages and calls are end-to-end encrypted|Les messages et les appels sont chiffr)/i.test(l.trim());
 
     let currentMsg = null;
     for (const line of lines) {
+      if (skipLine(line)) continue;
       let matched = false;
       for (const pat of datePatterns) {
         const m = line.match(pat);
@@ -8050,28 +8061,42 @@ const WhatsAppAnalyzerTab = ({user, lang}) => {
           const dateStr = m[1];
           const timeStr = m[2];
           const rest = line.slice(m[0].length);
-          const colonIdx = rest.indexOf(":");
+          // Strip leading ~ (WhatsApp contact prefix)
+          const cleanRest = rest.replace(/^~\s*/, "");
+          const colonIdx = cleanRest.indexOf(":");
           if (colonIdx > 0 && colonIdx < 60) {
-            const sender = rest.slice(0, colonIdx).trim();
-            const body = rest.slice(colonIdx + 1).trim();
-            // Parse date
+            const sender = cleanRest.slice(0, colonIdx).trim();
+            const body = cleanRest.slice(colonIdx + 1).trim();
+            // Parse date parts
             const dateParts = dateStr.split("/");
             let day, month, year;
             if (dateParts.length === 3) {
-              // Try dd/mm/yyyy first (most common in FR)
-              day = parseInt(dateParts[0], 10);
-              month = parseInt(dateParts[1], 10);
+              const p0 = parseInt(dateParts[0], 10);
+              const p1 = parseInt(dateParts[1], 10);
               year = parseInt(dateParts[2], 10);
-              if (day > 12) { /* dd/mm format confirmed */ }
-              else if (month > 12) { const tmp = day; day = month; month = tmp; } // mm/dd
               if (year < 100) year += 2000;
+              // Detect M/D/YY (US) vs D/M/YY (EU)
+              if (p1 > 12) {
+                // p1 can't be month → must be M/D/YY (US format)
+                month = p0; day = p1;
+              } else if (p0 > 12) {
+                // p0 can't be month → must be D/M/YY (EU format)
+                day = p0; month = p1;
+              } else {
+                // Ambiguous — use US (M/D/YY) for bracketed format, EU for bare
+                if (line.startsWith("[")) { month = p0; day = p1; }
+                else { day = p0; month = p1; }
+              }
             }
-            const timeParts = timeStr.replace(/\s*[APap][Mm]/, "").split(":");
+            // Parse time with AM/PM support
+            const isPM = /PM/i.test(timeStr);
+            const isAM = /AM/i.test(timeStr);
+            const timeParts = timeStr.replace(/\s*[APap][Mm]/g, "").trim().split(":");
             let hour = parseInt(timeParts[0], 10);
             const min = parseInt(timeParts[1], 10) || 0;
             const sec = parseInt(timeParts[2], 10) || 0;
-            if (/[Pp][Mm]/i.test(timeStr) && hour < 12) hour += 12;
-            if (/[Aa][Mm]/i.test(timeStr) && hour === 12) hour = 0;
+            if (isPM && hour < 12) hour += 12;
+            if (isAM && hour === 12) hour = 0;
             const date = new Date(year, month - 1, day, hour, min, sec);
             const isMedia = /(<Media omitted>|<Médias omis>|image omitted|video omitted|audio omitted|document omitted|sticker omitted|GIF omitted)/i.test(body);
             const isLink = /(https?:\/\/[^\s]+)/i.test(body);
@@ -8079,7 +8104,7 @@ const WhatsAppAnalyzerTab = ({user, lang}) => {
           } else {
             // System message (no colon = no sender)
             if (currentMsg) results.push(currentMsg);
-            currentMsg = { date: new Date(), sender: "__system__", body: rest, isMedia: false, isLink: false, isSystem: true };
+            currentMsg = { date: new Date(), sender: "__system__", body: cleanRest, isMedia: false, isLink: false, isSystem: true };
           }
           matched = true;
           break;
