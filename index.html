@@ -23,6 +23,7 @@
   <script src="https://cdn.jsdelivr.net/npm/recharts@2.1.16/umd/Recharts.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html { scroll-behavior: smooth; }
@@ -4774,12 +4775,13 @@ const CompetitionTab = ({user, lang, txs, profiles}) => {
 // =============================================
 // PAIES TAB
 // =============================================
-const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh}) => {
+const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh, invoices}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const dr = useDateRange("all");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [payesSubTab, setPayesSubTab] = useState("paies");
   const chatters = user.role==="chatter" ? profiles.filter(u=>u.id===user.id) : profiles.filter(u=>u.role==="chatter");
   const [form, setForm] = useState({user_id:chatters[0]?.id||"",amount:"",method:"Virement",date:""});
   const payFilteredTxs = dr.filterByDate(txs, "date");
@@ -4793,8 +4795,13 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh}) => {
     if(!form.amount||!form.date) return;
     setSaving(true);
     try {
-      const {error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date, status:"pending"});
+      const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date, status:"pending"}).select().single();
       if(error) { addToast("Erreur payout: " + error.message, "error"); setSaving(false); return; }
+      // Auto-generate invoice for chatter payout
+      const chatterProfile = profiles.find(p=>p.id===form.user_id);
+      if(inserted && user.role==="gerant") {
+        try { await generateChatterInvoice({id:inserted.id, user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { console.warn("Invoice gen error:", e); }
+      }
       setForm({user_id:chatters[0]?.id||"",amount:"",method:"Virement",date:""});
       setShowForm(false);
       await onRefresh();
@@ -4802,8 +4809,24 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh}) => {
     } catch(e) { addToast("Erreur payout: " + e.message, "error"); }
     setSaving(false);
   };
+  const myInvoices = (invoices||[]).filter(inv => {
+    if (user.role === "chatter") return inv.profile_id === user.id && inv.type === "outgoing_chatter";
+    if (user.role === "gerant") return inv.type === "outgoing_chatter";
+    return false;
+  });
+  const fr = lang === "fr";
   return (
     <div>
+      {/* Sub-tab selector */}
+      <div style={{display:"flex",gap:4,marginBottom:20}}>
+        {[{id:"paies",label:fr?"Mes Paies":"My Payouts"},{id:"factures",label:fr?"Mes Factures":"My Invoices"}].map(tb=>(
+          <button key={tb.id} className="btn" style={{padding:"6px 16px",fontSize:12,fontWeight:payesSubTab===tb.id?800:600,background:payesSubTab===tb.id?"var(--accent)":"var(--card-bg)",color:payesSubTab===tb.id?"#fff":"var(--text-secondary)",border:"1px solid "+(payesSubTab===tb.id?"var(--accent)":"var(--border-subtle)"),borderRadius:20}} onClick={()=>setPayesSubTab(tb.id)}>{tb.label}</button>
+        ))}
+      </div>
+      {payesSubTab==="factures" ? (
+        <MyInvoicesPanel invoices={myInvoices} lang={lang} />
+      ) : (
+      <>
       <GlobalFilterBar lang={lang} dr={dr} />
       {chatters.map(ch=>{
         const data = getChatterData(ch.id);
@@ -4866,6 +4889,8 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh}) => {
             </div>
           )}
         </>
+      )}
+      </>
       )}
     </div>
   );
@@ -6271,12 +6296,13 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
 // =============================================
 // PROVIDER COMPTA TAB — Full Provider Dashboard
 // =============================================
-const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, onRefresh, onNotify}) => {
+const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, onRefresh, onNotify, invoices}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [provSubTab, setProvSubTab] = useState("paiements");
   const [form, setForm] = useState({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
 
   // TX stats
@@ -6329,6 +6355,8 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
     return React.createElement("span",{style:{padding:"3px 10px",borderRadius:12,background:st.bg,color:st.color,fontSize:11,fontWeight:700}},st.icon+" "+s);
   };
 
+  const myProviderInvoices = (invoices||[]).filter(inv => inv.type === "incoming_provider" && inv.provider_id === user.id);
+
   return (
     <div>
       {/* Header */}
@@ -6336,6 +6364,18 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
         <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{fr?"Bonjour":"Hello"} {user.name} {"\u{1F44B}"}</h2>
         <p style={{fontSize:11,color:"var(--text-tertiary)",margin:"3px 0 0",fontStyle:"italic"}}>{fr?"Votre espace prestataire":"Your provider space"}</p>
       </div>
+
+      {/* Sub-tabs: Paiements / Factures */}
+      <div style={{display:"flex",gap:4,marginBottom:20}}>
+        {[{id:"paiements",label:fr?"Mes Paiements":"My Payments"},{id:"factures",label:fr?"Mes Factures":"My Invoices"}].map(tb=>(
+          <button key={tb.id} className="btn" style={{padding:"6px 16px",fontSize:12,fontWeight:provSubTab===tb.id?800:600,background:provSubTab===tb.id?"var(--accent)":"var(--card-bg)",color:provSubTab===tb.id?"#fff":"var(--text-secondary)",border:"1px solid "+(provSubTab===tb.id?"var(--accent)":"var(--border-subtle)"),borderRadius:20}} onClick={()=>setProvSubTab(tb.id)}>{tb.label}</button>
+        ))}
+      </div>
+
+      {provSubTab === "factures" ? (
+        <MyInvoicesPanel invoices={myProviderInvoices} lang={lang} />
+      ) : (
+      <>
 
       {/* KPIs */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:24}}>
@@ -6453,6 +6493,8 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
           </table>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 };
@@ -6774,6 +6816,8 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
               const pp=allPP.find(p=>p.id===ppId);
               const provName=profiles.find(p=>p.id===pp?.provider_id)?.name||"Provider";
               if(onNotify&&pp) await onNotify(pp.declared_by,"payment","\u2705 Paiement validé",`Votre paiement de ${pp.amount}${pp.currency==="EUR"?"€":"CHF"} a été validé`);
+              // Auto-generate provider invoice
+              if(pp) { try { await generateProviderInvoice(pp, profiles, user.id); } catch(e) { console.warn("Provider invoice gen error:", e); } }
               addToast(fr?"Paiement validé ✓":"Payment validated ✓","success");
               if(onRefresh) await onRefresh();
             }
@@ -7932,7 +7976,59 @@ const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeR
           <span style={{fontSize:11,color:"var(--text2)",marginLeft:8}}>{lang==="fr"?"(modifiable en temps réel)":"(live editable)"}</span>
         </div>
       </div>
+      {/* Agency Details Config for Invoicing */}
+      <AgencyConfigSection lang={lang} />
     </div>
+  );
+};
+
+// ── AGENCY CONFIG SECTION (for AdminTab) ──
+const AgencyConfigSection = ({ lang }) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [agencyForm, setAgencyForm] = useState(() => getAgencyDetails());
+  const [saved, setSaved] = useState(false);
+  const handleSave = () => {
+    saveAgencyDetails(agencyForm);
+    setSaved(true);
+    addToast(fr ? "Informations agence sauvegardées ✓" : "Agency details saved ✓", "success");
+    setTimeout(() => setSaved(false), 2000);
+  };
+  const fields = [
+    { key: "name", label: fr ? "Nom de l'agence" : "Agency name", placeholder: "DADASH Agency" },
+    { key: "address", label: fr ? "Adresse" : "Address", placeholder: fr ? "123 rue Example, 75001 Paris" : "123 Example St" },
+    { key: "email", label: "Email", placeholder: "contact@agency.com" },
+    { key: "phone", label: fr ? "Téléphone" : "Phone", placeholder: "+33 1 23 45 67 89" },
+    { key: "company_id", label: "SIRET / RC", placeholder: "123 456 789 00012" },
+    { key: "vat_number", label: fr ? "N° TVA" : "VAT Number", placeholder: "FR12345678901" },
+    { key: "bank_iban", label: "IBAN", placeholder: "FR76 1234 5678 9012 3456 7890 123" },
+    { key: "bank_bic", label: "BIC / SWIFT", placeholder: "BNPAFRPP" },
+    { key: "logo_url", label: fr ? "URL du logo" : "Logo URL", placeholder: "https://..." },
+  ];
+  return React.createElement("div", { className: "card", style: { marginTop: 20 } },
+    React.createElement("div", { className: "section-title" },
+      React.createElement("div", { className: "section-bar" }),
+      fr ? "Informations Agence (Factures)" : "Agency Details (Invoices)"
+    ),
+    React.createElement("p", { style: { fontSize: 11, color: "var(--text-tertiary)", marginBottom: 16 } },
+      fr ? "Ces informations apparaissent sur toutes les factures générées." : "This information appears on all generated invoices."
+    ),
+    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 12 } },
+      fields.map(f => React.createElement("div", { key: f.key, className: "form-group-modal" },
+        React.createElement("label", { className: "form-label" }, f.label),
+        React.createElement("input", {
+          className: "form-input",
+          value: agencyForm[f.key] || "",
+          onChange: e => setAgencyForm({ ...agencyForm, [f.key]: e.target.value }),
+          placeholder: f.placeholder,
+        })
+      ))
+    ),
+    React.createElement("div", { style: { marginTop: 16 } },
+      React.createElement("button", { className: "btn btn-success", onClick: handleSave },
+        saved ? (fr ? "Sauvegardé ✓" : "Saved ✓") : (fr ? "Sauvegarder" : "Save")
+      )
+    )
   );
 };
 
@@ -8658,11 +8754,12 @@ const ModelDashboardTab = ({user, lang}) => {
 // =============================================
 // MODEL ROLE — MES PAIES
 // =============================================
-const ModelPaymentsTab = ({user, lang}) => {
+const ModelPaymentsTab = ({user, lang, invoices}) => {
   const fr = lang === "fr";
   const { currencySymbol } = useCurrency();
   const [payments, setPayments] = useState([]);
   const [loadingP, setLoadingP] = useState(true);
+  const [modelPaySubTab, setModelPaySubTab] = useState("paies");
 
   useEffect(() => {
     const load = async () => {
@@ -8683,12 +8780,24 @@ const ModelPaymentsTab = ({user, lang}) => {
   const statusColor = (s) => s === "paid" ? "var(--success)" : s === "cancelled" ? "var(--danger)" : "var(--warning)";
   const statusLabel = (s) => s === "paid" ? (fr ? "Pay\u00E9" : "Paid") : s === "cancelled" ? (fr ? "Annul\u00E9" : "Cancelled") : "Pending";
 
+  const myModelInvoices = (invoices||[]).filter(inv => inv.profile_id === user.id && inv.type === "outgoing_model");
+
   return (
     <div>
       <div style={{ marginBottom: 24 }}>
         <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F4B0}"} {fr ? "Mes Paies" : "My Payments"}</h2>
         <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0", fontStyle: "italic" }}>{fr ? "Historique de tes paiements" : "Your payment history"}</p>
       </div>
+      {/* Sub-tabs */}
+      <div style={{display:"flex",gap:4,marginBottom:20}}>
+        {[{id:"paies",label:fr?"Mes Paies":"My Payments"},{id:"factures",label:fr?"Mes Factures":"My Invoices"}].map(tb=>(
+          <button key={tb.id} className="btn" style={{padding:"6px 16px",fontSize:12,fontWeight:modelPaySubTab===tb.id?800:600,background:modelPaySubTab===tb.id?"var(--accent)":"var(--card-bg)",color:modelPaySubTab===tb.id?"#fff":"var(--text-secondary)",border:"1px solid "+(modelPaySubTab===tb.id?"var(--accent)":"var(--border-subtle)"),borderRadius:20}} onClick={()=>setModelPaySubTab(tb.id)}>{tb.label}</button>
+        ))}
+      </div>
+      {modelPaySubTab === "factures" ? (
+        <MyInvoicesPanel invoices={myModelInvoices} lang={lang} />
+      ) : (
+      <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
         {[
           { label: fr ? "Salaire ce mois" : "Salary this month", value: salaryThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B5}", color: "var(--accent)" },
@@ -8727,6 +8836,8 @@ const ModelPaymentsTab = ({user, lang}) => {
           </div>
         )}
       </div>
+      </>
+      )}
     </div>
   );
 };
@@ -10815,6 +10926,630 @@ RÈGLES :
 };
 
 // =============================================
+// INVOICING SYSTEM — PHASE 6
+// =============================================
+
+// Agency details (default, overridden by localStorage config)
+const getAgencyDetails = () => {
+  try {
+    const saved = localStorage.getItem("dadash-agency-details");
+    if (saved) return JSON.parse(saved);
+  } catch {}
+  return { name:"DADASH Agency", address:"", email:"", phone:"", company_id:"", vat_number:"", bank_iban:"", bank_bic:"", logo_url:"" };
+};
+const saveAgencyDetails = (details) => {
+  try { localStorage.setItem("dadash-agency-details", JSON.stringify(details)); } catch {}
+};
+
+// Invoice number generator
+const getNextInvoiceNumber = async () => {
+  const year = new Date().getFullYear();
+  try {
+    const { data: counter } = await sb.from("invoice_counter").select("*").eq("id", 1).single();
+    let nextNum;
+    if (!counter || counter.year !== year) {
+      nextNum = 1;
+      await sb.from("invoice_counter").upsert({ id: 1, year, last_number: 1 });
+    } else {
+      nextNum = counter.last_number + 1;
+      await sb.from("invoice_counter").update({ last_number: nextNum }).eq("id", 1);
+    }
+    return `DADASH-${year}-${String(nextNum).padStart(4, "0")}`;
+  } catch (e) {
+    console.error("Invoice counter error:", e);
+    return `DADASH-${year}-${String(Date.now()).slice(-4)}`;
+  }
+};
+
+// Invoice status config
+const invoiceStatusConfig = {
+  draft:     { label: "Brouillon", bg: "var(--bg-base)", color: "var(--text-tertiary)", icon: "📝" },
+  sent:      { label: "Envoyée", bg: "var(--accent-subtle, rgba(99,102,241,0.1))", color: "var(--accent)", icon: "📧" },
+  paid:      { label: "Payée", bg: "var(--success-muted, rgba(52,211,153,0.1))", color: "var(--success)", icon: "✅" },
+  overdue:   { label: "En retard", bg: "var(--danger-muted, rgba(239,68,68,0.1))", color: "var(--danger)", icon: "⚠️" },
+  cancelled: { label: "Annulée", bg: "var(--bg-base)", color: "var(--text-muted, var(--text-tertiary))", icon: "❌" },
+};
+
+const invoiceTypeLabels = {
+  outgoing_chatter: { label: "→ Chatter", icon: "↗", color: "var(--warning)" },
+  outgoing_model:   { label: "→ Modèle", icon: "↗", color: "var(--pink, var(--accent))" },
+  incoming_provider: { label: "← Provider", icon: "↙", color: "var(--success)" },
+};
+
+// Generate invoice HTML for PDF
+const generateInvoiceHTML = (invoice) => {
+  const agency = getAgencyDetails();
+  const isOutgoing = invoice.type.startsWith("outgoing");
+  const fromName = isOutgoing ? agency.name : invoice.from_name;
+  const fromDetails = isOutgoing ? agency : (invoice.from_details || {});
+  const toName = isOutgoing ? invoice.to_name : agency.name;
+  const toDetails = isOutgoing ? (invoice.to_details || {}) : agency;
+  const items = Array.isArray(invoice.line_items) ? invoice.line_items : [];
+  const cur = invoice.currency || "EUR";
+  const fmtN = (n) => Number(n||0).toFixed(2);
+  const fmtDateFR = (d) => d ? new Date(d).toLocaleDateString("fr-FR") : "";
+
+  return `<div style="font-family:'DM Sans',Helvetica,Arial,sans-serif;padding:40px;max-width:800px;margin:0 auto;color:#1a1a2e;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:40px;">
+      <div>
+        ${agency.logo_url ? `<img src="${agency.logo_url}" style="height:40px;margin-bottom:8px;" />` : ""}
+        <h1 style="font-size:28px;font-weight:800;margin:0;color:#0a0a0f;">${fromName}</h1>
+        <p style="color:#666;font-size:12px;margin:4px 0 0;">${fromDetails.address||""}</p>
+        <p style="color:#666;font-size:12px;margin:2px 0;">${fromDetails.email||""}</p>
+        <p style="color:#666;font-size:12px;margin:2px 0;">${fromDetails.phone||""}</p>
+        ${fromDetails.company_id?`<p style="color:#666;font-size:11px;margin:2px 0;">SIRET: ${fromDetails.company_id}</p>`:""}
+        ${fromDetails.vat_number?`<p style="color:#666;font-size:11px;margin:2px 0;">TVA: ${fromDetails.vat_number}</p>`:""}
+      </div>
+      <div style="text-align:right;">
+        <h2 style="font-size:24px;font-weight:700;color:#6366f1;margin:0;">FACTURE</h2>
+        <p style="font-size:14px;color:#333;margin:4px 0;">${invoice.invoice_number}</p>
+        <p style="font-size:12px;color:#666;margin:4px 0;">Date : ${fmtDateFR(invoice.created_at)}</p>
+        ${invoice.due_date?`<p style="font-size:12px;color:#666;">Échéance : ${fmtDateFR(invoice.due_date)}</p>`:""}
+      </div>
+    </div>
+    <div style="background:#f8f8fa;padding:20px;border-radius:8px;margin-bottom:30px;">
+      <p style="font-size:10px;color:#999;text-transform:uppercase;margin:0 0 4px;">Facturé à</p>
+      <p style="font-size:16px;font-weight:700;margin:0;">${toName}</p>
+      <p style="font-size:12px;color:#666;margin:4px 0;">${toDetails.email||""}</p>
+      <p style="font-size:12px;color:#666;margin:4px 0;">${toDetails.address||""}</p>
+    </div>
+    ${invoice.period_from?`<p style="font-size:12px;color:#666;margin-bottom:20px;">Période : ${fmtDateFR(invoice.period_from)} → ${fmtDateFR(invoice.period_to)}</p>`:""}
+    <table style="width:100%;border-collapse:collapse;margin-bottom:30px;">
+      <thead><tr style="border-bottom:2px solid #e5e5e5;">
+        <th style="text-align:left;padding:10px 0;font-size:11px;text-transform:uppercase;color:#999;">Description</th>
+        <th style="text-align:center;padding:10px 0;font-size:11px;text-transform:uppercase;color:#999;">Qté</th>
+        <th style="text-align:right;padding:10px 0;font-size:11px;text-transform:uppercase;color:#999;">Prix unitaire</th>
+        <th style="text-align:right;padding:10px 0;font-size:11px;text-transform:uppercase;color:#999;">Total</th>
+      </tr></thead>
+      <tbody>${items.map(item=>`<tr style="border-bottom:1px solid #f0f0f0;">
+        <td style="padding:12px 0;font-size:13px;">${item.description||""}</td>
+        <td style="text-align:center;padding:12px 0;font-size:13px;">${item.quantity||1}</td>
+        <td style="text-align:right;padding:12px 0;font-size:13px;">${fmtN(item.unit_price)} ${cur}</td>
+        <td style="text-align:right;padding:12px 0;font-size:13px;font-weight:600;">${fmtN(item.total)} ${cur}</td>
+      </tr>`).join("")}</tbody>
+    </table>
+    <div style="display:flex;justify-content:flex-end;">
+      <div style="width:250px;">
+        <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:13px;">
+          <span style="color:#666;">Sous-total</span><span>${fmtN(invoice.subtotal)} ${cur}</span>
+        </div>
+        ${Number(invoice.tax_rate)>0?`<div style="display:flex;justify-content:space-between;padding:8px 0;font-size:13px;">
+          <span style="color:#666;">TVA (${invoice.tax_rate}%)</span><span>${fmtN(invoice.tax_amount)} ${cur}</span>
+        </div>`:""}
+        <div style="display:flex;justify-content:space-between;padding:12px 0;font-size:18px;font-weight:800;border-top:2px solid #0a0a0f;">
+          <span>Total</span><span>${fmtN(invoice.total)} ${cur}</span>
+        </div>
+      </div>
+    </div>
+    ${invoice.payment_method?`<div style="margin-top:30px;padding:16px;background:#f0fdf4;border-radius:8px;border-left:3px solid #34d399;">
+      <p style="font-size:12px;font-weight:600;color:#166534;margin:0 0 4px;">Paiement</p>
+      <p style="font-size:12px;color:#333;margin:0;">Méthode : ${invoice.payment_method}${invoice.payment_reference?` · Réf : ${invoice.payment_reference}`:""}${invoice.payment_date?` · Date : ${fmtDateFR(invoice.payment_date)}`:""}</p>
+    </div>`:""}
+    ${agency.bank_iban?`<div style="margin-top:16px;padding:16px;background:#f8f8fa;border-radius:8px;">
+      <p style="font-size:11px;color:#999;margin:0 0 4px;">Coordonnées bancaires</p>
+      <p style="font-size:12px;color:#333;margin:0;">IBAN : ${agency.bank_iban}${agency.bank_bic?` · BIC : ${agency.bank_bic}`:""}</p>
+    </div>`:""}
+    ${invoice.notes?`<div style="margin-top:16px;padding:16px;background:#f8f8fa;border-radius:8px;">
+      <p style="font-size:11px;color:#999;margin:0 0 4px;">Notes</p>
+      <p style="font-size:12px;color:#333;margin:0;">${invoice.notes}</p>
+    </div>`:""}
+    <div style="margin-top:40px;padding-top:20px;border-top:1px solid #e5e5e5;text-align:center;">
+      <p style="font-size:10px;color:#999;">${agency.name} · Facture générée automatiquement · ${invoice.invoice_number}</p>
+    </div>
+  </div>`;
+};
+
+// Download invoice as PDF
+const downloadInvoicePDF = (invoice) => {
+  if (typeof html2pdf === "undefined") {
+    alert("html2pdf.js not loaded. Please refresh the page.");
+    return;
+  }
+  const html = generateInvoiceHTML(invoice);
+  const el = document.createElement("div");
+  el.innerHTML = html;
+  document.body.appendChild(el);
+  html2pdf().set({
+    margin: 10,
+    filename: `${invoice.invoice_number}.pdf`,
+    image: { type: "jpeg", quality: 0.98 },
+    html2canvas: { scale: 2 },
+    jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+  }).from(el).save().then(() => { document.body.removeChild(el); });
+};
+
+// Auto-generate chatter invoice
+const generateChatterInvoice = async (payout, txs, profiles, userId) => {
+  try {
+    const chatter = profiles.find(p => p.id === payout.user_id);
+    if (!chatter) return;
+    const invoiceNumber = await getNextInvoiceNumber();
+    const agency = getAgencyDetails();
+    // For chatters, payouts table has amount and date
+    const lineItems = [{
+      description: `Commission chatter — ${chatter.name} — Paiement du ${new Date(payout.date).toLocaleDateString("fr-FR")}`,
+      quantity: 1,
+      unit_price: Number(payout.amount),
+      total: Number(payout.amount),
+    }];
+    await sb.from("invoices").insert({
+      invoice_number: invoiceNumber,
+      type: "outgoing_chatter",
+      from_name: agency.name,
+      from_details: agency,
+      to_name: chatter.name,
+      to_details: { email: chatter.email },
+      subtotal: Number(payout.amount),
+      tax_rate: 0, tax_amount: 0,
+      total: Number(payout.amount),
+      currency: "EUR",
+      line_items: lineItems,
+      payment_method: payout.method || "Virement",
+      status: "paid",
+      payment_date: payout.date || new Date().toISOString().slice(0, 10),
+      payout_id: payout.id,
+      profile_id: payout.user_id,
+      created_by: userId,
+    });
+  } catch (e) { console.error("generateChatterInvoice error:", e); }
+};
+
+// Auto-generate model invoice
+const generateModelInvoice = async (payout, profiles, userId) => {
+  try {
+    const model = profiles.find(p => p.id === payout.user_id);
+    if (!model) return;
+    const invoiceNumber = await getNextInvoiceNumber();
+    const agency = getAgencyDetails();
+    const lineItems = [{
+      description: `Rémunération modèle — ${model.name} — Paiement du ${new Date(payout.date).toLocaleDateString("fr-FR")}`,
+      quantity: 1,
+      unit_price: Number(payout.amount),
+      total: Number(payout.amount),
+    }];
+    await sb.from("invoices").insert({
+      invoice_number: invoiceNumber,
+      type: "outgoing_model",
+      from_name: agency.name,
+      from_details: agency,
+      to_name: model.name,
+      to_details: { email: model.email },
+      subtotal: Number(payout.amount),
+      tax_rate: 0, tax_amount: 0,
+      total: Number(payout.amount),
+      currency: "EUR",
+      line_items: lineItems,
+      payment_method: payout.method || "Virement",
+      status: "paid",
+      payment_date: payout.date || new Date().toISOString().slice(0, 10),
+      payout_id: payout.id,
+      profile_id: payout.user_id,
+      created_by: userId,
+    });
+  } catch (e) { console.error("generateModelInvoice error:", e); }
+};
+
+// Auto-generate provider invoice
+const generateProviderInvoice = async (payout, profiles, userId) => {
+  try {
+    const provider = profiles.find(p => p.id === payout.provider_id);
+    const provName = provider?.name || "Provider";
+    const invoiceNumber = await getNextInvoiceNumber();
+    const agency = getAgencyDetails();
+    const lineItems = [{
+      description: `Versement ${provName}${payout.period_from ? ` — Période ${new Date(payout.period_from).toLocaleDateString("fr-FR")} au ${new Date(payout.period_to).toLocaleDateString("fr-FR")}` : ""}`,
+      quantity: 1,
+      unit_price: Number(payout.amount),
+      total: Number(payout.amount),
+    }];
+    await sb.from("invoices").insert({
+      invoice_number: invoiceNumber,
+      type: "incoming_provider",
+      from_name: provName,
+      from_details: { reference: payout.reference },
+      to_name: agency.name,
+      to_details: agency,
+      subtotal: Number(payout.amount),
+      tax_rate: 0, tax_amount: 0,
+      total: Number(payout.amount),
+      currency: payout.currency || "EUR",
+      line_items: lineItems,
+      period_from: payout.period_from,
+      period_to: payout.period_to,
+      payment_method: payout.payment_method,
+      payment_reference: payout.reference,
+      status: "paid",
+      payment_date: payout.received_date || new Date().toISOString().slice(0, 10),
+      payout_id: payout.id,
+      provider_id: payout.provider_id,
+      created_by: userId,
+    });
+  } catch (e) { console.error("generateProviderInvoice error:", e); }
+};
+
+// ── MY INVOICES SUB-COMPONENT (for chatter/modele/provider) ──
+const MyInvoicesPanel = ({ invoices, lang }) => {
+  const fr = lang === "fr";
+  if (!invoices || invoices.length === 0) return React.createElement("div", { className: "card", style: { textAlign: "center", padding: 40, color: "var(--text-tertiary)" } }, fr ? "Aucune facture pour le moment" : "No invoices yet");
+  return React.createElement("div", { className: "table-wrap" },
+    React.createElement("table", { className: "table", style: { fontSize: 12 } },
+      React.createElement("thead", null,
+        React.createElement("tr", null,
+          React.createElement("th", null, "N°"),
+          React.createElement("th", null, "Date"),
+          React.createElement("th", null, fr ? "Montant" : "Amount"),
+          React.createElement("th", null, fr ? "Période" : "Period"),
+          React.createElement("th", null, "Status"),
+          React.createElement("th", null, "Actions"),
+        )
+      ),
+      React.createElement("tbody", null,
+        invoices.map(inv => {
+          const st = invoiceStatusConfig[inv.status] || invoiceStatusConfig.draft;
+          return React.createElement("tr", { key: inv.id },
+            React.createElement("td", { style: { fontFamily: "monospace", fontWeight: 700 } }, inv.invoice_number),
+            React.createElement("td", null, fmtDate(inv.created_at)),
+            React.createElement("td", { style: { fontWeight: 700 } }, Number(inv.total).toFixed(2) + " " + (inv.currency || "EUR")),
+            React.createElement("td", null, inv.period_from ? `${fmtDate(inv.period_from)} → ${fmtDate(inv.period_to)}` : "—"),
+            React.createElement("td", null, React.createElement("span", { style: { padding: "3px 10px", borderRadius: 12, background: st.bg, color: st.color, fontSize: 11, fontWeight: 700 } }, st.icon + " " + st.label)),
+            React.createElement("td", null, React.createElement("button", { className: "btn", style: { fontSize: 11, padding: "4px 10px" }, onClick: () => downloadInvoicePDF(inv) }, "📄 PDF")),
+          );
+        })
+      )
+    )
+  );
+};
+
+// ── INVOICES TAB (gérant) ──
+const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onRefresh }) => {
+  const addToast = useToast();
+  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const dr = useDateRange("month");
+  const [activeFilter, setActiveFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [showCreate, setShowCreate] = useState(false);
+  const [showEmail, setShowEmail] = useState(null);
+  const [emailTo, setEmailTo] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [createForm, setCreateForm] = useState({
+    type: "outgoing_chatter",
+    profile_id: "",
+    provider_id: "",
+    line_items: [{ description: "", quantity: 1, unit_price: 0, total: 0 }],
+    payment_method: "Virement",
+    payment_reference: "",
+    notes: "",
+    due_date: "",
+    period_from: "",
+    period_to: "",
+    currency: "EUR",
+  });
+
+  const allInvoices = invoices || [];
+  const filteredByDate = dr.filterByDate(allInvoices, "created_at");
+
+  // Apply type filter
+  let filtered = filteredByDate;
+  if (activeFilter === "outgoing") filtered = filtered.filter(i => i.type === "outgoing_chatter" || i.type === "outgoing_model");
+  else if (activeFilter === "incoming") filtered = filtered.filter(i => i.type === "incoming_provider");
+  else if (activeFilter === "drafts") filtered = filtered.filter(i => i.status === "draft");
+
+  // Apply status filter
+  if (statusFilter !== "all") filtered = filtered.filter(i => i.status === statusFilter);
+
+  // KPIs
+  const totalFacture = filteredByDate.reduce((s, i) => s + Number(i.total || 0), 0);
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const thisMonth = allInvoices.filter(i => new Date(i.created_at) >= monthStart);
+  const countThisMonth = thisMonth.length;
+  const outgoing = filteredByDate.filter(i => i.type === "outgoing_chatter" || i.type === "outgoing_model");
+  const outgoingTotal = outgoing.reduce((s, i) => s + Number(i.total || 0), 0);
+  const incoming = filteredByDate.filter(i => i.type === "incoming_provider");
+  const incomingTotal = incoming.reduce((s, i) => s + Number(i.total || 0), 0);
+  const pendingPayment = filteredByDate.filter(i => i.status === "sent" || i.status === "draft" || i.status === "overdue");
+  const pendingTotal = pendingPayment.reduce((s, i) => s + Number(i.total || 0), 0);
+
+  // Create manual invoice
+  const handleCreate = async () => {
+    setSaving(true);
+    try {
+      const invoiceNumber = await getNextInvoiceNumber();
+      const agency = getAgencyDetails();
+      const items = createForm.line_items.map(li => ({ ...li, total: li.quantity * li.unit_price }));
+      const subtotal = items.reduce((s, i) => s + i.total, 0);
+      const isOutgoing = createForm.type.startsWith("outgoing");
+
+      let toName = "", toDetails = {}, profileId = null, providerId = null;
+      if (isOutgoing) {
+        const p = profiles.find(pr => pr.id === createForm.profile_id);
+        toName = p?.name || "Inconnu";
+        toDetails = { email: p?.email };
+        profileId = createForm.profile_id;
+      } else {
+        const p = profiles.find(pr => pr.id === createForm.provider_id);
+        toName = agency.name;
+        toDetails = agency;
+        providerId = createForm.provider_id;
+      }
+
+      const { error } = await sb.from("invoices").insert({
+        invoice_number: invoiceNumber,
+        type: createForm.type,
+        from_name: isOutgoing ? agency.name : (profiles.find(pr => pr.id === createForm.provider_id)?.name || "Provider"),
+        from_details: isOutgoing ? agency : {},
+        to_name: toName,
+        to_details: toDetails,
+        subtotal: subtotal,
+        tax_rate: 0, tax_amount: 0,
+        total: subtotal,
+        currency: createForm.currency,
+        line_items: items,
+        period_from: createForm.period_from || null,
+        period_to: createForm.period_to || null,
+        payment_method: createForm.payment_method,
+        payment_reference: createForm.payment_reference,
+        due_date: createForm.due_date || null,
+        notes: createForm.notes,
+        status: "draft",
+        profile_id: profileId,
+        provider_id: providerId,
+        created_by: user.id,
+      });
+      if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+      addToast(fr ? "Facture créée ✓" : "Invoice created ✓", "success");
+      setShowCreate(false);
+      setCreateForm({ type: "outgoing_chatter", profile_id: "", provider_id: "", line_items: [{ description: "", quantity: 1, unit_price: 0, total: 0 }], payment_method: "Virement", payment_reference: "", notes: "", due_date: "", period_from: "", period_to: "", currency: "EUR" });
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  // Cancel invoice
+  const handleCancel = async (inv) => {
+    if (inv.status !== "draft" && inv.status !== "sent") return;
+    try {
+      const { error } = await sb.from("invoices").update({ status: "cancelled" }).eq("id", inv.id);
+      if (error) { addToast("Erreur: " + error.message, "error"); return; }
+      addToast(fr ? "Facture annulée" : "Invoice cancelled", "success");
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+  };
+
+  // Mark as sent
+  const handleSendEmail = async () => {
+    if (!showEmail || !emailTo) return;
+    try {
+      const { error } = await sb.from("invoices").update({ status: "sent", sent_at: new Date().toISOString(), sent_to_email: emailTo }).eq("id", showEmail.id);
+      if (error) { addToast("Erreur: " + error.message, "error"); return; }
+      addToast(fr ? "Facture marquée comme envoyée ✓" : "Invoice marked as sent ✓", "success");
+      setShowEmail(null); setEmailTo("");
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+  };
+
+  // Update line item in create form
+  const updateLineItem = (idx, field, value) => {
+    const items = [...createForm.line_items];
+    items[idx] = { ...items[idx], [field]: field === "description" ? value : Number(value) };
+    items[idx].total = items[idx].quantity * items[idx].unit_price;
+    setCreateForm({ ...createForm, line_items: items });
+  };
+  const addLineItem = () => setCreateForm({ ...createForm, line_items: [...createForm.line_items, { description: "", quantity: 1, unit_price: 0, total: 0 }] });
+  const removeLineItem = (idx) => { if (createForm.line_items.length > 1) setCreateForm({ ...createForm, line_items: createForm.line_items.filter((_, i) => i !== idx) }); };
+
+  const chatters = profiles.filter(p => p.role === "chatter");
+  const modeles = profiles.filter(p => p.role === "modele");
+  const providers = profiles.filter(p => p.role === "provider");
+
+  const tabs = [
+    { id: "all", label: fr ? "Toutes" : "All", count: filteredByDate.length },
+    { id: "outgoing", label: fr ? "Sortantes ↗" : "Outgoing ↗", count: outgoing.length },
+    { id: "incoming", label: fr ? "Entrantes ↙" : "Incoming ↙", count: incoming.length },
+    { id: "drafts", label: fr ? "Brouillons" : "Drafts", count: filteredByDate.filter(i => i.status === "draft").length },
+  ];
+
+  return React.createElement("div", null,
+    // Header
+    React.createElement(GlobalFilterBar, { lang, dr }),
+    // KPIs
+    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(5,1fr)", gap: 12, marginBottom: 24 } },
+      [
+        { label: fr ? "Total facturé" : "Total invoiced", value: totalFacture.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + "€", icon: "🧾", color: "var(--text-primary)" },
+        { label: fr ? "Factures ce mois" : "This month", value: countThisMonth, icon: "📅", color: "var(--accent)" },
+        { label: fr ? "Sortantes" : "Outgoing", value: outgoingTotal.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + "€", icon: "↗", color: "var(--warning)" },
+        { label: fr ? "Entrantes" : "Incoming", value: incomingTotal.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + "€", icon: "↙", color: "var(--success)" },
+        { label: fr ? "En attente" : "Pending", value: pendingTotal.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + "€", icon: "⏳", color: pendingTotal > 0 ? "var(--warning)" : "var(--success)" },
+      ].map((k, i) => React.createElement("div", { key: i, style: { background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 18, padding: "14px 16px" } },
+        React.createElement("div", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 } }, k.icon + " " + k.label),
+        React.createElement("div", { style: { fontSize: 22, fontWeight: 800, color: k.color } }, k.value),
+      ))
+    ),
+
+    // Actions bar
+    React.createElement("div", { style: { display: "flex", gap: 12, marginBottom: 20, alignItems: "center", flexWrap: "wrap" } },
+      React.createElement("button", { className: "btn btn-primary", style: { width: "auto" }, onClick: () => setShowCreate(!showCreate) }, "+ " + (fr ? "Créer facture" : "Create invoice")),
+      React.createElement("select", { className: "filter-select", value: statusFilter, onChange: e => setStatusFilter(e.target.value), style: { width: "auto", minWidth: 140 } },
+        React.createElement("option", { value: "all" }, fr ? "Tous status" : "All statuses"),
+        Object.entries(invoiceStatusConfig).map(([k, v]) => React.createElement("option", { key: k, value: k }, v.icon + " " + v.label))
+      ),
+    ),
+
+    // Tab filter
+    React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 20 } },
+      tabs.map(tb => React.createElement("button", {
+        key: tb.id,
+        className: "btn",
+        style: { padding: "6px 16px", fontSize: 12, fontWeight: activeFilter === tb.id ? 800 : 600, background: activeFilter === tb.id ? "var(--accent)" : "var(--card-bg)", color: activeFilter === tb.id ? "#fff" : "var(--text-secondary)", border: "1px solid " + (activeFilter === tb.id ? "var(--accent)" : "var(--border-subtle)"), borderRadius: 20 },
+        onClick: () => setActiveFilter(tb.id)
+      }, tb.label + " (" + tb.count + ")"))
+    ),
+
+    // Create modal
+    showCreate && React.createElement("div", { className: "card", style: { marginBottom: 20 } },
+      React.createElement("div", { style: { fontSize: 16, fontWeight: 800, marginBottom: 16 } }, fr ? "Nouvelle facture manuelle" : "New manual invoice"),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 12 } },
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, "Type"),
+          React.createElement("select", { className: "filter-select", value: createForm.type, onChange: e => setCreateForm({ ...createForm, type: e.target.value }) },
+            React.createElement("option", { value: "outgoing_chatter" }, fr ? "Sortante → Chatter" : "Outgoing → Chatter"),
+            React.createElement("option", { value: "outgoing_model" }, fr ? "Sortante → Modèle" : "Outgoing → Model"),
+            React.createElement("option", { value: "incoming_provider" }, fr ? "Entrante ← Provider" : "Incoming ← Provider"),
+          )
+        ),
+        createForm.type.startsWith("outgoing") ? React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Destinataire" : "Recipient"),
+          React.createElement("select", { className: "filter-select", value: createForm.profile_id, onChange: e => setCreateForm({ ...createForm, profile_id: e.target.value }) },
+            React.createElement("option", { value: "" }, "—"),
+            (createForm.type === "outgoing_chatter" ? chatters : modeles).map(p => React.createElement("option", { key: p.id, value: p.id }, p.name))
+          )
+        ) : React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, "Provider"),
+          React.createElement("select", { className: "filter-select", value: createForm.provider_id, onChange: e => setCreateForm({ ...createForm, provider_id: e.target.value }) },
+            React.createElement("option", { value: "" }, "—"),
+            providers.map(p => React.createElement("option", { key: p.id, value: p.id }, p.name))
+          )
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Devise" : "Currency"),
+          React.createElement("select", { className: "filter-select", value: createForm.currency, onChange: e => setCreateForm({ ...createForm, currency: e.target.value }) },
+            React.createElement("option", { value: "EUR" }, "EUR"), React.createElement("option", { value: "CHF" }, "CHF")
+          )
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Méthode paiement" : "Payment method"),
+          React.createElement("select", { className: "filter-select", value: createForm.payment_method, onChange: e => setCreateForm({ ...createForm, payment_method: e.target.value }) },
+            ["Virement", "PayPal", "Revolut", "Twint", "Cash", "Crypto"].map(m => React.createElement("option", { key: m }, m))
+          )
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Référence" : "Reference"),
+          React.createElement("input", { className: "form-input", value: createForm.payment_reference, onChange: e => setCreateForm({ ...createForm, payment_reference: e.target.value }) })
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Échéance" : "Due date"),
+          React.createElement("input", { className: "filter-date", type: "date", value: createForm.due_date, onChange: e => setCreateForm({ ...createForm, due_date: e.target.value }) })
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Période du" : "Period from"),
+          React.createElement("input", { className: "filter-date", type: "date", value: createForm.period_from, onChange: e => setCreateForm({ ...createForm, period_from: e.target.value }) })
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, fr ? "Période au" : "Period to"),
+          React.createElement("input", { className: "filter-date", type: "date", value: createForm.period_to, onChange: e => setCreateForm({ ...createForm, period_to: e.target.value }) })
+        ),
+      ),
+      // Line items
+      React.createElement("div", { style: { marginTop: 16 } },
+        React.createElement("div", { style: { fontSize: 13, fontWeight: 700, marginBottom: 8 } }, fr ? "Lignes de détail" : "Line items"),
+        createForm.line_items.map((li, idx) => React.createElement("div", { key: idx, style: { display: "grid", gridTemplateColumns: "3fr 1fr 1fr 1fr auto", gap: 8, marginBottom: 6 } },
+          React.createElement("input", { className: "form-input", placeholder: "Description", value: li.description, onChange: e => updateLineItem(idx, "description", e.target.value), style: { fontSize: 12 } }),
+          React.createElement("input", { className: "form-input", type: "number", placeholder: "Qté", value: li.quantity, onChange: e => updateLineItem(idx, "quantity", e.target.value), style: { fontSize: 12 } }),
+          React.createElement("input", { className: "form-input", type: "number", step: "0.01", placeholder: "Prix", value: li.unit_price, onChange: e => updateLineItem(idx, "unit_price", e.target.value), style: { fontSize: 12 } }),
+          React.createElement("div", { style: { display: "flex", alignItems: "center", fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" } }, (li.quantity * li.unit_price).toFixed(2) + " " + createForm.currency),
+          React.createElement("button", { className: "btn btn-danger", style: { padding: "4px 8px", fontSize: 11 }, onClick: () => removeLineItem(idx) }, "×"),
+        )),
+        React.createElement("button", { className: "btn", style: { fontSize: 11, padding: "4px 12px", marginTop: 4 }, onClick: addLineItem }, "+ " + (fr ? "Ajouter ligne" : "Add line")),
+      ),
+      // Notes
+      React.createElement("div", { className: "form-group-modal", style: { marginTop: 12 } },
+        React.createElement("label", { className: "form-label" }, "Notes"),
+        React.createElement("textarea", { className: "form-input", rows: 2, value: createForm.notes, onChange: e => setCreateForm({ ...createForm, notes: e.target.value }), style: { resize: "vertical" } })
+      ),
+      // Buttons
+      React.createElement("div", { style: { display: "flex", gap: 12, marginTop: 16 } },
+        React.createElement("button", { className: "btn btn-success", onClick: handleCreate, disabled: saving }, saving ? "..." : (fr ? "Créer facture" : "Create invoice")),
+        React.createElement("button", { className: "btn btn-danger", onClick: () => setShowCreate(false) }, fr ? "Annuler" : "Cancel"),
+      ),
+    ),
+
+    // Email modal
+    showEmail && React.createElement("div", { style: { position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }, onClick: () => setShowEmail(null) },
+      React.createElement("div", { className: "card", style: { maxWidth: 500, width: "90%", maxHeight: "80vh", overflow: "auto" }, onClick: e => e.stopPropagation() },
+        React.createElement("div", { style: { fontSize: 16, fontWeight: 800, marginBottom: 16 } }, fr ? "Envoyer facture par email" : "Send invoice by email"),
+        React.createElement("div", { style: { marginBottom: 12 } },
+          React.createElement("div", { style: { fontSize: 12, color: "var(--text-tertiary)", marginBottom: 4 } }, "Facture: " + showEmail.invoice_number),
+          React.createElement("div", { style: { fontSize: 14, fontWeight: 700 } }, showEmail.to_name + " — " + Number(showEmail.total).toFixed(2) + " " + (showEmail.currency || "EUR")),
+        ),
+        React.createElement("div", { className: "form-group-modal" },
+          React.createElement("label", { className: "form-label" }, "Email"),
+          React.createElement("input", { className: "form-input", type: "email", value: emailTo, onChange: e => setEmailTo(e.target.value), placeholder: "email@example.com" })
+        ),
+        React.createElement("div", { style: { fontSize: 11, color: "var(--text-tertiary)", marginTop: 8, padding: 12, background: "var(--bg-base)", borderRadius: 8 } },
+          fr ? "Note : La facture sera marquée comme envoyée. L'envoi réel par email nécessite une intégration supplémentaire (SendGrid, etc.)." : "Note: Invoice will be marked as sent. Actual email sending requires additional integration."
+        ),
+        React.createElement("div", { style: { display: "flex", gap: 12, marginTop: 16 } },
+          React.createElement("button", { className: "btn btn-primary", onClick: handleSendEmail, disabled: !emailTo }, fr ? "Marquer envoyée" : "Mark as sent"),
+          React.createElement("button", { className: "btn", onClick: () => setShowEmail(null) }, fr ? "Fermer" : "Close"),
+          React.createElement("button", { className: "btn btn-success", onClick: () => downloadInvoicePDF(showEmail) }, "📄 " + (fr ? "Télécharger PDF" : "Download PDF")),
+        ),
+      )
+    ),
+
+    // Table
+    filtered.length === 0
+      ? React.createElement("div", { className: "card", style: { textAlign: "center", padding: 40, color: "var(--text-tertiary)" } }, fr ? "Aucune facture trouvée" : "No invoices found")
+      : React.createElement("div", { className: "table-wrap" },
+          React.createElement("table", { className: "table", style: { fontSize: 12 } },
+            React.createElement("thead", null,
+              React.createElement("tr", null,
+                React.createElement("th", null, "N° Facture"),
+                React.createElement("th", null, "Date"),
+                React.createElement("th", null, "Type"),
+                React.createElement("th", null, fr ? "De → À" : "From → To"),
+                React.createElement("th", null, fr ? "Montant" : "Amount"),
+                React.createElement("th", null, "Status"),
+                React.createElement("th", null, "Actions"),
+              )
+            ),
+            React.createElement("tbody", null,
+              filtered.map(inv => {
+                const st = invoiceStatusConfig[inv.status] || invoiceStatusConfig.draft;
+                const tp = invoiceTypeLabels[inv.type] || { label: inv.type, icon: "•", color: "var(--text-secondary)" };
+                return React.createElement("tr", { key: inv.id },
+                  React.createElement("td", { style: { fontFamily: "monospace", fontWeight: 700, fontSize: 11 } }, inv.invoice_number),
+                  React.createElement("td", null, fmtDate(inv.created_at)),
+                  React.createElement("td", null, React.createElement("span", { style: { padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 700, color: tp.color, background: tp.color + "18" } }, tp.icon + " " + tp.label)),
+                  React.createElement("td", { style: { fontSize: 11 } }, inv.from_name + " → " + inv.to_name),
+                  React.createElement("td", { style: { fontWeight: 800, whiteSpace: "nowrap" } }, Number(inv.total).toFixed(2) + " " + (inv.currency || "EUR")),
+                  React.createElement("td", null, React.createElement("span", { style: { padding: "3px 10px", borderRadius: 12, background: st.bg, color: st.color, fontSize: 11, fontWeight: 700 } }, st.icon + " " + st.label)),
+                  React.createElement("td", null,
+                    React.createElement("div", { style: { display: "flex", gap: 4, flexWrap: "wrap" } },
+                      React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px" }, onClick: () => downloadInvoicePDF(inv), title: "PDF" }, "📄"),
+                      React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px" }, onClick: () => { setShowEmail(inv); setEmailTo(inv.to_details?.email || inv.sent_to_email || ""); }, title: "Email" }, "📧"),
+                      (inv.status === "draft" || inv.status === "sent") && React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px", color: "var(--danger)" }, onClick: () => handleCancel(inv), title: fr ? "Annuler" : "Cancel" }, "❌"),
+                    )
+                  ),
+                );
+              })
+            )
+          )
+        ),
+  );
+};
+
+// =============================================
 // MAIN APP
 // =============================================
 const App = () => {
@@ -10862,6 +11597,7 @@ const App = () => {
   const [contentList, setContentList] = useState([]);
   const [checklistTemplates, setChecklistTemplates] = useState([]);
   const [checklistInstances, setChecklistInstances] = useState([]);
+  const [invoices, setInvoices] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [botStats, setBotStats] = useState([]);
   // ── NOTIFICATIONS STATE ──
@@ -10917,9 +11653,9 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     console.log("[loadData] START — role:", currentUser?.role, "id:", currentUser?.id);
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR;
     try {
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR] = await Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR] = await Promise.all([
         sb.from("transactions").select("*").order("date",{ascending:false}),
         sb.from("spenders").select("*"),
         sb.from("profiles").select("*"),
@@ -10936,6 +11672,7 @@ const App = () => {
         sb.from("checklist_instances").select("*").order("date",{ascending:false}),
         sb.from("alerts").select("*").order("created_at",{ascending:false}).limit(100),
         sb.from("bot_stats").select("*").order("timestamp",{ascending:false}).limit(200),
+        sb.from("invoices").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})),
       ]);
     } catch(e) { console.error("[loadData] Promise.all error:", e); return; }
     let txData = txR.data||[];
@@ -10980,6 +11717,7 @@ const App = () => {
     setChecklistInstances((ciR&&ciR.data)||[]);
     setAlerts((alR&&alR.data)||[]);
     setBotStats((bsR&&bsR.data)||[]);
+    setInvoices((invR&&invR.data)||[]);
     // Load notifications
     if (currentUser) {
       try {
@@ -11097,6 +11835,7 @@ const App = () => {
     {id:"mes_spenders",icon:"\u{1F465}",label:lang==="fr"?"Mes Spenders":"My Spenders",show:user.role==="chatter"||user.role==="gerant"},
     {id:"objectifs",icon:"\u{1F3AF}",label:t(lang,"objectifs"),show:!isModele&&user.role!=="provider"},
     {id:"compta",icon:"\u{1F4D2}",label:t(lang,"compta"),show:user.role==="gerant"},
+    {id:"invoices",icon:"\u{1F9FE}",label:lang==="fr"?"Factures":"Invoices",show:user.role==="gerant"},
     {id:"paies",icon:"\u{1F4B0}",label:t(lang,"paies"),show:!isModele&&user.role!=="provider"},
     {id:"competition",icon:"\u{1F3C6}",label:t(lang,"competition"),show:!isModele&&user.role!=="provider"},
     {id:"chatters",icon:"\u{1F4AC}",label:t(lang,"chatters"),show:user.role==="gerant"},
@@ -11193,7 +11932,7 @@ const App = () => {
           {tab==="model_tasks"&&user.role==="modele"&&<ModelTasksTab user={user} lang={lang} />}
           {tab==="model_content"&&user.role==="modele"&&<ModelContentTab user={user} lang={lang} onRefresh={onRefresh} />}
           {tab==="model_dashboard"&&user.role==="modele"&&<ModelDashboardTab user={user} lang={lang} />}
-          {tab==="model_payments"&&user.role==="modele"&&<ModelPaymentsTab user={user} lang={lang} />}
+          {tab==="model_payments"&&user.role==="modele"&&<ModelPaymentsTab user={user} lang={lang} invoices={invoices} />}
           {/* ── Standard pages ── */}
           {tab==="dashboard"&&user.role!=="provider"&&user.role!=="modele"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} />}
           {tab==="modeles"&&user.role==="gerant"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} />}
@@ -11203,12 +11942,13 @@ const App = () => {
           {tab==="mes_spenders"&&(user.role==="chatter"||user.role==="gerant")&&<MesSpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} products={products} productTags={productTags} onRefresh={onRefresh} />}
           {tab==="objectifs"&&user.role!=="provider"&&user.role!=="modele"&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="competition"&&user.role!=="provider"&&user.role!=="modele"&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
-          {tab==="paies"&&user.role!=="provider"&&user.role!=="modele"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} />}
+          {tab==="paies"&&user.role!=="provider"&&user.role!=="modele"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
           {tab==="chatters"&&user.role==="gerant"&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} />}
           {tab==="providers"&&user.role==="gerant"&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} />}
           {tab==="products"&&user.role==="gerant"&&<ProductCatalogTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} onRefresh={onRefresh} />}
           {tab==="compta"&&user.role==="gerant"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
-          {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} />}
+          {tab==="invoices"&&user.role==="gerant"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txs} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
+          {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} />}
           {tab==="telegram"&&user.role==="gerant"&&<TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
           {tab==="whatsapp"&&(user.role==="gerant"||user.role==="chatter")&&<WhatsAppAnalyzerTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="agents"&&user.role==="gerant"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();setTab(t);}} />}
