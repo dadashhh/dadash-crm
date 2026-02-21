@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script>try{document.documentElement.setAttribute("data-theme",localStorage.getItem("dadash-theme")||"dark")}catch(e){}</script>
+  <script>try{document.documentElement.setAttribute("data-theme",localStorage.getItem("dadash-theme")||"dark")}catch(e){/* localStorage unavailable — dark theme fallback */}</script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -1362,6 +1362,38 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // =============================================
+// CONSTANTS — no hardcoded magic values in business logic
+// =============================================
+const DEFAULT_EXCHANGE_RATE = 0.94;
+const DEFAULT_TIMEZONE = "Europe/Paris";
+const DEFAULT_CURRENCY = "EUR";
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
+const ANTHROPIC_API_VERSION = "2023-06-01";
+const INVOICE_PREFIX = "DADASH";
+const MAX_RECENT_TX_DISPLAY = 30;
+const NOTIFICATIONS_LIMIT = 50;
+const BOT_STATS_LIMIT = 200;
+const ALERTS_LIMIT = 100;
+
+// =============================================
+// XSS SANITIZATION — escape HTML entities in user-controlled strings
+// =============================================
+const escapeHTML = (str) => {
+  if (typeof str !== "string") return str;
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+};
+
+// Input validation helpers
+const isValidAmount = (val) => {
+  const n = parseFloat(val);
+  return !isNaN(n) && n > 0 && isFinite(n);
+};
+const isValidHandle = (val) => typeof val === "string" && val.trim().length > 0 && val.trim().length <= 100;
+const isValidDate = (val) => typeof val === "string" && val.length > 0 && !isNaN(new Date(val).getTime());
+const sanitizeHandle = (val) => typeof val === "string" ? val.replace(/^@/, "").replace(/[<>"'`]/g, "").trim().substring(0, 100) : "";
+
+// =============================================
 // BULLETPROOF DB HELPERS
 // =============================================
 // safeInsertTx: ULTRA-BULLETPROOF transaction insert with try-catch at EVERY level
@@ -1444,7 +1476,7 @@ const useTimezone = () => useContext(TimezoneContext);
 // =============================================
 // CURRENCY CONSTANTS & CONTEXT
 // =============================================
-const CurrencyContext = createContext({ displayCurrency: "EUR", exchangeRate: 0.94, convertAmount: (a) => a, fmtAmount: (a) => a + "\u20AC" });
+const CurrencyContext = createContext({ displayCurrency: "EUR", exchangeRate: DEFAULT_EXCHANGE_RATE, convertAmount: (a) => a, fmtAmount: (a) => a + "\u20AC" });
 const useCurrency = () => useContext(CurrencyContext);
 
 // =============================================
@@ -2762,7 +2794,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, onR
   };
 
   const handleAddExpense = async () => {
-    if(!expForm.amount){addToast("Montant requis","error");return;}
+    if(!isValidAmount(expForm.amount)) { addToast(fr?"Montant invalide":"Invalid amount","error"); return; }
     setSaving(true);
     try {
       const row = {amount:parseFloat(expForm.amount),currency:expForm.currency,category:expForm.category,name:expForm.description||expForm.category,date:expForm.date||new Date().toISOString().slice(0,10)};
@@ -3111,11 +3143,12 @@ const TransactionsTab = React.memo(({user, lang, txs, models, profiles, dbSpende
   }, [dbSpenders, txs]);
 
   const handleCreate = async () => {
-    if(!form.spender_handle||!form.amount||isNaN(parseFloat(form.amount))||parseFloat(form.amount)<=0) return;
+    if(!isValidHandle(form.spender_handle)) { addToast(lang==="fr"?"Nom du spender requis":"Spender name required","error"); return; }
+    if(!isValidAmount(form.amount)) { addToast(lang==="fr"?"Montant invalide (doit être > 0)":"Invalid amount (must be > 0)","error"); return; }
     setSaving(true);
     try {
       // Step 1: UPSERT le Spender en DB
-      const handle = form.spender_handle.replace(/^@/, "").trim();
+      const handle = sanitizeHandle(form.spender_handle);
       try {
         await safeUpsertSpender({handle, name: handle, status: "active", last_seen: new Date().toISOString()});
       } catch(e) { /* Spender upsert best-effort */ }
@@ -3434,7 +3467,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       const h = dbSp.handle || dbSp.name;
       if (!h) return;
       let contactInfo = {};
-      try { contactInfo = typeof dbSp.contact_info === "string" ? JSON.parse(dbSp.contact_info) : (dbSp.contact_info || {}); } catch(e) {}
+      try { contactInfo = typeof dbSp.contact_info === "string" ? JSON.parse(dbSp.contact_info) : (dbSp.contact_info || {}); } catch(e) { /* malformed JSON in contact_info — use empty object */ }
       map[h] = {
         name: h,
         dbId: dbSp.id,
@@ -5140,7 +5173,8 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh, invoices}) => 
     return {totalEarned:totalComm, paidAmount, balance:totalComm-paidAmount};
   };
   const handleAddPayout = async () => {
-    if(!form.amount||!form.date) return;
+    if(!isValidAmount(form.amount)) { addToast(lang==="fr"?"Montant invalide (doit être > 0)":"Invalid amount (must be > 0)","error"); return; }
+    if(!isValidDate(form.date)) { addToast(lang==="fr"?"Date invalide":"Invalid date","error"); return; }
     setSaving(true);
     try {
       const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date, status:"pending"}).select().single();
@@ -5386,7 +5420,8 @@ const ComptaTab = React.memo(({user, lang, txs, expenses, models, profiles, onRe
     };
   }, [comptaFiltered, expenses]);
   const handleAdd = async () => {
-    if(!form.name||!form.amount) return;
+    if(!form.name || form.name.trim().length === 0) { addToast(lang==="fr"?"Nom requis":"Name required","error"); return; }
+    if(!isValidAmount(form.amount)) { addToast(lang==="fr"?"Montant invalide (doit être > 0)":"Invalid amount (must be > 0)","error"); return; }
     setSaving(true);
     try {
       const {error} = await sb.from("expenses").insert({name:form.name, amount:parseFloat(form.amount), category:form.category});
@@ -5800,7 +5835,6 @@ const TelegramTab = React.memo(({user, lang, txs, models, profiles, spenders, on
   const debouncedSearchQuery = useDebounce(searchQuery);
   const [activeFilter, setActiveFilter] = useState("all");
   const [filterModel, setFilterModel] = useState("all");
-  const [showDebug, setShowDebug] = useState(false);
   const [tgPage, setTgPage] = useState(0);
   const tgSort = useSortable("ltv","desc");
 
@@ -6213,17 +6247,19 @@ const TelegramTab = React.memo(({user, lang, txs, models, profiles, spenders, on
   const [quickForm, setQuickForm] = useState({spender: "", amount: "", model_id: "", type: ""});
   const [saving, setSaving] = useState(false);
   const handleQuickAdd = async () => {
-    if (!quickForm.spender || !quickForm.amount) return;
+    if(!isValidHandle(quickForm.spender)) { addToast(fr?"Nom du spender requis":"Spender name required","error"); return; }
+    if(!isValidAmount(quickForm.amount)) { addToast(fr?"Montant invalide (doit être > 0)":"Invalid amount (must be > 0)","error"); return; }
     setSaving(true);
     const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     try {
       const now = new Date().toISOString();
+      const handle = sanitizeHandle(quickForm.spender);
       try {
-        await safeUpsertSpender({handle: quickForm.spender, name: quickForm.spender, status: "active", last_seen: now});
+        await safeUpsertSpender({handle, name: handle, status: "active", last_seen: now});
       } catch(e) { /* QA spender upsert best-effort */ }
       const txRow = {
         date: now,
-        spender_handle: quickForm.spender,
+        spender_handle: handle,
         amount: Number(quickForm.amount),
         status: "pending",
         notes: null,
@@ -6640,53 +6676,6 @@ const TelegramTab = React.memo(({user, lang, txs, models, profiles, spenders, on
         );
       })()}
 
-      {/* ═══ DEBUG PANEL ═══ */}
-      <div style={{marginTop: 24, borderTop: "1px solid var(--accent-muted)", paddingTop: 12}}>
-        <button onClick={() => setShowDebug(!showDebug)} style={{background: "none", border: "1px solid var(--border-accent)", color: "var(--text2)", fontSize: 11, padding: "4px 12px", borderRadius: 6, cursor: "pointer"}}>
-          🔧 {showDebug ? "Masquer Debug" : "Debug Panel"}
-        </button>
-        {showDebug && (
-          <div style={{marginTop: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, padding: 16, fontSize: 11, fontFamily: "monospace", color: "var(--text2)"}}>
-            <div style={{fontWeight: 700, color: "var(--accent)", marginBottom: 8}}>🔬 PIPELINE CHECKS</div>
-            <div style={{marginBottom: 6}}>
-              <strong>{rawData.length > 0 ? "✅" : "❌"} CHECK 1 — raw_count:</strong>{" "}
-              <span style={{color: rawData.length > 0 ? "var(--success)" : "var(--danger)"}}>{rawData.length}</span>
-              {rawData.length > 0 && <span> | sample: tg:{rawData[0].telegramId} = {rawData[0].entry.orig || "?"} (depense:{rawData[0].entry.depense})</span>}
-            </div>
-            <div style={{marginBottom: 6}}>
-              <strong>{normalizedTxs.length > 0 ? "✅" : "❌"} CHECK 2 — normalized_tx_count:</strong>{" "}
-              <span style={{color: normalizedTxs.length > 0 ? "var(--success)" : "var(--danger)"}}>{normalizedTxs.length}</span>
-              {normalizedTxs.slice(0, 3).map((tx, i) => (
-                <div key={tx.txId} style={{marginLeft: 16, fontSize: 10, color: "var(--text-tertiary)"}}>
-                  [{tx.txId}] {tx.spenderHandle} | {fmtAmount(tx.amount,tx.currency)} | {tx.modelName} | {tx.providerName}
-                </div>
-              ))}
-            </div>
-            <div style={{marginBottom: 6}}>
-              <strong>{spendersList.length > 0 ? "✅" : "❌"} CHECK 3 — distinct_spender_count:</strong>{" "}
-              <span style={{color: spendersList.length > 0 ? "var(--success)" : "var(--danger)"}}>{spendersList.length}</span>
-              {" "}(with LTV&gt;0: {spendersList.filter(s => s.ltv > 0).length})
-              {spendersList.filter(s => s.ltv > 0).slice(0, 5).map((s, i) => (
-                <div key={s.handle} style={{marginLeft: 16, fontSize: 10, color: "var(--text-tertiary)"}}>
-                  {s.handle} | LTV:{s.ltv.toFixed(0)}{currencySymbol} | TX:{s.nbTx} | {s.segment}
-                </div>
-              ))}
-            </div>
-            <div style={{marginBottom: 6}}>
-              <strong>{filteredSpenders.length > 0 ? "✅" : "⚠️"} CHECK 4 — cards_rendered:</strong>{" "}
-              <span style={{color: filteredSpenders.length > 0 ? "var(--success)" : "var(--danger)"}}>{filteredSpenders.length}</span>
-              {" "}(filter: {activeFilter}, model: {filterModel})
-            </div>
-            <div style={{marginBottom: 6}}>
-              <strong>ℹ️ CHECK 5 — Supabase:</strong>{" "}
-              txs.length={txs.length} | url={typeof SUPABASE_URL !== "undefined" ? SUPABASE_URL.substring(8, 35) + "..." : "?"}
-            </div>
-            <div style={{color: "var(--text-tertiary)", borderTop: "1px solid var(--border-default)", paddingTop: 6, marginTop: 6}}>
-              🕒 {new Date().toLocaleTimeString("fr-FR",{timeZone:_tz.current})}
-            </div>
-          </div>
-        )}
-      </div>
     </div>
   );
 });
@@ -6723,7 +6712,8 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
   const balance = totalCA - totalPaid - totalPendingPayout;
 
   const handleDeclare = async () => {
-    if(!form.amount||!form.period_from||!form.period_to){addToast(fr?"Remplissez les champs obligatoires":"Fill required fields","error");return;}
+    if(!isValidAmount(form.amount)){addToast(fr?"Montant invalide (doit être > 0)":"Invalid amount (must be > 0)","error");return;}
+    if(!isValidDate(form.period_from)||!isValidDate(form.period_to)){addToast(fr?"Dates invalides":"Invalid dates","error");return;}
     setSaving(true);
     try {
       const {error} = await sb.from("provider_payouts").insert({
@@ -8418,7 +8408,7 @@ const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeR
         <div className="section-title"><div className="section-bar"></div>{t(lang,"exchange_rate")}</div>
         <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0"}}>
           <span style={{fontSize:13,fontWeight:600}}>1 EUR =</span>
-          <input type="number" step="0.01" value={exchangeRate||0.94} onChange={(e)=>setExchangeRate&&setExchangeRate(Number(e.target.value))} style={{width:80,padding:"6px 10px",borderRadius:8,border:"1px solid var(--border-default)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:14,fontWeight:700,textAlign:"center"}} />
+          <input type="number" step="0.01" value={exchangeRate||DEFAULT_EXCHANGE_RATE} onChange={(e)=>setExchangeRate&&setExchangeRate(Number(e.target.value))} style={{width:80,padding:"6px 10px",borderRadius:8,border:"1px solid var(--border-default)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:14,fontWeight:700,textAlign:"center"}} />
           <span style={{fontSize:13,fontWeight:600}}>CHF</span>
           <span style={{fontSize:11,color:"var(--text2)",marginLeft:8}}>{t(lang,"exchange_rate_desc")}</span>
         </div>
@@ -10615,16 +10605,16 @@ RÈGLES :
         : participants[0]?.name || "inconnu";
       const phone = extractPhoneFromFilename(fileName || "");
 
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      const resp = await fetch(ANTHROPIC_API_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-api-key": claudeKey,
-          "anthropic-version": "2023-06-01",
+          "anthropic-version": ANTHROPIC_API_VERSION,
           "anthropic-dangerous-direct-browser-access": "true",
         },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: ANTHROPIC_MODEL,
           max_tokens: 1500,
           system: WA_ANALYSIS_PROMPT,
           messages: [{ role: "user", content: `Analyse cette conversation WhatsApp :\n\nContact : ${contactName}\nNuméro : ${phone || "inconnu"}\n\n--- CONVERSATION ---\n${text}\n--- FIN ---` }],
@@ -11410,11 +11400,11 @@ const getAgencyDetails = () => {
   try {
     const saved = localStorage.getItem("dadash-agency-details");
     if (saved) return JSON.parse(saved);
-  } catch {}
+  } catch { /* localStorage unavailable or corrupted — use defaults */ }
   return { name:"DADASH Agency", address:"", email:"", phone:"", company_id:"", vat_number:"", bank_iban:"", bank_bic:"", logo_url:"" };
 };
 const saveAgencyDetails = (details) => {
-  try { localStorage.setItem("dadash-agency-details", JSON.stringify(details)); } catch {}
+  try { localStorage.setItem("dadash-agency-details", JSON.stringify(details)); } catch { /* localStorage write failed — silent */ }
 };
 
 // Invoice number generator
@@ -11430,10 +11420,10 @@ const getNextInvoiceNumber = async () => {
       nextNum = counter.last_number + 1;
       await sb.from("invoice_counter").update({ last_number: nextNum }).eq("id", 1);
     }
-    return `DADASH-${year}-${String(nextNum).padStart(4, "0")}`;
+    return `${INVOICE_PREFIX}-${year}-${String(nextNum).padStart(4, "0")}`;
   } catch (e) {
     // Invoice counter error
-    return `DADASH-${year}-${String(Date.now()).slice(-4)}`;
+    return `${INVOICE_PREFIX}-${year}-${String(Date.now()).slice(-4)}`;
   }
 };
 
@@ -11468,26 +11458,26 @@ const generateInvoiceHTML = (invoice) => {
   return `<div style="font-family:'DM Sans',Helvetica,Arial,sans-serif;padding:40px;max-width:800px;margin:0 auto;color:#1a1a2e;">
     <div style="display:flex;justify-content:space-between;margin-bottom:40px;">
       <div>
-        ${agency.logo_url ? `<img src="${agency.logo_url}" style="height:40px;margin-bottom:8px;" />` : ""}
-        <h1 style="font-size:28px;font-weight:800;margin:0;color:#0a0a0f;">${fromName}</h1>
-        <p style="color:#666;font-size:12px;margin:4px 0 0;">${fromDetails.address||""}</p>
-        <p style="color:#666;font-size:12px;margin:2px 0;">${fromDetails.email||""}</p>
-        <p style="color:#666;font-size:12px;margin:2px 0;">${fromDetails.phone||""}</p>
-        ${fromDetails.company_id?`<p style="color:#666;font-size:11px;margin:2px 0;">SIRET: ${fromDetails.company_id}</p>`:""}
-        ${fromDetails.vat_number?`<p style="color:#666;font-size:11px;margin:2px 0;">TVA: ${fromDetails.vat_number}</p>`:""}
+        ${agency.logo_url ? `<img src="${escapeHTML(agency.logo_url)}" style="height:40px;margin-bottom:8px;" />` : ""}
+        <h1 style="font-size:28px;font-weight:800;margin:0;color:#0a0a0f;">${escapeHTML(fromName)}</h1>
+        <p style="color:#666;font-size:12px;margin:4px 0 0;">${escapeHTML(fromDetails.address||"")}</p>
+        <p style="color:#666;font-size:12px;margin:2px 0;">${escapeHTML(fromDetails.email||"")}</p>
+        <p style="color:#666;font-size:12px;margin:2px 0;">${escapeHTML(fromDetails.phone||"")}</p>
+        ${fromDetails.company_id?`<p style="color:#666;font-size:11px;margin:2px 0;">SIRET: ${escapeHTML(fromDetails.company_id)}</p>`:""}
+        ${fromDetails.vat_number?`<p style="color:#666;font-size:11px;margin:2px 0;">TVA: ${escapeHTML(fromDetails.vat_number)}</p>`:""}
       </div>
       <div style="text-align:right;">
         <h2 style="font-size:24px;font-weight:700;color:#6366f1;margin:0;">FACTURE</h2>
-        <p style="font-size:14px;color:#333;margin:4px 0;">${invoice.invoice_number}</p>
+        <p style="font-size:14px;color:#333;margin:4px 0;">${escapeHTML(invoice.invoice_number)}</p>
         <p style="font-size:12px;color:#666;margin:4px 0;">Date : ${fmtDateFR(invoice.created_at)}</p>
         ${invoice.due_date?`<p style="font-size:12px;color:#666;">Échéance : ${fmtDateFR(invoice.due_date)}</p>`:""}
       </div>
     </div>
     <div style="background:#f8f8fa;padding:20px;border-radius:8px;margin-bottom:30px;">
       <p style="font-size:10px;color:#999;text-transform:uppercase;margin:0 0 4px;">Facturé à</p>
-      <p style="font-size:16px;font-weight:700;margin:0;">${toName}</p>
-      <p style="font-size:12px;color:#666;margin:4px 0;">${toDetails.email||""}</p>
-      <p style="font-size:12px;color:#666;margin:4px 0;">${toDetails.address||""}</p>
+      <p style="font-size:16px;font-weight:700;margin:0;">${escapeHTML(toName)}</p>
+      <p style="font-size:12px;color:#666;margin:4px 0;">${escapeHTML(toDetails.email||"")}</p>
+      <p style="font-size:12px;color:#666;margin:4px 0;">${escapeHTML(toDetails.address||"")}</p>
     </div>
     ${invoice.period_from?`<p style="font-size:12px;color:#666;margin-bottom:20px;">Période : ${fmtDateFR(invoice.period_from)} → ${fmtDateFR(invoice.period_to)}</p>`:""}
     <table style="width:100%;border-collapse:collapse;margin-bottom:30px;">
@@ -11498,7 +11488,7 @@ const generateInvoiceHTML = (invoice) => {
         <th style="text-align:right;padding:10px 0;font-size:11px;text-transform:uppercase;color:#999;">Total</th>
       </tr></thead>
       <tbody>${items.map(item=>`<tr style="border-bottom:1px solid #f0f0f0;">
-        <td style="padding:12px 0;font-size:13px;">${item.description||""}</td>
+        <td style="padding:12px 0;font-size:13px;">${escapeHTML(item.description||"")}</td>
         <td style="text-align:center;padding:12px 0;font-size:13px;">${item.quantity||1}</td>
         <td style="text-align:right;padding:12px 0;font-size:13px;">${fmtN(item.unit_price)} ${cur}</td>
         <td style="text-align:right;padding:12px 0;font-size:13px;font-weight:600;">${fmtN(item.total)} ${cur}</td>
@@ -11519,18 +11509,18 @@ const generateInvoiceHTML = (invoice) => {
     </div>
     ${invoice.payment_method?`<div style="margin-top:30px;padding:16px;background:#f0fdf4;border-radius:8px;border-left:3px solid #34d399;">
       <p style="font-size:12px;font-weight:600;color:#166534;margin:0 0 4px;">Paiement</p>
-      <p style="font-size:12px;color:#333;margin:0;">Méthode : ${invoice.payment_method}${invoice.payment_reference?` · Réf : ${invoice.payment_reference}`:""}${invoice.payment_date?` · Date : ${fmtDateFR(invoice.payment_date)}`:""}</p>
+      <p style="font-size:12px;color:#333;margin:0;">Méthode : ${escapeHTML(invoice.payment_method)}${invoice.payment_reference?` · Réf : ${escapeHTML(invoice.payment_reference)}`:""}${invoice.payment_date?` · Date : ${fmtDateFR(invoice.payment_date)}`:""}</p>
     </div>`:""}
     ${agency.bank_iban?`<div style="margin-top:16px;padding:16px;background:#f8f8fa;border-radius:8px;">
       <p style="font-size:11px;color:#999;margin:0 0 4px;">Coordonnées bancaires</p>
-      <p style="font-size:12px;color:#333;margin:0;">IBAN : ${agency.bank_iban}${agency.bank_bic?` · BIC : ${agency.bank_bic}`:""}</p>
+      <p style="font-size:12px;color:#333;margin:0;">IBAN : ${escapeHTML(agency.bank_iban)}${agency.bank_bic?` · BIC : ${escapeHTML(agency.bank_bic)}`:""}</p>
     </div>`:""}
     ${invoice.notes?`<div style="margin-top:16px;padding:16px;background:#f8f8fa;border-radius:8px;">
       <p style="font-size:11px;color:#999;margin:0 0 4px;">Notes</p>
-      <p style="font-size:12px;color:#333;margin:0;">${invoice.notes}</p>
+      <p style="font-size:12px;color:#333;margin:0;">${escapeHTML(invoice.notes)}</p>
     </div>`:""}
     <div style="margin-top:40px;padding-top:20px;border-top:1px solid #e5e5e5;text-align:center;">
-      <p style="font-size:10px;color:#999;">${agency.name} · Facture générée automatiquement · ${invoice.invoice_number}</p>
+      <p style="font-size:10px;color:#999;">${escapeHTML(agency.name)} · Facture générée automatiquement · ${escapeHTML(invoice.invoice_number)}</p>
     </div>
   </div>`;
 };
@@ -12632,7 +12622,7 @@ const App = () => {
   const [user, setUser] = useState(null);
   const [lang, setLang] = useState("fr");
   const [theme, setTheme] = useState(() => {
-    try { return localStorage.getItem("dadash-theme") || "dark"; } catch { return "dark"; }
+    try { return localStorage.getItem("dadash-theme") || "dark"; } catch { return "dark"; /* localStorage unavailable */ }
   });
   const [tab, _setTab] = useState("dashboard");
   const {setDrillDown} = useNav();
@@ -12700,9 +12690,9 @@ const App = () => {
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifs, setShowNotifs] = useState(false);
   // ── TIMEZONE & CURRENCY STATE ──
-  const [timezone, setTimezone] = useState("Europe/Paris");
+  const [timezone, setTimezone] = useState(DEFAULT_TIMEZONE);
   const [displayCurrency, setDisplayCurrency] = useState("EUR");
-  const [exchangeRate, setExchangeRate] = useState(0.94);
+  const [exchangeRate, setExchangeRate] = useState(DEFAULT_EXCHANGE_RATE);
 
   // Keep global _tz in sync with state
   useEffect(() => { _tz.current = timezone; }, [timezone]);
@@ -12742,7 +12732,7 @@ const App = () => {
   // Theme toggle effect + localStorage persistence
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    try { localStorage.setItem("dadash-theme", theme); } catch {}
+    try { localStorage.setItem("dadash-theme", theme); } catch { /* localStorage unavailable */ }
   }, [theme]);
   const toggleTheme = () => setTheme(prev => prev === "dark" ? "light" : "dark");
 
@@ -12766,8 +12756,8 @@ const App = () => {
         sb.from("content_list").select("*").order("created_at",{ascending:false}),
         sb.from("checklist_templates").select("*").order("created_at"),
         sb.from("checklist_instances").select("*").order("date",{ascending:false}),
-        sb.from("alerts").select("*").order("created_at",{ascending:false}).limit(100),
-        sb.from("bot_stats").select("*").order("timestamp",{ascending:false}).limit(200),
+        sb.from("alerts").select("*").order("created_at",{ascending:false}).limit(ALERTS_LIMIT),
+        sb.from("bot_stats").select("*").order("timestamp",{ascending:false}).limit(BOT_STATS_LIMIT),
         sb.from("invoices").select("*").order("created_at",{ascending:false}),
         sb.from("model_videos").select("*").order("created_at",{ascending:false}),
         sb.from("video_sessions").select("*").order("created_at",{ascending:false}),
