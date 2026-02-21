@@ -1485,6 +1485,11 @@ const NavProvider = ({children}) => {
   };
   const closeDrill = () => {
     setDrillDown(null);
+    // Sync URL: remove drill-down hash, keep current tab hash
+    const hash = window.location.hash.replace(/^#/, "");
+    if (hash.includes("/")) {
+      window.history.pushState({tab:"dashboard"}, "", "#dashboard");
+    }
   };
   // Expose raw setter for popstate handler
   return (
@@ -2061,6 +2066,11 @@ const DashboardTab = ({user, lang, txs, models, profiles, onRefresh, onNotify, a
   const handleDashStatus = async (txId, newStatus) => {
     try {
       const currentTx = txs.find(tx=>tx.id===txId);
+      // Immutability guard: only pending transactions can change status
+      if (currentTx && currentTx.status !== "pending") {
+        addToast(t(lang,"tx_immutable"), "error");
+        return;
+      }
       const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
       if(error) { addToast("Erreur: " + error.message, "error"); return; }
       if(onNotify&&currentTx) {
@@ -2782,9 +2792,19 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:""});
   const [editingTx, setEditingTx] = useState(null);
+  const [processingTxId, setProcessingTxId] = useState(null);
+  const [txPage, setTxPage] = useState(0);
+  const TX_PER_PAGE = 50;
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
   let filtered = filterByStatus(filterByChatter(filterByProvider(filterByModel(dr.filterByDate(txs, "date"), model), txProvider), chatter), status);
+
+  // Reset page when filters change
+  const filteredLen = filtered.length;
+  useEffect(() => { setTxPage(0); }, [filteredLen]);
+
+  const totalTxPages = Math.max(1, Math.ceil(filtered.length / TX_PER_PAGE));
+  const paginatedTxs = filtered.slice(txPage * TX_PER_PAGE, (txPage + 1) * TX_PER_PAGE);
 
   // Build spender list for autocomplete
   const spenderOptions = React.useMemo(() => {
@@ -2855,15 +2875,18 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
     }
   };
   const handleStatus = async (txId, newStatus) => {
+    if (processingTxId) return; // double-click guard
+    setProcessingTxId(txId);
     try {
       // Immutability guard: only pending transactions can change status
       const currentTx = txs.find(tx => tx.id === txId);
       if (currentTx && currentTx.status !== "pending") {
         addToast(t(lang,"tx_immutable"), "error");
+        setProcessingTxId(null);
         return;
       }
       const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
-      if(error) { addToast("Erreur: " + error.message, "error"); return; }
+      if(error) { addToast("Erreur: " + error.message, "error"); setProcessingTxId(null); return; }
       // ── Notify on validate/refuse ──
       if(onNotify&&currentTx) {
         const cur = currencySymbol;
@@ -2879,6 +2902,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
       await onRefresh();
       addToast(newStatus==="validated"?(t(lang,"tx_validated")||"Validée ✓"):(t(lang,"tx_refused")||"Refusée"), newStatus==="validated"?"success":"error");
     } catch(e) { addToast("Erreur: " + e.message, "error"); }
+    setProcessingTxId(null);
   };
   const handleEditSave = async (updates) => {
     if (!editingTx || editingTx.status !== "pending") {
@@ -3007,7 +3031,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
               <tr><th>{t(lang,"date")}</th><th>{lang==="fr"?"Heure":"Time"}</th><th>Spender</th><th>{t(lang,"amount")}</th><th>{lang==="fr"?"Devise":"Cur."}</th><th>Model</th><th>Provider</th><th>Chatter</th><th>{lang==="fr"?"Produit":"Product"}</th><th>{t(lang,"notes")}</th><th>{t(lang,"status")}</th>{(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&<th>{t(lang,"actions")}</th>}</tr>
             </thead>
             <tbody>
-              {filtered.map(tx=>{
+              {paginatedTxs.map(tx=>{
                 const chName = profiles.find(u=>u.id===tx.chatter_id)?.name||"?";
                 const provName = profiles.find(u=>u.id===tx.provider_id)?.name||"?";
                 const canEdit = tx.status === "pending" && (user.role === "gerant" || user.role === "chatter" || (user.role === "provider" && tx.provider_id === user.id));
@@ -3031,8 +3055,8 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
                         )}
                         {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
                           <>
-                            <button className="btn btn-success btn-small" onClick={()=>handleStatus(tx.id,"validated")}>{t(lang,"validate")}</button>{" "}
-                            <button className="btn btn-danger btn-small" onClick={()=>handleStatus(tx.id,"refused")}>{t(lang,"refuse")}</button>
+                            <button className="btn btn-success btn-small" onClick={()=>handleStatus(tx.id,"validated")} disabled={!!processingTxId}>{processingTxId===tx.id?"...":t(lang,"validate")}</button>{" "}
+                            <button className="btn btn-danger btn-small" onClick={()=>handleStatus(tx.id,"refused")} disabled={!!processingTxId}>{processingTxId===tx.id?"...":t(lang,"refuse")}</button>
                           </>
                         )}
                       </td>
@@ -3043,6 +3067,15 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
             </tbody>
           </table>
         </div>
+        {totalTxPages > 1 && (
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 0",borderTop:"1px solid var(--border-subtle)",marginTop:8}}>
+            <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{filtered.length} {lang==="fr"?"transactions":"transactions"} — page {txPage+1}/{totalTxPages}</span>
+            <div style={{display:"flex",gap:6}}>
+              <button disabled={txPage===0} onClick={()=>setTxPage(p=>p-1)} style={{padding:"5px 12px",borderRadius:8,border:"1px solid var(--border-default)",background:txPage===0?"transparent":"var(--accent-subtle)",color:txPage===0?"var(--text-quaternary)":"var(--accent)",fontSize:11,fontWeight:600,cursor:txPage===0?"default":"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Prec.":"Prev"}</button>
+              <button disabled={txPage>=totalTxPages-1} onClick={()=>setTxPage(p=>p+1)} style={{padding:"5px 12px",borderRadius:8,border:"1px solid var(--border-default)",background:txPage>=totalTxPages-1?"transparent":"var(--accent-subtle)",color:txPage>=totalTxPages-1?"var(--text-quaternary)":"var(--accent)",fontSize:11,fontWeight:600,cursor:txPage>=totalTxPages-1?"default":"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Suiv.":"Next"}</button>
+            </div>
+          </div>
+        )}
       </div>
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={() => setEditingTx(null)} saving={saving} models={models} profiles={profiles} />}
     </div>
@@ -3067,6 +3100,11 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
   const handleSpStatus = async (txId, newStatus) => {
     try {
       const currentTx = txs.find(tx=>tx.id===txId);
+      // Immutability guard: only pending transactions can change status
+      if (currentTx && currentTx.status !== "pending") {
+        addToast(t(lang,"tx_immutable"), "error");
+        return;
+      }
       const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
       if(error) { addToast("Erreur: " + error.message, "error"); return; }
       if(onNotify&&currentTx) {
@@ -8345,7 +8383,7 @@ const LoginPage = ({onLogin, lang, setLang}) => {
         <div className="login-subtitle">Pushy Team</div>
         <div className="form-group">
           <label className="form-label">{t(lang,"email")}</label>
-          <input className="form-input" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" onKeyDown={e=>e.key==="Enter"&&handleLogin()} />
+          <input className="form-input" type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="nom@pushyteam.com" autoComplete="email" onKeyDown={e=>e.key==="Enter"&&handleLogin()} />
         </div>
         <div className="form-group">
           <label className="form-label">{t(lang,"password")}</label>
@@ -12158,11 +12196,28 @@ const App = () => {
       }
     };
     window.addEventListener("popstate", onPopState);
-    // Set initial state so first back doesn't leave the app
-    window.history.replaceState({tab:"dashboard"}, "", "#dashboard");
+    // Restore tab from URL hash on load (e.g. #transactions, #spender/handle)
+    const hash = window.location.hash.replace(/^#/, "");
+    if (hash) {
+      const slashIdx = hash.indexOf("/");
+      if (slashIdx > 0) {
+        const type = hash.substring(0, slashIdx);
+        const id = decodeURIComponent(hash.substring(slashIdx + 1));
+        if (type && id) {
+          setDrillDown({type, id});
+          window.history.replaceState({drill:type, drillId:id}, "", `#${type}/${id}`);
+        }
+      } else {
+        _setTab(hash);
+        window.history.replaceState({tab:hash}, "", `#${hash}`);
+      }
+    } else {
+      window.history.replaceState({tab:"dashboard"}, "", "#dashboard");
+    }
     return () => window.removeEventListener("popstate", onPopState);
   }, [setDrillDown]);
   const [loading, setLoading] = useState(true);
+  const _loadVersion = useRef(0); // race condition guard: discard stale loadData results
   const [txs, setTxs] = useState([]);
   const [profiles, setProfiles] = useState([]);
   const [models, setModels] = useState([]);
@@ -12196,11 +12251,12 @@ const App = () => {
 
   // Currency conversion helpers
   const convertAmount = useCallback((amount, fromCurrency) => {
+    const num = Number(amount) || 0;
     const from = fromCurrency || "EUR";
-    if (from === displayCurrency) return amount;
-    if (from === "EUR" && displayCurrency === "CHF") return Math.round(amount * exchangeRate * 100) / 100;
-    if (from === "CHF" && displayCurrency === "EUR") return Math.round(amount / exchangeRate * 100) / 100;
-    return amount;
+    if (from === displayCurrency) return num;
+    if (from === "EUR" && displayCurrency === "CHF") return Math.round(num * exchangeRate * 100) / 100;
+    if (from === "CHF" && displayCurrency === "EUR") return Math.round(num / exchangeRate * 100) / 100;
+    return num;
   }, [displayCurrency, exchangeRate]);
 
   const currencySymbol = displayCurrency === "EUR" ? "\u20AC" : "CHF";
@@ -12234,6 +12290,7 @@ const App = () => {
 
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
+    const thisVersion = ++_loadVersion.current;
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR;
     try {
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR] = await Promise.all([
@@ -12258,6 +12315,8 @@ const App = () => {
         sb.from("video_sessions").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})),
       ]);
     } catch(e) { /* loadData network error — data will remain stale */ return; }
+    // Discard results if a newer loadData call was started while we were awaiting
+    if (thisVersion !== _loadVersion.current) return;
     let txData = txR.data||[];
     let modelData = moR.data||[];
 
@@ -12414,6 +12473,8 @@ const App = () => {
     setChecklistTemplates([]);
     setChecklistInstances([]);
     setInvoices([]);
+    setModelVideos([]);
+    setVideoSessions([]);
     setAlerts([]);
     setBotStats([]);
     setNotifications([]);
