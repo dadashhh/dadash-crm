@@ -3524,7 +3524,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
 // =============================================
 // MES SPENDERS TAB — Chatter + Gérant enriched cards
 // =============================================
-const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, onRefresh}) => {
+const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, products, productTags, onRefresh}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
@@ -3537,6 +3537,14 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, onRefres
   const [editMode, setEditMode] = useState(false);
   const [form, setForm] = useState({});
   const [saving, setSaving] = useState(false);
+
+  // ── WhatsApp Analyzer state ──
+  const [waText, setWaText] = useState("");
+  const [waExtracting, setWaExtracting] = useState(false);
+  const [waResults, setWaResults] = useState(null); // {entries: [{spender, amount, product, date, currency, notes}], raw}
+  const [waMatchedSpenders, setWaMatchedSpenders] = useState({}); // {idx: {matched: spender|null, action: "link"|"create"|null}}
+  const [waTxCreating, setWaTxCreating] = useState({});
+  const [waTxCreated, setWaTxCreated] = useState({});
 
   const classColors = {
     whale: { bg: "var(--accent-subtle)", border: "var(--accent-muted)", text: "var(--accent)", icon: "\u{1F40B}" },
@@ -3693,6 +3701,148 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, onRefres
     return txs.filter(tx => tx.spender_handle === selectedSpender.spender_handle).sort((a, b) => new Date(b.date) - new Date(a.date));
   }, [selectedSpender, txs]);
 
+  // ── WhatsApp Analyzer: IA extraction ──
+  const waExtract = () => {
+    if (!waText.trim()) return;
+    setWaExtracting(true);
+    try {
+      const lines = waText.split("\n").map(l => l.trim()).filter(Boolean);
+      const entries = [];
+      // Amount patterns: $50, 50$, 50€, €50, 50 USD, 50 EUR, 50.00, 50,00
+      const amountRe = /(?:[\$\u20AC\u00A3])\s*(\d[\d.,]*)|(\d[\d.,]*)\s*(?:[\$\u20AC\u00A3]|(?:USD|EUR|GBP|usd|eur))/;
+      const amountRe2 = /\b(\d{1,6}(?:[.,]\d{1,2})?)\s*(?:\$|\u20AC|\u00A3|USD|EUR|dollars?|euros?)/i;
+      const amountRe3 = /(?:\$|\u20AC|\u00A3)\s*(\d{1,6}(?:[.,]\d{1,2})?)/;
+      // Date patterns in messages
+      const msgDateRe = /\[?(\d{1,2}\/\d{1,2}\/\d{2,4})[,\s]+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[APap][Mm])?)\]?\s*[-–]?\s*/;
+      // Known product keywords from catalog
+      const productNames = (products || []).map(p => p.name?.toLowerCase()).filter(Boolean);
+      const tagNames = (productTags || []).map(t => t.name?.toLowerCase()).filter(Boolean);
+      let currentSender = null;
+      let currentDate = null;
+      for (const line of lines) {
+        // Try to parse message header
+        const hdr = line.match(msgDateRe);
+        if (hdr) {
+          const rest = line.slice(hdr[0].length);
+          const colonIdx = rest.indexOf(":");
+          if (colonIdx > 0 && colonIdx < 60) {
+            currentSender = rest.slice(0, colonIdx).replace(/^~\s*/, "").trim();
+            const dateParts = hdr[1].split("/");
+            if (dateParts.length === 3) {
+              const p0 = parseInt(dateParts[0],10), p1 = parseInt(dateParts[1],10);
+              let yr = parseInt(dateParts[2],10); if (yr < 100) yr += 2000;
+              const day = p0 > 12 ? p0 : (p1 > 12 ? p1 : p0);
+              const month = p0 > 12 ? p1 : (p1 > 12 ? p0 : p1);
+              currentDate = `${yr}-${String(month).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+            }
+          }
+        }
+        // Look for amounts in this line
+        let amt = null, cur = "EUR";
+        const m1 = line.match(amountRe) || line.match(amountRe2) || line.match(amountRe3);
+        if (m1) {
+          const rawAmt = (m1[1] || m1[2] || "").replace(",", ".");
+          amt = parseFloat(rawAmt);
+          if (isNaN(amt) || amt <= 0 || amt > 100000) amt = null;
+          if (line.match(/[\$]|USD|usd|dollars?/i)) cur = "USD";
+          else if (line.match(/[\u00A3]|GBP|pounds?/i)) cur = "GBP";
+        }
+        if (amt) {
+          // Detect product mention
+          let product = null, tag = null;
+          const lower = line.toLowerCase();
+          for (const pn of productNames) { if (lower.includes(pn)) { product = pn; break; } }
+          for (const tn of tagNames) { if (lower.includes(tn)) { tag = tn; break; } }
+          entries.push({
+            spender: currentSender || "?",
+            amount: amt,
+            currency: cur,
+            product: product,
+            tag: tag,
+            date: currentDate || new Date().toISOString().slice(0,10),
+            notes: line.slice(0, 120),
+            line: line,
+          });
+        }
+      }
+      // Try matching spenders
+      const matches = {};
+      entries.forEach((e, idx) => {
+        const name = (e.spender || "").toLowerCase().trim();
+        const found = enrichedSpenders.find(sp =>
+          sp.spender_handle?.toLowerCase() === name ||
+          sp.first_name?.toLowerCase() === name ||
+          sp.name?.toLowerCase() === name ||
+          (sp.telegram_username && sp.telegram_username.toLowerCase() === name)
+        );
+        matches[idx] = { matched: found || null, action: found ? "link" : null };
+      });
+      setWaResults({ entries });
+      setWaMatchedSpenders(matches);
+      setWaTxCreated({});
+      setWaTxCreating({});
+      if (entries.length === 0) {
+        addToast(fr ? "Aucune transaction d\u00E9tect\u00E9e dans le texte." : "No transactions detected in text.", "warning");
+      } else {
+        addToast(fr ? `${entries.length} transaction(s) d\u00E9tect\u00E9e(s) !` : `${entries.length} transaction(s) detected!`, "success");
+      }
+    } catch (err) {
+      addToast(fr ? "Erreur d'extraction: " + err.message : "Extraction error: " + err.message, "error");
+    }
+    setWaExtracting(false);
+  };
+
+  // ── WhatsApp Analyzer: create TX from extracted entry ──
+  const waCreateTx = async (idx, entry, matchedSp) => {
+    setWaTxCreating(p => ({...p, [idx]: true}));
+    try {
+      const handle = matchedSp?.spender_handle || entry.spender?.replace(/^@/, "").replace(/\s+/g, "_").toLowerCase() || "unknown";
+      // Upsert spender if new
+      if (!matchedSp) {
+        await safeUpsertSpender({ handle, name: entry.spender || handle, status: "active", last_seen: new Date().toISOString() });
+      }
+      // Build TX row
+      const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+      const txRow = {
+        date: new Date(entry.date || Date.now()).toISOString(),
+        spender_handle: handle,
+        amount: entry.amount,
+        status: "pending",
+        notes: entry.notes || null,
+      };
+      if (entry.currency && entry.currency !== "EUR") txRow.currency = entry.currency;
+      if (entry.product) txRow.product = entry.product;
+      if (entry.tag) txRow.tag = entry.tag;
+      // Try to find model from user's assigned models
+      if (user.assigned_models && user.assigned_models.length === 1) {
+        txRow.model_id = user.assigned_models[0];
+      }
+      txRow.chatter_id = user.id;
+      const res = await safeInsertTx(txRow);
+      if (!res.error) {
+        setWaTxCreated(p => ({...p, [idx]: true}));
+        addToast(`${handle} \u2014 ${entry.amount}${entry.currency === "USD" ? "$" : "\u20AC"} \u2713`, "success");
+        await onRefresh();
+      } else {
+        addToast("Erreur: " + res.error.message, "error");
+      }
+    } catch (e) {
+      addToast("Erreur: " + e.message, "error");
+    }
+    setWaTxCreating(p => ({...p, [idx]: false}));
+  };
+
+  // ── WhatsApp Analyzer: create all TX at once ──
+  const waCreateAll = async () => {
+    if (!waResults?.entries) return;
+    for (let i = 0; i < waResults.entries.length; i++) {
+      if (waTxCreated[i]) continue;
+      const e = waResults.entries[i];
+      const m = waMatchedSpenders[i]?.matched;
+      await waCreateTx(i, e, m);
+    }
+  };
+
   // ── RENDER ──
   return (
     <div>
@@ -3711,6 +3861,7 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, onRefres
         <div style={{display:"flex",gap:0,borderRadius:14,border:"1px solid var(--border-default)",overflow:"hidden"}}>
           <button onClick={()=>setViewMode("cards")} style={{padding:"7px 14px",border:"none",background:viewMode==="cards"?"var(--accent-muted)":"transparent",color:viewMode==="cards"?"var(--accent)":"var(--text-tertiary)",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{"\u{1F4CB}"} Cards</button>
           <button onClick={()=>setViewMode("table")} style={{padding:"7px 14px",border:"none",background:viewMode==="table"?"var(--accent-muted)":"transparent",color:viewMode==="table"?"var(--accent)":"var(--text-tertiary)",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{"\u{1F4CA}"} Table</button>
+          <button onClick={()=>setViewMode("analyzer")} style={{padding:"7px 14px",border:"none",background:viewMode==="analyzer"?"var(--accent-muted)":"transparent",color:viewMode==="analyzer"?"var(--accent)":"var(--text-tertiary)",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{"\u{1F4F1}"} WA Analyzer</button>
         </div>
       </div>
 
@@ -3916,7 +4067,181 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, onRefres
       </div>
       )}
 
-      {mySpenders.length === 0 && (
+      {/* ══ WhatsApp Analyzer View ══ */}
+      {viewMode === "analyzer" && (
+      <div>
+        {/* Step 1: Paste conversation */}
+        <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 14, padding: 24, marginBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+            <span style={{ fontSize: 20 }}>{"\u{1F4F1}"}</span>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 800 }}>{fr ? "Analyseur WhatsApp" : "WhatsApp Analyzer"}</div>
+              <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{fr ? "Colle une conversation WhatsApp pour extraire automatiquement les transactions" : "Paste a WhatsApp conversation to auto-extract transactions"}</div>
+            </div>
+          </div>
+          <textarea
+            value={waText}
+            onChange={e => setWaText(e.target.value)}
+            placeholder={fr
+              ? "Colle ici l'export WhatsApp ou le texte d'une conversation...\n\nExemple:\n21/02/2024, 14:30 - John: Je veux acheter le custom video pour 50$\n21/02/2024, 14:32 - Moi: Ok je t'envoie \u00E7a !\n21/02/2024, 14:35 - John: $50 envoy\u00E9"
+              : "Paste the WhatsApp export or conversation text here...\n\nExample:\n02/21/2024, 2:30 PM - John: I want to buy the custom video for $50\n02/21/2024, 2:32 PM - Me: Ok sending!\n02/21/2024, 2:35 PM - John: $50 sent"}
+            style={{
+              width: "100%", minHeight: 160, padding: 14, borderRadius: 12,
+              background: "var(--bg-overlay)", border: "1px solid var(--border-default)",
+              color: "var(--text-primary)", fontSize: 12, fontFamily: "monospace",
+              resize: "vertical", outline: "none", boxSizing: "border-box",
+            }}
+          />
+          <div style={{ display: "flex", gap: 10, marginTop: 14, alignItems: "center" }}>
+            <button onClick={waExtract} disabled={waExtracting || !waText.trim()} style={{
+              padding: "10px 24px", borderRadius: 12, background: "var(--accent-muted)",
+              border: "1px solid var(--border-accent)", color: "var(--accent)",
+              fontSize: 13, fontWeight: 700, cursor: waExtracting ? "wait" : "pointer",
+              fontFamily: "'DM Sans',sans-serif", opacity: !waText.trim() ? 0.5 : 1,
+            }}>
+              {waExtracting ? "\u23F3" : "\u{1F9E0}"} {fr ? "Extraire les TX" : "Extract TXs"}
+            </button>
+            {waText.trim() && (
+              <button onClick={() => { setWaText(""); setWaResults(null); setWaMatchedSpenders({}); setWaTxCreated({}); }} style={{
+                padding: "10px 16px", borderRadius: 12, background: "transparent",
+                border: "1px solid var(--border-default)", color: "var(--text-tertiary)",
+                fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans',sans-serif",
+              }}>
+                {fr ? "Effacer" : "Clear"}
+              </button>
+            )}
+            <span style={{ fontSize: 11, color: "var(--text-quaternary)", marginLeft: "auto" }}>
+              {fr ? "Supporte les formats EU et US" : "Supports EU and US formats"}
+            </span>
+          </div>
+        </div>
+
+        {/* Step 2: Results */}
+        {waResults && waResults.entries.length > 0 && (
+        <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 14, padding: 24 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 800 }}>
+              {"\u{1F4B8}"} {waResults.entries.length} transaction{waResults.entries.length > 1 ? "s" : ""} {fr ? "d\u00E9tect\u00E9e(s)" : "detected"}
+            </div>
+            <button onClick={waCreateAll} disabled={Object.keys(waTxCreated).length === waResults.entries.length} style={{
+              padding: "8px 18px", borderRadius: 10, background: "var(--success-muted)",
+              border: "1px solid var(--success-muted)", color: "var(--success)",
+              fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "'DM Sans',sans-serif",
+            }}>
+              {"\u26A1"} {fr ? "Cr\u00E9er toutes les TX" : "Create all TXs"}
+            </button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {waResults.entries.map((e, idx) => {
+              const match = waMatchedSpenders[idx];
+              const isCreated = waTxCreated[idx];
+              const isCreating = waTxCreating[idx];
+              const c = match?.matched ? classColors[match.matched.classification] || classColors.regular : classColors.new;
+              return (
+                <div key={idx} style={{
+                  padding: 16, borderRadius: 12, border: `1px solid ${isCreated ? "var(--success-muted)" : "var(--border-subtle)"}`,
+                  background: isCreated ? "var(--success-muted)" : "var(--bg-overlay)", opacity: isCreated ? 0.7 : 1,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+                    {/* Left: spender + match info */}
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                        <span style={{ fontSize: 14, fontWeight: 800 }}>@{e.spender}</span>
+                        {match?.matched ? (
+                          <span style={{ padding: "2px 8px", borderRadius: 6, background: c.bg, border: `1px solid ${c.border}`, color: c.text, fontSize: 9, fontWeight: 700 }}>
+                            {"\u2705"} {fr ? "Match\u00E9" : "Matched"}: @{match.matched.spender_handle}
+                          </span>
+                        ) : (
+                          <span style={{ padding: "2px 8px", borderRadius: 6, background: "var(--warning-muted)", color: "var(--warning)", fontSize: 9, fontWeight: 700 }}>
+                            {"\u{1F195}"} {fr ? "Nouveau spender" : "New spender"}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 4 }}>
+                        <span style={{ fontSize: 18, fontWeight: 800, color: "var(--success)" }}>
+                          {e.amount.toLocaleString("fr-FR", { maximumFractionDigits: 2 })}{e.currency === "USD" ? "$" : "\u20AC"}
+                        </span>
+                        {e.product && <span style={{ padding: "2px 8px", borderRadius: 6, background: "var(--accent-subtle)", color: "var(--accent)", fontSize: 10, fontWeight: 600 }}>{e.product}</span>}
+                        {e.tag && <span style={{ padding: "2px 8px", borderRadius: 6, background: "var(--pink-muted)", color: "var(--pink)", fontSize: 10, fontWeight: 600 }}>{e.tag}</span>}
+                        <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{e.date}</span>
+                      </div>
+                      {e.notes && <div style={{ fontSize: 10, color: "var(--text-quaternary)", fontStyle: "italic", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 400 }}>{"\u{1F4AC}"} {e.notes}</div>}
+                    </div>
+                    {/* Right: action button */}
+                    <div style={{ flexShrink: 0 }}>
+                      {isCreated ? (
+                        <span style={{ padding: "8px 16px", borderRadius: 10, background: "var(--success-muted)", color: "var(--success)", fontSize: 12, fontWeight: 700 }}>
+                          {"\u2705"} {fr ? "Cr\u00E9\u00E9e" : "Created"}
+                        </span>
+                      ) : (
+                        <button onClick={() => waCreateTx(idx, e, match?.matched)} disabled={isCreating} style={{
+                          padding: "8px 16px", borderRadius: 10, background: "var(--accent-muted)",
+                          border: "1px solid var(--border-accent)", color: "var(--accent)",
+                          fontSize: 12, fontWeight: 700, cursor: isCreating ? "wait" : "pointer",
+                          fontFamily: "'DM Sans',sans-serif",
+                        }}>
+                          {isCreating ? "\u23F3" : "\u{1F4BE}"} {fr ? "Cr\u00E9er TX" : "Create TX"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  {/* Spender matching section for new spenders */}
+                  {!match?.matched && !isCreated && (
+                    <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: "var(--bg-overlay)", border: "1px solid var(--border-subtle)" }}>
+                      <div style={{ fontSize: 10, color: "var(--text-tertiary)", marginBottom: 6 }}>{fr ? "Chercher un spender existant :" : "Search existing spender:"}</div>
+                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                        {enrichedSpenders.filter(sp => {
+                          const q = (e.spender || "").toLowerCase();
+                          return q.length >= 2 && (
+                            sp.spender_handle?.toLowerCase().includes(q) ||
+                            sp.first_name?.toLowerCase().includes(q) ||
+                            sp.name?.toLowerCase().includes(q)
+                          );
+                        }).slice(0, 5).map(sp => (
+                          <button key={sp.spender_handle} onClick={() => {
+                            setWaMatchedSpenders(prev => ({...prev, [idx]: { matched: sp, action: "link" }}));
+                          }} style={{
+                            padding: "3px 10px", borderRadius: 8, background: "var(--accent-subtle)",
+                            border: "1px solid var(--accent-muted)", color: "var(--accent)",
+                            fontSize: 10, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans',sans-serif",
+                          }}>
+                            @{sp.spender_handle}
+                          </button>
+                        ))}
+                        {enrichedSpenders.filter(sp => {
+                          const q = (e.spender || "").toLowerCase();
+                          return q.length >= 2 && (sp.spender_handle?.toLowerCase().includes(q) || sp.first_name?.toLowerCase().includes(q));
+                        }).length === 0 && (
+                          <span style={{ fontSize: 10, color: "var(--text-quaternary)", fontStyle: "italic" }}>
+                            {fr ? "Aucun match \u2014 un nouveau spender sera cr\u00E9\u00E9" : "No match \u2014 a new spender will be created"}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        )}
+
+        {/* No results state */}
+        {waResults && waResults.entries.length === 0 && (
+          <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 14, padding: 40, textAlign: "center" }}>
+            <div style={{ fontSize: 32, marginBottom: 8 }}>{"\u{1F50D}"}</div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 4 }}>
+              {fr ? "Aucune transaction d\u00E9tect\u00E9e" : "No transactions detected"}
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-quaternary)" }}>
+              {fr ? "V\u00E9rifie que le texte contient des montants ($, \u20AC, USD, EUR...)" : "Check that the text contains amounts ($, \u20AC, USD, EUR...)"}
+            </div>
+          </div>
+        )}
+      </div>
+      )}
+
+      {mySpenders.length === 0 && viewMode !== "analyzer" && (
         <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 60, fontSize: 14 }}>
           {fr ? "Aucun spender trouv\u00E9" : "No spenders found"}
         </div>
@@ -10483,7 +10808,7 @@ const App = () => {
           {tab==="model_mgmt"&&user.role==="gerant"&&<ModelManagementTab user={user} lang={lang} models={models} profiles={profiles} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role!=="modele"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
           {tab==="spenders"&&user.role==="gerant"&&<SpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} />}
-          {tab==="mes_spenders"&&(user.role==="chatter"||user.role==="gerant")&&<MesSpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} />}
+          {tab==="mes_spenders"&&(user.role==="chatter"||user.role==="gerant")&&<MesSpendersTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} products={products} productTags={productTags} onRefresh={onRefresh} />}
           {tab==="objectifs"&&user.role!=="provider"&&user.role!=="modele"&&<ObjectifsTab user={user} lang={lang} txs={txs} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="competition"&&user.role!=="provider"&&user.role!=="modele"&&<CompetitionTab user={user} lang={lang} txs={txs} profiles={profiles} />}
           {tab==="paies"&&user.role!=="provider"&&user.role!=="modele"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} />}
