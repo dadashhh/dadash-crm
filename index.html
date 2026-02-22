@@ -1435,7 +1435,36 @@
     // Create Supabase client in normal script scope (not Babel) so it's globally accessible
     window.SUPABASE_URL = "https://lkrzjwfwhiimpnsyeuxi.supabase.co";
     window.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxrcnpqd2Z3aGlpbXBuc3lldXhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0NTYwNDgsImV4cCI6MjA4NzAzMjA0OH0.qs9yvOv_eb_QIHzv977qRwEBIIHDfyAvtKRvdJ4DKus";
-    window.sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+
+    // ═══ SUPABASE CLIENT — with guard and connection check ═══
+    window.__sbReady = false;
+    window.__sbError = null;
+    try {
+      if (!window.supabase || !window.supabase.createClient) {
+        throw new Error("Supabase JS library not loaded. Check CDN or network.");
+      }
+      window.sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY);
+      window.__sbReady = true;
+      console.log("[DADASH] Supabase client initialized ✓ →", window.SUPABASE_URL);
+    } catch (e) {
+      window.__sbError = e.message;
+      console.error("[DADASH] ❌ Supabase client init failed:", e.message);
+      // Create a stub so the app doesn't crash on sb.xxx calls
+      window.sb = {
+        auth: {
+          getSession: function() { return Promise.resolve({data:{session:null}}); },
+          signInWithPassword: function() { return Promise.resolve({data:null, error:{message: "Supabase not connected: " + (window.__sbError || "unknown error")}}); },
+          signOut: function() { return Promise.resolve(); },
+          onAuthStateChange: function() { return {data:{subscription:{unsubscribe:function(){}}}}; }
+        },
+        from: function() {
+          var chain = {select:function(){return chain;},eq:function(){return chain;},neq:function(){return chain;},not:function(){return chain;},is:function(){return chain;},in:function(){return chain;},order:function(){return chain;},limit:function(){return chain;},range:function(){return chain;},single:function(){return chain;},insert:function(){return chain;},update:function(){return chain;},delete:function(){return chain;},then:function(r){r({data:[],error:{message:"Supabase not connected"}}); return chain;}};
+          return chain;
+        },
+        channel: function() { return {on:function(){return this;},subscribe:function(){return this;}}; },
+        removeChannel: function() {}
+      };
+    }
 
     // ═══ PWA: Service Worker Registration ═══
     if ('serviceWorker' in navigator) {
@@ -12397,18 +12426,35 @@ const LoginPage = ({onLogin, lang, setLang}) => {
   const handleLogin = async () => {
     setError("");
     setLoading(true);
-    const {data, error: authErr} = await sb.auth.signInWithPassword({email, password: pass});
-    if(authErr) {
-      setError(t(lang,"login_error"));
+    try {
+      if (window.__sbError) {
+        setError("Supabase non connecté: " + window.__sbError);
+        setLoading(false);
+        return;
+      }
+      const {data, error: authErr} = await sb.auth.signInWithPassword({email, password: pass});
+      if(authErr) {
+        console.error("[DADASH] Login error:", authErr.message);
+        setError(authErr.message || t(lang,"login_error"));
+        setLoading(false);
+        return;
+      }
+      const {data: profile, error: profileErr} = await sb.from("profiles").select("*").eq("id", data.user.id).single();
       setLoading(false);
-      return;
-    }
-    const {data: profile} = await sb.from("profiles").select("*").eq("id", data.user.id).single();
-    setLoading(false);
-    if(profile) {
-      onLogin({...profile, email: data.user.email});
-    } else {
-      setError("Profil non trouve. Contacte l'admin.");
+      if(profileErr) {
+        console.error("[DADASH] Profile error:", profileErr.message);
+        setError("Erreur profil: " + profileErr.message);
+        return;
+      }
+      if(profile) {
+        onLogin({...profile, email: data.user.email});
+      } else {
+        setError("Profil non trouvé. Contacte l'admin.");
+      }
+    } catch(e) {
+      console.error("[DADASH] Login crash:", e.message || e);
+      setError("Erreur connexion: " + (e.message || "impossible de joindre le serveur"));
+      setLoading(false);
     }
   };
   return (
@@ -19698,38 +19744,34 @@ const App = () => {
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR;
-    const safe = (promise) => Promise.resolve(promise).then(r => r.error ? {data:[]} : r).catch(()=>({data:[]}));
+    const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
     try {
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR] = await Promise.all([
-        // ── HEAVY TABLES: paginated (100/page) with count ──
-        safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99)),
-        safe(sb.from("spenders").select("*")),
-        // ── LIGHT TABLES: full load ──
-        safe(sb.from("profiles").select("*")),
-        safe(sb.from("models").select("*")),
-        safe(sb.from("payouts").select("*").order("date",{ascending:false})),
-        safe(sb.from("expenses").select("*")),
-        safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false})),
-        safe(sb.from("products").select("*").order("sort_order")),
-        safe(sb.from("product_tags").select("*").order("sort_order")),
-        safe(sb.from("model_prices").select("*")),
-        safe(sb.from("model_tasks").select("*").order("created_at",{ascending:false})),
-        safe(sb.from("content_list").select("*").order("created_at",{ascending:false})),
-        safe(sb.from("checklist_templates").select("*").order("created_at")),
-        safe(sb.from("checklist_instances").select("*").order("date",{ascending:false})),
-        safe(sb.from("alerts").select("*").order("created_at",{ascending:false}).limit(100)),
-        safe(sb.from("bot_stats").select("*").order("timestamp",{ascending:false}).limit(200)),
-        safe(sb.from("invoices").select("*").order("created_at",{ascending:false})),
-        safe(sb.from("model_videos").select("*").order("created_at",{ascending:false})),
-        safe(sb.from("video_sessions").select("*").order("created_at",{ascending:false})),
-        safe(sb.from("provider_payment_methods").select("*").order("sort_order",{ascending:true})),
-        // ── HEAVY TABLES: paginated (100/page) with count ──
-        safe(sb.from("chatter_logs").select("*",{count:"exact"}).order("created_at",{ascending:false}).range(0,99)),
-        safe(sb.from("screenshot_checks").select("*",{count:"exact"}).order("created_at",{ascending:false}).range(0,99)),
-        safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200)),
-        safe(sb.from("payslips").select("*").order("period",{ascending:false})),
-        // ── TX SUMMARY: lightweight columns for dashboard KPIs + spender stats ──
-        safe(sb.from("transactions").select("id,amount,currency,date,model_id,spender_id,spender_handle,status,chatter_id,provider_id,created_at,payment_method,product,product_id,product_tag_id,tag,provider_payment_method_id").order("date",{ascending:false})),
+        safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
+        safe(sb.from("spenders").select("*"), "spenders"),
+        safe(sb.from("profiles").select("*"), "profiles"),
+        safe(sb.from("models").select("*"), "models"),
+        safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
+        safe(sb.from("expenses").select("*"), "expenses"),
+        safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
+        safe(sb.from("products").select("*").order("sort_order"), "products"),
+        safe(sb.from("product_tags").select("*").order("sort_order"), "product_tags"),
+        safe(sb.from("model_prices").select("*"), "model_prices"),
+        safe(sb.from("model_tasks").select("*").order("created_at",{ascending:false}), "model_tasks"),
+        safe(sb.from("content_list").select("*").order("created_at",{ascending:false}), "content_list"),
+        safe(sb.from("checklist_templates").select("*").order("created_at"), "checklist_templates"),
+        safe(sb.from("checklist_instances").select("*").order("date",{ascending:false}), "checklist_instances"),
+        safe(sb.from("alerts").select("*").order("created_at",{ascending:false}).limit(100), "alerts"),
+        safe(sb.from("bot_stats").select("*").order("timestamp",{ascending:false}).limit(200), "bot_stats"),
+        safe(sb.from("invoices").select("*").order("created_at",{ascending:false}), "invoices"),
+        safe(sb.from("model_videos").select("*").order("created_at",{ascending:false}), "model_videos"),
+        safe(sb.from("video_sessions").select("*").order("created_at",{ascending:false}), "video_sessions"),
+        safe(sb.from("provider_payment_methods").select("*").order("sort_order",{ascending:true}), "provider_payment_methods"),
+        safe(sb.from("chatter_logs").select("*",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "chatter_logs"),
+        safe(sb.from("screenshot_checks").select("*",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "screenshot_checks"),
+        safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200), "broadcasts"),
+        safe(sb.from("payslips").select("*").order("period",{ascending:false}), "payslips"),
+        safe(sb.from("transactions").select("id,amount,currency,date,model_id,spender_id,spender_handle,status,chatter_id,provider_id,created_at,payment_method,product,product_id,product_tag_id,tag,provider_payment_method_id").order("date",{ascending:false}), "tx_summary"),
       ]);
     } catch(e) { /* loadData critical failure */ console.error("loadData crash:", e); return; }
     // Discard results if a newer loadData call was started while we were awaiting
@@ -19865,16 +19907,33 @@ const App = () => {
 
   useEffect(()=>{
     const init = async () => {
-      const {data:{session}} = await sb.auth.getSession();
-      if(session) {
-        const {data:profile} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
-        if(profile) {
-          const fullUser = {...profile, email:session.user.email};
-          setUser(fullUser);
-          if(fullUser.role === "provider") setTab("transactions");
-          if(fullUser.role === "modele") setTab("model_checklist");
-          await loadData(fullUser);
+      // ── Connection health check ──
+      if (window.__sbError) {
+        console.error("[DADASH] Supabase not available:", window.__sbError);
+        addToast("Erreur connexion Supabase: " + window.__sbError, "error");
+        setLoading(false);
+        return;
+      }
+      try {
+        const {data:{session}} = await sb.auth.getSession();
+        if(session) {
+          const {data:profile, error:profileErr} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
+          if (profileErr) {
+            console.error("[DADASH] Profile fetch error:", profileErr.message);
+            // Session exists but profile query failed — could be RLS or missing table
+            addToast("Erreur chargement profil: " + profileErr.message, "error");
+          }
+          if(profile) {
+            const fullUser = {...profile, email:session.user.email};
+            setUser(fullUser);
+            if(fullUser.role === "provider") setTab("transactions");
+            if(fullUser.role === "modele") setTab("model_checklist");
+            await loadData(fullUser);
+          }
         }
+      } catch(e) {
+        console.error("[DADASH] Init failed:", e.message || e);
+        addToast("Erreur initialisation: " + (e.message || "connexion impossible"), "error");
       }
       setLoading(false);
     };
@@ -20017,7 +20076,7 @@ const App = () => {
     }
   };
 
-  if(loading) return <div className="loading-wrap"><div className="spinner"></div></div>;
+  if(loading) return <div className="loading-wrap"><div className="spinner"></div>{window.__sbError && <div style={{marginTop:20,padding:"12px 20px",background:"rgba(239,68,68,0.15)",border:"1px solid rgba(239,68,68,0.3)",borderRadius:12,color:"#EF4444",fontSize:13,maxWidth:400,textAlign:"center"}}>{"\u26A0\uFE0F"} Supabase: {window.__sbError}</div>}</div>;
   if(!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
 
   const isModele = user.role === "modele";
