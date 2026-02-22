@@ -970,6 +970,7 @@ const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeR
                 <label className="form-label">{t(lang,"role")}</label>
                 <select className="filter-select" value={form.role} onChange={e=>setForm({...form,role:e.target.value})}>
                   <option value="gerant">gerant</option>
+                  <option value="modele">modele</option>
                   <option value="chatter">chatter</option>
                   <option value="provider">provider</option>
                 </select>
