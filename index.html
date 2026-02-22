@@ -1641,25 +1641,81 @@ const EditTxModal = ({tx, lang, onSave, onCancel, saving, models, profiles, prod
 };
 
 // =============================================
-// SORTABLE TABLE HEADER + HOOK
+// SORTABLE TABLE HEADER + HOOK (3-state: neutral → ASC → DESC → neutral)
 // =============================================
-const SortTh = ({label, sortKey, sort, onSort}) => {
+const SortTh = ({label, sortKey, sort, onSort, style}) => {
   const active = sort.key===sortKey;
-  const arrow = active?(sort.dir==="asc"?"▲":"▼"):"▽";
-  return <th className="sort-th" onClick={()=>onSort(sortKey)}>{label} <span className={`sort-arrow ${active?"active":""}`}>{arrow}</span></th>;
+  const arrow = active?(sort.dir==="asc"?"↑":"↓"):"↕";
+  return <th className="sort-th" onClick={()=>onSort(sortKey)} style={{cursor:"pointer",userSelect:"none",...(style||{})}}>{label} <span className={`sort-arrow ${active?"active":""}`}>{arrow}</span></th>;
 };
-const useSortable = (defaultKey="date", defaultDir="desc") => {
+const useSortable = (defaultKey=null, defaultDir="desc") => {
   const [sort, setSort] = useState({key:defaultKey, dir:defaultDir});
-  const onSort = (key) => setSort(prev=>({key, dir:prev.key===key&&prev.dir==="desc"?"asc":"desc"}));
+  const onSort = (key) => setSort(prev=>{
+    if(prev.key!==key) return {key, dir:"asc"};
+    if(prev.dir==="asc") return {key, dir:"desc"};
+    return {key:null, dir:"desc"};
+  });
   const doSort = (data, getters={}) => {
+    if(!sort.key) return data;
     return [...data].sort((a,b)=>{
       const g = getters[sort.key]||(x=>x[sort.key]);
       const va=g(a), vb=g(b);
-      const cmp = typeof va==="string"? (va||"").localeCompare(vb||"") : (Number(va)||0)-(Number(vb)||0);
+      // Date detection
+      if(typeof va==="string" && /^\d{4}-\d{2}/.test(va||"")) {
+        const da=new Date(va||0), db=new Date(vb||0);
+        return sort.dir==="asc"?da-db:db-da;
+      }
+      const cmp = typeof va==="string"?(va||"").localeCompare(vb||""):(Number(va)||0)-(Number(vb)||0);
       return sort.dir==="asc"?cmp:-cmp;
     });
   };
   return {sort, onSort, doSort};
+};
+
+// =============================================
+// PAGINATION HOOK + CONTROLS
+// =============================================
+const usePagination = (data, pageSize=50) => {
+  const [page, setPage] = useState(0);
+  const totalPages = Math.max(1, Math.ceil(data.length / pageSize));
+  const safeP = Math.min(page, totalPages - 1);
+  useEffect(() => { setPage(0); }, [data.length]);
+  const paginatedData = data.slice(safeP * pageSize, (safeP + 1) * pageSize);
+  return {
+    page: safeP, totalPages, paginatedData,
+    goFirst: () => setPage(0),
+    goPrev: () => setPage(p => Math.max(0, p - 1)),
+    goNext: () => setPage(p => Math.min(totalPages - 1, p + 1)),
+    goLast: () => setPage(totalPages - 1),
+    setPage,
+    total: data.length,
+    from: data.length > 0 ? safeP * pageSize + 1 : 0,
+    to: Math.min((safeP + 1) * pageSize, data.length),
+  };
+};
+const PaginationControls = ({pag, lang}) => {
+  if(pag.totalPages <= 1) return null;
+  const fr = lang==="fr";
+  const bs = (dis) => ({
+    padding:"5px 12px", borderRadius:8, border:"1px solid var(--border-default)",
+    background: dis ? "transparent" : "var(--accent-subtle)",
+    color: dis ? "var(--text-quaternary)" : "var(--accent)",
+    fontSize:11, fontWeight:600, cursor: dis ? "default" : "pointer",
+    fontFamily:"'DM Sans',sans-serif",
+  });
+  return (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 0",borderTop:"1px solid var(--border-subtle)",marginTop:8,flexWrap:"wrap",gap:8}}>
+      <span style={{fontSize:11,color:"var(--text-tertiary)"}}>
+        {fr?`Résultats ${pag.from} à ${pag.to} sur ${pag.total} total`:`Results ${pag.from} to ${pag.to} of ${pag.total} total`}
+      </span>
+      <div style={{display:"flex",gap:6}}>
+        <button disabled={pag.page===0} onClick={pag.goFirst} style={bs(pag.page===0)}>{fr?"Première":"First"}</button>
+        <button disabled={pag.page===0} onClick={pag.goPrev} style={bs(pag.page===0)}>{fr?"Préc.":"Prev"}</button>
+        <button disabled={pag.page>=pag.totalPages-1} onClick={pag.goNext} style={bs(pag.page>=pag.totalPages-1)}>{fr?"Suiv.":"Next"}</button>
+        <button disabled={pag.page>=pag.totalPages-1} onClick={pag.goLast} style={bs(pag.page>=pag.totalPages-1)}>{fr?"Dernière":"Last"}</button>
+      </div>
+    </div>
+  );
 };
 
 // =============================================
@@ -2423,6 +2479,7 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
   const [expForm, setExpForm] = useState({model_id:"",amount:"",currency:"EUR",category:"contenu",description:"",date:new Date().toISOString().slice(0,10)});
   const [editingTx, setEditingTx] = useState(null);
   const [saving, setSaving] = useState(false);
+  const {sort:mSort, onSort:mOnSort, doSort:mDoSort} = useSortable();
   const filteredTxs = useMemo(() => {
     return filterByProvider(dr.filterByDate(txs, "date"), mfProvider);
   }, [txs, dr.startDate, dr.endDate, dr.activePreset, mfProvider]);
@@ -2450,6 +2507,11 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
     }).sort((a,b) => b.ca - a.ca);
   }, [filteredTxs, models, profiles, expenses, convertAmount]);
 
+  const sortedModelStats = mDoSort(modelStats, {
+    name: x=>(x.name||"").toLowerCase(), ca: x=>x.ca, totalExp: x=>x.totalExp,
+    benefice: x=>x.benefice, margin: x=>x.margin, txCount: x=>x.txCount, convRate: x=>x.convRate,
+  });
+  const mPag = usePagination(sortedModelStats);
   const globalCA = modelStats.reduce((s,m)=>s+m.ca,0);
   const globalExp = modelStats.reduce((s,m)=>s+m.totalExp,0) + (expenses||[]).filter(e=>!e.model_id).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0);
   const globalBenef = globalCA - globalExp;
@@ -2591,9 +2653,9 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
           <div className="section-title"><div className="section-bar"></div>{fr?"Tableau Comparatif":"Comparative Table"}</div>
           <div className="table-wrap">
             <table className="table">
-              <thead><tr><th>{t(lang,"model")}</th><th>CA</th><th>{fr?"Dépenses":"Expenses"}</th><th>{fr?"Bénéf":"Profit"}</th><th>Marge</th><th>TX</th><th>Conv %</th><th>Badges</th></tr></thead>
+              <thead><tr><SortTh label={t(lang,"model")} sortKey="name" sort={mSort} onSort={mOnSort}/><SortTh label="CA" sortKey="ca" sort={mSort} onSort={mOnSort}/><SortTh label={fr?"Dépenses":"Expenses"} sortKey="totalExp" sort={mSort} onSort={mOnSort}/><SortTh label={fr?"Bénéf":"Profit"} sortKey="benefice" sort={mSort} onSort={mOnSort}/><SortTh label="Marge" sortKey="margin" sort={mSort} onSort={mOnSort}/><SortTh label="TX" sortKey="txCount" sort={mSort} onSort={mOnSort}/><SortTh label="Conv %" sortKey="convRate" sort={mSort} onSort={mOnSort}/><th>Badges</th></tr></thead>
               <tbody>
-                {modelStats.map(m => (
+                {mPag.paginatedData.map(m => (
                   <tr key={m.id} style={{cursor:"pointer"}} onClick={()=>{setSelectedModel(m.id);setView("model");}}>
                     <td style={{fontWeight:600}}><Tag type="model" label={m.name} id={m.id}/></td>
                     <td style={{color:"var(--success)",fontWeight:700}}>{Math.round(m.ca)}{currencySymbol}</td>
@@ -2613,6 +2675,7 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
               </tbody>
             </table>
           </div>
+          <PaginationControls pag={mPag} lang={lang}/>
         </div>
       </>}
 
@@ -2799,18 +2862,18 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
   const [form, setForm] = useState({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:""});
   const [editingTx, setEditingTx] = useState(null);
   const [processingTxId, setProcessingTxId] = useState(null);
-  const [txPage, setTxPage] = useState(0);
-  const TX_PER_PAGE = 50;
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
+  const {sort, onSort, doSort} = useSortable();
   let filtered = filterByStatus(filterByChatter(filterByProvider(filterByModel(dr.filterByDate(txs, "date"), model), txProvider), chatter), status);
-
-  // Reset page when filters change
-  const filteredLen = filtered.length;
-  useEffect(() => { setTxPage(0); }, [filteredLen]);
-
-  const totalTxPages = Math.max(1, Math.ceil(filtered.length / TX_PER_PAGE));
-  const paginatedTxs = filtered.slice(txPage * TX_PER_PAGE, (txPage + 1) * TX_PER_PAGE);
+  const sortedFiltered = doSort(filtered, {
+    date: x=>x.date, amount: x=>Number(x.amount)||0, spender_handle: x=>(x.spender_handle||"").toLowerCase(),
+    model_id: x=>(models.find(m=>m.id===x.model_id)?.name||"").toLowerCase(),
+    provider_id: x=>(profiles.find(p=>p.id===x.provider_id)?.name||"").toLowerCase(),
+    chatter_id: x=>(profiles.find(p=>p.id===x.chatter_id)?.name||"").toLowerCase(),
+    product: x=>(x.product||"").toLowerCase(), status: x=>(x.status||"").toLowerCase(),
+  });
+  const pag = usePagination(sortedFiltered);
 
   // Build spender list for autocomplete
   const spenderOptions = React.useMemo(() => {
@@ -3034,10 +3097,10 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
         <div className="table-wrap">
           <table className="table">
             <thead>
-              <tr><th>{t(lang,"date")}</th><th>{lang==="fr"?"Heure":"Time"}</th><th>Spender</th><th>{t(lang,"amount")}</th><th>{lang==="fr"?"Devise":"Cur."}</th><th>Model</th><th>Provider</th><th>Chatter</th><th>{lang==="fr"?"Produit":"Product"}</th><th>{t(lang,"notes")}</th><th>{t(lang,"status")}</th>{(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&<th>{t(lang,"actions")}</th>}</tr>
+              <tr><SortTh label={t(lang,"date")} sortKey="date" sort={sort} onSort={onSort}/><th>{lang==="fr"?"Heure":"Time"}</th><SortTh label="Spender" sortKey="spender_handle" sort={sort} onSort={onSort}/><SortTh label={t(lang,"amount")} sortKey="amount" sort={sort} onSort={onSort}/><th>{lang==="fr"?"Devise":"Cur."}</th><SortTh label="Model" sortKey="model_id" sort={sort} onSort={onSort}/><SortTh label="Provider" sortKey="provider_id" sort={sort} onSort={onSort}/><SortTh label="Chatter" sortKey="chatter_id" sort={sort} onSort={onSort}/><SortTh label={lang==="fr"?"Produit":"Product"} sortKey="product" sort={sort} onSort={onSort}/><th>{t(lang,"notes")}</th><SortTh label={t(lang,"status")} sortKey="status" sort={sort} onSort={onSort}/>{(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&<th>{t(lang,"actions")}</th>}</tr>
             </thead>
             <tbody>
-              {paginatedTxs.map(tx=>{
+              {pag.paginatedData.map(tx=>{
                 const chName = profiles.find(u=>u.id===tx.chatter_id)?.name||"?";
                 const provName = profiles.find(u=>u.id===tx.provider_id)?.name||"?";
                 const canEdit = tx.status === "pending" && (user.role === "gerant" || user.role === "chatter" || (user.role === "provider" && tx.provider_id === user.id));
@@ -3073,15 +3136,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
             </tbody>
           </table>
         </div>
-        {totalTxPages > 1 && (
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 0",borderTop:"1px solid var(--border-subtle)",marginTop:8}}>
-            <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{filtered.length} {lang==="fr"?"transactions":"transactions"} — page {txPage+1}/{totalTxPages}</span>
-            <div style={{display:"flex",gap:6}}>
-              <button disabled={txPage===0} onClick={()=>setTxPage(p=>p-1)} style={{padding:"5px 12px",borderRadius:8,border:"1px solid var(--border-default)",background:txPage===0?"transparent":"var(--accent-subtle)",color:txPage===0?"var(--text-quaternary)":"var(--accent)",fontSize:11,fontWeight:600,cursor:txPage===0?"default":"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Prec.":"Prev"}</button>
-              <button disabled={txPage>=totalTxPages-1} onClick={()=>setTxPage(p=>p+1)} style={{padding:"5px 12px",borderRadius:8,border:"1px solid var(--border-default)",background:txPage>=totalTxPages-1?"transparent":"var(--accent-subtle)",color:txPage>=totalTxPages-1?"var(--text-quaternary)":"var(--accent)",fontSize:11,fontWeight:600,cursor:txPage>=totalTxPages-1?"default":"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Suiv.":"Next"}</button>
-            </div>
-          </div>
-        )}
+        <PaginationControls pag={pag} lang={lang}/>
       </div>
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={() => setEditingTx(null)} saving={saving} models={models} profiles={profiles} />}
     </div>
@@ -3231,6 +3286,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
   else if(sortBy==="model_ca" && filterModel) sorted.sort((a,b)=>(b.byModel[filterModel]?.ca||0)-(a.byModel[filterModel]?.ca||0));
   else sorted.sort((a,b)=>b.ltv-a.ltv);
 
+  const spPag = usePagination(sorted);
   const avgLtv = sorted.length>0 ? sorted.reduce((s,x)=>s+x.ltv,0)/sorted.length : 0;
   const multiModelCount = sorted.filter(s=>s.modelCount>1).length;
   const totalValidated = sorted.reduce((s,x)=>s+x.validCA,0);
@@ -3260,7 +3316,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
 
       <div className="grid-55-45">
         <div>
-          {sorted.map(s=>(
+          {spPag.paginatedData.map(s=>(
             <div key={s.name} className="spender-card" onClick={()=>{setSelected(s);setDetailModel("");setDetailTab("models");}}>
               <div className="spender-top">
                 <div className="spender-name"><Tag type="spender" label={s.name} id={s.name}/></div>
@@ -3294,6 +3350,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
             </div>
           ))}
           {sorted.length===0 && <div style={{color:"var(--text2)",textAlign:"center",padding:40}}>{fr?"Aucun spender":"No spenders"}</div>}
+          <PaginationControls pag={spPag} lang={lang}/>
         </div>
 
         {/* Detail Panel */}
@@ -6559,6 +6616,7 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
   const [rejectId, setRejectId] = useState(null);
   const [rejectNotes, setRejectNotes] = useState("");
   const [actionLoading, setActionLoading] = useState(null);
+  const {sort:pSort, onSort:pOnSort, doSort:pDoSort} = useSortable();
 
   const providers = profiles.filter(p => p.role === "provider");
   const filteredTxs = useMemo(() => {
@@ -6587,6 +6645,12 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
     }).sort((a, b) => b.totalCA - a.totalCA);
   }, [filteredTxs, providers, models, convertAmount]);
 
+  const sortedProvStats = pDoSort(providerStats, {
+    name: x=>(x.provider.name||"").toLowerCase(), totalCA: x=>x.totalCA, txCount: x=>x.txCount,
+    validatedCount: x=>x.validatedCount, pendingCount: x=>x.pendingCount, refusedCount: x=>x.refusedCount,
+    validationRate: x=>x.validationRate, avgTicket: x=>x.avgTicket, pendingAmount: x=>x.pendingAmount,
+  });
+  const pPag = usePagination(sortedProvStats);
   // Global KPIs
   const totalProviders = providers.length;
   const globalCA = providerStats.reduce((s, ps) => s + ps.totalCA, 0);
@@ -6703,19 +6767,19 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
           <div style={{ overflowX: "auto" }}>
             <table className="table" style={{ fontSize: 12 }}>
               <thead><tr>
-                <th>{fr ? "Prestataire" : "Provider"}</th>
-                <th>CA Trait\u00E9</th>
-                <th>TX Total</th>
-                <th>{fr ? "Valid\u00E9es" : "Validated"}</th>
-                <th>{fr ? "En attente" : "Pending"}</th>
-                <th>{fr ? "Refus\u00E9es" : "Refused"}</th>
-                <th>{fr ? "Taux Valid." : "Valid. Rate"}</th>
-                <th>{fr ? "Panier Moyen" : "Avg Ticket"}</th>
-                <th>{fr ? "Montant Pending" : "Pending Amount"}</th>
-                <th>{fr ? "Mod\u00E8les" : "Models"}</th>
+                <SortTh label={fr ? "Prestataire" : "Provider"} sortKey="name" sort={pSort} onSort={pOnSort}/>
+                <SortTh label="CA Traité" sortKey="totalCA" sort={pSort} onSort={pOnSort}/>
+                <SortTh label="TX Total" sortKey="txCount" sort={pSort} onSort={pOnSort}/>
+                <SortTh label={fr ? "Validées" : "Validated"} sortKey="validatedCount" sort={pSort} onSort={pOnSort}/>
+                <SortTh label={fr ? "En attente" : "Pending"} sortKey="pendingCount" sort={pSort} onSort={pOnSort}/>
+                <SortTh label={fr ? "Refusées" : "Refused"} sortKey="refusedCount" sort={pSort} onSort={pOnSort}/>
+                <SortTh label={fr ? "Taux Valid." : "Valid. Rate"} sortKey="validationRate" sort={pSort} onSort={pOnSort}/>
+                <SortTh label={fr ? "Panier Moyen" : "Avg Ticket"} sortKey="avgTicket" sort={pSort} onSort={pOnSort}/>
+                <SortTh label={fr ? "Montant Pending" : "Pending Amount"} sortKey="pendingAmount" sort={pSort} onSort={pOnSort}/>
+                <th>{fr ? "Modèles" : "Models"}</th>
               </tr></thead>
               <tbody>
-                {providerStats.map((ps, i) => (
+                {pPag.paginatedData.map((ps, i) => (
                   <tr key={ps.provider.id} style={{ cursor: "pointer" }} onClick={() => setSelectedProv(ps)}>
                     <td>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -6750,6 +6814,7 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
               </tbody>
             </table>
           </div>
+          <PaginationControls pag={pPag} lang={lang}/>
         </div>
       )}
 
@@ -11304,6 +11369,14 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
   // Apply status filter
   if (statusFilter !== "all") filtered = filtered.filter(i => i.status === statusFilter);
 
+  const {sort:iSort, onSort:iOnSort, doSort:iDoSort} = useSortable();
+  const sortedInvoices = iDoSort(filtered, {
+    invoice_number: x=>(x.invoice_number||""), created_at: x=>x.created_at,
+    type: x=>(x.type||""), from_to: x=>((x.from_name||"")+" "+(x.to_name||"")).toLowerCase(),
+    total: x=>Number(x.total)||0, status: x=>(x.status||""),
+  });
+  const iPag = usePagination(sortedInvoices);
+
   // KPIs
   const totalFacture = filteredByDate.reduce((s, i) => s + Number(i.total || 0), 0);
   const now = new Date();
@@ -11554,23 +11627,23 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
     ),
 
     // Table
-    filtered.length === 0
+    sortedInvoices.length === 0
       ? React.createElement("div", { className: "card", style: { textAlign: "center", padding: 40, color: "var(--text-tertiary)" } }, fr ? "Aucune facture trouvée" : "No invoices found")
       : React.createElement("div", { className: "table-wrap" },
           React.createElement("table", { className: "table", style: { fontSize: 12 } },
             React.createElement("thead", null,
               React.createElement("tr", null,
-                React.createElement("th", null, "N° Facture"),
-                React.createElement("th", null, "Date"),
-                React.createElement("th", null, "Type"),
+                React.createElement(SortTh, { label: "N° Facture", sortKey: "invoice_number", sort: iSort, onSort: iOnSort }),
+                React.createElement(SortTh, { label: "Date", sortKey: "created_at", sort: iSort, onSort: iOnSort }),
+                React.createElement(SortTh, { label: "Type", sortKey: "type", sort: iSort, onSort: iOnSort }),
                 React.createElement("th", null, fr ? "De → À" : "From → To"),
-                React.createElement("th", null, fr ? "Montant" : "Amount"),
-                React.createElement("th", null, "Status"),
+                React.createElement(SortTh, { label: fr ? "Montant" : "Amount", sortKey: "total", sort: iSort, onSort: iOnSort }),
+                React.createElement(SortTh, { label: "Status", sortKey: "status", sort: iSort, onSort: iOnSort }),
                 React.createElement("th", null, "Actions"),
               )
             ),
             React.createElement("tbody", null,
-              filtered.map(inv => {
+              iPag.paginatedData.map(inv => {
                 const st = invoiceStatusConfig[inv.status] || invoiceStatusConfig.draft;
                 const tp = invoiceTypeLabels[inv.type] || { label: inv.type, icon: "•", color: "var(--text-secondary)" };
                 return React.createElement("tr", { key: inv.id },
@@ -11590,7 +11663,8 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
                 );
               })
             )
-          )
+          ),
+          React.createElement(PaginationControls, { pag: iPag, lang: lang }),
         ),
   );
 };
