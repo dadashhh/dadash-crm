@@ -1428,6 +1428,7 @@ const SPENDER_LANGUAGES = ["FR", "DE", "EN", "IT"];
 
 const computeSpenderBadges = (sp) => {
   const badges = [];
+  if (sp.scam_flag || (sp.scam_count && sp.scam_count >= 2)) badges.push({ icon: "\u{1F6A8}", label: "SCAM", color: "var(--danger)", bg: "rgba(239,68,68,0.15)" });
   const ltv = sp.ltv || sp.total_spent || 0;
   const cnt = sp.cnt || sp.tx_count || 0;
   const txArr = sp.txs || [];
@@ -1486,7 +1487,7 @@ const MiniSparkline = ({data, width=120, height=28, color="var(--accent)"}) => {
 const ROLE_ACCESS = {
   gerant: ["dashboard","business","equipe","messagerie","compta","automation","admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments"],
-  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition"],
+  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition","chatter_scan"],
   provider: ["provider_dashboard","transactions","provider_compta"]
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
@@ -4628,6 +4629,17 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                     )):<span style={{color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucun badge":"No badges"}</span>}
                   </div>
                 </div>
+                {(()=>{const _scChecks=(window.__screenshotChecks||[]).filter(c=>c.spender_id===selected.id);const _scSub=_scChecks.length;const _scVal=_scChecks.filter(c=>c.status==="validated").length;const _scRej=_scChecks.filter(c=>c.status==="rejected").length;const _scamFlag=selected.scam_flag||(selected.scam_count&&selected.scam_count>=2);return _scSub>0||_scamFlag?(
+                <div style={{marginBottom:16}}>
+                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{"\u{1F4F8}"} Scan Checker</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8}}>
+                    <div style={{padding:10,borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Soumis</div><div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{_scSub}</div></div>
+                    <div style={{padding:10,borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Valid\u00E9s</div><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{_scVal}</div></div>
+                    <div style={{padding:10,borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Rejet\u00E9s</div><div style={{fontSize:16,fontWeight:800,color:"var(--danger)"}}>{_scRej}</div></div>
+                    <div style={{padding:10,borderRadius:10,background:_scamFlag?"rgba(239,68,68,0.1)":"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Scam flag</div><div style={{fontSize:14,fontWeight:800,color:_scamFlag?"var(--danger)":"var(--success)"}}>{_scamFlag?"\u{1F6A8} OUI":"\u2705 NON"}</div></div>
+                  </div>
+                </div>
+                ):null;})()}
                 <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{fr?"Prédictions":"Predictions"}</div>
                 <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
                   {(()=>{
@@ -13517,6 +13529,741 @@ const ChallengesSection = ({user, lang, txs, profiles, convertAmount, currencySy
 };
 
 // =============================================
+// SCAN CHECKER — RISK SCORE ENGINE
+// =============================================
+const analyzeScreenshot = ({ spender, amount, method, provider, providerPaymentMethods, transactions, screenshotChecks, products }) => {
+  let score = 0;
+  const reds = [];
+  const greens = [];
+
+  // RED FLAGS CRITIQUES (+30 à +50)
+  if (spender.scam_flag) {
+    score += 50;
+    reds.push({ level: "critical", icon: "\u{1F6A8}", text: "SPENDER MARQU\u00C9 SCAMMER \u2014 NE PAS ENVOYER" });
+  }
+  const rejected = screenshotChecks.filter(c => c.spender_id === spender.id && c.status === "rejected");
+  if (rejected.length > 0) {
+    score += 40;
+    reds.push({ level: "danger", icon: "\u{1F534}", text: `${rejected.length} screenshot(s) rejet\u00E9(s) pr\u00E9c\u00E9demment pour ce spender` });
+  }
+  const provMethods = providerPaymentMethods.filter(m => m.provider_id === provider.id && m.active !== false);
+  const hasMethod = provMethods.some(m => m.type === method);
+  if (!hasMethod) {
+    score += 30;
+    reds.push({ level: "danger", icon: "\u{1F534}", text: `Provider ${provider.name} n'a PAS de compte ${method} configur\u00E9 !` });
+  }
+
+  // RED FLAGS MODÉRÉS (+10 à +20)
+  const validatedTx = transactions.filter(t => t.spender_id === spender.id && t.status === "validated");
+  if (validatedTx.length === 0) {
+    score += 20;
+    reds.push({ level: "warning", icon: "\u{1F7E0}", text: "Nouveau spender \u2014 aucune TX valid\u00E9e auparavant" });
+  }
+  if (validatedTx.length === 0 && amount > 80) {
+    score += 15;
+    reds.push({ level: "warning", icon: "\u{1F7E0}", text: `Premier achat \u00E0 ${amount} CHF \u2014 inhabituellement \u00E9lev\u00E9` });
+  }
+  const avgBasket = validatedTx.length > 0 ? validatedTx.reduce((s, t) => s + Number(t.amount), 0) / validatedTx.length : 0;
+  if (avgBasket > 0 && amount > avgBasket * 2) {
+    score += 15;
+    reds.push({ level: "warning", icon: "\u{1F7E0}", text: `Montant ${amount} CHF = ${(amount / avgBasket).toFixed(1)}x le panier moyen (${Math.round(avgBasket)} CHF)` });
+  }
+  if (amount > 200) {
+    score += 10;
+    reds.push({ level: "warning", icon: "\u{1F7E0}", text: `Montant \u00E9lev\u00E9 : ${amount} CHF \u2014 double v\u00E9rification recommand\u00E9e` });
+  }
+
+  // RED FLAGS LÉGERS (+5 à +10)
+  const last24h = screenshotChecks.filter(c => c.spender_id === spender.id && (Date.now() - new Date(c.created_at).getTime()) < 24 * 3600000);
+  if (last24h.length >= 2) {
+    score += 10;
+    reds.push({ level: "info", icon: "\u{1F7E1}", text: `${last24h.length} screens soumis par ce spender en 24h` });
+  }
+  const hour = new Date().getHours();
+  if (hour >= 1 && hour <= 5) {
+    score += 5;
+    reds.push({ level: "info", icon: "\u{1F7E1}", text: "Transaction \u00E0 une heure tardive (1h-5h)" });
+  }
+
+  // GREEN FLAGS (-5 à -15)
+  if (validatedTx.length >= 5) { score -= 15; greens.push(`Spender fid\u00E8le \u2014 ${validatedTx.length} TX valid\u00E9es`); }
+  else if (validatedTx.length >= 3) { score -= 10; greens.push(`Spender r\u00E9current \u2014 ${validatedTx.length} TX valid\u00E9es`); }
+  if (spender.vip_score && spender.vip_score > 70) { score -= 10; greens.push(`VIP Score \u00E9lev\u00E9 : ${spender.vip_score}/100`); }
+  if (hasMethod) { greens.push(`Provider a bien un compte ${method} actif`); }
+  const matchingProduct = (products || []).find(p => Math.abs(Number(p.price) - amount) <= 5);
+  if (matchingProduct) { score -= 5; greens.push(`Montant coh\u00E9rent avec "${matchingProduct.name}" (${matchingProduct.price} CHF)`); }
+  const lastValidated = screenshotChecks.filter(c => c.spender_id === spender.id && c.status === "validated").sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+  if (lastValidated) {
+    const ago = Math.floor((Date.now() - new Date(lastValidated.created_at).getTime()) / 60000);
+    const agoStr = ago < 60 ? `il y a ${ago}min` : ago < 1440 ? `il y a ${Math.floor(ago / 60)}h` : `il y a ${Math.floor(ago / 1440)}j`;
+    greens.push(`Dernier screen valid\u00E9 : ${agoStr}`);
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  let level, label, color, recommendation;
+  if (score <= 25) { level = "safe"; label = "SAFE"; color = "#10B981"; recommendation = "Tu peux envoyer le contenu."; }
+  else if (score <= 50) { level = "attention"; label = "ATTENTION"; color = "#F59E0B"; recommendation = "V\u00E9rifie avec le provider que le paiement est bien re\u00E7u."; }
+  else if (score <= 75) { level = "suspect"; label = "SUSPECT"; color = "#F97316"; recommendation = "\u26A0\uFE0F Confirmation provider OBLIGATOIRE avant envoi."; }
+  else { level = "danger"; label = "DANGER"; color = "#EF4444"; recommendation = "\u{1F6A8} NE PAS ENVOYER. Signaler au g\u00E9rant imm\u00E9diatement."; }
+  return { score, level, label, color, recommendation, reds, greens };
+};
+
+// =============================================
+// SCAN CHECKER COMPONENT
+// =============================================
+const ScanChecker = ({ user, lang, spenders, txs, models, profiles, products, providerPaymentMethods, screenshotChecks, onRefresh }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const isGerant = user.role === "gerant";
+
+  const [imagePreview, setImagePreview] = useState(null);
+  const [imageThumb, setImageThumb] = useState(null);
+  const [selectedSpender, setSelectedSpender] = useState(null);
+  const [selectedModel, setSelectedModel] = useState(null);
+  const [amount, setAmount] = useState("");
+  const [currency, setCurrency] = useState("CHF");
+  const [method, setMethod] = useState("");
+  const [selectedProvider, setSelectedProvider] = useState(null);
+  const [selectedPPM, setSelectedPPM] = useState(null);
+  const [notes, setNotes] = useState("");
+  const [result, setResult] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [spenderSearch, setSpenderSearch] = useState("");
+  const [showSpenderDrop, setShowSpenderDrop] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const fileRef = useRef(null);
+
+  // Filter models for chatter (assigned) vs gérant (all)
+  const availModels = isGerant ? models : models.filter(m => {
+    const prof = profiles.find(p => p.id === user.id);
+    if (!prof) return true;
+    const assigned = prof.assigned_models || [];
+    return assigned.length === 0 || assigned.includes(m.id);
+  });
+
+  // Providers filtered by selected method
+  const availProviders = method ? profiles.filter(p => p.role === "provider" && providerPaymentMethods.some(pm => pm.provider_id === p.id && pm.type === method && pm.active !== false)) : profiles.filter(p => p.role === "provider");
+
+  // Payment method accounts for selected provider+method
+  const provAccounts = selectedProvider && method ? providerPaymentMethods.filter(pm => pm.provider_id === selectedProvider.id && pm.type === method && pm.active !== false) : [];
+
+  // Auto-select primary account
+  useEffect(() => {
+    if (provAccounts.length === 1) setSelectedPPM(provAccounts[0]);
+    else if (provAccounts.length > 1) {
+      const primary = provAccounts.find(a => a.is_primary);
+      setSelectedPPM(primary || provAccounts[0]);
+    } else setSelectedPPM(null);
+  }, [selectedProvider?.id, method]);
+
+  // Image handling
+  const handleFile = (file) => {
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) { addToast("Image trop lourde (max 5MB)", "warning"); return; }
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { addToast("Format non support\u00E9 (PNG, JPG, WEBP)", "warning"); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setImagePreview(e.target.result);
+      setImageThumb(e.target.result.substring(0, 100));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Paste listener
+  useEffect(() => {
+    const handler = (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          handleFile(item.getAsFile());
+          break;
+        }
+      }
+    };
+    document.addEventListener("paste", handler);
+    return () => document.removeEventListener("paste", handler);
+  }, []);
+
+  // Filtered spenders for dropdown
+  const filteredSpenders = spenderSearch.trim() ? spenders.filter(s => {
+    const q = spenderSearch.toLowerCase();
+    return (s.handle || "").toLowerCase().includes(q) || (s.name || "").toLowerCase().includes(q) || (s.first_name || "").toLowerCase().includes(q);
+  }).slice(0, 15) : spenders.slice(0, 15);
+
+  const resetForm = () => { setImagePreview(null); setImageThumb(null); setSelectedSpender(null); setSelectedModel(null); setAmount(""); setCurrency("CHF"); setMethod(""); setSelectedProvider(null); setSelectedPPM(null); setNotes(""); setResult(null); setSpenderSearch(""); };
+
+  const doAnalyze = () => {
+    if (!selectedSpender || !selectedModel || !amount || !method || !selectedProvider) {
+      addToast("Remplis tous les champs obligatoires", "warning"); return;
+    }
+    const r = analyzeScreenshot({
+      spender: selectedSpender, amount: Number(amount), method, provider: selectedProvider,
+      providerPaymentMethods, transactions: txs, screenshotChecks, products
+    });
+    setResult(r);
+  };
+
+  const saveCheck = async (status) => {
+    setSaving(true);
+    try {
+      const checkData = {
+        checked_by: user.id, checked_by_role: user.role,
+        spender_id: selectedSpender.id, model_id: selectedModel.id,
+        provider_id: selectedProvider.id,
+        provider_payment_method_id: selectedPPM ? selectedPPM.id : null,
+        claimed_amount: Number(amount), claimed_method: method, claimed_currency: currency,
+        risk_score: result ? result.score : 0,
+        red_flags: result ? result.reds : [], green_flags: result ? result.greens : [],
+        status, notes: notes || null, image_thumb: imageThumb || null
+      };
+      const { error } = await sb.from("screenshot_checks").insert(checkData);
+      if (error) throw error;
+
+      if (status === "validated") {
+        const { error: txErr } = await sb.from("transactions").insert({
+          spender_id: selectedSpender.id, model_id: selectedModel.id,
+          provider_id: selectedProvider.id,
+          provider_payment_method_id: selectedPPM ? selectedPPM.id : null,
+          amount: Number(amount), currency, payment_method: method,
+          status: "pending", created_by: user.id,
+          notes: `Cr\u00E9\u00E9e depuis scan checker (score: ${result.score}/100)`
+        });
+        if (txErr) throw txErr;
+        addToast("\u2705 Screen valid\u00E9 \u2014 TX cr\u00E9\u00E9e en pending", "success");
+      } else if (status === "awaiting_confirmation") {
+        addToast("\u{1F4DE} Contacte le provider pour confirmer la r\u00E9ception du paiement", "info");
+      } else if (status === "rejected") {
+        const newCount = (selectedSpender.scam_count || 0) + 1;
+        await sb.from("spenders").update({ scam_count: newCount, scam_flag: newCount >= 2 }).eq("id", selectedSpender.id);
+        addToast("\u274C Screen rejet\u00E9 \u2014 spender marqu\u00E9", "warning");
+      } else if (status === "pending") {
+        addToast("\u23F8 Screen en attente de v\u00E9rification", "info");
+      }
+      resetForm();
+      if (onRefresh) onRefresh();
+    } catch (e) { addToast("Erreur: " + (e.message || e), "error"); }
+    setSaving(false);
+  };
+
+  const inputStyle = { width: "100%", padding: "10px 14px", borderRadius: 12, border: "1px solid #2A2A3E", background: "#0D0D1A", color: "#fff", fontSize: 13, fontFamily: "'DM Sans',sans-serif", outline: "none", boxSizing: "border-box" };
+  const labelStyle = { fontSize: 11, fontWeight: 700, color: "#9CA3AF", textTransform: "uppercase", marginBottom: 6, display: "block" };
+
+  return (
+    <div>
+      <div style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0, display: "flex", alignItems: "center", gap: 8 }}>{"\u{1F50D}"} V\u00E9rifier un screenshot de paiement</h2>
+        <p style={{ fontSize: 12, color: "#F59E0B", marginTop: 6, fontWeight: 600 }}>{"\u26A0\uFE0F"} R\u00C8GLE D'OR : Z\u00E9ro contenu envoy\u00E9 sans v\u00E9rification</p>
+      </div>
+
+      {selectedSpender && selectedSpender.scam_flag && (
+        <div style={{ padding: "14px 18px", borderRadius: 14, background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)", marginBottom: 20, fontSize: 13, color: "#EF4444", fontWeight: 600 }}>
+          {"\u{1F6A8}"} ATTENTION \u2014 Ce spender a \u00E9t\u00E9 marqu\u00E9 comme scammer ({selectedSpender.scam_count || 0} screens rejet\u00E9s). Ne pas envoyer de contenu sans confirmation provider pr\u00E9alable.
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "45% 55%", gap: 24, marginBottom: 24 }}>
+        {/* LEFT — IMAGE ZONE */}
+        <div>
+          <div
+            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+            onDragLeave={() => setIsDragOver(false)}
+            onDrop={(e) => { e.preventDefault(); setIsDragOver(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
+            onClick={() => !imagePreview && fileRef.current?.click()}
+            style={{ width: "100%", minHeight: 350, background: "#0D0D1A", border: `2px dashed ${isDragOver || imagePreview ? "#8B5CF6" : "#2A2A3E"}`, borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", cursor: imagePreview ? "default" : "pointer", transition: "all 0.2s", position: "relative", overflow: "hidden" }}
+          >
+            {imagePreview ? (
+              <div style={{ position: "relative", width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <img src={imagePreview} style={{ maxWidth: "100%", maxHeight: 350, borderRadius: 12 }} />
+                <button onClick={(e) => { e.stopPropagation(); setImagePreview(null); setImageThumb(null); }} style={{ position: "absolute", top: 8, right: 8, width: 28, height: 28, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{"\u2715"}</button>
+              </div>
+            ) : (
+              <div style={{ textAlign: "center", color: "#6B7280" }}>
+                <span style={{ fontSize: 48 }}>{"\u{1F4F8}"}</span>
+                <p style={{ fontSize: 16, marginTop: 12 }}>Glisser un screenshot ici</p>
+                <p style={{ fontSize: 13 }}>ou <strong>Ctrl+V</strong> pour coller</p>
+                <p style={{ fontSize: 13 }}>ou <strong>clic</strong> pour s\u00E9lectionner</p>
+                <p style={{ fontSize: 11, marginTop: 8, color: "#4B5563" }}>PNG, JPG, WEBP \u2014 max 5MB</p>
+              </div>
+            )}
+          </div>
+          <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/webp" style={{ display: "none" }} onChange={(e) => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
+        </div>
+
+        {/* RIGHT — FORM */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>INFORMATIONS DU PAIEMENT</div>
+
+          {/* Spender */}
+          <div style={{ position: "relative" }}>
+            <label style={labelStyle}>Spender *</label>
+            <input value={selectedSpender ? `@${selectedSpender.handle || selectedSpender.name}` : spenderSearch} onChange={(e) => { setSpenderSearch(e.target.value); setSelectedSpender(null); setShowSpenderDrop(true); }} onFocus={() => setShowSpenderDrop(true)} placeholder={"\u{1F50D} Chercher par handle..."} style={inputStyle} />
+            {showSpenderDrop && !selectedSpender && (
+              <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50, background: "#1A1A2E", border: "1px solid #2A2A3E", borderRadius: 12, maxHeight: 200, overflow: "auto", marginTop: 4 }}>
+                {filteredSpenders.map(s => (
+                  <div key={s.id} onClick={() => { setSelectedSpender(s); setSpenderSearch(""); setShowSpenderDrop(false); }} style={{ padding: "10px 14px", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid #2A2A3E" }} onMouseOver={(e) => e.currentTarget.style.background = "#2A2A3E"} onMouseOut={(e) => e.currentTarget.style.background = "transparent"}>
+                    <span>@{s.handle || s.name}</span>
+                    {s.first_name && <span style={{ color: "#6B7280" }}>{s.first_name}</span>}
+                    {(s.scam_flag || (s.scam_count && s.scam_count >= 2)) && <span style={{ padding: "2px 6px", borderRadius: 6, background: "rgba(239,68,68,0.15)", color: "#EF4444", fontSize: 9, fontWeight: 700 }}>{"\u{1F6A8}"} SCAM</span>}
+                  </div>
+                ))}
+                {filteredSpenders.length === 0 && <div style={{ padding: 12, color: "#6B7280", fontSize: 12 }}>Aucun r\u00E9sultat</div>}
+              </div>
+            )}
+          </div>
+
+          {/* Model */}
+          <div>
+            <label style={labelStyle}>Mod\u00E8le *</label>
+            <select value={selectedModel ? selectedModel.id : ""} onChange={(e) => setSelectedModel(models.find(m => m.id === e.target.value) || null)} style={inputStyle}>
+              <option value="">S\u00E9lectionner...</option>
+              {availModels.map(m => <option key={m.id} value={m.id}>{m.name || m.display_name}</option>)}
+            </select>
+          </div>
+
+          {/* Amount + Currency */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 90px", gap: 8 }}>
+            <div>
+              <label style={labelStyle}>Montant d\u00E9clar\u00E9 *</label>
+              <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="150" style={inputStyle} min="0" step="1" />
+            </div>
+            <div>
+              <label style={labelStyle}>Devise</label>
+              <select value={currency} onChange={(e) => setCurrency(e.target.value)} style={inputStyle}>
+                <option value="CHF">CHF</option>
+                <option value="EUR">EUR</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Payment Method */}
+          <div>
+            <label style={labelStyle}>M\u00E9thode de paiement *</label>
+            <select value={method} onChange={(e) => { setMethod(e.target.value); setSelectedProvider(null); setSelectedPPM(null); }} style={inputStyle}>
+              <option value="">S\u00E9lectionner...</option>
+              {PAYMENT_METHODS.map(pm => { const ptc = PAYMENT_TYPE_COLORS[pm] || PAYMENT_TYPE_COLORS["Autre"]; return <option key={pm} value={pm}>{ptc.icon} {pm}</option>; })}
+            </select>
+          </div>
+
+          {/* Provider */}
+          <div>
+            <label style={labelStyle}>Provider *</label>
+            <select value={selectedProvider ? selectedProvider.id : ""} onChange={(e) => { setSelectedProvider(profiles.find(p => p.id === e.target.value) || null); setSelectedPPM(null); }} style={inputStyle}>
+              <option value="">S\u00E9lectionner...</option>
+              {availProviders.map(p => <option key={p.id} value={p.id}>{p.name || p.display_name}</option>)}
+            </select>
+          </div>
+
+          {/* Account */}
+          {provAccounts.length > 0 && (
+            <div>
+              <label style={labelStyle}>Compte du provider</label>
+              <select value={selectedPPM ? selectedPPM.id : ""} onChange={(e) => setSelectedPPM(provAccounts.find(a => a.id === e.target.value) || null)} style={inputStyle}>
+                {provAccounts.map(a => { const ptc = PAYMENT_TYPE_COLORS[a.type] || PAYMENT_TYPE_COLORS["Autre"]; return <option key={a.id} value={a.id}>{ptc.icon} {a.label || a.type} \u2014 {a.detail} ({a.currency || "CHF"}){a.is_primary ? " \u2B50" : ""}</option>; })}
+              </select>
+            </div>
+          )}
+
+          {/* Notes */}
+          <div>
+            <label style={labelStyle}>Notes (optionnel)</label>
+            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Le spender dit avoir pay\u00E9 \u00E0 14h..." style={{ ...inputStyle, minHeight: 50, resize: "vertical" }} />
+          </div>
+
+          {/* VERIFY BUTTON */}
+          <button onClick={doAnalyze} disabled={!selectedSpender || !selectedModel || !amount || !method || !selectedProvider} style={{ width: "100%", padding: "14px 20px", borderRadius: 14, border: "none", background: (!selectedSpender || !selectedModel || !amount || !method || !selectedProvider) ? "#2A2A3E" : "#8B5CF6", color: "#fff", fontSize: 15, fontWeight: 800, cursor: (!selectedSpender || !selectedModel || !amount || !method || !selectedProvider) ? "not-allowed" : "pointer", fontFamily: "'DM Sans',sans-serif", transition: "all 0.2s" }}>
+            {"\u{1F50D}"} V\u00C9RIFIER CE SCREENSHOT
+          </button>
+        </div>
+      </div>
+
+      {/* RESULT ZONE */}
+      {result && (
+        <div style={{ padding: 24, borderRadius: 16, border: `1px solid ${result.score >= 76 ? "rgba(239,68,68,0.4)" : result.score <= 25 ? "rgba(16,185,129,0.4)" : "rgba(245,158,11,0.3)"}`, background: result.score >= 76 ? "rgba(239,68,68,0.06)" : result.score <= 25 ? "rgba(16,185,129,0.06)" : "rgba(245,158,11,0.04)", marginBottom: 24 }}>
+          <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 16 }}>RISK SCORE</div>
+          {/* Score bar */}
+          <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 12 }}>
+            <div style={{ flex: 1, height: 12, borderRadius: 6, background: "#1A1A2E", overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${result.score}%`, borderRadius: 6, background: result.color, transition: "width 0.5s ease" }} />
+            </div>
+            <span style={{ fontSize: 18, fontWeight: 800, color: result.color }}>{result.score}/100</span>
+          </div>
+          <div style={{ fontSize: 16, fontWeight: 800, color: result.color, marginBottom: 4 }}>{result.score <= 25 ? "\u{1F7E2}" : result.score <= 50 ? "\u{1F7E1}" : result.score <= 75 ? "\u{1F7E0}" : "\u{1F534}"} {result.label}</div>
+          <div style={{ fontSize: 13, color: "#D1D5DB", marginBottom: 20 }}>{result.recommendation}</div>
+
+          {/* Red flags */}
+          {result.reds.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", marginBottom: 8, borderBottom: "1px solid #2A2A3E", paddingBottom: 6 }}>RED FLAGS</div>
+              {result.reds.map((r, i) => <div key={i} style={{ fontSize: 13, padding: "6px 0", color: r.level === "critical" ? "#EF4444" : r.level === "danger" ? "#F87171" : r.level === "warning" ? "#FBBF24" : "#9CA3AF" }}>{r.icon} {r.text}</div>)}
+            </div>
+          )}
+
+          {/* Green flags */}
+          {result.greens.length > 0 && (
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", marginBottom: 8, borderBottom: "1px solid #2A2A3E", paddingBottom: 6 }}>GREEN FLAGS</div>
+              {result.greens.map((g, i) => <div key={i} style={{ fontSize: 13, padding: "6px 0", color: "#10B981" }}>{"\u2705"} {g}</div>)}
+            </div>
+          )}
+
+          {/* Action buttons */}
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", marginBottom: 10, borderBottom: "1px solid #2A2A3E", paddingBottom: 6 }}>ACTIONS</div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <button onClick={() => saveCheck("validated")} disabled={saving || result.score >= 76} title={result.score >= 76 ? "Score trop \u00E9lev\u00E9 \u2014 demande confirmation provider d'abord" : ""} style={{ padding: "10px 18px", borderRadius: 12, border: "none", background: result.score >= 76 ? "#2A2A3E" : "#10B981", color: result.score >= 76 ? "#6B7280" : "#fff", fontWeight: 700, fontSize: 13, cursor: result.score >= 76 ? "not-allowed" : "pointer", fontFamily: "'DM Sans',sans-serif", animation: result.score <= 25 ? "pulse 2s infinite" : "none" }}>{"\u2705"} VALIDER \u2014 Cr\u00E9er TX</button>
+            <button onClick={() => saveCheck("awaiting_confirmation")} disabled={saving} style={{ padding: "10px 18px", borderRadius: 12, border: "none", background: "#3B82F6", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u{1F4DE}"} CONFIRM PROVIDER</button>
+            <button onClick={() => saveCheck("rejected")} disabled={saving} style={{ padding: "10px 18px", borderRadius: 12, border: result.score >= 76 ? "none" : "1px solid #EF4444", background: result.score >= 76 ? "#EF4444" : "transparent", color: result.score >= 76 ? "#fff" : "#EF4444", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u274C"} REJETER</button>
+            <button onClick={() => saveCheck("pending")} disabled={saving} style={{ padding: "10px 18px", borderRadius: 12, border: "1px solid #6B7280", background: "transparent", color: "#6B7280", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u23F8"} EN ATTENTE</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
+// SCAN LOGS COMPONENT (GÉRANT)
+// =============================================
+const ScanLogs = ({ user, lang, spenders, txs, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [filterPeriod, setFilterPeriod] = useState("all");
+  const [filterScore, setFilterScore] = useState("all");
+  const [filterChatter, setFilterChatter] = useState("all");
+  const [filterSpender, setFilterSpender] = useState("all");
+  const [selectedScan, setSelectedScan] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const checks = screenshotChecks || [];
+  const chatters = profiles.filter(p => p.role === "chatter" || p.role === "gerant");
+
+  // Filtered checks
+  const filtered = checks.filter(c => {
+    if (filterStatus !== "all" && c.status !== filterStatus) return false;
+    if (filterPeriod !== "all") {
+      const age = Date.now() - new Date(c.created_at).getTime();
+      if (filterPeriod === "today" && age > 86400000) return false;
+      if (filterPeriod === "7d" && age > 7 * 86400000) return false;
+      if (filterPeriod === "30d" && age > 30 * 86400000) return false;
+    }
+    if (filterScore !== "all") {
+      const s = c.risk_score || 0;
+      if (filterScore === "safe" && s > 25) return false;
+      if (filterScore === "attention" && (s <= 25 || s > 50)) return false;
+      if (filterScore === "suspect" && (s <= 50 || s > 75)) return false;
+      if (filterScore === "danger" && s <= 75) return false;
+    }
+    if (filterChatter !== "all" && c.checked_by !== filterChatter) return false;
+    if (filterSpender !== "all" && c.spender_id !== filterSpender) return false;
+    return true;
+  });
+
+  // KPIs
+  const total = checks.length;
+  const validated = checks.filter(c => c.status === "validated").length;
+  const rejectedCnt = checks.filter(c => c.status === "rejected").length;
+  const pendingCnt = checks.filter(c => c.status === "pending").length;
+  const awaitingCnt = checks.filter(c => c.status === "awaiting_confirmation").length;
+  const totalAmount = checks.filter(c => c.status === "validated").reduce((s, c) => s + Number(c.claimed_amount || 0), 0);
+  const avgScore = total > 0 ? Math.round(checks.reduce((s, c) => s + (c.risk_score || 0), 0) / total) : 0;
+  const scammers = spenders.filter(s => s.scam_flag || (s.scam_count && s.scam_count >= 2)).length;
+
+  const getSpender = (id) => spenders.find(s => s.id === id);
+  const getModel = (id) => models.find(m => m.id === id);
+  const getProfile = (id) => profiles.find(p => p.id === id);
+  const getProvider = (id) => profiles.find(p => p.id === id);
+
+  const scoreColor = (s) => s <= 25 ? "#10B981" : s <= 50 ? "#F59E0B" : s <= 75 ? "#F97316" : "#EF4444";
+  const scoreIcon = (s) => s <= 25 ? "\u{1F7E2}" : s <= 50 ? "\u{1F7E1}" : s <= 75 ? "\u{1F7E0}" : "\u{1F534}";
+  const statusLabel = (st) => st === "validated" ? "\u2705 Valid\u00E9" : st === "rejected" ? "\u274C Rejet\u00E9" : st === "awaiting_confirmation" ? "\u{1F4DE} Attente confirm" : "\u23F8 En attente";
+  const statusColor = (st) => st === "validated" ? "#10B981" : st === "rejected" ? "#EF4444" : st === "awaiting_confirmation" ? "#3B82F6" : "#6B7280";
+
+  const fmtTimeAgo = (d) => {
+    if (!d) return "";
+    const ms = Date.now() - new Date(d).getTime();
+    const min = Math.floor(ms / 60000);
+    if (min < 60) return `il y a ${min}min`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `il y a ${hr}h`;
+    return `il y a ${Math.floor(hr / 24)}j`;
+  };
+
+  const forceAction = async (check, action) => {
+    setSaving(true);
+    try {
+      await sb.from("screenshot_checks").update({ status: action, force_by: user.id, force_at: new Date().toISOString() }).eq("id", check.id);
+      if (action === "rejected") {
+        const sp = getSpender(check.spender_id);
+        if (sp) {
+          const newCount = (sp.scam_count || 0) + 1;
+          await sb.from("spenders").update({ scam_count: newCount, scam_flag: newCount >= 2 }).eq("id", sp.id);
+        }
+      }
+      addToast(action === "validated" ? "\u2705 Forc\u00E9 valid\u00E9" : "\u274C Forc\u00E9 rejet\u00E9", action === "validated" ? "success" : "warning");
+      setSelectedScan(null);
+      if (onRefresh) onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const filterBtnStyle = (active) => ({ padding: "6px 14px", borderRadius: 10, border: "1px solid " + (active ? "#8B5CF6" : "#2A2A3E"), background: active ? "rgba(139,92,246,0.15)" : "transparent", color: active ? "#8B5CF6" : "#6B7280", fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" });
+
+  return (
+    <div>
+      {/* KPIs */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(140px,1fr))", gap: 12, marginBottom: 24 }}>
+        {[
+          { icon: "\u{1F4F8}", label: "TOTAL", value: total, color: "#8B5CF6" },
+          { icon: "\u2705", label: "VALID\u00C9S", value: validated, sub: total > 0 ? `(${(validated / total * 100).toFixed(1)}%)` : "", color: "#10B981" },
+          { icon: "\u274C", label: "REJET\u00C9S", value: rejectedCnt, sub: total > 0 ? `(${(rejectedCnt / total * 100).toFixed(1)}%)` : "", color: "#EF4444" },
+          { icon: "\u23F8", label: "EN ATTENTE", value: pendingCnt, color: "#6B7280" },
+          { icon: "\u{1F4DE}", label: "ATTENTE CONFIRM", value: awaitingCnt, color: "#3B82F6" },
+          { icon: "\u{1F4B0}", label: "MONTANT V\u00C9RIFI\u00C9", value: `${totalAmount.toLocaleString()} CHF`, color: "#F59E0B" },
+          { icon: "\u{1F4CA}", label: "SCORE MOYEN", value: `${avgScore}/100`, color: scoreColor(avgScore) },
+          { icon: "\u{1F6A8}", label: "SCAMMERS", value: scammers, color: "#EF4444" },
+        ].map(k => (
+          <div key={k.label} style={{ padding: 16, borderRadius: 14, background: "var(--bg-overlay)", border: "1px solid var(--border-subtle)", textAlign: "center" }}>
+            <div style={{ fontSize: 18 }}>{k.icon}</div>
+            <div style={{ fontSize: 9, color: "#6B7280", textTransform: "uppercase", fontWeight: 700, marginTop: 4 }}>{k.label}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: k.color, marginTop: 2 }}>{k.value}</div>
+            {k.sub && <div style={{ fontSize: 10, color: "#6B7280" }}>{k.sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      {/* Filters */}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 20 }}>
+        <div style={{ display: "flex", gap: 4 }}>
+          {[{ v: "all", l: "Tous" }, { v: "validated", l: "\u2705 Valid\u00E9s" }, { v: "rejected", l: "\u274C Rejet\u00E9s" }, { v: "pending", l: "\u23F8 Attente" }, { v: "awaiting_confirmation", l: "\u{1F4DE} Confirm" }].map(f => (
+            <button key={f.v} onClick={() => setFilterStatus(f.v)} style={filterBtnStyle(filterStatus === f.v)}>{f.l}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {[{ v: "all", l: "Tout" }, { v: "today", l: "Auj" }, { v: "7d", l: "7j" }, { v: "30d", l: "30j" }].map(f => (
+            <button key={f.v} onClick={() => setFilterPeriod(f.v)} style={filterBtnStyle(filterPeriod === f.v)}>{f.l}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {[{ v: "all", l: "Scores" }, { v: "safe", l: "\u{1F7E2} Safe" }, { v: "attention", l: "\u{1F7E1} Attention" }, { v: "suspect", l: "\u{1F7E0} Suspect" }, { v: "danger", l: "\u{1F534} Danger" }].map(f => (
+            <button key={f.v} onClick={() => setFilterScore(f.v)} style={filterBtnStyle(filterScore === f.v)}>{f.l}</button>
+          ))}
+        </div>
+        <select value={filterChatter} onChange={(e) => setFilterChatter(e.target.value)} style={{ padding: "6px 12px", borderRadius: 10, border: "1px solid #2A2A3E", background: "#0D0D1A", color: "#9CA3AF", fontSize: 11, fontFamily: "'DM Sans',sans-serif" }}>
+          <option value="all">Tous chatters</option>
+          {chatters.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+        <select value={filterSpender} onChange={(e) => setFilterSpender(e.target.value)} style={{ padding: "6px 12px", borderRadius: 10, border: "1px solid #2A2A3E", background: "#0D0D1A", color: "#9CA3AF", fontSize: 11, fontFamily: "'DM Sans',sans-serif" }}>
+          <option value="all">Tous spenders</option>
+          {spenders.slice(0, 50).map(s => <option key={s.id} value={s.id}>@{s.handle || s.name}</option>)}
+        </select>
+      </div>
+
+      {/* Cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(320px,1fr))", gap: 14 }}>
+        {filtered.map(c => {
+          const sp = getSpender(c.spender_id);
+          const mo = getModel(c.model_id);
+          const checker = getProfile(c.checked_by);
+          const prov = getProvider(c.provider_id);
+          const ptc = PAYMENT_TYPE_COLORS[c.claimed_method] || PAYMENT_TYPE_COLORS["Autre"];
+          const sc = c.risk_score || 0;
+          return (
+            <div key={c.id} onClick={() => setSelectedScan(c)} className="card-hover" style={{ padding: 16, borderRadius: 14, background: "var(--bg-overlay)", border: "1px solid var(--border-subtle)", cursor: "pointer", transition: "all 0.2s" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 700 }}>{"\u{1F4F8}"} @{sp?.handle || "?"} {"\u2192"} {mo?.name || "?"}</span>
+                <span style={{ padding: "3px 10px", borderRadius: 10, background: `${scoreColor(sc)}22`, color: scoreColor(sc), fontSize: 11, fontWeight: 700 }}>{scoreIcon(sc)} {sc}/100</span>
+              </div>
+              <div style={{ fontSize: 12, color: "#9CA3AF", marginBottom: 6 }}>{c.claimed_amount} {c.claimed_currency || "CHF"} {"\u00B7"} <span style={{ color: ptc.bg || ptc.color }}>{ptc.icon} {c.claimed_method}</span> {"\u00B7"} {prov?.name || "?"}</div>
+              <div style={{ fontSize: 11, color: "#6B7280", marginBottom: 8 }}>V\u00E9rifi\u00E9 par: {checker?.name || "?"} {"\u00B7"} {fmtTimeAgo(c.created_at)}</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: statusColor(c.status), marginBottom: 8 }}>{statusLabel(c.status)}</div>
+              <div style={{ height: 5, borderRadius: 3, background: "#1A1A2E", overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${sc}%`, borderRadius: 3, background: scoreColor(sc) }} />
+              </div>
+            </div>
+          );
+        })}
+        {filtered.length === 0 && <div style={{ gridColumn: "1/-1", padding: 40, textAlign: "center", color: "#6B7280" }}>Aucun scan trouv\u00E9</div>}
+      </div>
+
+      {/* DETAIL MODAL */}
+      {selectedScan && (() => {
+        const c = selectedScan;
+        const sp = getSpender(c.spender_id);
+        const mo = getModel(c.model_id);
+        const checker = getProfile(c.checked_by);
+        const prov = getProvider(c.provider_id);
+        const ppm = providerPaymentMethods.find(pm => pm.id === c.provider_payment_method_id);
+        const ptc = PAYMENT_TYPE_COLORS[c.claimed_method] || PAYMENT_TYPE_COLORS["Autre"];
+        const sc = c.risk_score || 0;
+        const flags = Array.isArray(c.red_flags) ? c.red_flags : [];
+        const gflags = Array.isArray(c.green_flags) ? c.green_flags : [];
+        return (
+          <div style={{ position: "fixed", inset: 0, zIndex: 10000, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={() => setSelectedScan(null)}>
+            <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 640, maxHeight: "85vh", overflow: "auto", background: "#12121F", borderRadius: 20, padding: 28, position: "relative" }}>
+              <button onClick={() => setSelectedScan(null)} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", color: "#6B7280", fontSize: 20, cursor: "pointer" }}>{"\u2715"}</button>
+              <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 20 }}>{"\u{1F4F8}"} Scan #{c.id?.substring(0, 6)} \u2014 D\u00E9tail</div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+                {[
+                  { l: "Spender", v: `@${sp?.handle || "?"}` }, { l: "Mod\u00E8le", v: mo?.name || "?" },
+                  { l: "Montant", v: `${c.claimed_amount} ${c.claimed_currency || "CHF"}` }, { l: "M\u00E9thode", v: `${ptc.icon} ${c.claimed_method}` },
+                  { l: "Provider", v: prov?.name || "?" }, { l: "Compte", v: ppm ? `${ppm.detail} (${ppm.currency || "CHF"})` : "\u2014" },
+                  { l: "V\u00E9rifi\u00E9 par", v: `${checker?.name || "?"} (${c.checked_by_role})` }, { l: "Date", v: c.created_at ? new Date(c.created_at).toLocaleString("fr-FR") : "\u2014" },
+                ].map(f => (
+                  <div key={f.l} style={{ padding: 10, borderRadius: 10, background: "#1A1A2E" }}>
+                    <div style={{ fontSize: 9, color: "#6B7280", textTransform: "uppercase", fontWeight: 700 }}>{f.l}</div>
+                    <div style={{ fontSize: 13, fontWeight: 600, marginTop: 2 }}>{f.v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Score */}
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+                  <div style={{ flex: 1, height: 10, borderRadius: 5, background: "#1A1A2E", overflow: "hidden" }}>
+                    <div style={{ height: "100%", width: `${sc}%`, borderRadius: 5, background: scoreColor(sc) }} />
+                  </div>
+                  <span style={{ fontSize: 16, fontWeight: 800, color: scoreColor(sc) }}>{sc}/100 {scoreIcon(sc)} {sc <= 25 ? "SAFE" : sc <= 50 ? "ATTENTION" : sc <= 75 ? "SUSPECT" : "DANGER"}</span>
+                </div>
+              </div>
+
+              {/* Flags */}
+              {flags.length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>RED FLAGS</div>
+                  {flags.map((f, i) => <div key={i} style={{ fontSize: 12, padding: "4px 0", color: "#F87171" }}>{f.icon || "\u{1F534}"} {f.text || f}</div>)}
+                </div>
+              )}
+              {gflags.length > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", marginBottom: 6 }}>GREEN FLAGS</div>
+                  {gflags.map((g, i) => <div key={i} style={{ fontSize: 12, padding: "4px 0", color: "#10B981" }}>{"\u2705"} {typeof g === "string" ? g : g.text || g}</div>)}
+                </div>
+              )}
+
+              {/* Status */}
+              <div style={{ padding: 12, borderRadius: 12, background: "#1A1A2E", marginBottom: 14 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: statusColor(c.status) }}>{statusLabel(c.status)}</div>
+                {c.provider_confirmed !== undefined && c.provider_confirmed !== null && (
+                  <div style={{ fontSize: 12, marginTop: 4, color: c.provider_confirmed ? "#10B981" : "#EF4444" }}>Provider confirm\u00E9: {c.provider_confirmed ? "\u2705 Oui" : "\u274C Non"}{c.provider_confirmed_at ? ` (${new Date(c.provider_confirmed_at).toLocaleString("fr-FR")})` : ""}</div>
+                )}
+              </div>
+
+              {/* Notes */}
+              {c.notes && <div style={{ padding: 12, borderRadius: 12, background: "#1A1A2E", marginBottom: 14, fontSize: 12, color: "#9CA3AF", fontStyle: "italic" }}>"{c.notes}"</div>}
+
+              {/* Gérant actions */}
+              {user.role === "gerant" && (
+                <div style={{ borderTop: "1px solid #2A2A3E", paddingTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <button onClick={() => forceAction(c, "validated")} disabled={saving} style={{ padding: "8px 16px", borderRadius: 10, border: "none", background: "#10B981", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u2705"} Forcer validation</button>
+                  <button onClick={() => forceAction(c, "rejected")} disabled={saving} style={{ padding: "8px 16px", borderRadius: 10, border: "none", background: "#EF4444", color: "#fff", fontWeight: 700, fontSize: 12, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u274C"} Forcer rejet</button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+};
+
+// =============================================
+// SCANS TAB (GÉRANT — Automation > Scans)
+// =============================================
+const ScansTab = ({ user, lang, spenders, txs, models, profiles, products, providerPaymentMethods, screenshotChecks, onRefresh }) => {
+  const [scanSub, setScanSub] = useState("checker");
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 0, marginBottom: 24, borderBottom: "1px solid #2A2A3E" }}>
+        {[{ id: "checker", label: "\u{1F50D} Checker", icon: "" }, { id: "logs", label: "\u{1F4CB} Historique", icon: "" }].map(t => (
+          <button key={t.id} onClick={() => setScanSub(t.id)} style={{ padding: "12px 20px", background: "none", border: "none", borderBottom: scanSub === t.id ? "2px solid #8B5CF6" : "2px solid transparent", color: scanSub === t.id ? "#fff" : "#6B7280", cursor: "pointer", fontSize: 14, fontWeight: 600, fontFamily: "'DM Sans',sans-serif" }}>{t.label}</button>
+        ))}
+      </div>
+      {scanSub === "checker" && <ScanChecker user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
+      {scanSub === "logs" && <ScanLogs user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
+    </div>
+  );
+};
+
+// =============================================
+// PROVIDER CONFIRMATIONS COMPONENT
+// =============================================
+const ProviderConfirmations = ({ user, lang, spenders, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh }) => {
+  const addToast = useToast();
+  const [saving, setSaving] = useState(false);
+  const pending = (screenshotChecks || []).filter(c => c.status === "awaiting_confirmation" && c.provider_id === user.id);
+
+  if (pending.length === 0) return null;
+
+  const handleConfirm = async (check, confirmed) => {
+    setSaving(true);
+    try {
+      await sb.from("screenshot_checks").update({
+        provider_confirmed: confirmed,
+        provider_confirmed_at: new Date().toISOString(),
+        status: confirmed ? "validated" : "rejected"
+      }).eq("id", check.id);
+      if (confirmed) {
+        await sb.from("transactions").insert({
+          spender_id: check.spender_id, model_id: check.model_id,
+          provider_id: check.provider_id, provider_payment_method_id: check.provider_payment_method_id,
+          amount: check.claimed_amount, currency: check.claimed_currency || "CHF",
+          payment_method: check.claimed_method, status: "pending", created_by: user.id,
+          notes: `Confirm\u00E9 par provider (scan score: ${check.risk_score}/100)`
+        });
+        addToast("\u2705 Paiement confirm\u00E9 \u2014 TX cr\u00E9\u00E9e", "success");
+      } else {
+        const sp = spenders.find(s => s.id === check.spender_id);
+        if (sp) {
+          const newCount = (sp.scam_count || 0) + 1;
+          await sb.from("spenders").update({ scam_count: newCount, scam_flag: newCount >= 2 }).eq("id", sp.id);
+        }
+        addToast("\u274C Paiement NON re\u00E7u \u2014 alerte envoy\u00E9e", "warning");
+      }
+      if (onRefresh) onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const fmtTimeAgo = (d) => {
+    if (!d) return "";
+    const ms = Date.now() - new Date(d).getTime();
+    const min = Math.floor(ms / 60000);
+    if (min < 60) return `il y a ${min}min`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `il y a ${hr}h`;
+    return `il y a ${Math.floor(hr / 24)}j`;
+  };
+
+  return (
+    <div style={{ marginBottom: 28 }}>
+      <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 14 }}>{"\u{1F4CB}"} Confirmations en attente ({pending.length})</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {pending.map(c => {
+          const sp = spenders.find(s => s.id === c.spender_id);
+          const mo = models.find(m => m.id === c.model_id);
+          const ppm = providerPaymentMethods.find(pm => pm.id === c.provider_payment_method_id);
+          const ptc = PAYMENT_TYPE_COLORS[c.claimed_method] || PAYMENT_TYPE_COLORS["Autre"];
+          return (
+            <div key={c.id} style={{ padding: 18, borderRadius: 14, background: "rgba(59,130,246,0.06)", border: "1px solid rgba(59,130,246,0.2)" }}>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{"\u{1F4F8}"} {c.claimed_amount} {c.claimed_currency || "CHF"} {"\u00B7"} <span style={{ color: ptc.bg || ptc.color }}>{ptc.icon} {c.claimed_method}</span> {ppm ? ppm.detail : ""} {"\u00B7"} {fmtTimeAgo(c.created_at)}</div>
+              <div style={{ fontSize: 12, color: "#9CA3AF", marginBottom: 12 }}>Spender: @{sp?.handle || "?"} {"\u2192"} Mod\u00E8le: {mo?.name || "?"}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: "#D1D5DB" }}>As-tu bien re\u00E7u ce paiement ?</div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={() => handleConfirm(c, true)} disabled={saving} style={{ padding: "8px 18px", borderRadius: 10, border: "none", background: "#10B981", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u2705"} OUI, re\u00E7u</button>
+                <button onClick={() => handleConfirm(c, false)} disabled={saving} style={{ padding: "8px 18px", borderRadius: 10, border: "none", background: "#EF4444", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u274C"} NON, pas re\u00E7u</button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
 // WHATSAPP ANALYZER
 // =============================================
 const WhatsAppAnalyzerTab = ({user, lang, spenders, txs, models, profiles, onRefresh}) => {
@@ -15904,6 +16651,7 @@ const App = () => {
   const [botStats, setBotStats] = useState([]);
   const [providerPaymentMethods, setProviderPaymentMethods] = useState([]);
   const [chatterLogs, setChatterLogs] = useState([]);
+  const [screenshotChecks, setScreenshotChecks] = useState([]);
   const [escalationCount, setEscalationCount] = useState(0);
   // ── NOTIFICATIONS STATE ──
   const [notifications, setNotifications] = useState([]);
@@ -15977,10 +16725,10 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR;
     const safe = (promise) => Promise.resolve(promise).then(r => r.error ? {data:[]} : r).catch(()=>({data:[]}));
     try {
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR] = await Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR] = await Promise.all([
         safe(sb.from("transactions").select("*").order("date",{ascending:false})),
         safe(sb.from("spenders").select("*")),
         safe(sb.from("profiles").select("*")),
@@ -16002,6 +16750,7 @@ const App = () => {
         safe(sb.from("video_sessions").select("*").order("created_at",{ascending:false})),
         safe(sb.from("provider_payment_methods").select("*").order("sort_order",{ascending:true})),
         safe(sb.from("chatter_logs").select("*").order("created_at",{ascending:false}).limit(500)),
+        safe(sb.from("screenshot_checks").select("*").order("created_at",{ascending:false}).limit(500)),
       ]);
     } catch(e) { /* loadData critical failure */ console.error("loadData crash:", e); return; }
     // Discard results if a newer loadData call was started while we were awaiting
@@ -16082,6 +16831,7 @@ const App = () => {
     setVideoSessions((vsR&&vsR.data)||[]);
     setProviderPaymentMethods((ppmR&&ppmR.data)||[]);
     setChatterLogs((chLogR&&chLogR.data)||[]);
+    setScreenshotChecks((scR&&scR.data)||[]); window.__screenshotChecks=(scR&&scR.data)||[];
     // Load escalation count for messagerie badge
     if (currentUser && currentUser.role === "gerant") {
       try {
@@ -16218,6 +16968,7 @@ const App = () => {
     {id:"chatter_messagerie",icon:"\u{1F4AC}",label:lang==="fr"?"Messagerie":"Messaging",show:user.role==="chatter"},
     {id:"chatter_compta",icon:"\u{1F4C4}",label:lang==="fr"?"Compta":"Accounting",show:user.role==="chatter"},
     {id:"chatter_competition",icon:"\u{1F3C6}",label:lang==="fr"?"Compétition":"Competition",show:user.role==="chatter"},
+    {id:"chatter_scan",icon:"\u{1F50D}",label:lang==="fr"?"Vérifier screen":"Verify screen",show:user.role==="chatter"},
     {id:"transactions",icon:"\u{1F4B8}",label:"Mes Transactions",show:user.role==="provider"},
     {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:user.role==="provider"},
     {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:user.role==="chatter"},
@@ -16272,7 +17023,7 @@ const App = () => {
       case "automation":
         return (<>{renderGerantTabBar("automation")}
           {subTab==="bots"&&<AgentsAuditTab lang={lang} txs={txs} models={models} profiles={profiles} onNavigate={(t)=>{closeDrill();navigateTo(t);}} />}
-          {subTab==="scans"&&<WhatsAppAnalyzerTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} />}
+          {subTab==="scans"&&<ScansTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {subTab==="broadcasts"&&<PlaceholderTab title="Broadcasts" />}
         </>);
       case "admin":
@@ -16437,7 +17188,9 @@ const App = () => {
           {tab==="chatter_messagerie"&&user.role==="chatter"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
           {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} profiles={profiles} />}
-          {/* ── Provider pages — UNCHANGED ── */}
+          {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
+          {/* ── Provider pages ── */}
+          {user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
           {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txs} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />}
           </>)}
