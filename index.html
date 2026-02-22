@@ -1792,6 +1792,11 @@ const FAB_ACTIONS_CHATTER = [
   { id: "create_tx", label: "Créer Transaction", icon: "\u{1F4B0}", color: "#10B981" },
   { id: "verify_screen", label: "Vérifier Screen", icon: "\u{1F4F8}", color: "#F59E0B" },
 ];
+const FAB_ACTIONS_PROVIDER = [
+  { id: "provider_add_tx", label: "Ajouter TX", icon: "\u{1F4B0}", color: "#10B981" },
+  { id: "provider_models", label: "Voir Modèles", icon: "\u{1F469}", color: "#EC4899" },
+  { id: "provider_compta", label: "Ma Compta", icon: "\u{1F4B5}", color: "#8B5CF6" },
+];
 
 // =============================================
 // EXPORT & RAPPORTS (PR#29)
@@ -16918,6 +16923,208 @@ const ScansTab = ({ user, lang, spenders, txs, models, profiles, products, provi
 };
 
 // =============================================
+// PROVIDER DASHBOARD TAB — Analytics for Providers
+// =============================================
+const ProviderDashboardTab = ({user, lang, txs, models, profiles, providerPayouts, providerPaymentMethods, onRefresh}) => {
+  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const cs = currencySymbol;
+
+  // Filter TX for this provider
+  const providerTxs = useMemo(() => (txs || []).filter(tx => tx.provider_id === user.id), [txs, user.id]);
+  const validTxs = useMemo(() => providerTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee"), [providerTxs]);
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  // ── KPI Calculations ──
+  const totalRevenue = useMemo(() => validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0), [validTxs]);
+  const monthRevenue = useMemo(() => validTxs.filter(tx => new Date(tx.date) >= monthStart).reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0), [validTxs]);
+  const pendingCount = useMemo(() => providerTxs.filter(tx => tx.status === "pending" || tx.status === "en_attente").length, [providerTxs]);
+  const modelIds = useMemo(() => [...new Set(providerTxs.map(tx => tx.model_id).filter(Boolean))], [providerTxs]);
+
+  const kpis = [
+    { label: fr ? "Revenus Total" : "Total Revenue", value: fmtAmount(totalRevenue), icon: "\u{1F4B0}", color: "#8B5CF6", glow: "rgba(139,92,246,0.15)" },
+    { label: fr ? "Revenus ce mois" : "This Month", value: fmtAmount(monthRevenue), icon: "\u{1F4C8}", color: "#10B981", glow: "rgba(16,185,129,0.15)" },
+    { label: fr ? "TX en attente" : "Pending TX", value: pendingCount, icon: "⏳", color: "#F59E0B", glow: "rgba(245,158,11,0.15)" },
+    { label: fr ? "Modèles" : "Models", value: modelIds.length, icon: "\u{1F469}", color: "#EC4899", glow: "rgba(236,72,153,0.15)" },
+  ];
+
+  // ── Monthly Revenue Bar Chart Data (last 6 months) ──
+  const monthlyData = useMemo(() => {
+    const months = [];
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const end = new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59);
+      const label = d.toLocaleDateString(fr ? "fr-FR" : "en-US", { month: "short" });
+      const rev = validTxs.filter(tx => { const td = new Date(tx.date); return td >= d && td <= end; }).reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      months.push({ name: label, revenue: Math.round(rev) });
+    }
+    return months;
+  }, [validTxs]);
+
+  // ── Revenue by Model Pie Chart Data ──
+  const modelData = useMemo(() => {
+    const byModel = {};
+    validTxs.forEach(tx => {
+      const mid = tx.model_id || "unknown";
+      byModel[mid] = (byModel[mid] || 0) + convertAmount(Number(tx.amount || 0), tx.currency);
+    });
+    const colors = ["#8B5CF6", "#EC4899", "#06B6D4", "#10B981", "#F97316", "#3B82F6", "#FFD700", "#EF4444"];
+    return Object.entries(byModel).map(([id, value], idx) => {
+      const model = (models || []).find(m => m.id === id);
+      return { name: model ? model.name : (fr ? "Inconnu" : "Unknown"), value: Math.round(value), color: colors[idx % colors.length] };
+    }).sort((a, b) => b.value - a.value);
+  }, [validTxs, models]);
+
+  // ── Recent TX (last 20) ──
+  const recentTxs = useMemo(() => {
+    return [...providerTxs].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 20);
+  }, [providerTxs]);
+
+  const statusBadge = (s) => {
+    const map = {
+      validated: { bg: "var(--success-muted)", color: "var(--success)", label: fr ? "Validée" : "Validated" },
+      confirmee: { bg: "var(--success-muted)", color: "var(--success)", label: fr ? "Confirmée" : "Confirmed" },
+      payee: { bg: "rgba(96,165,250,0.15)", color: "#60a5fa", label: fr ? "Payée" : "Paid" },
+      pending: { bg: "var(--warning-muted)", color: "var(--warning)", label: fr ? "En attente" : "Pending" },
+      en_attente: { bg: "var(--warning-muted)", color: "var(--warning)", label: fr ? "En attente" : "Pending" },
+      refused: { bg: "var(--danger-muted)", color: "var(--danger)", label: fr ? "Refusée" : "Refused" },
+    };
+    const st = map[s] || map.pending;
+    return React.createElement("span", { style: { padding: "3px 10px", borderRadius: 12, background: st.bg, color: st.color, fontSize: 10, fontWeight: 700, whiteSpace: "nowrap" } }, st.label);
+  };
+
+  // Payout summary
+  const myPayouts = (providerPayouts || []).filter(p => p.provider_id === user.id);
+  const totalPaid = myPayouts.filter(p => p.status === "validated").reduce((s, p) => s + Number(p.amount || 0), 0);
+  const balance = totalRevenue - totalPaid;
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F4CA}"} {fr ? "Mon Dashboard" : "My Dashboard"}</h2>
+        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0" }}>{fr ? "Vue d'ensemble de votre activité" : "Overview of your activity"}</p>
+      </div>
+
+      {/* KPI Cards */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "repeat(2, 1fr)" : "repeat(4, 1fr)", gap: _isMobile ? 10 : 14, marginBottom: 24 }}>
+        {kpis.map(k => (
+          <div key={k.label} style={{ background: "var(--card-bg, var(--bg-raised))", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: _isMobile ? "14px 14px" : "18px 20px", position: "relative", overflow: "hidden" }}>
+            <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: k.color, opacity: 0.6, borderRadius: "16px 16px 0 0" }} />
+            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8, fontWeight: 600 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: _isMobile ? 20 : 26, fontWeight: 800, color: k.color, fontFamily: "'Space Mono', monospace" }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Balance card */}
+      <div style={{ background: "linear-gradient(135deg, rgba(139,92,246,0.12), rgba(236,72,153,0.08))", border: "1px solid rgba(139,92,246,0.2)", borderRadius: 16, padding: _isMobile ? 16 : 20, marginBottom: 24, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 11, color: "var(--text-tertiary)", textTransform: "uppercase", fontWeight: 700, letterSpacing: 0.5 }}>{fr ? "Solde non reversé" : "Unpaid Balance"}</div>
+          <div style={{ fontSize: _isMobile ? 24 : 32, fontWeight: 800, color: balance > 0 ? "var(--warning)" : "var(--success)", fontFamily: "'Space Mono', monospace", marginTop: 4 }}>{fmtAmount(balance)}</div>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{fr ? "Total reversé" : "Total Paid"}</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: "var(--success)" }}>{fmtAmount(totalPaid)}</div>
+        </div>
+      </div>
+
+      {/* Charts Section */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1.5fr 1fr", gap: 16, marginBottom: 24 }}>
+        {/* Bar Chart — Revenue by Month */}
+        <div style={{ background: "var(--card-bg, var(--bg-raised))", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: _isMobile ? 14 : 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 16 }}>{"\u{1F4CA}"} {fr ? "Revenus par mois" : "Revenue by Month"}</div>
+          {rechartsReady && monthlyData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={monthlyData} barCategoryGap="20%">
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" />
+                <XAxis dataKey="name" tick={{ fill: "var(--text-tertiary)", fontSize: 11, fontFamily: "'DM Sans', sans-serif" }} tickLine={false} axisLine={false} />
+                <YAxis tick={{ fill: "var(--text-tertiary)", fontSize: 10, fontFamily: "'Space Mono', monospace" }} tickLine={false} axisLine={false} tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(1) + "K" : v} />
+                <RechartsTooltip contentStyle={{ background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 10, fontSize: 12, fontFamily: "'DM Sans', sans-serif" }} formatter={(v) => [fmtAmount(v), fr ? "Revenus" : "Revenue"]} />
+                <Bar dataKey="revenue" radius={[8, 8, 0, 0]} name={fr ? "Revenus" : "Revenue"}>
+                  {monthlyData.map((entry, i) => (
+                    <Cell key={i} fill={i === monthlyData.length - 1 ? "#8B5CF6" : "rgba(139,92,246,0.35)"} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div style={{ height: 220, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-quaternary)", fontSize: 12 }}>{fr ? "Pas de données" : "No data"}</div>
+          )}
+        </div>
+
+        {/* Pie Chart — Revenue by Model */}
+        <div style={{ background: "var(--card-bg, var(--bg-raised))", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: _isMobile ? 14 : 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 16 }}>{"\u{1F469}"} {fr ? "Revenus par modèle" : "Revenue by Model"}</div>
+          {rechartsReady && modelData.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+              <PieChart width={180} height={180}>
+                <Pie data={modelData} cx={90} cy={90} innerRadius={45} outerRadius={72} paddingAngle={3} dataKey="value" stroke="none">
+                  {modelData.map((entry, i) => <Cell key={i} fill={entry.color} />)}
+                </Pie>
+                <RechartsTooltip contentStyle={{ background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 10, fontSize: 12 }} formatter={(v) => [fmtAmount(v), fr ? "Revenus" : "Revenue"]} />
+              </PieChart>
+              {/* Legend */}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "center", marginTop: 12 }}>
+                {modelData.slice(0, 6).map((m, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "var(--text-secondary)" }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: m.color, flexShrink: 0 }} />
+                    <span style={{ maxWidth: 80, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div style={{ height: 220, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-quaternary)", fontSize: 12 }}>{fr ? "Pas de données" : "No data"}</div>
+          )}
+        </div>
+      </div>
+
+      {/* Recent Transactions */}
+      <div style={{ background: "var(--card-bg, var(--bg-raised))", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: _isMobile ? 14 : 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>{"\u{1F4B8}"} {fr ? "Transactions récentes" : "Recent Transactions"}</div>
+          <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{providerTxs.length} total</span>
+        </div>
+        {recentTxs.length === 0 ? (
+          <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 32, fontSize: 12 }}>{fr ? "Aucune transaction" : "No transactions yet"}</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {recentTxs.map(tx => {
+              const model = (models || []).find(m => m.id === tx.model_id);
+              return (
+                <div key={tx.id} style={{ display: "flex", alignItems: "center", gap: _isMobile ? 8 : 12, padding: _isMobile ? "10px 10px" : "10px 14px", borderRadius: 12, background: "var(--bg-overlay, rgba(255,255,255,0.02))", border: "1px solid var(--border-subtle)", transition: "background 0.15s" }}>
+                  <div style={{ width: 36, height: 36, borderRadius: 10, background: "var(--accent-subtle, rgba(99,102,241,0.08))", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, flexShrink: 0 }}>{model ? "\u{1F469}" : "\u{1F4B0}"}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <span style={{ fontWeight: 700, fontSize: 13 }}>{tx.spender_handle ? "@" + tx.spender_handle : "—"}</span>
+                      {model && <span style={{ fontSize: 10, color: "var(--text-tertiary)", background: "var(--accent-subtle)", padding: "1px 6px", borderRadius: 6 }}>{model.name}</span>}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>{new Date(tx.date).toLocaleDateString(fr ? "fr-FR" : "en-US", { day: "2-digit", month: "short", year: "numeric" })}</div>
+                  </div>
+                  <div style={{ textAlign: "right", flexShrink: 0 }}>
+                    <div style={{ fontWeight: 800, fontSize: 14, color: "var(--text-primary)", fontFamily: "'Space Mono', monospace" }}>{fmtAmount(convertAmount(Number(tx.amount || 0), tx.currency))}</div>
+                    <div style={{ marginTop: 3 }}>{statusBadge(tx.status)}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Refresh hint */}
+      <div style={{ textAlign: "center", marginTop: 20, fontSize: 11, color: "var(--text-quaternary)" }}>
+        {fr ? "Dernière mise à jour" : "Last updated"}: {now.toLocaleTimeString(fr ? "fr-FR" : "en-US", { hour: "2-digit", minute: "2-digit" })}
+        <button onClick={onRefresh} style={{ marginLeft: 8, background: "none", border: "none", color: "var(--accent)", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>{"\u{1F504}"} {fr ? "Actualiser" : "Refresh"}</button>
+      </div>
+    </div>
+  );
+};
+
+// =============================================
 // PROVIDER CONFIRMATIONS COMPONENT
 // =============================================
 const ProviderConfirmations = ({ user, lang, spenders, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh }) => {
@@ -20192,7 +20399,7 @@ const App = () => {
           if(profile) {
             const fullUser = {...profile, email:session.user.email};
             setUser(fullUser);
-            if(fullUser.role === "provider") setTab("transactions");
+            if(fullUser.role === "provider") setTab("provider_dashboard");
             if(fullUser.role === "modele") setTab("model_checklist");
             await loadData(fullUser);
           }
@@ -20295,7 +20502,7 @@ const App = () => {
   /* DB FIX — handleLogin with error resilience */
   const handleLogin = async (u) => {
     setUser(u);
-    if(u.role === "provider") setTab("transactions");
+    if(u.role === "provider") setTab("provider_dashboard");
     if(u.role === "modele") setTab("model_checklist");
     if(u.role === "chatter") setTab("chatter_dashboard");
     setLoading(true);
@@ -20414,6 +20621,7 @@ const App = () => {
     {id:"chatter_compta",icon:"\u{1F4C4}",label:t(lang,"compta"),show:user.role==="chatter"},
     {id:"chatter_competition",icon:"\u{1F3C6}",label:t(lang,"competition_label"),show:user.role==="chatter"},
     {id:"chatter_scan",icon:"\u{1F50D}",label:t(lang,"verify_screen"),show:user.role==="chatter"},
+    {id:"provider_dashboard",icon:"\u{1F4CA}",label:t(lang,"dashboard")||"Dashboard",show:user.role==="provider"},
     {id:"transactions",icon:"\u{1F4B8}",label:"Mes Transactions",show:user.role==="provider"},
     {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:user.role==="provider"},
     {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:user.role==="chatter"},
@@ -20520,6 +20728,10 @@ const App = () => {
     else if (actionId === "create_broadcast") { navigateTo("automation","broadcasts"); }
     else if (actionId === "create_model") { setFabMoForm({ name: "", email: "", language: "fr" }); setFabModelModal(true); }
     else if (actionId === "assign_chatter") { setFabAssignModel(""); setFabAssignChatter(""); setFabAssignModal(true); }
+    // Provider FAB actions
+    else if (actionId === "provider_add_tx") { _setTab("transactions"); window.history.pushState({tab:"transactions"},"","#transactions"); }
+    else if (actionId === "provider_models") { _setTab("provider_dashboard"); window.history.pushState({tab:"provider_dashboard"},"","#provider_dashboard"); }
+    else if (actionId === "provider_compta") { _setTab("provider_compta"); window.history.pushState({tab:"provider_compta"},"","#provider_compta"); }
   };
   const handleFabCreateSpender = async () => {
     if (!fabSpForm.handle.trim()) return addToast("Handle requis","error");
@@ -20795,14 +21007,15 @@ const App = () => {
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
           {user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
+          {tab==="provider_dashboard"&&user.role==="provider"&&<ProviderDashboardTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} onOptimisticTx={optimisticTxUpdate} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
           {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />}
           </>)}
         </div>
       </div>
       {/* ═══ CHRISTINE FIX — FAB — Gérant + Chatter — improved mobile + feedback ═══ */}
-      {(isGerant || user.role === "chatter") && (() => {
-        const fabActions = isGerant ? FAB_ACTIONS_GERANT : FAB_ACTIONS_CHATTER;
+      {(isGerant || user.role === "chatter" || user.role === "provider") && (() => {
+        const fabActions = isGerant ? FAB_ACTIONS_GERANT : user.role === "provider" ? FAB_ACTIONS_PROVIDER : FAB_ACTIONS_CHATTER;
         return (<>
           {fabOpen && <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:9998,backdropFilter:"blur(2px)",transition:"opacity 0.2s"}} onClick={()=>setFabOpen(false)}/>}
           <div className="fab-wrap">
