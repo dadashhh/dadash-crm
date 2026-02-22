@@ -415,224 +415,221 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
     </div>
   );
 };
+// =============================================
+// MODEL ROLE — ONBOARDING (Page 1)
+// =============================================
+const ONBOARDING_ITEMS = [
+  { key: "photos", icon: "\u{1F4F8}", label_fr: "Photos upload\u00E9es", label_en: "Photos uploaded" },
+  { key: "videos", icon: "\u{1F3A5}", label_fr: "Vid\u00E9os envoy\u00E9es", label_en: "Videos sent" },
+  { key: "infos", icon: "\u{1F4DD}", label_fr: "Infos remplies", label_en: "Info completed" },
+  { key: "voice", icon: "\u{1F399}\uFE0F", label_fr: "Script voix", label_en: "Voice script" },
+  { key: "ai_persona", icon: "\u{1F916}", label_fr: "Personnalit\u00E9 IA valid\u00E9e", label_en: "AI persona validated" },
+  { key: "payments", icon: "\u{1F4B3}", label_fr: "Paiements configur\u00E9s", label_en: "Payments configured" },
+];
+
+const ONBOARDING_DOCS = [
+  { icon: "\u{1F4C4}", label_fr: "Guide de d\u00E9marrage", label_en: "Getting started guide" },
+  { icon: "\u{1F4CB}", label_fr: "Charte qualit\u00E9 contenu", label_en: "Content quality charter" },
+  { icon: "\u{1F4D6}", label_fr: "FAQ mod\u00E8les", label_en: "Models FAQ" },
+];
+
+const ModelChecklistTab = ({user, lang}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const storageKey = `dadash-onboarding-${user.id}`;
+  const [checked, setChecked] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(storageKey)) || {}; } catch(e) { return {}; }
+  });
+
+  const toggle = (key) => {
+    const next = { ...checked, [key]: !checked[key] };
+    setChecked(next);
+    try { localStorage.setItem(storageKey, JSON.stringify(next)); } catch(e) {/* ignore */}
+  };
+
+  const doneCount = ONBOARDING_ITEMS.filter(it => checked[it.key]).length;
+  const total = ONBOARDING_ITEMS.length;
+  const pct = Math.round((doneCount / total) * 100);
+
+  return (
+    <div>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{"\u2705"} Onboarding</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr?"Compl\u00E8te toutes les \u00E9tapes pour commencer":"Complete all steps to get started"}</p>
+      </div>
+
+      {/* Progress bar */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:"18px 20px",marginBottom:24}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+          <span style={{fontSize:14,fontWeight:700}}>Onboarding {doneCount}/{total} {fr?"compl\u00E9t\u00E9":"completed"}</span>
+          <span style={{fontSize:16,fontWeight:800,color:pct===100?"var(--success)":pct>=50?"var(--accent)":"var(--warning)"}}>{pct}%</span>
+        </div>
+        <div style={{height:10,borderRadius:5,background:"var(--bg-overlay)"}}>
+          <div style={{height:10,borderRadius:5,background:pct===100?"var(--success)":"var(--grad)",width:pct+"%",transition:"width 0.4s cubic-bezier(0.16,1,0.3,1)"}}/>
+        </div>
+      </div>
+
+      {/* Checklist items */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20,marginBottom:24}}>
+        <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{fr?"\u00C9tapes d'onboarding":"Onboarding steps"}</div>
+        {ONBOARDING_ITEMS.map(item => (
+          <div key={item.key} onClick={() => toggle(item.key)} style={{
+            display:"flex",alignItems:"center",gap:14,padding:"14px 16px",cursor:"pointer",
+            borderRadius:12,marginBottom:4,background:checked[item.key]?"var(--accent-subtle)":"transparent",transition:"background 0.2s",
+          }}>
+            <div style={{width:24,height:24,borderRadius:8,border:"2px solid "+(checked[item.key]?"var(--success)":"var(--border-default)"),background:checked[item.key]?"var(--success)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.2s"}}>
+              {checked[item.key]&&<span style={{color:"#fff",fontSize:14,fontWeight:800}}>{"\u2713"}</span>}
+            </div>
+            <span style={{fontSize:18,flexShrink:0}}>{item.icon}</span>
+            <span style={{fontSize:14,fontWeight:600,textDecoration:checked[item.key]?"line-through":"none",opacity:checked[item.key]?0.5:1,transition:"all 0.2s"}}>{fr?item.label_fr:item.label_en}</span>
+            <span style={{marginLeft:"auto",fontSize:12,color:checked[item.key]?"var(--success)":"var(--text-quaternary)",fontWeight:700}}>{checked[item.key]?"\u2705":"\u2B55"}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Documents section */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20}}>
+        <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{"\u{1F4E5}"} {fr?"Documents \u00E0 t\u00E9l\u00E9charger":"Documents to download"}</div>
+        {ONBOARDING_DOCS.map((doc, i) => (
+          <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderRadius:12,marginBottom:4,background:"var(--bg-overlay)"}}>
+            <span style={{fontSize:18}}>{doc.icon}</span>
+            <span style={{flex:1,fontSize:13,fontWeight:600}}>{fr?doc.label_fr:doc.label_en}</span>
+            <button onClick={() => addToast(fr?"Bient\u00F4t disponible":"Coming soon","info")} className="btn" style={{padding:"4px 12px",fontSize:11,background:"var(--accent-subtle)",color:"var(--accent)",border:"1px solid var(--accent-muted)",borderRadius:8,cursor:"pointer",fontWeight:600}}>
+              {"\u{1F4E5}"} {fr?"T\u00E9l\u00E9charger":"Download"}
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// MODEL ROLE — CONTENT LIST WEEKLY (Page 2)
+// =============================================
+const DAYS_FR = ["Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi","Dimanche"];
+const DAYS_EN = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+
+const getWeekRange = (offset) => {
+  const now = new Date();
+  const day = now.getDay();
+  const monday = new Date(now);
+  monday.setDate(now.getDate() - (day === 0 ? 6 : day - 1) + (offset * 7));
+  monday.setHours(0, 0, 0, 0);
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  return { start: monday, end: sunday };
+};
+
+const fmtShort = (d) => d.toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
+
 const ModelContentTab = ({user, lang, onRefresh}) => {
   const addToast = useToast();
   const fr = lang === "fr";
-  const { currencySymbol } = useCurrency();
-  const [tasks, setTasks] = useState([]);
-  const [filter, setFilter] = useState("tout");
-  const [loadingTasks, setLoadingTasks] = useState(true);
+  const [weekOffset, setWeekOffset] = useState(0);
+  const { start, end } = getWeekRange(weekOffset);
+  const storageKey = `dadash-content-${user.id}-${start.toISOString().slice(0,10)}`;
 
-  useEffect(() => {
-    const load = async () => {
-      const { data } = await sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false });
-      setTasks(data || []);
-      setLoadingTasks(false);
-    };
-    load();
-  }, [user.id]);
-
-  const updateStatus = async (taskId, newStatus) => {
-    const updates = { status: newStatus };
-    if (newStatus === "done") updates.completed_at = new Date().toISOString();
-    const { error } = await sb.from("content_tasks").update(updates).eq("id", taskId);
-    if (error) { addToast("Erreur: " + error.message, "error"); return; }
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...updates } : t));
-    if (newStatus === "done") addToast(fr ? "T\u00E2che termin\u00E9e \u2705" : "Task completed \u2705", "success");
-  };
-
-  const toggleTask = (task) => {
-    updateStatus(task.id, task.status === "done" ? "todo" : "done");
-  };
-
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const todoCount = tasks.filter(t => t.status === "todo").length;
-  const inProgressCount = tasks.filter(t => t.status === "in_progress").length;
-  const doneThisMonth = tasks.filter(t => t.status === "done" && t.completed_at && new Date(t.completed_at) >= monthStart).length;
-  const totalBonus = tasks.filter(t => t.status === "done").reduce((s, t) => s + Number(t.bonus_amount || 0), 0);
-
-  const filtered = filter === "tout" ? tasks : tasks.filter(t => t.status === filter);
-  const isOverdue = (d) => d && new Date(d) < new Date(new Date().toISOString().slice(0, 10));
-
-  const catIcon = (c) => c === "photo" ? "\u{1F4F8}" : c === "video" ? "\u{1F3A5}" : c === "live" ? "\u{1F534}" : "\u{1F4E6}";
-
-  return (
-    <div>
-      <div style={{ marginBottom: 24 }}>
-        <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>{"\u{1F4CB}"} {fr ? "Ma Content List" : "My Content List"}</h2>
-        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0" }}>
-          {fr ? "Contenus \u00E0 produire" : "Content to produce"} \u2014 {todoCount} {fr ? "\u00E0 faire" : "to do"} {"\u00B7"} {doneThisMonth} {fr ? "termin\u00E9s" : "done"}
-        </p>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 24 }}>
-        {[
-          { label: fr ? "\u00C0 faire" : "To do", value: todoCount, icon: "\u{1F4DD}", color: "var(--warning)" },
-          { label: fr ? "En cours" : "In progress", value: inProgressCount, icon: "\u{1F504}", color: "var(--accent)" },
-          { label: fr ? "Termin\u00E9s ce mois" : "Done this month", value: doneThisMonth, icon: "\u2705", color: "var(--success)" },
-          { label: fr ? "Bonus accumul\u00E9" : "Bonus earned", value: totalBonus + currencySymbol, icon: "\u{1F4B0}", color: "var(--pink)" },
-        ].map((k) => (
-          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 18, padding: "14px 16px" }}>
-            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{k.icon} {k.label}</div>
-            <div style={{ fontSize: 22, fontWeight: 800, color: k.color }}>{k.value}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
-        {[{k:"tout",l:fr?"Tout":"All"},{k:"todo",l:fr?"\u00C0 faire":"To do"},{k:"in_progress",l:fr?"En cours":"In progress"},{k:"review",l:fr?"En review":"In review"},{k:"done",l:fr?"Fait":"Done"}].map(f => (
-          <button key={f.k} onClick={() => setFilter(f.k)} className={`filter-chip ${filter===f.k?"active":""}`}>{f.l}</button>
-        ))}
-      </div>
-      {loadingTasks && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>Chargement...</div>}
-      {!loadingTasks && filtered.length === 0 && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>{fr ? "Aucune t\u00E2che" : "No tasks"}</div>}
-      {filtered.map(task => (
-        <div key={task.id} style={{
-          display: "flex", alignItems: "center", gap: 16, padding: "16px 20px",
-          background: "var(--card-bg)",
-          border: "1px solid " + (task.priority === "urgent" ? "var(--danger-muted)" : task.priority === "high" ? "var(--warning-muted)" : "var(--border-subtle)"),
-          borderRadius: 16, marginBottom: 8,
-          borderLeft: "4px solid " + (task.status === "done" ? "var(--success)" : task.status === "in_progress" ? "var(--accent)" : task.status === "review" ? "var(--pink)" : "var(--warning)"),
-        }}>
-          <input type="checkbox" checked={task.status === "done"} onChange={() => toggleTask(task)}
-            style={{ width: 20, height: 20, accentColor: "var(--success)", cursor: "pointer", flexShrink: 0 }} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, textDecoration: task.status === "done" ? "line-through" : "none", opacity: task.status === "done" ? 0.5 : 1 }}>{task.title}</div>
-            {task.description && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 3 }}>{task.description}</div>}
-            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-              <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 6, background: "var(--accent-subtle)", color: "var(--accent)", fontWeight: 600 }}>{catIcon(task.category)} {task.category}</span>
-              {task.due_date && <span style={{ fontSize: 10, color: isOverdue(task.due_date) && task.status !== "done" ? "var(--danger)" : "var(--text-quaternary)" }}>{"\u{1F4C5}"} {fmtDate(task.due_date)}</span>}
-              {task.bonus_amount > 0 && <span style={{ fontSize: 10, color: "var(--success)", fontWeight: 600 }}>{"\u{1F4B0}"} +{task.bonus_amount}{task.bonus_currency === "EUR" ? "\u20AC" : " CHF"}</span>}
-              {task.priority === "urgent" && <span style={{ fontSize: 10, color: "var(--danger)", fontWeight: 700 }}>{"\u{1F6A8}"} URGENT</span>}
-              {task.priority === "high" && <span style={{ fontSize: 10, color: "var(--warning)", fontWeight: 600 }}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
-            </div>
-          </div>
-          <select value={task.status} onChange={e => updateStatus(task.id, e.target.value)} className="filter-select" style={{ fontSize: 11, padding: "5px 8px" }}>
-            <option value="todo">{fr ? "\u00C0 faire" : "To do"}</option>
-            <option value="in_progress">{fr ? "En cours" : "In progress"}</option>
-            <option value="review">{fr ? "En review" : "In review"}</option>
-            <option value="done">{fr ? "Fait \u2705" : "Done \u2705"}</option>
-          </select>
-        </div>
-      ))}
-    </div>
-  );
-};
-
-// =============================================
-// MODEL ROLE — MON ESPACE (DASHBOARD)
-// =============================================
-const ModelDashboardTab = ({user, lang}) => {
-  const fr = lang === "fr";
-  const { currencySymbol } = useCurrency();
-  const [tasks, setTasks] = useState([]);
-  const [payments, setPayments] = useState([]);
-
-  useEffect(() => {
-    const load = async () => {
-      const [tR, pR] = await Promise.all([
-        sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false }),
-        sb.from("model_payments").select("*").eq("model_id", user.id).order("date", { ascending: false }),
-      ]);
-      setTasks(tR.data || []);
-      setPayments(pR.data || []);
-    };
-    load();
-  }, [user.id]);
-
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const doneThisMonth = tasks.filter(t => t.status === "done" && t.completed_at && new Date(t.completed_at) >= monthStart).length;
-  const totalBonus = tasks.filter(t => t.status === "done").reduce((s, t) => s + Number(t.bonus_amount || 0), 0);
-
-  // Streak: consecutive days with a completed task
-  const doneDates = tasks.filter(t => t.status === "done" && t.completed_at).map(t => new Date(t.completed_at).toISOString().slice(0, 10)).filter((v, i, a) => a.indexOf(v) === i).sort().reverse();
-  let streak = 0;
-  if (doneDates.length) {
-    const today = new Date().toISOString().slice(0, 10);
-    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-    if (doneDates[0] === today || doneDates[0] === yesterday) {
-      streak = 1;
-      for (let i = 0; i < doneDates.length - 1; i++) {
-        if ((new Date(doneDates[i]) - new Date(doneDates[i + 1])) / 86400000 === 1) streak++; else break;
-      }
-    }
-  }
-
-  // Badges
-  const MODEL_BADGES = [
-    { icon: "\u{1F4F8}", name: "First Shot", desc: "1 contenu termin\u00E9", unlocked: tasks.filter(t=>t.status==="done").length >= 1 },
-    { icon: "\u{1F3AC}", name: "Productrice", desc: "10 contenus termin\u00E9s", unlocked: tasks.filter(t=>t.status==="done").length >= 10 },
-    { icon: "\u{1F31F}", name: "Star", desc: "25 contenus termin\u00E9s", unlocked: tasks.filter(t=>t.status==="done").length >= 25 },
-    { icon: "\u{1F525}", name: "On Fire", desc: "7j streak", unlocked: streak >= 7 },
-    { icon: "\u{1F4B0}", name: "Bonus Queen", desc: "500\u20AC de bonus", unlocked: totalBonus >= 500 },
-    { icon: "\u{1F451}", name: "Legend", desc: "50 contenus + 1000\u20AC bonus", unlocked: tasks.filter(t=>t.status==="done").length >= 50 && totalBonus >= 1000 },
+  const DEFAULT_WEEK = [
+    { day: 0, items: [{ text: fr?"5 photos casual":"5 casual photos", done: false }, { text: fr?"1 vid\u00E9o story":"1 story video", done: false }] },
+    { day: 1, items: [{ text: fr?"3 photos lifestyle":"3 lifestyle photos", done: false }] },
+    { day: 2, items: [{ text: fr?"5 photos sexy":"5 sexy photos", done: false }, { text: fr?"1 vid\u00E9o custom":"1 custom video", done: false }] },
+    { day: 3, items: [{ text: fr?"3 photos casual":"3 casual photos", done: false }] },
+    { day: 4, items: [{ text: fr?"5 photos premium":"5 premium photos", done: false }, { text: fr?"1 vid\u00E9o teaser":"1 teaser video", done: false }] },
+    { day: 5, items: [{ text: fr?"Contenu libre":"Free content", done: false }] },
+    { day: 6, items: [{ text: fr?"Repos ou contenu bonus":"Rest or bonus content", done: false }] },
   ];
 
-  const upcomingTasks = tasks.filter(t => t.status !== "done").sort((a, b) => (a.due_date || "9999") < (b.due_date || "9999") ? -1 : 1).slice(0, 5);
+  const [weekData, setWeekData] = useState(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      return saved ? JSON.parse(saved) : DEFAULT_WEEK;
+    } catch(e) { return DEFAULT_WEEK; }
+  });
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      setWeekData(saved ? JSON.parse(saved) : DEFAULT_WEEK);
+    } catch(e) { setWeekData(DEFAULT_WEEK); }
+  }, [weekOffset]);
+
+  const toggleItem = (dayIdx, itemIdx) => {
+    const next = weekData.map((d, di) => di === dayIdx ? {
+      ...d, items: d.items.map((it, ii) => ii === itemIdx ? { ...it, done: !it.done } : it)
+    } : d);
+    setWeekData(next);
+    try { localStorage.setItem(storageKey, JSON.stringify(next)); } catch(e) {/* ignore */}
+  };
+
+  const totalItems = weekData.reduce((s, d) => s + d.items.length, 0);
+  const doneItems = weekData.reduce((s, d) => s + d.items.filter(it => it.done).length, 0);
+  const pct = totalItems > 0 ? Math.round((doneItems / totalItems) * 100) : 0;
+  const days = fr ? DAYS_FR : DAYS_EN;
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F469}\u200D\u{1F4BC}"} {fr ? "Mon Espace" : "My Space"} \u2014 {user.name}</h2>
-        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0", fontStyle: "italic" }}>{fr ? "Ton tableau de bord personnel" : "Your personal dashboard"}</p>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{"\u{1F4F8}"} {fr?"Content List":"Content List"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr?"Planning contenu semaine par semaine":"Weekly content planning"}</p>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
-        {[
-          { label: fr ? "Contenus ce mois" : "Done this month", value: doneThisMonth, icon: "\u2705", color: "var(--success)" },
-          { label: "Streak \u{1F525}", value: streak + (fr ? " jours" : " days"), icon: "\u{1F525}", color: "var(--warning)" },
-          { label: fr ? "Bonus accumul\u00E9" : "Bonus earned", value: totalBonus + currencySymbol, icon: "\u{1F4B0}", color: "var(--pink)" },
-        ].map((k) => (
-          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 18, padding: "18px 20px" }}>
-            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>{k.icon} {k.label}</div>
-            <div style={{ fontSize: 26, fontWeight: 800, color: k.color }}>{k.value}</div>
-          </div>
-        ))}
+
+      {/* Week navigation */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <button onClick={() => setWeekOffset(w => w - 1)} className="btn" style={{padding:"6px 14px",fontSize:12,background:"var(--bg-overlay)",color:"var(--text-secondary)",border:"1px solid var(--border-default)",borderRadius:10,cursor:"pointer"}}>{"\u2190"} {fr?"Pr\u00E9c\u00E9dente":"Previous"}</button>
+        <span style={{fontSize:14,fontWeight:700}}>{fr?"Semaine du":"Week of"} {fmtShort(start)} {fr?"au":"to"} {fmtShort(end)}</span>
+        <button onClick={() => setWeekOffset(w => w + 1)} className="btn" style={{padding:"6px 14px",fontSize:12,background:"var(--bg-overlay)",color:"var(--text-secondary)",border:"1px solid var(--border-default)",borderRadius:10,cursor:"pointer"}}>{fr?"Suivante":"Next"} {"\u2192"}</button>
       </div>
-      <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12, padding: 20, marginBottom: 20 }}>
-        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{"\u{1F3C6}"} {fr ? "Mes Badges" : "My Badges"}</h3>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12 }}>
-          {MODEL_BADGES.map((b) => (
-            <div key={b.label} style={{
-              padding: "14px 12px", borderRadius: 14, textAlign: "center",
-              background: b.unlocked ? "var(--accent-subtle)" : "var(--bg-overlay)",
-              border: "1px solid " + (b.unlocked ? "var(--accent-muted)" : "var(--border-subtle)"),
-              opacity: b.unlocked ? 1 : 0.3,
-            }}>
-              <div style={{ fontSize: 28 }}>{b.icon}</div>
-              <div style={{ fontSize: 11, fontWeight: 700, marginTop: 6 }}>{b.name}</div>
-              <div style={{ fontSize: 9, color: "var(--text-tertiary)", marginTop: 2 }}>{b.desc}</div>
-              {b.unlocked && <div style={{ fontSize: 9, color: "var(--success)", marginTop: 4, fontWeight: 600 }}>{"\u2705"} {fr ? "D\u00C9BLOQU\u00C9" : "UNLOCKED"}</div>}
-            </div>
-          ))}
+
+      {/* Progress */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:14,padding:"14px 18px",marginBottom:20}}>
+        <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+          <span style={{fontSize:12,fontWeight:600}}>{doneItems}/{totalItems} {fr?"termin\u00E9s":"completed"}</span>
+          <span style={{fontSize:12,fontWeight:800,color:pct===100?"var(--success)":"var(--accent)"}}>{pct}%</span>
+        </div>
+        <div style={{height:6,borderRadius:3,background:"var(--bg-overlay)"}}>
+          <div style={{height:6,borderRadius:3,background:pct===100?"var(--success)":"var(--grad)",width:pct+"%",transition:"width 0.3s"}}/>
         </div>
       </div>
-      <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12, padding: 20 }}>
-        <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{"\u{1F4CB}"} {fr ? "Prochaines t\u00E2ches" : "Upcoming tasks"}</h3>
-        {upcomingTasks.length === 0 && <div style={{ color: "var(--text-quaternary)", textAlign: "center", padding: 20 }}>{fr ? "Aucune t\u00E2che en attente \u{1F389}" : "No pending tasks \u{1F389}"}</div>}
-        {upcomingTasks.map(task => (
-          <div key={task.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-            <div style={{ width: 8, height: 8, borderRadius: "50%", background: task.status === "in_progress" ? "var(--accent)" : task.status === "review" ? "var(--pink)" : "var(--warning)", flexShrink: 0 }} />
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, fontWeight: 600 }}>{task.title}</div>
-              <div style={{ fontSize: 10, color: "var(--text-quaternary)" }}>{task.category} {task.due_date ? "\u00B7 " + fmtDate(task.due_date) : ""}</div>
+
+      {/* Daily checklist */}
+      {weekData.map((dayData, dayIdx) => {
+        const dayDone = dayData.items.every(it => it.done);
+        return (
+          <div key={dayIdx} style={{background:"var(--card-bg)",border:"1px solid "+(dayDone?"var(--success-muted)":"var(--border-subtle)"),borderRadius:14,padding:16,marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <span style={{fontSize:14,fontWeight:700}}>{days[dayIdx]}</span>
+              {dayDone && <span style={{fontSize:11,color:"var(--success)",fontWeight:700}}>{"\u2705"} {fr?"Complet":"Complete"}</span>}
             </div>
-            {task.bonus_amount > 0 && <span style={{ fontSize: 10, color: "var(--success)", fontWeight: 600 }}>{"\u{1F4B0}"} +{task.bonus_amount}\u20AC</span>}
+            {dayData.items.map((item, itemIdx) => (
+              <div key={itemIdx} onClick={() => toggleItem(dayIdx, itemIdx)} style={{
+                display:"flex",alignItems:"center",gap:12,padding:"10px 12px",cursor:"pointer",
+                borderRadius:10,marginBottom:2,background:item.done?"var(--accent-subtle)":"transparent",transition:"background 0.15s",
+              }}>
+                <div style={{width:20,height:20,borderRadius:6,border:"2px solid "+(item.done?"var(--success)":"var(--border-default)"),background:item.done?"var(--success)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                  {item.done&&<span style={{color:"#fff",fontSize:12,fontWeight:800}}>{"\u2713"}</span>}
+                </div>
+                <span style={{fontSize:13,fontWeight:500,textDecoration:item.done?"line-through":"none",opacity:item.done?0.5:1}}>{item.text}</span>
+              </div>
+            ))}
+            <button onClick={() => addToast(fr?"Bient\u00F4t disponible":"Coming soon","info")} style={{marginTop:8,padding:"5px 12px",fontSize:11,background:"transparent",color:"var(--accent)",border:"1px dashed var(--accent-muted)",borderRadius:8,cursor:"pointer",fontWeight:600,width:"100%"}}>
+              {"\u{1F4E4}"} {fr?"Upload contenu":"Upload content"}
+            </button>
           </div>
-        ))}
-      </div>
+        );
+      })}
     </div>
   );
 };
 
 // =============================================
-// MODEL ROLE — MES PAIES
+// MODEL ROLE — MES PAIEMENTS (Page 4)
 // =============================================
 const ModelPaymentsTab = ({user, lang, invoices}) => {
   const fr = lang === "fr";
   const { currencySymbol } = useCurrency();
   const [payments, setPayments] = useState([]);
   const [loadingP, setLoadingP] = useState(true);
-  const [modelPaySubTab, setModelPaySubTab] = useState("paies");
 
   useEffect(() => {
     const load = async () => {
@@ -643,65 +640,36 @@ const ModelPaymentsTab = ({user, lang, invoices}) => {
     load();
   }, [user.id]);
 
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const salaryThisMonth = payments.filter(p => p.type === "salary" && p.status === "paid" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount), 0);
-  const bonusThisMonth = payments.filter(p => p.type === "bonus" && p.status === "paid" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount), 0);
-  const totalPaid = payments.filter(p => p.status === "paid").reduce((s, p) => s + Number(p.amount), 0);
-
-  const typeLabel = (t) => t === "salary" ? (fr ? "\u{1F4B5} Salaire" : "\u{1F4B5} Salary") : t === "bonus" ? (fr ? "\u{1F381} Bonus" : "\u{1F381} Bonus") : (fr ? "\u{1F4B8} Autre" : "\u{1F4B8} Other");
   const statusColor = (s) => s === "paid" ? "var(--success)" : s === "cancelled" ? "var(--danger)" : "var(--warning)";
-  const statusLabel = (s) => s === "paid" ? (fr ? "Pay\u00E9" : "Paid") : s === "cancelled" ? (fr ? "Annul\u00E9" : "Cancelled") : "Pending";
-
-  const myModelInvoices = (invoices||[]).filter(inv => inv.profile_id === user.id && inv.type === "outgoing_model");
+  const statusLabel = (s) => s === "paid" ? (fr ? "Pay\u00E9" : "Paid") : s === "cancelled" ? (fr ? "Annul\u00E9" : "Cancelled") : (fr ? "En attente" : "Pending");
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F4B0}"} {fr ? "Mes Paies" : "My Payments"}</h2>
-        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0", fontStyle: "italic" }}>{fr ? "Historique de tes paiements" : "Your payment history"}</p>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{"\u{1F4B0}"} {fr?"Mes Paiements":"My Payments"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr?"Historique de tes paiements re\u00E7us":"Your received payment history"}</p>
       </div>
-      {/* Sub-tabs */}
-      <div style={{display:"flex",gap:4,marginBottom:20}}>
-        {[{id:"paies",label:fr?"Mes Paies":"My Payments"},{id:"factures",label:fr?"Mes Factures":"My Invoices"}].map(tb=>(
-          <button key={tb.id} className="btn" style={{padding:"6px 16px",fontSize:12,fontWeight:modelPaySubTab===tb.id?800:600,background:modelPaySubTab===tb.id?"var(--accent)":"var(--card-bg)",color:modelPaySubTab===tb.id?"#fff":"var(--text-secondary)",border:"1px solid "+(modelPaySubTab===tb.id?"var(--accent)":"var(--border-subtle)"),borderRadius:20}} onClick={()=>setModelPaySubTab(tb.id)}>{tb.label}</button>
-        ))}
-      </div>
-      {modelPaySubTab === "factures" ? (
-        <MyInvoicesPanel invoices={myModelInvoices} lang={lang} />
-      ) : (
-      <>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
-        {[
-          { label: fr ? "Salaire ce mois" : "Salary this month", value: salaryThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B5}", color: "var(--accent)" },
-          { label: fr ? "Bonus ce mois" : "Bonus this month", value: bonusThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F381}", color: "var(--success)" },
-          { label: fr ? "Total vers\u00E9" : "Total paid", value: totalPaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B0}", color: "var(--pink)" },
-        ].map((k) => (
-          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 18, padding: "18px 20px" }}>
-            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>{k.icon} {k.label}</div>
-            <div style={{ fontSize: 26, fontWeight: 800, color: k.color }}>{k.value}</div>
-          </div>
-        ))}
-      </div>
-      <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12, overflow: "hidden" }}>
-        <div style={{ padding: "14px 20px", borderBottom: "1px solid var(--border-subtle)", fontSize: 13, fontWeight: 700 }}>{"\u{1F4CA}"} {fr ? "Historique des paiements" : "Payment history"}</div>
-        {loadingP && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>Chargement...</div>}
-        {!loadingP && payments.length === 0 && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>{fr ? "Aucun paiement" : "No payments"}</div>}
+
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:12,overflow:"hidden"}}>
+        <div style={{padding:"14px 20px",borderBottom:"1px solid var(--border-subtle)",fontSize:13,fontWeight:700}}>{"\u{1F4CA}"} {fr?"Paiements re\u00E7us":"Received payments"}</div>
+        {loadingP && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
+        {!loadingP && payments.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr?"Aucun paiement pour le moment":"No payments yet"}</div>}
         {!loadingP && payments.length > 0 && (
-          <div style={{ overflowX: "auto" }}>
-            <table className="table" style={{ fontSize: 12 }}>
+          <div style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
               <thead><tr>
-                <th>Date</th><th>Type</th><th>{fr ? "Montant" : "Amount"}</th><th>{fr ? "Devise" : "Currency"}</th><th>Notes</th><th>{fr ? "Statut" : "Status"}</th>
+                <th>Date</th>
+                <th>{fr?"P\u00E9riode":"Period"}</th>
+                <th>{fr?"Montant":"Amount"}</th>
+                <th>{fr?"Statut":"Status"}</th>
               </tr></thead>
               <tbody>
                 {payments.map(p => (
                   <tr key={p.id}>
                     <td>{fmtDate(p.date)}</td>
-                    <td>{typeLabel(p.type)}</td>
-                    <td style={{ fontWeight: 800, color: "var(--success)" }}>+{Number(p.amount).toLocaleString("fr-FR", { maximumFractionDigits: 0 })}{p.currency === "EUR" ? "\u20AC" : " CHF"}</td>
-                    <td>{p.currency}</td>
-                    <td style={{ color: "var(--text-secondary)" }}>{p.notes || "\u2014"}</td>
-                    <td><span style={{ padding: "2px 8px", borderRadius: 10, background: statusColor(p.status) + "15", color: statusColor(p.status), fontSize: 10, fontWeight: 700 }}>{statusLabel(p.status)}</span></td>
+                    <td style={{color:"var(--text-secondary)"}}>{p.notes || "\u2014"}</td>
+                    <td style={{fontWeight:800,color:"var(--success)"}}>+{Number(p.amount).toLocaleString("fr-FR",{maximumFractionDigits:0})}{p.currency === "EUR" ? "\u20AC" : " CHF"}</td>
+                    <td><span style={{padding:"2px 8px",borderRadius:10,background:statusColor(p.status)+"15",color:statusColor(p.status),fontSize:10,fontWeight:700}}>{statusLabel(p.status)}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -709,11 +677,116 @@ const ModelPaymentsTab = ({user, lang, invoices}) => {
           </div>
         )}
       </div>
-      </>
-      )}
     </div>
   );
 };
+
+// =============================================
+// MODEL ROLE — TO DO LIST (Page 3)
+// =============================================
+const ModelTasksTab = ({user, lang}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [tasks, setTasks] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("active");
+
+  useEffect(() => {
+    const load = async () => {
+      const {data} = await sb.from("model_tasks").select("*").eq("model_id", user.id).order("due_date", {ascending: true, nullsFirst: false});
+      setTasks(data || []);
+      setLoading(false);
+    };
+    load();
+  }, [user.id]);
+
+  const updateStatus = async (taskId, newStatus) => {
+    const updates = {status: newStatus};
+    if (newStatus === "done") updates.completed_at = new Date().toISOString();
+    else updates.completed_at = null;
+    const {error} = await sb.from("model_tasks").update(updates).eq("id", taskId);
+    if (error) { addToast("Erreur: " + error.message, "error"); return; }
+    setTasks(prev => prev.map(t => t.id === taskId ? {...t, ...updates} : t));
+    if (newStatus === "done") addToast(fr ? "T\u00E2che termin\u00E9e \u2705" : "Task completed \u2705", "success");
+  };
+
+  const todoCount = tasks.filter(t => t.status === "todo").length;
+  const inProgressCount = tasks.filter(t => t.status === "in_progress").length;
+  const doneCount = tasks.filter(t => t.status === "done").length;
+  const pendingCount = todoCount + inProgressCount;
+  const isOverdue = (d) => d && new Date(d) < new Date(new Date().toISOString().slice(0, 10));
+
+  // Sort: overdue first, then by due_date ascending
+  const sorted = [...tasks].sort((a, b) => {
+    if (a.status === "done" && b.status !== "done") return 1;
+    if (a.status !== "done" && b.status === "done") return -1;
+    const aOver = isOverdue(a.due_date) && a.status !== "done";
+    const bOver = isOverdue(b.due_date) && b.status !== "done";
+    if (aOver && !bOver) return -1;
+    if (!aOver && bOver) return 1;
+    return (a.due_date || "9999").localeCompare(b.due_date || "9999");
+  });
+
+  const filtered = filter === "active" ? sorted.filter(t => t.status !== "done") : filter === "done" ? sorted.filter(t => t.status === "done") : sorted;
+
+  return (
+    <div>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{"\u{1F4CB}"} {fr?"Mes T\u00E2ches":"My Tasks"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>
+          {pendingCount > 0 && <span style={{color:"var(--warning)",fontWeight:700}}>{pendingCount} {fr?"en attente":"pending"}</span>}
+          {pendingCount > 0 && " \u00B7 "}
+          {doneCount} {fr?"termin\u00E9es":"done"}
+        </p>
+      </div>
+
+      {/* Pending badge */}
+      {pendingCount > 0 && (
+        <div style={{background:"var(--warning-muted)",border:"1px solid var(--warning)",borderRadius:12,padding:"10px 16px",marginBottom:16,display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:16}}>{"\u26A0\uFE0F"}</span>
+          <span style={{fontSize:12,fontWeight:700,color:"var(--warning)"}}>{pendingCount} {fr?"t\u00E2ches en attente":"tasks pending"}</span>
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:6,marginBottom:18}}>
+        {[{k:"active",l:fr?"Actives":"Active"},{k:"done",l:fr?"Termin\u00E9es":"Done"},{k:"all",l:fr?"Toutes":"All"}].map(f => (
+          <button key={f.k} onClick={() => setFilter(f.k)} className={`filter-chip ${filter===f.k?"active":""}`}>{f.l}</button>
+        ))}
+      </div>
+
+      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
+      {!loading && filtered.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr?"Aucune t\u00E2che":"No tasks"} {"\u{1F389}"}</div>}
+      {filtered.map(task => (
+        <div key={task.id} style={{
+          display:"flex",alignItems:"center",gap:16,padding:"16px 20px",
+          background:"var(--card-bg)",
+          border:"1px solid "+(isOverdue(task.due_date)&&task.status!=="done"?"var(--danger-muted)":"var(--border-subtle)"),
+          borderRadius:16,marginBottom:8,
+          borderLeft:"4px solid "+(task.status==="done"?"var(--success)":task.status==="in_progress"?"var(--accent)":"var(--warning)"),
+        }}>
+          <input type="checkbox" checked={task.status==="done"} onChange={()=>updateStatus(task.id,task.status==="done"?"todo":"done")}
+            style={{width:20,height:20,accentColor:"var(--success)",cursor:"pointer",flexShrink:0}} />
+          <div style={{flex:1}}>
+            <div style={{fontSize:14,fontWeight:700,textDecoration:task.status==="done"?"line-through":"none",opacity:task.status==="done"?0.5:1}}>{task.title}</div>
+            {task.description && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:3}}>{task.description}</div>}
+            <div style={{display:"flex",gap:8,marginTop:6,flexWrap:"wrap"}}>
+              {task.due_date && <span style={{fontSize:10,color:isOverdue(task.due_date)&&task.status!=="done"?"var(--danger)":"var(--text-quaternary)",fontWeight:isOverdue(task.due_date)&&task.status!=="done"?700:400}}>{"\u{1F4C5}"} {fmtDate(task.due_date)} {isOverdue(task.due_date)&&task.status!=="done"?" \u2014 "+(fr?"EN RETARD":"OVERDUE"):""}</span>}
+              {task.priority==="urgent"&&<span style={{fontSize:10,color:"var(--danger)",fontWeight:700}}>{"\u{1F6A8}"} URGENT</span>}
+              {task.priority==="high"&&<span style={{fontSize:10,color:"var(--warning)",fontWeight:600}}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
+            </div>
+          </div>
+          <select value={task.status} onChange={e=>updateStatus(task.id,e.target.value)} className="filter-select" style={{fontSize:11,padding:"5px 8px"}}>
+            <option value="todo">{fr?"\u00C0 faire":"To do"}</option>
+            <option value="in_progress">{fr?"En cours":"In progress"}</option>
+            <option value="done">{fr?"Termin\u00E9 \u2705":"Done \u2705"}</option>
+          </select>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+
 const ContentTaskManager = ({modelId, lang, onRefresh}) => {
   const addToast = useToast();
   const fr = lang === "fr";
@@ -1287,193 +1360,4 @@ const ModelManagementTab = ({user, lang, models, profiles, modelTasks, contentLi
   );
 };
 
-// =============================================
-// MODEL ROLE — MA CHECKLIST DU JOUR
-// =============================================
-const ModelChecklistTab = ({user, lang}) => {
-  const addToast = useToast();
-  const fr = lang === "fr";
-  const [instances, setInstances] = useState([]);
-  const [templates, setTemplates] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const today = new Date().toISOString().slice(0, 10);
-
-  useEffect(() => {
-    const load = async () => {
-      const [tplR, instR] = await Promise.all([
-        sb.from("checklist_templates").select("*").eq("active", true),
-        sb.from("checklist_instances").select("*").eq("model_id", user.id).eq("date", today),
-      ]);
-      const tpls = tplR.data || [];
-      let insts = instR.data || [];
-      setTemplates(tpls);
-      // Auto-generate missing instances
-      for (const tpl of tpls) {
-        if (!insts.find(i => i.template_id === tpl.id)) {
-          const items = (tpl.items || []).map(it => ({title: it.title, checked: false}));
-          const {data} = await sb.from("checklist_instances").insert({model_id: user.id, template_id: tpl.id, date: today, items}).select().single();
-          if (data) insts = [...insts, data];
-        }
-      }
-      setInstances(insts);
-      setLoading(false);
-    };
-    load();
-  }, [user.id, today]);
-
-  const toggleItem = async (instanceId, itemIdx) => {
-    const inst = instances.find(ci => ci.id === instanceId);
-    if (!inst) return;
-    const updatedItems = inst.items.map((it, i) => i === itemIdx ? {...it, checked: !it.checked} : it);
-    await sb.from("checklist_instances").update({items: updatedItems}).eq("id", instanceId);
-    setInstances(prev => prev.map(ci => ci.id === instanceId ? {...ci, items: updatedItems} : ci));
-  };
-
-  const totalItems = instances.reduce((s, ci) => s + (ci.items || []).length, 0);
-  const totalChecked = instances.reduce((s, ci) => s + (ci.items || []).filter(i => i.checked).length, 0);
-  const globalPct = totalItems > 0 ? Math.round((totalChecked / totalItems) * 100) : 0;
-
-  return (
-    <div>
-      <div style={{marginBottom:24}}>
-        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u2705"} {fr?"Ma Checklist du Jour":"My Daily Checklist"}</h2>
-        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{today}</p>
-      </div>
-
-      {/* Global progress */}
-      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:"18px 20px",marginBottom:24}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-          <span style={{fontSize:13,fontWeight:700}}>{fr?"Progression globale":"Overall progress"}</span>
-          <span style={{fontSize:15,fontWeight:800,color:globalPct===100?"var(--success)":globalPct>=50?"var(--accent)":"var(--warning)"}}>{globalPct}%</span>
-        </div>
-        <div style={{height:8,borderRadius:4,background:"var(--bg-overlay)"}}>
-          <div style={{height:8,borderRadius:4,background:globalPct===100?"var(--success)":globalPct>=50?"var(--accent)":"var(--warning)",width:globalPct+"%",transition:"width 0.3s"}}/>
-        </div>
-        <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:6}}>{totalChecked}/{totalItems} {fr?"complétés":"completed"}</div>
-      </div>
-
-      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
-
-      {!loading && instances.map(inst => {
-        const tpl = templates.find(t => t.id === inst.template_id);
-        const items = inst.items || [];
-        const checked = items.filter(i => i.checked).length;
-        const pct = items.length > 0 ? Math.round((checked / items.length) * 100) : 0;
-        return (
-          <div key={inst.id} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20,marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-              <span style={{fontSize:14,fontWeight:700}}>{tpl?.name || "Checklist"}</span>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                {pct===100&&<span style={{fontSize:12}}>{"\u{1F389}"}</span>}
-                <span style={{fontSize:12,fontWeight:700,color:pct===100?"var(--success)":pct>=50?"var(--accent)":"var(--warning)"}}>{checked}/{items.length}</span>
-              </div>
-            </div>
-            <div style={{height:5,borderRadius:3,background:"var(--bg-overlay)",marginBottom:16}}>
-              <div style={{height:5,borderRadius:3,background:pct===100?"var(--success)":pct>=50?"var(--accent)":"var(--warning)",width:pct+"%",transition:"width 0.3s"}}/>
-            </div>
-            {items.map((item, idx) => (
-              <div key={idx} onClick={() => toggleItem(inst.id, idx)} style={{
-                display:"flex",alignItems:"center",gap:14,padding:"12px 16px",cursor:"pointer",
-                borderRadius:12,marginBottom:4,background:item.checked?"var(--accent-subtle)":"transparent",transition:"background 0.2s",
-              }}>
-                <div style={{width:22,height:22,borderRadius:7,border:"2px solid "+(item.checked?"var(--success)":"var(--border-default)"),background:item.checked?"var(--success)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.2s"}}>
-                  {item.checked&&<span style={{color:"#fff",fontSize:13,fontWeight:800}}>{"\u2713"}</span>}
-                </div>
-                <span style={{fontSize:14,fontWeight:500,textDecoration:item.checked?"line-through":"none",opacity:item.checked?0.5:1,transition:"all 0.2s"}}>{item.title}</span>
-              </div>
-            ))}
-          </div>
-        );
-      })}
-
-      {!loading && instances.length === 0 && (
-        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>
-          {fr?"Aucune checklist configurée. Contacte ton gérant.":"No checklist configured. Contact your manager."}
-        </div>
-      )}
-    </div>
-  );
-};
-
-// =============================================
-// MODEL ROLE — MES TÂCHES (from model_tasks)
-// =============================================
-const ModelTasksTab = ({user, lang}) => {
-  const addToast = useToast();
-  const fr = lang === "fr";
-  const [tasks, setTasks] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState("active");
-
-  useEffect(() => {
-    const load = async () => {
-      const {data} = await sb.from("model_tasks").select("*").eq("model_id", user.id).order("created_at", {ascending: false});
-      setTasks(data || []);
-      setLoading(false);
-    };
-    load();
-  }, [user.id]);
-
-  const updateStatus = async (taskId, newStatus) => {
-    const updates = {status: newStatus};
-    if (newStatus === "done") updates.completed_at = new Date().toISOString();
-    else updates.completed_at = null;
-    const {error} = await sb.from("model_tasks").update(updates).eq("id", taskId);
-    if (error) { addToast("Erreur: " + error.message, "error"); return; }
-    setTasks(prev => prev.map(t => t.id === taskId ? {...t, ...updates} : t));
-    if (newStatus === "done") addToast(fr ? "Tâche terminée" : "Task completed", "success");
-  };
-
-  const filtered = filter === "active" ? tasks.filter(t => t.status !== "done") : filter === "done" ? tasks.filter(t => t.status === "done") : tasks;
-  const todoCount = tasks.filter(t => t.status === "todo").length;
-  const inProgressCount = tasks.filter(t => t.status === "in_progress").length;
-  const doneCount = tasks.filter(t => t.status === "done").length;
-  const isOverdue = (d) => d && new Date(d) < new Date(new Date().toISOString().slice(0, 10));
-  const catIcon = (c) => c === "social" ? "\u{1F4F1}" : c === "admin" ? "\u{1F4CB}" : c === "content" ? "\u{1F4F8}" : c === "communication" ? "\u{1F4AC}" : "\u{1F4CC}";
-
-  return (
-    <div>
-      <div style={{marginBottom:24}}>
-        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4CB}"} {fr?"Mes Tâches":"My Tasks"}</h2>
-        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{todoCount} {fr?"à faire":"to do"} {"\u00B7"} {inProgressCount} {fr?"en cours":"in progress"} {"\u00B7"} {doneCount} {fr?"terminées":"done"}</p>
-      </div>
-
-      <div style={{display:"flex",gap:6,marginBottom:18}}>
-        {[{k:"active",l:fr?"Actives":"Active"},{k:"done",l:fr?"Terminées":"Done"},{k:"all",l:fr?"Toutes":"All"}].map(f => (
-          <button key={f.k} onClick={() => setFilter(f.k)} className={`filter-chip ${filter===f.k?"active":""}`}>{f.l}</button>
-        ))}
-      </div>
-
-      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
-      {!loading && filtered.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr?"Aucune tâche":"No tasks"}</div>}
-      {filtered.map(task => (
-        <div key={task.id} style={{
-          display:"flex",alignItems:"center",gap:16,padding:"16px 20px",
-          background:"var(--card-bg)",border:"1px solid "+(task.priority==="urgent"?"var(--danger-muted)":task.priority==="high"?"var(--warning-muted)":"var(--border-subtle)"),
-          borderRadius:16,marginBottom:8,
-          borderLeft:"4px solid "+(task.status==="done"?"var(--success)":task.status==="in_progress"?"var(--accent)":"var(--warning)"),
-        }}>
-          <input type="checkbox" checked={task.status==="done"} onChange={()=>updateStatus(task.id,task.status==="done"?"todo":"done")}
-            style={{width:20,height:20,accentColor:"var(--success)",cursor:"pointer",flexShrink:0}} />
-          <div style={{flex:1}}>
-            <div style={{fontSize:14,fontWeight:700,textDecoration:task.status==="done"?"line-through":"none",opacity:task.status==="done"?0.5:1}}>{task.title}</div>
-            {task.description && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:3}}>{task.description}</div>}
-            <div style={{display:"flex",gap:8,marginTop:6}}>
-              <span style={{fontSize:10,padding:"1px 6px",borderRadius:6,background:"var(--accent-subtle)",color:"var(--accent)",fontWeight:600}}>{catIcon(task.category)} {task.category}</span>
-              {task.due_date && <span style={{fontSize:10,color:isOverdue(task.due_date)&&task.status!=="done"?"var(--danger)":"var(--text-quaternary)"}}>{"\u{1F4C5}"} {fmtDate(task.due_date)}</span>}
-              {task.priority==="urgent"&&<span style={{fontSize:10,color:"var(--danger)",fontWeight:700}}>{"\u{1F6A8}"} URGENT</span>}
-              {task.priority==="high"&&<span style={{fontSize:10,color:"var(--warning)",fontWeight:600}}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
-            </div>
-          </div>
-          <select value={task.status} onChange={e=>updateStatus(task.id,e.target.value)} className="filter-select" style={{fontSize:11,padding:"5px 8px"}}>
-            <option value="todo">{fr?"À faire":"To do"}</option>
-            <option value="in_progress">{fr?"En cours":"In progress"}</option>
-            <option value="done">{fr?"Terminé":"Done"}</option>
-          </select>
-        </div>
-      ))}
-    </div>
-  );
-};
-
-module.exports = { ModelesTab, ModelContentTab, ModelDashboardTab, ModelPaymentsTab, ContentTaskManager, ModelManagementTab, ModelChecklistTab, ModelTasksTab };
+module.exports = { ModelesTab, ModelContentTab, ModelPaymentsTab, ContentTaskManager, ModelManagementTab, ModelChecklistTab, ModelTasksTab };
