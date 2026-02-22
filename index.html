@@ -1224,7 +1224,7 @@
   <script type="text/babel">
 const {useState, useEffect, useMemo, useCallback, useContext, createContext, useRef} = React;
 const _Recharts = window.Recharts || {};
-const {ResponsiveContainer, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, CartesianGrid, XAxis, YAxis, Tooltip: RechartsTooltip, Legend} = _Recharts;
+const {ResponsiveContainer, AreaChart, Area, BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, CartesianGrid, XAxis, YAxis, Tooltip: RechartsTooltip, Legend} = _Recharts;
 const rechartsReady = !!(ResponsiveContainer && AreaChart);
 
 // =============================================
@@ -9478,20 +9478,380 @@ const ChatterComptaTab = ({user, lang}) => {
 };
 
 // =============================================
-// CHATTER ROLE — COMPETITION (Placeholder PR #13B)
+// CHATTER ROLE — COMPETITION + GAMIFICATION
 // =============================================
-const ChatterCompetitionTab = ({user, lang}) => {
+const CHATTER_LEVELS = [
+  { name: "Débutant", icon: "\u{1F331}", minScore: 0, color: "#6B7280" },
+  { name: "Apprenti", icon: "\u2B50", minScore: 500, color: "#3B82F6" },
+  { name: "Confirmé", icon: "\u{1F525}", minScore: 2000, color: "#F59E0B" },
+  { name: "Expert", icon: "\u{1F48E}", minScore: 5000, color: "#8B5CF6" },
+  { name: "Légende", icon: "\u{1F451}", minScore: 10000, color: "#EF4444" },
+];
+
+const getChatterLevel = (score) => {
+  let lvl = CHATTER_LEVELS[0];
+  for (const l of CHATTER_LEVELS) { if (score >= l.minScore) lvl = l; }
+  return lvl;
+};
+
+const getNextLevel = (score) => {
+  for (const l of CHATTER_LEVELS) { if (score < l.minScore) return l; }
+  return null;
+};
+
+const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) => {
+  const { fmtAmount, convertAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
+  const [period, setPeriod] = useState("month");
+  const [section, setSection] = useState("classement");
+
+  const chatters = useMemo(() => profiles.filter(p => p.role === "chatter"), [profiles]);
+
+  const periodFilter = useMemo(() => {
+    const now = new Date();
+    if (period === "week") {
+      const d = new Date(now); d.setDate(d.getDate() - d.getDay() + (d.getDay() === 0 ? -6 : 1));
+      d.setHours(0,0,0,0);
+      return d;
+    }
+    if (period === "month") return new Date(now.getFullYear(), now.getMonth(), 1);
+    if (period === "last_month") return new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    if (period === "3months") { const d = new Date(now); d.setMonth(d.getMonth() - 3); return d; }
+    return new Date(0);
+  }, [period]);
+
+  const periodEnd = useMemo(() => {
+    if (period === "last_month") return new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    return new Date();
+  }, [period]);
+
+  const ranking = useMemo(() => {
+    return chatters.map(ch => {
+      const chModelIds = ch.assigned_models || [];
+      const chTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= periodFilter && new Date(tx.date) < periodEnd);
+      const validTxs = chTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+      const ca = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const nbTx = chTxs.length;
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600000);
+      const spenderHandles = new Set(chTxs.filter(tx => new Date(tx.date) >= thirtyDaysAgo).map(tx => tx.spender_handle));
+      const activeSpenders = spenderHandles.size;
+      const allSpenderHandles = new Set(txs.filter(tx => chModelIds.includes(tx.model_id)).map(tx => tx.spender_handle));
+      const totalSpenders = allSpenderHandles.size;
+      const convRate = totalSpenders > 0 ? Math.round((activeSpenders / totalSpenders) * 100) : 0;
+      const score = Math.round((ca / 10) + (nbTx * 5) + (activeSpenders * 10) + (convRate * 3));
+      return { user: ch, ca, nbTx, activeSpenders, totalSpenders, convRate, score };
+    }).sort((a, b) => b.score - a.score);
+  }, [chatters, txs, periodFilter, periodEnd, convertAmount]);
+
+  // My stats
+  const myRank = useMemo(() => ranking.find(r => r.user.id === user.id), [ranking, user.id]);
+  const myIdx = useMemo(() => ranking.findIndex(r => r.user.id === user.id), [ranking, user.id]);
+  const myScore = myRank?.score || 0;
+  const myLevel = getChatterLevel(myScore);
+  const nextLevel = getNextLevel(myScore);
+
+  // Previous month stats for variation %
+  const prevMonthStats = useMemo(() => {
+    const now = new Date();
+    const prevStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const prevEnd = new Date(now.getFullYear(), now.getMonth(), 1);
+    const chModelIds = user.assigned_models || [];
+    const prevTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= prevStart && new Date(tx.date) < prevEnd);
+    const prevValid = prevTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+    const prevCA = prevValid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const prevSpenders = new Set(prevTxs.map(tx => tx.spender_handle)).size;
+    return { ca: prevCA, nbTx: prevTxs.length, spenders: prevSpenders };
+  }, [txs, user.assigned_models, convertAmount]);
+
+  // Badges computation
+  const badges = useMemo(() => {
+    const chModelIds = user.assigned_models || [];
+    const allMyTxs = txs.filter(tx => chModelIds.includes(tx.model_id));
+    const validMyTxs = allMyTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+
+    // First Blood: first TX created
+    const firstBlood = allMyTxs.length > 0;
+
+    // Centurion: 100 TX total
+    const centurion = allMyTxs.length >= 100;
+
+    // Whale Hunter: 1 spender with TX > 500 CHF
+    const whaleHunter = validMyTxs.some(tx => convertAmount(Number(tx.amount || 0), tx.currency) > 500);
+
+    // On Fire: 10 TX in 1 day
+    const txByDay = {};
+    allMyTxs.forEach(tx => { const d = (tx.date || "").slice(0, 10); txByDay[d] = (txByDay[d] || 0) + 1; });
+    const onFire = Object.values(txByDay).some(c => c >= 10);
+
+    // Top Dog: #1 in current ranking
+    const topDog = myIdx === 0 && ranking.length > 1;
+
+    // Rising Star: best progression % vs last month
+    const currCA = myRank?.ca || 0;
+    const prevCA = prevMonthStats.ca;
+    let isBestProgression = false;
+    if (prevCA > 0 && chatters.length > 1) {
+      const now = new Date();
+      const prevStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const prevEnd = new Date(now.getFullYear(), now.getMonth(), 1);
+      const curStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      const progressions = chatters.map(ch => {
+        const ids = ch.assigned_models || [];
+        const pTxs = txs.filter(tx => ids.includes(tx.model_id) && new Date(tx.date) >= prevStart && new Date(tx.date) < prevEnd);
+        const pCA = pTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+        const cTxs = txs.filter(tx => ids.includes(tx.model_id) && new Date(tx.date) >= curStart);
+        const cCA = cTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+        const prog = pCA > 0 ? ((cCA - pCA) / pCA) * 100 : 0;
+        return { id: ch.id, prog };
+      });
+      const best = progressions.sort((a, b) => b.prog - a.prog)[0];
+      isBestProgression = best && best.id === user.id && best.prog > 0;
+    }
+
+    return [
+      { id: "first_blood", icon: "\u{1F3AF}", name: "First Blood", desc: fr ? "Première TX créée" : "First TX created", unlocked: firstBlood },
+      { id: "centurion", icon: "\u{1F4AF}", name: "Centurion", desc: fr ? "100 TX au total" : "100 TX total", unlocked: centurion },
+      { id: "whale_hunter", icon: "\u{1F40B}", name: "Whale Hunter", desc: fr ? "1 spender avec TX > 500 CHF" : "1 spender with TX > 500 CHF", unlocked: whaleHunter },
+      { id: "on_fire", icon: "\u{1F525}", name: "On Fire", desc: fr ? "10 TX en 1 journée" : "10 TX in 1 day", unlocked: onFire },
+      { id: "top_dog", icon: "\u{1F451}", name: "Top Dog", desc: fr ? "#1 du classement" : "#1 in ranking", unlocked: topDog },
+      { id: "rising_star", icon: "\u{1F31F}", name: "Rising Star", desc: fr ? "Meilleure progression % vs mois dernier" : "Best progression % vs last month", unlocked: isBestProgression },
+    ];
+  }, [txs, user, myIdx, myRank, prevMonthStats, ranking, chatters, convertAmount, fr]);
+
+  // Score history (6 last months)
+  const scoreHistory = useMemo(() => {
+    const now = new Date();
+    const months = [];
+    const chModelIds = user.assigned_models || [];
+    for (let i = 5; i >= 0; i--) {
+      const mStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const mEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
+      const label = mStart.toLocaleDateString(fr ? "fr-FR" : "en-US", { month: "short" });
+      const mTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= mStart && new Date(tx.date) < mEnd);
+      const valid = mTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+      const ca = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const spH = new Set(mTxs.map(tx => tx.spender_handle)).size;
+      const totalSp = new Set(txs.filter(tx => chModelIds.includes(tx.model_id)).map(tx => tx.spender_handle)).size;
+      const conv = totalSp > 0 ? Math.round((spH / totalSp) * 100) : 0;
+      const sc = Math.round((ca / 10) + (mTxs.length * 5) + (spH * 10) + (conv * 3));
+      months.push({ name: label, score: sc });
+    }
+    return months;
+  }, [txs, user.assigned_models, convertAmount, fr]);
+
+  const medals = ["\u{1F947}", "\u{1F948}", "\u{1F949}"];
+  const medalColors = ["#FFD700", "#C0C0C0", "#CD7F32"];
+  const top3 = ranking.slice(0, 3);
+  const rest = ranking.slice(3);
+  const maxScore = top3.length > 0 ? top3[0].score : 1;
+
+  const getInitials = (name) => (name || "?").split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
+  const avatarColor = (id) => { let h = 0; for (let i = 0; i < (id || "").length; i++) h = (id || "").charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h) % 360}, 60%, 50%)`; };
+
+  const periodOpts = [
+    { k: "week", l: fr ? "Cette semaine" : "This week" },
+    { k: "month", l: fr ? "Ce mois" : "This month" },
+    { k: "last_month", l: fr ? "Mois dernier" : "Last month" },
+    { k: "3months", l: fr ? "3 mois" : "3 months" },
+  ];
+
+  const varPct = (curr, prev) => {
+    if (!prev || prev === 0) return null;
+    return Math.round(((curr - prev) / prev) * 100);
+  };
+
   return (
     <div>
       <div style={{marginBottom:24}}>
         <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F3C6}"} {fr ? "Compétition" : "Competition"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Classement & Gamification" : "Rankings & Gamification"}</p>
       </div>
-      <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:60}}>
-        <div style={{fontSize:48,marginBottom:16}}>{"\u{1F3C6}"}</div>
-        <div style={{fontSize:16,fontWeight:700,marginBottom:8}}>{fr ? "Bientôt disponible" : "Coming soon"}</div>
-        <div style={{fontSize:13}}>{fr ? "La page compétition arrive dans une prochaine mise à jour." : "The competition page is coming in a future update."}</div>
+
+      {/* Section toggle */}
+      <div style={{display:"flex",gap:8,marginBottom:20}}>
+        {[{k:"classement",l:fr?"Classement":"Rankings",ic:"\u{1F3C6}"},{k:"stats",l:fr?"Mes Stats":"My Stats",ic:"\u{1F4CA}"}].map(s => (
+          <button key={s.k} onClick={() => setSection(s.k)} style={{padding:"8px 18px",borderRadius:12,border:"1px solid "+(section===s.k?"#8B5CF6":"var(--border-subtle)"),background:section===s.k?"rgba(139,92,246,0.15)":"var(--card-bg)",color:section===s.k?"#8B5CF6":"var(--text-secondary)",fontWeight:700,fontSize:13,cursor:"pointer"}}>{s.ic} {s.l}</button>
+        ))}
       </div>
+
+      {/* ─── SECTION: CLASSEMENT ─── */}
+      {section === "classement" && (<>
+        {/* Period filters */}
+        <div style={{display:"flex",gap:6,marginBottom:20,flexWrap:"wrap"}}>
+          {periodOpts.map(p => (
+            <button key={p.k} onClick={() => setPeriod(p.k)} className={`filter-chip ${period===p.k?"active":""}`} style={{fontSize:12}}>{p.l}</button>
+          ))}
+        </div>
+
+        {chatters.length === 0 && (
+          <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:60}}>{fr ? "Aucun chatter trouvé" : "No chatters found"}</div>
+        )}
+
+        {/* Podium Top 3 */}
+        {top3.length > 0 && (
+          <div style={{display:"grid",gridTemplateColumns:top3.length >= 3 ? "1fr 1fr 1fr" : `repeat(${top3.length}, 1fr)`,gap:16,marginBottom:28}}>
+            {top3.map((r, idx) => {
+              const isMe = r.user.id === user.id;
+              const lvl = getChatterLevel(r.score);
+              return (
+                <div key={r.user.id} style={{background:isMe ? "rgba(139,92,246,0.12)" : "#1A1A2E",border:`2px solid ${medalColors[idx]}`,borderRadius:16,padding:24,textAlign:"center",position:"relative",transition:"all 0.2s"}}>
+                  <div style={{fontSize:32,marginBottom:8}}>{medals[idx]}</div>
+                  <div style={{width:56,height:56,borderRadius:"50%",background:avatarColor(r.user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff",margin:"0 auto 10px"}}>{getInitials(r.user.name)}</div>
+                  <div style={{fontSize:15,fontWeight:800,marginBottom:2}}>{r.user.name}</div>
+                  <div style={{fontSize:11,color:lvl.color,marginBottom:10}}>{lvl.icon} {lvl.name}</div>
+                  <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:4}}>CA</div>
+                  <div style={{fontSize:20,fontWeight:800,color:"var(--accent)",marginBottom:8}}>{fmtAmount(r.ca)}</div>
+                  <div style={{display:"flex",justifyContent:"center",gap:12,fontSize:11,color:"var(--text-tertiary)",marginBottom:12}}>
+                    <span>{r.nbTx} TX</span>
+                    <span>{r.activeSpenders} {"\u{1F525}"}</span>
+                  </div>
+                  <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:6}}>Score</div>
+                  <div style={{fontSize:18,fontWeight:800,color:medalColors[idx]}}>{r.score.toLocaleString()}</div>
+                  {/* Progress bar */}
+                  <div style={{marginTop:12,height:6,borderRadius:3,background:"rgba(255,255,255,0.08)",overflow:"hidden"}}>
+                    <div style={{height:"100%",borderRadius:3,background:medalColors[idx],width:`${Math.min(100, (r.score / maxScore) * 100)}%`,transition:"width 0.5s"}} />
+                  </div>
+                  {isMe && <div style={{position:"absolute",top:8,right:10,fontSize:9,color:"#8B5CF6",fontWeight:700,background:"rgba(139,92,246,0.15)",padding:"2px 8px",borderRadius:8}}>{fr ? "Toi" : "You"}</div>}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Rest of ranking — Table */}
+        {rest.length > 0 && (
+          <div style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,overflow:"hidden",marginBottom:20}}>
+            <div style={{overflowX:"auto"}}>
+              <table className="table">
+                <thead><tr>
+                  <th style={{width:50}}>#</th>
+                  <th>{fr ? "Chatter" : "Chatter"}</th>
+                  <th>{fr ? "CA Généré" : "Revenue"}</th>
+                  <th>{fr ? "Nb TX" : "TX Count"}</th>
+                  <th>{fr ? "Spenders Actifs" : "Active Spenders"}</th>
+                  <th>{fr ? "Taux Conv." : "Conv. Rate"}</th>
+                  <th>Score</th>
+                </tr></thead>
+                <tbody>
+                  {rest.map((r, idx) => {
+                    const isMe = r.user.id === user.id;
+                    const lvl = getChatterLevel(r.score);
+                    return (
+                      <tr key={r.user.id} style={{background:isMe ? "rgba(139,92,246,0.1)" : ""}}>
+                        <td style={{fontWeight:700,color:"var(--text-tertiary)"}}>{idx + 4}</td>
+                        <td>
+                          <div style={{display:"flex",alignItems:"center",gap:8}}>
+                            <div style={{width:28,height:28,borderRadius:"50%",background:avatarColor(r.user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,color:"#fff"}}>{getInitials(r.user.name)}</div>
+                            <span style={{fontWeight:600}}>{r.user.name}</span>
+                            <span style={{fontSize:10,color:lvl.color}}>{lvl.icon}</span>
+                            {isMe && <span style={{fontSize:9,color:"#8B5CF6",fontWeight:700}}>({fr ? "Toi" : "You"})</span>}
+                          </div>
+                        </td>
+                        <td style={{fontWeight:700}}>{fmtAmount(r.ca)}</td>
+                        <td>{r.nbTx}</td>
+                        <td>{r.activeSpenders}</td>
+                        <td>
+                          <span style={{padding:"2px 8px",borderRadius:10,background:r.convRate >= 50 ? "rgba(16,185,129,0.15)" : r.convRate >= 25 ? "rgba(245,158,11,0.15)" : "rgba(239,68,68,0.15)",color:r.convRate >= 50 ? "#10B981" : r.convRate >= 25 ? "#F59E0B" : "#EF4444",fontSize:11,fontWeight:700}}>{r.convRate}%</span>
+                        </td>
+                        <td style={{fontWeight:700}}>{r.score.toLocaleString()}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </>)}
+
+      {/* ─── SECTION: MES STATS ─── */}
+      {section === "stats" && (<>
+        {/* 4 KPI Cards */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:14,marginBottom:24}}>
+          {[
+            { label: fr ? "CA Généré" : "Revenue", value: fmtAmount(myRank?.ca || 0), prev: prevMonthStats.ca, curr: myRank?.ca || 0, icon: "\u{1F4B0}", color: "var(--accent)" },
+            { label: fr ? "Nb TX ce mois" : "TX this month", value: myRank?.nbTx || 0, prev: prevMonthStats.nbTx, curr: myRank?.nbTx || 0, icon: "\u{1F4B8}", color: "var(--success)" },
+            { label: fr ? "Spenders Actifs" : "Active Spenders", value: myRank?.activeSpenders || 0, prev: prevMonthStats.spenders, curr: myRank?.activeSpenders || 0, icon: "\u{1F465}", color: "#EC4899" },
+            { label: fr ? "Taux de Conversion" : "Conv. Rate", value: (myRank?.convRate || 0) + "%", prev: null, curr: null, icon: "\u{1F3AF}", color: "#8B5CF6" },
+          ].map(k => {
+            const vPct = k.prev !== null ? varPct(k.curr, k.prev) : null;
+            return (
+              <div key={k.label} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:"20px 22px"}}>
+                <div style={{fontSize:10,color:"#9CA3AF",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>{k.icon} {k.label}</div>
+                <div style={{fontSize:26,fontWeight:800,color:k.color}}>{k.value}</div>
+                {vPct !== null && (
+                  <div style={{fontSize:11,marginTop:6,color:vPct >= 0 ? "#10B981" : "#EF4444",fontWeight:600}}>
+                    {vPct >= 0 ? "\u2191" : "\u2193"} {Math.abs(vPct)}% {fr ? "vs mois dernier" : "vs last month"}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Rank display */}
+        <div style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:20,marginBottom:20,display:"flex",alignItems:"center",gap:16}}>
+          <div style={{width:48,height:48,borderRadius:"50%",background:avatarColor(user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:800,color:"#fff"}}>{getInitials(user.name)}</div>
+          <div style={{flex:1}}>
+            <div style={{fontSize:14,fontWeight:700}}>{user.name}</div>
+            <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Classement" : "Rank"}: <span style={{fontWeight:800,color:"#8B5CF6"}}>#{myIdx + 1}</span> / {ranking.length}</div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:22,fontWeight:800,color:"var(--accent)"}}>{myScore.toLocaleString()}</div>
+            <div style={{fontSize:10,color:"var(--text-tertiary)"}}>Score</div>
+          </div>
+        </div>
+
+        {/* Level card */}
+        <div style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:24,marginBottom:20,textAlign:"center"}}>
+          <div style={{fontSize:48,marginBottom:8}}>{myLevel.icon}</div>
+          <div style={{fontSize:18,fontWeight:800,color:myLevel.color,marginBottom:4}}>{myLevel.name}</div>
+          <div style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:16}}>Score: {myScore.toLocaleString()}</div>
+          {nextLevel ? (
+            <div>
+              <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:8}}>{fr ? "Prochain niveau" : "Next level"}: <span style={{color:nextLevel.color,fontWeight:700}}>{nextLevel.icon} {nextLevel.name}</span> ({nextLevel.minScore.toLocaleString()} pts)</div>
+              <div style={{height:10,borderRadius:5,background:"rgba(255,255,255,0.08)",overflow:"hidden",maxWidth:400,margin:"0 auto"}}>
+                <div style={{height:"100%",borderRadius:5,background:`linear-gradient(90deg, ${myLevel.color}, ${nextLevel.color})`,width:`${Math.min(100, ((myScore - myLevel.minScore) / (nextLevel.minScore - myLevel.minScore)) * 100)}%`,transition:"width 0.5s"}} />
+              </div>
+              <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:6}}>{Math.max(0, nextLevel.minScore - myScore).toLocaleString()} {fr ? "points restants" : "points remaining"}</div>
+            </div>
+          ) : (
+            <div style={{fontSize:12,color:"#EF4444",fontWeight:700}}>{fr ? "Niveau maximum atteint !" : "Max level reached!"}</div>
+          )}
+        </div>
+
+        {/* Badges grid */}
+        <div style={{fontSize:14,fontWeight:700,marginBottom:12}}>{"\u{1F396}\uFE0F"} {fr ? "Badges" : "Badges"}</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:12,marginBottom:24}}>
+          {badges.map(b => (
+            <div key={b.id} style={{background:b.unlocked ? "#1A1A2E" : "rgba(26,26,46,0.5)",border:"1px solid "+(b.unlocked ? "#2A2A3E" : "rgba(42,42,62,0.4)"),borderRadius:16,padding:20,textAlign:"center",opacity:b.unlocked ? 1 : 0.5,position:"relative"}}>
+              <div style={{fontSize:36,marginBottom:8,filter:b.unlocked ? "none" : "grayscale(100%)"}}>{b.icon}</div>
+              <div style={{fontSize:13,fontWeight:700,marginBottom:4,color:b.unlocked ? "#fff" : "var(--text-quaternary)"}}>{b.name}</div>
+              <div style={{fontSize:11,color:b.unlocked ? "var(--text-tertiary)" : "var(--text-quaternary)"}}>{b.desc}</div>
+              {!b.unlocked && <div style={{position:"absolute",top:8,right:10,fontSize:14}}>{"\u{1F512}"}</div>}
+              {b.unlocked && <div style={{marginTop:8,fontSize:10,color:"#10B981",fontWeight:700}}>{"\u2713"} {fr ? "Débloqué" : "Unlocked"}</div>}
+            </div>
+          ))}
+        </div>
+
+        {/* Score history chart */}
+        <div style={{fontSize:14,fontWeight:700,marginBottom:12}}>{"\u{1F4C8}"} {fr ? "Évolution du Score" : "Score History"}</div>
+        <div style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:20,marginBottom:20}}>
+          {rechartsReady && LineChart ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={scoreHistory}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#2A2A3E" />
+                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill:"#9CA3AF",fontSize:11}} />
+                <YAxis axisLine={false} tickLine={false} tick={{fill:"#9CA3AF",fontSize:11}} />
+                <RechartsTooltip contentStyle={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:8,fontSize:12}} />
+                <Line type="monotone" dataKey="score" stroke="#8B5CF6" strokeWidth={3} dot={{fill:"#8B5CF6",r:5}} activeDot={{r:7}} name="Score" />
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Graphique non disponible" : "Chart unavailable"}</div>
+          )}
+        </div>
+      </>)}
     </div>
   );
 };
@@ -13577,7 +13937,7 @@ const App = () => {
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} onRefresh={onRefresh} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
           {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} />}
-          {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} />}
+          {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} profiles={profiles} />}
           {/* ── Standard pages ── */}
           {tab==="dashboard"&&user.role!=="provider"&&user.role!=="modele"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} />}
           {tab==="modeles"&&user.role==="gerant"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
