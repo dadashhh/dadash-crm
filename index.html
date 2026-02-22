@@ -19129,6 +19129,60 @@ const App = () => {
     init();
   },[]);
 
+  // ── SUPABASE REALTIME: Notifications + TX + Scans + Broadcasts ──
+  useEffect(() => {
+    if (!user) return;
+    const channel = sb.channel("dadash-realtime-notifs-" + user.id)
+      // Listen for new notifications inserted for this user
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications", filter: "user_id=eq." + user.id }, (payload) => {
+        if (payload.new) {
+          setNotifications(prev => [payload.new, ...prev].slice(0, 50));
+          setUnreadCount(prev => prev + 1);
+        }
+      })
+      // Listen for new transactions (auto-generate notification for gérant)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "transactions" }, (payload) => {
+        if (user.role === "gerant" && payload.new) {
+          const tx = payload.new;
+          const amt = convertAmount(Number(tx.amount), tx.currency);
+          const notif = { id: "rt-tx-" + Date.now(), type: "tx_created", title: (lang === "fr" ? "Nouvelle TX" : "New TX") + " \u{1F4B0}", message: "@" + (tx.spender_handle || "?") + " \u2014 " + fmtAmount(amt), created_at: new Date().toISOString(), read: false, _local: true };
+          setNotifications(prev => [notif, ...prev].slice(0, 50));
+          setUnreadCount(prev => prev + 1);
+        }
+      })
+      // Listen for transaction status changes (validated/refused)
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "transactions" }, (payload) => {
+        if (user.role === "gerant" && payload.new && payload.old && payload.new.status !== payload.old.status) {
+          const tx = payload.new;
+          const amt = convertAmount(Number(tx.amount), tx.currency);
+          const icon = tx.status === "validated" ? "\u2705" : tx.status === "refused" ? "\u274C" : "\u270F\uFE0F";
+          const notif = { id: "rt-txu-" + Date.now(), type: tx.status === "validated" ? "tx_validated" : "tx_modified", title: icon + " TX " + tx.status, message: "@" + (tx.spender_handle || "?") + " \u2014 " + fmtAmount(amt), created_at: new Date().toISOString(), read: false, _local: true };
+          setNotifications(prev => [notif, ...prev].slice(0, 50));
+          setUnreadCount(prev => prev + 1);
+        }
+      })
+      // Listen for new screenshot checks
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "screenshot_checks" }, (payload) => {
+        if (user.role === "gerant" && payload.new) {
+          const sc = payload.new;
+          const notif = { id: "rt-sc-" + Date.now(), type: "scan", title: (lang === "fr" ? "Nouveau scan" : "New scan") + " \u{1F4F8}", message: (sc.spender_handle || sc.spender_id || "") + (sc.amount ? " \u2014 " + fmtAmount(convertAmount(Number(sc.amount), sc.currency)) : ""), created_at: new Date().toISOString(), read: false, _local: true };
+          setNotifications(prev => [notif, ...prev].slice(0, 50));
+          setUnreadCount(prev => prev + 1);
+        }
+      })
+      // Listen for new broadcasts
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "broadcasts" }, (payload) => {
+        if (user.role === "gerant" && payload.new) {
+          const bc = payload.new;
+          const notif = { id: "rt-bc-" + Date.now(), type: "broadcast", title: (lang === "fr" ? "Broadcast envoyé" : "Broadcast sent") + " \u{1F4E2}", message: (bc.message || bc.content || "").slice(0, 60), created_at: new Date().toISOString(), read: false, _local: true };
+          setNotifications(prev => [notif, ...prev].slice(0, 50));
+          setUnreadCount(prev => prev + 1);
+        }
+      })
+      .subscribe();
+    return () => { sb.removeChannel(channel); };
+  }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
+
   const handleLogin = async (u) => {
     setUser(u);
     if(u.role === "provider") setTab("transactions");
@@ -19409,34 +19463,56 @@ const App = () => {
               <span style={{width:8,height:8,borderRadius:"50%",background:"var(--success)",boxShadow:"none",animation:"pulse 2s infinite"}}/>
               <span style={{color:"var(--text-secondary)",fontSize:12}}>Live</span>
             </div>
-            {/* Notifications bell */}
+            {/* Notifications bell + dropdown */}
             <div style={{position:"relative"}}>
-              <div style={{cursor:"pointer",padding:"4px 6px",borderRadius:12,background:showNotifs?"var(--accent-muted)":"transparent",transition:"background 0.2s"}} onClick={()=>setShowNotifs(!showNotifs)}>
+              <div style={{cursor:"pointer",padding:"4px 8px",borderRadius:12,background:showNotifs?"var(--accent-muted)":"transparent",transition:"background 0.2s",display:"flex",alignItems:"center",gap:4}} onClick={()=>setShowNotifs(!showNotifs)}>
                 <span style={{fontSize:20}}>{"\u{1F514}"}</span>
-                {unreadCount>0&&<span style={{position:"absolute",top:-2,right:-4,width:18,height:18,borderRadius:"50%",background:"var(--danger)",color:"var(--text-primary)",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"var(--shadow-sm)",animation:"pulse 2s infinite"}}>{unreadCount>9?"9+":unreadCount}</span>}
+                {unreadCount>0&&<span style={{position:"absolute",top:-4,right:-4,minWidth:20,height:20,borderRadius:10,background:"#EF4444",color:"#fff",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 4px",boxShadow:"0 2px 8px rgba(239,68,68,0.4)",animation:"pulse 2s infinite"}}>{unreadCount>99?"99+":unreadCount}</span>}
               </div>
-              {showNotifs&&<div style={{position:"absolute",top:44,right:0,width:380,maxHeight:500,background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:12,boxShadow:"var(--shadow-lg)",overflow:"hidden",zIndex:3000}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 20px",borderBottom:"1px solid var(--border-subtle)"}}>
-                  <span style={{fontSize:14,fontWeight:700}}>Notifications</span>
-                  <button onClick={markAllRead} style={{fontSize:10,color:"var(--accent)",fontWeight:600,background:"none",border:"none",cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Tout marquer lu":"Mark all read"}</button>
-                </div>
-                <div style={{overflowY:"auto",maxHeight:420}}>
-                  {notifications.length===0&&<div style={{padding:30,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{lang==="fr"?"Aucune notification":"No notifications"}</div>}
-                  {notifications.map(n=>(
-                    <div key={n.id} style={{padding:"14px 20px",borderBottom:"1px solid var(--border-subtle)",background:n.read?"transparent":"var(--accent-subtle)",cursor:"pointer",transition:"background 0.2s"}} onClick={()=>{markRead(n.id);setShowNotifs(false);}}>
-                      <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
-                        <span style={{fontSize:16,marginTop:2}}>{n.type==="tx_created"?"\u{1F4B0}":n.type==="tx_modified"?"\u270F\uFE0F":n.type==="tx_validated"?"\u2705":"\u274C"}</span>
-                        <div style={{flex:1}}>
-                          <div style={{fontSize:13,fontWeight:n.read?500:700}}>{n.title}</div>
-                          <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>{n.message}</div>
-                          <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:4}}>{formatTimeAgo(n.created_at)}</div>
-                        </div>
-                        {!n.read&&<span style={{width:8,height:8,borderRadius:"50%",background:"var(--accent)",flexShrink:0,marginTop:6}}/>}
+              {showNotifs&&(
+                <>
+                  <div style={{position:"fixed",inset:0,zIndex:2999}} onClick={()=>setShowNotifs(false)} />
+                  <div style={{position:"absolute",top:48,right:0,width:400,maxHeight:520,background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,boxShadow:"0 20px 60px rgba(0,0,0,.35)",overflow:"hidden",zIndex:3000}}>
+                    {/* Header */}
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"16px 20px",borderBottom:"1px solid var(--border-subtle)",background:"var(--bg-overlay)"}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{fontSize:15,fontWeight:800}}>{"\u{1F514}"} Notifications</span>
+                        {unreadCount>0&&<span style={{padding:"2px 8px",borderRadius:8,background:"#EF444420",color:"#EF4444",fontSize:10,fontWeight:700}}>{unreadCount} {lang==="fr"?"non lues":"unread"}</span>}
                       </div>
+                      {unreadCount>0&&<button onClick={markAllRead} style={{fontSize:11,color:"var(--accent)",fontWeight:700,background:"var(--accent-muted)",border:"none",borderRadius:8,padding:"4px 12px",cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Tout marquer lu":"Mark all read"}</button>}
                     </div>
-                  ))}
-                </div>
-              </div>}
+                    {/* Notification cards feed */}
+                    <div style={{overflowY:"auto",maxHeight:440}}>
+                      {notifications.length===0&&(
+                        <div style={{padding:40,textAlign:"center",color:"var(--text-quaternary)"}}>
+                          <div style={{fontSize:28,marginBottom:8}}>{"\u{1F514}"}</div>
+                          <div style={{fontSize:12}}>{lang==="fr"?"Aucune notification":"No notifications"}</div>
+                          <div style={{fontSize:11,color:"var(--text-quaternary)",marginTop:4}}>{lang==="fr"?"Les événements apparaîtront ici en temps réel":"Events will appear here in real-time"}</div>
+                        </div>
+                      )}
+                      {notifications.slice(0,30).map(n=>{
+                        const iconMap = {tx_created:"\u{1F4B0}",tx_modified:"\u270F\uFE0F",tx_validated:"\u2705",tx_refused:"\u274C",scan:"\u{1F4F8}",broadcast:"\u{1F4E2}",message:"\u{1F4AC}"};
+                        const colorMap = {tx_created:"var(--success)",tx_validated:"var(--success)",tx_modified:"var(--warning)",tx_refused:"var(--danger)",scan:"var(--warning)",broadcast:"var(--pink)",message:"var(--info)"};
+                        const ic = iconMap[n.type]||"\u{1F514}";
+                        const cl = colorMap[n.type]||"var(--accent)";
+                        return (
+                          <div key={n.id} style={{display:"flex",gap:12,padding:"12px 20px",borderBottom:"1px solid var(--border-subtle)",background:n.read?"transparent":cl+"08",cursor:"pointer",transition:"background 0.15s"}} onClick={()=>{if(!n._local)markRead(n.id);else setNotifications(prev=>prev.map(x=>x.id===n.id?{...x,read:true}:x));setUnreadCount(prev=>Math.max(0,prev-(n.read?0:1)));setShowNotifs(false);}}>
+                            <div style={{width:36,height:36,borderRadius:10,background:cl+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{ic}</div>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                                <span style={{fontSize:13,fontWeight:n.read?500:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.title}</span>
+                                {!n.read&&<span style={{width:7,height:7,borderRadius:"50%",background:cl,flexShrink:0}}/>}
+                              </div>
+                              <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.message}</div>
+                              <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:3}}>{formatTimeAgo(n.created_at)}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
             {/* Timezone selector */}
             <select value={timezone} onChange={(e)=>setTimezone(e.target.value)} title="Timezone" style={{padding:"5px 28px 5px 10px",borderRadius:10,border:"1px solid var(--border-default)",background:"var(--bg-overlay)",color:"var(--accent)",fontSize:11,fontWeight:600,outline:"none",cursor:"pointer",fontFamily:"'DM Sans', sans-serif",appearance:"none",WebkitAppearance:"none",backgroundImage:"url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.35)' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E\")",backgroundRepeat:"no-repeat",backgroundPosition:"right 8px center"}}>
