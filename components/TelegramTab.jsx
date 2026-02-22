@@ -21,7 +21,6 @@ const {
   getStreakBadges, getDailyProgress, getWeeklyProgress, launchConfetti,
   AGENCY_ACHIEVEMENTS, LevelBadge, XPProgressBar, StreakBadge,
   AgencyHealthScore, AgencyAchievements, ActivityHeatmap, ChallengesSection,
-  ContentTaskManager,
   q_spender_profile, q_spender_transactions, q_spender_kpis,
   q_spender_breakdown_models, q_spender_breakdown_chatter, q_spender_breakdown_provider,
   _hashStr, tonightDate, tonightStatus,
