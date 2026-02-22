@@ -6557,90 +6557,170 @@ const CompetitionTab = ({user, lang, txs, profiles}) => {
 // =============================================
 // PAIES TAB
 // =============================================
-const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh, invoices}) => {
+const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invoices}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const dr = useDateRange("all");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [payesSubTab, setPayesSubTab] = useState("paies");
+  const [breakdownChatter, setBreakdownChatter] = useState(null);
   const chatters = user.role==="chatter" ? profiles.filter(u=>u.id===user.id) : profiles.filter(u=>u.role==="chatter");
-  const [form, setForm] = useState({user_id:chatters[0]?.id||"",amount:"",method:"Virement",date:""});
+  const [form, setForm] = useState({user_id:chatters[0]?.id||"",amount:"",currency:"CHF",method:"Virement",date:""});
   const fr = lang === "fr";
   const payFilteredTxs = dr.filterByDate(txs, "date");
+
   const getChatterData = (chatterId) => {
     const chTx = payFilteredTxs.filter(tx=>tx.chatter_id===chatterId && tx.status==="validated");
-    const totalComm = chTx.reduce((s,tx)=>s+Number(tx.chatter_commission||0),0);
-    const paidAmount = payouts.filter(p=>p.user_id===chatterId && p.status==="done").reduce((s,p)=>s+Number(p.amount),0);
-    return {totalEarned:totalComm, paidAmount, balance:totalComm-paidAmount};
+    const totalComm = chTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
+    const paidAmount = payouts.filter(p=>p.user_id===chatterId && p.status==="done").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const pendingAmount = payouts.filter(p=>p.user_id===chatterId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const chPayslips = (payslips||[]).filter(p=>p.user_id===chatterId);
+    const paidPayslips = chPayslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
+    return {totalEarned:totalComm, paidAmount, pendingAmount, balance:totalComm-paidAmount, chPayslips, paidPayslips};
   };
+
+  // Global KPIs
+  const allChatterData = chatters.map(ch=>({...ch, data:getChatterData(ch.id)}));
+  const globalTotalComm = allChatterData.reduce((s,c)=>s+c.data.totalEarned,0);
+  const globalPaid = allChatterData.reduce((s,c)=>s+c.data.paidAmount,0);
+  const globalPending = allChatterData.reduce((s,c)=>s+c.data.pendingAmount,0);
+  const globalBalance = allChatterData.reduce((s,c)=>s+c.data.balance,0);
+
   const handleAddPayout = async () => {
     if(!form.amount||isNaN(parseFloat(form.amount))||parseFloat(form.amount)<=0) { addToast(fr?"Montant invalide (> 0)":"Invalid amount (> 0)","error"); return; }
     if(!form.date) { addToast(fr?"Date requise":"Date required","error"); return; }
     setSaving(true);
     try {
-      const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date, status:"pending"}).select().single();
+      const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), currency:form.currency, method:form.method, date:form.date, status:"pending"}).select().single();
       if(error) { addToast("Erreur payout: " + error.message, "error"); setSaving(false); return; }
-      // Auto-generate invoice for chatter payout
-      const chatterProfile = profiles.find(p=>p.id===form.user_id);
       if(inserted && user.role==="gerant") {
-        try { await generateChatterInvoice({id:inserted.id, user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { /* Chatter invoice gen best-effort */ addToast(fr?"Erreur génération facture":"Invoice generation error","error"); }
+        try { await generateChatterInvoice({id:inserted.id, user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { addToast(fr?"Erreur génération facture":"Invoice generation error","error"); }
       }
-      setForm({user_id:chatters[0]?.id||"",amount:"",method:"Virement",date:""});
+      setForm({user_id:chatters[0]?.id||"",amount:"",currency:"CHF",method:"Virement",date:""});
       setShowForm(false);
       await onRefresh();
-      addToast(t(lang,"payout_added")||"Payout ajouté ✓","success");
-    } catch(e) { /* Payout creation failed */ addToast("Erreur payout: " + e.message, "error"); }
+      addToast(t(lang,"payout_added")||"Payout ajouté","success");
+    } catch(e) { addToast("Erreur payout: " + e.message, "error"); }
     setSaving(false);
   };
+
   const myInvoices = (invoices||[]).filter(inv => {
     if (user.role === "chatter") return inv.profile_id === user.id && inv.type === "outgoing_chatter";
     if (user.role === "gerant") return inv.type === "outgoing_chatter";
     return false;
   });
+
+  // Breakdown modal data
+  const bdCh = breakdownChatter ? allChatterData.find(c=>c.id===breakdownChatter) : null;
+  const bdPayouts = bdCh ? payouts.filter(p=>p.user_id===bdCh.id).sort((a,b)=>new Date(b.date)-new Date(a.date)) : [];
+  const bdPayslips = bdCh ? (bdCh.data.chPayslips||[]).sort((a,b)=>b.period?.localeCompare(a.period)) : [];
+  const bdTxs = bdCh ? payFilteredTxs.filter(tx=>tx.chatter_id===bdCh.id && tx.status==="validated").sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,20) : [];
+
   return (
     <div>
       {/* Sub-tab selector */}
       <div style={{display:"flex",gap:4,marginBottom:20}}>
-        {[{id:"paies",label:fr?"Mes Paies":"My Payouts"},{id:"factures",label:fr?"Mes Factures":"My Invoices"}].map(tb=>(
+        {[{id:"paies",label:fr?"Paies":"Payouts"},{id:"fiches",label:fr?"Fiches de paie":"Payslips"},{id:"factures",label:fr?"Factures":"Invoices"}].map(tb=>(
           <button key={tb.id} className="btn" style={{padding:"6px 16px",fontSize:12,fontWeight:payesSubTab===tb.id?800:600,background:payesSubTab===tb.id?"var(--accent)":"var(--card-bg)",color:payesSubTab===tb.id?"#fff":"var(--text-secondary)",border:"1px solid "+(payesSubTab===tb.id?"var(--accent)":"var(--border-subtle)"),borderRadius:20}} onClick={()=>setPayesSubTab(tb.id)}>{tb.label}</button>
         ))}
       </div>
+
       {payesSubTab==="factures" ? (
         <MyInvoicesPanel invoices={myInvoices} lang={lang} />
+      ) : payesSubTab==="fiches" ? (
+        /* ── PAYSLIPS SUB-TAB ── */
+        <div>
+          {chatters.map(ch=>{
+            const chPS = (payslips||[]).filter(p=>p.user_id===ch.id).sort((a,b)=>b.period?.localeCompare(a.period));
+            if(chPS.length===0) return null;
+            return (
+              <div key={ch.id} style={{marginBottom:24}}>
+                <div style={{fontSize:13,fontWeight:700,marginBottom:10}}><Tag type="chatter" label={ch.name} id={ch.id}/></div>
+                {chPS.map(p=>{
+                  const isPaid = p.status==="paid";
+                  const sc = isPaid?"var(--success)":"var(--warning)";
+                  return (
+                    <div key={p.id} style={{display:"flex",alignItems:"center",gap:14,padding:"14px 18px",background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:14,marginBottom:8}}>
+                      <div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"\u2705":"\u23F3"}</div>
+                      <div style={{flex:1}}>
+                        <div style={{fontSize:14,fontWeight:700}}>{p.period}</div>
+                        <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"\u00B7"} Bonus: {fmtAmount(p.bonus||0)}</div>
+                      </div>
+                      <div style={{textAlign:"right"}}>
+                        <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div>
+                        <span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{isPaid?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+          {chatters.every(ch=>(payslips||[]).filter(p=>p.user_id===ch.id).length===0) && (
+            <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>
+              <div style={{fontSize:32,marginBottom:12}}>{"\u{1F4C4}"}</div>
+              {fr?"Aucune fiche de paie":"No payslips yet"}
+            </div>
+          )}
+        </div>
       ) : (
       <>
       <GlobalFilterBar lang={lang} dr={dr} />
-      {chatters.map(ch=>{
-        const data = getChatterData(ch.id);
-        const chPayouts = payouts.filter(p=>p.user_id===ch.id);
+
+      {/* ── KPI CARDS ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:14,marginBottom:24}}>
+        {[
+          {label:fr?"Commissions totales":"Total commissions", value:fmtAmount(globalTotalComm), color:"var(--accent)", icon:"\u{1F4B0}"},
+          {label:fr?"Déjà payé":"Already paid", value:fmtAmount(globalPaid), color:"var(--success)", icon:"\u2705"},
+          {label:fr?"En attente":"Pending", value:fmtAmount(globalPending), color:"var(--warning)", icon:"\u23F3"},
+          {label:fr?"Solde dû":"Balance due", value:fmtAmount(globalBalance), color:globalBalance>0?"var(--danger)":"var(--success)", icon:"\u{1F4CA}"},
+        ].map(k=>(
+          <div key={k.label} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:"18px 20px"}}>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>{k.icon} {k.label}</div>
+            <div style={{fontSize:22,fontWeight:800,color:k.color}}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── CHATTER CARDS ── */}
+      {allChatterData.map(ch=>{
+        const {data} = ch;
+        const chPayouts = payouts.filter(p=>p.user_id===ch.id).sort((a,b)=>new Date(b.date)-new Date(a.date));
+        const lastPayout = chPayouts[0];
         return (
-          <div key={ch.id} className="card" style={{marginBottom:20}}>
-            <div className="profile-header"><div className="profile-name"><Tag type="chatter" label={ch.name} id={ch.id}/></div></div>
-            <div className="profile-section">
-              <div className="profile-row"><span>{t(lang,"total_earned")}</span><span>{data.totalEarned.toFixed(0)}</span></div>
-              <div className="profile-row"><span>{t(lang,"already_paid")}</span><span>{data.paidAmount.toFixed(0)}</span></div>
-              <div className="profile-row"><span>{t(lang,"balance_due")}</span><span style={{color:data.balance>0?"var(--warning)":"var(--success)",fontWeight:700}}>{data.balance.toFixed(0)}</span></div>
+          <div key={ch.id} className="card" style={{marginBottom:16,cursor:"pointer",transition:"box-shadow .15s"}} onClick={()=>setBreakdownChatter(ch.id)}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
+              <Tag type="chatter" label={ch.name} id={ch.id}/>
+              <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{fr?"Cliquer pour détails":"Click for details"} &rarr;</span>
             </div>
-            <div style={{marginTop:16}}>
-              <div className="section-title"><div className="section-bar"></div>{t(lang,"payment_history")}</div>
-              <div className="table-wrap">
-                <table className="table" style={{fontSize:12}}>
-                  <thead><tr><th>{t(lang,"date")}</th><th>{t(lang,"amount")}</th><th>{t(lang,"method")}</th><th>{t(lang,"status")}</th></tr></thead>
-                  <tbody>
-                    {chPayouts.map(p=>(
-                      <tr key={p.id}><td>{fmtDate(p.date)}</td><td>{p.amount}</td><td>{p.method}</td><td><span className={`badge ${p.status==="done"?"badge-done":"badge-pending"}`}>{p.status}</span></td></tr>
-                    ))}
-                  </tbody>
-                </table>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
+              <div style={{background:"var(--bg-overlay)",borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Gagné":"Earned"}</div>
+                <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(data.totalEarned)}</div>
+              </div>
+              <div style={{background:"var(--bg-overlay)",borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Payé":"Paid"}</div>
+                <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(data.paidAmount)}</div>
+              </div>
+              <div style={{background:"var(--bg-overlay)",borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Solde":"Balance"}</div>
+                <div style={{fontSize:16,fontWeight:800,color:data.balance>0?"var(--danger)":"var(--success)"}}>{fmtAmount(data.balance)}</div>
               </div>
             </div>
+            {lastPayout && (
+              <div style={{marginTop:10,fontSize:11,color:"var(--text-tertiary)"}}>
+                {fr?"Dernier paiement":"Last payment"}: {fmtDate(lastPayout.date)} — {fmtAmount(lastPayout.amount)} ({lastPayout.method}) <span className={`badge ${lastPayout.status==="done"?"badge-done":"badge-pending"}`} style={{fontSize:9}}>{lastPayout.status}</span>
+              </div>
+            )}
           </div>
         );
       })}
+
+      {/* ── ADD PAYOUT FORM (gerant) ── */}
       {user.role==="gerant"&&(
         <>
-          <button className="btn btn-primary" style={{marginBottom:20,width:"auto"}} onClick={()=>setShowForm(!showForm)}>+ {t(lang,"add_payout")}</button>
+          <button className="btn btn-primary" style={{marginBottom:20,width:"auto"}} onClick={()=>setShowForm(!showForm)}>+ {t(lang,"add_payout")||"Ajouter paiement"}</button>
           {showForm&&(
             <div className="card" style={{marginBottom:20}}>
               <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12}}>
@@ -6651,29 +6731,129 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh, invoices}) => 
                   </select>
                 </div>
                 <div className="form-group-modal">
-                  <label className="form-label">{t(lang,"amount")}</label>
-                  <input className="form-input" type="number" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} />
+                  <label className="form-label">{t(lang,"amount")||"Montant"} ({form.currency})</label>
+                  <input className="form-input" type="number" step="0.01" placeholder="0.00" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} />
                 </div>
                 <div className="form-group-modal">
-                  <label className="form-label">{t(lang,"method")}</label>
+                  <label className="form-label">{fr?"Devise":"Currency"}</label>
+                  <select className="filter-select" value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}>
+                    <option value="CHF">CHF</option><option value="EUR">EUR</option>
+                  </select>
+                </div>
+                <div className="form-group-modal">
+                  <label className="form-label">{t(lang,"method")||"Méthode"}</label>
                   <select className="filter-select" value={form.method} onChange={e=>setForm({...form,method:e.target.value})}>
                     <option>Virement</option><option>PayPal</option><option>Revolut</option><option>Twint</option><option>Cash</option>
                   </select>
                 </div>
                 <div className="form-group-modal">
-                  <label className="form-label">{t(lang,"date")}</label>
+                  <label className="form-label">{t(lang,"date")||"Date"}</label>
                   <input className="filter-date" type="date" value={form.date} onChange={e=>setForm({...form,date:e.target.value})} />
                 </div>
               </div>
               <div style={{display:"flex",gap:12,marginTop:16}}>
-                <button className="btn btn-success" onClick={handleAddPayout} disabled={saving}>{saving?"...":t(lang,"create")}</button>
-                <button className="btn btn-danger" onClick={()=>setShowForm(false)}>{t(lang,"cancel")}</button>
+                <button className="btn btn-success" onClick={handleAddPayout} disabled={saving}>{saving?"...":(t(lang,"create")||"Créer")}</button>
+                <button className="btn btn-danger" onClick={()=>setShowForm(false)}>{t(lang,"cancel")||"Annuler"}</button>
               </div>
             </div>
           )}
         </>
       )}
       </>
+      )}
+
+      {/* ── BREAKDOWN MODAL ── */}
+      {breakdownChatter && bdCh && (
+        <div style={{position:"fixed",inset:0,zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,.55)",backdropFilter:"blur(6px)"}} onClick={()=>setBreakdownChatter(null)}>
+          <div style={{background:"var(--card-bg)",borderRadius:20,width:"95%",maxWidth:620,maxHeight:"85vh",overflow:"auto",padding:28,position:"relative",border:"1px solid var(--border-subtle)"}} onClick={e=>e.stopPropagation()}>
+            <button onClick={()=>setBreakdownChatter(null)} style={{position:"absolute",top:16,right:16,background:"none",border:"none",color:"var(--text-secondary)",fontSize:22,cursor:"pointer",lineHeight:1}}>&times;</button>
+            <div style={{marginBottom:20}}>
+              <Tag type="chatter" label={bdCh.name} id={bdCh.id}/>
+              <span style={{fontSize:12,color:"var(--text-tertiary)",marginLeft:8}}>{fr?"Détail des paies":"Payout breakdown"}</span>
+            </div>
+
+            {/* Modal KPIs */}
+            <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:10,marginBottom:20}}>
+              {[
+                {label:fr?"Commissions gagnées":"Commissions earned", val:fmtAmount(bdCh.data.totalEarned), color:"var(--accent)"},
+                {label:fr?"Total payé":"Total paid", val:fmtAmount(bdCh.data.paidAmount), color:"var(--success)"},
+                {label:fr?"En attente":"Pending", val:fmtAmount(bdCh.data.pendingAmount), color:"var(--warning)"},
+                {label:fr?"Solde dû":"Balance due", val:fmtAmount(bdCh.data.balance), color:bdCh.data.balance>0?"var(--danger)":"var(--success)"},
+              ].map(k=>(
+                <div key={k.label} style={{background:"var(--bg-overlay)",borderRadius:12,padding:"14px 16px"}}>
+                  <div style={{fontSize:10,textTransform:"uppercase",color:"var(--text-tertiary)",marginBottom:4}}>{k.label}</div>
+                  <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.val}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Payslips section */}
+            {bdPayslips.length>0 && (
+              <div style={{marginBottom:20}}>
+                <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:"var(--text-secondary)"}}>{"\u{1F4C4}"} {fr?"Fiches de paie":"Payslips"}</div>
+                {bdPayslips.slice(0,5).map(p=>{
+                  const isPaid = p.status==="paid";
+                  const sc = isPaid?"var(--success)":"var(--warning)";
+                  return (
+                    <div key={p.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",background:"var(--bg-overlay)",borderRadius:10,marginBottom:6}}>
+                      <span style={{fontSize:14}}>{isPaid?"\u2705":"\u23F3"}</span>
+                      <div style={{flex:1}}>
+                        <span style={{fontSize:13,fontWeight:700}}>{p.period}</span>
+                        <span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>Base: {fmtAmount(p.base||0)} + Bonus: {fmtAmount(p.bonus||0)}</span>
+                      </div>
+                      <div style={{fontWeight:800,color:sc,fontSize:14}}>{fmtAmount(p.total||0)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Payouts history */}
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:"var(--text-secondary)"}}>{"\u{1F4B8}"} {fr?"Historique paiements":"Payment history"}</div>
+              {bdPayouts.length===0 ? (
+                <div style={{color:"var(--text-quaternary)",fontSize:12,padding:16,textAlign:"center"}}>{fr?"Aucun paiement":"No payments yet"}</div>
+              ) : (
+                <div className="table-wrap">
+                  <table className="table" style={{fontSize:12}}>
+                    <thead><tr><th>{t(lang,"date")||"Date"}</th><th>{t(lang,"amount")||"Montant"}</th><th>{t(lang,"method")||"Méthode"}</th><th>Status</th></tr></thead>
+                    <tbody>
+                      {bdPayouts.map(p=>(
+                        <tr key={p.id}>
+                          <td>{fmtDate(p.date)}</td>
+                          <td style={{fontWeight:700}}>{fmtAmount(p.amount)}</td>
+                          <td>{p.method}</td>
+                          <td><span className={`badge ${p.status==="done"?"badge-done":"badge-pending"}`}>{p.status==="done"?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Recent commissions */}
+            {bdTxs.length>0 && (
+              <div>
+                <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:"var(--text-secondary)"}}>{"\u{1F4CA}"} {fr?"Dernières commissions":"Recent commissions"}</div>
+                <div className="table-wrap">
+                  <table className="table" style={{fontSize:11}}>
+                    <thead><tr><th>Date</th><th>{fr?"Montant tx":"Tx amount"}</th><th>Commission</th></tr></thead>
+                    <tbody>
+                      {bdTxs.map(tx=>(
+                        <tr key={tx.id}>
+                          <td>{fmtDate(tx.date)}</td>
+                          <td>{fmtAmount(Number(tx.amount),tx.currency)}</td>
+                          <td style={{fontWeight:700,color:"var(--accent)"}}>{fmtAmount(Number(tx.chatter_commission||0),tx.currency)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );
@@ -12376,25 +12556,10 @@ const ChatterMessagerieTab = ({user, lang, spenders}) => {
 // =============================================
 // CHATTER ROLE — COMPTA (Fiches de paie)
 // =============================================
-const ChatterComptaTab = ({user, lang}) => {
+const ChatterComptaTab = ({user, lang, payslips: allPayslips}) => {
   const fr = lang === "fr";
   const { fmtAmount } = useCurrency();
-  const [payslips, setPayslips] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const {data} = await sb.from("payslips").select("*").eq("user_id", user.id).order("period", {ascending: false});
-        setPayslips(data || []);
-      } catch (e) {
-        // Payslips table may not exist yet
-        setPayslips([]);
-      }
-      setLoading(false);
-    };
-    load();
-  }, [user.id]);
+  const payslips = (allPayslips||[]).filter(p=>p.user_id===user.id);
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -12414,7 +12579,7 @@ const ChatterComptaTab = ({user, lang}) => {
         {[
           {label: fr ? "Reçu ce mois" : "Received this month", value: fmtAmount(totalThisMonth), icon: "\u{1F4C5}", color: "var(--accent)"},
           {label: fr ? "Total reçu" : "Total received", value: fmtAmount(totalAllTime), icon: "\u{1F4B0}", color: "var(--success)"},
-          {label: fr ? "Prochain paiement" : "Next payment", value: nextPayslip ? fmtAmount(nextPayslip.total) : "—", icon: "\u{1F4E8}", color: "var(--pink)"},
+          {label: fr ? "Prochain paiement" : "Next payment", value: nextPayslip ? fmtAmount(nextPayslip.total) : "\u2014", icon: "\u{1F4E8}", color: "var(--pink)"},
         ].map(k => (
           <div key={k.label} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:"18px 20px"}}>
             <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>{k.icon} {k.label}</div>
@@ -12423,16 +12588,14 @@ const ChatterComptaTab = ({user, lang}) => {
         ))}
       </div>
 
-      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
-
-      {!loading && payslips.length === 0 && (
+      {payslips.length === 0 && (
         <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>
           <div style={{fontSize:32,marginBottom:12}}>{"\u{1F4C4}"}</div>
           {fr ? "Fiches de paie bientôt disponibles" : "Payslips coming soon"}
         </div>
       )}
 
-      {!loading && payslips.length > 0 && (
+      {payslips.length > 0 && (
         <div>
           <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>{"\u{1F4CB}"} {fr ? "Fiches de paie" : "Payslips"}</div>
           {payslips.map(p => {
@@ -12443,7 +12606,7 @@ const ChatterComptaTab = ({user, lang}) => {
                 <div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"\u2705":"\u23F3"}</div>
                 <div style={{flex:1}}>
                   <div style={{fontSize:14,fontWeight:700}}>{p.period}</div>
-                  <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"·"} Bonus: {fmtAmount(p.bonus||0)}</div>
+                  <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"\u00B7"} Bonus: {fmtAmount(p.bonus||0)}</div>
                 </div>
                 <div style={{textAlign:"right"}}>
                   <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div>
@@ -18024,6 +18187,7 @@ const App = () => {
   const [profiles, setProfiles] = useState([]);
   const [models, setModels] = useState([]);
   const [payouts, setPayouts] = useState([]);
+  const [payslips, setPayslips] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [spenders, setSpenders] = useState([]);
   const [providerPayouts, setProviderPayouts] = useState([]);
@@ -18050,7 +18214,7 @@ const App = () => {
   const [showNotifs, setShowNotifs] = useState(false);
   // ── TIMEZONE & CURRENCY STATE ──
   const [timezone, setTimezone] = useState("Europe/Paris");
-  const [displayCurrency, setDisplayCurrency] = useState("EUR");
+  const [displayCurrency, setDisplayCurrency] = useState("CHF");
   const [exchangeRate, setExchangeRate] = useState(EXCHANGE_RATE_EUR_CHF);
 
   // Keep global _tz in sync with state
@@ -18116,10 +18280,10 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR;
     const safe = (promise) => Promise.resolve(promise).then(r => r.error ? {data:[]} : r).catch(()=>({data:[]}));
     try {
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR] = await Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR] = await Promise.all([
         safe(sb.from("transactions").select("*").order("date",{ascending:false})),
         safe(sb.from("spenders").select("*")),
         safe(sb.from("profiles").select("*")),
@@ -18143,6 +18307,7 @@ const App = () => {
         safe(sb.from("chatter_logs").select("*").order("created_at",{ascending:false}).limit(500)),
         safe(sb.from("screenshot_checks").select("*").order("created_at",{ascending:false}).limit(500)),
         safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200)),
+        safe(sb.from("payslips").select("*").order("period",{ascending:false})),
       ]);
     } catch(e) { /* loadData critical failure */ console.error("loadData crash:", e); return; }
     // Discard results if a newer loadData call was started while we were awaiting
@@ -18207,6 +18372,7 @@ const App = () => {
     setProfiles(profileData);
     setModels(modelData);
     setPayouts(payoutData);
+    setPayslips((psR&&psR.data)||[]);
     setExpenses(expenseData);
     setProviderPayouts(ppData);
     setProducts((prodR&&prodR.data)||[]);
@@ -18304,6 +18470,7 @@ const App = () => {
     setProfiles([]);
     setModels([]);
     setPayouts([]);
+    setPayslips([]);
     setExpenses([]);
     setSpenders([]);
     setProviderPayouts([]);
@@ -18417,7 +18584,7 @@ const App = () => {
       case "compta":
         return (<>{renderGerantTabBar("compta")}
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
-          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
+          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} payslips={payslips} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txs} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txs} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
         </>);
@@ -18627,7 +18794,7 @@ const App = () => {
           {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} products={products} productTags={productTags} onRefresh={onRefresh} />}
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} onRefresh={onRefresh} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
-          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} />}
+          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} profiles={profiles} />}
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
