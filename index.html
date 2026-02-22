@@ -15662,6 +15662,7 @@ const analyzeScreenshot = ({ screenshotChecks, user }) => {
 // =============================================
 const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
   const addToast = useToast();
+  const fr = lang === "fr";
 
   const [imagePreview, setImagePreview] = useState(null);
   const [imageThumb, setImageThumb] = useState(null);
@@ -15669,6 +15670,74 @@ const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
   const [saving, setSaving] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileRef = useRef(null);
+  /* CHRISTINE FIX — Claude Vision analysis state */
+  const [analyzing, setAnalyzing] = useState(false);
+  const [detectedInfo, setDetectedInfo] = useState(null);
+  const [claudeKey, setClaudeKey] = useState(() => localStorage.getItem("dadash_claude_key") || "");
+
+  /* CHRISTINE FIX — Analyze screenshot with Claude Vision API */
+  const analyzeImageWithClaude = async (base64DataUrl) => {
+    const apiKey = claudeKey || localStorage.getItem("dadash_claude_key");
+    if (!apiKey) {
+      setDetectedInfo({ method: "—", amount: "—", currency: "—", beneficiary: "—", ai_risk: null, note: fr ? "Ajoute ta clé API Claude pour l'analyse IA" : "Add your Claude API key for AI analysis" });
+      return;
+    }
+    setAnalyzing(true);
+    setDetectedInfo(null);
+    try {
+      /* Primary: try Supabase Edge Function */
+      let aiResult = null;
+      try {
+        const { data, error } = await sb.functions.invoke('analyze-screen', {
+          body: { image: base64DataUrl }
+        });
+        if (!error && data && data.method) aiResult = data;
+      } catch (edgeErr) {
+        console.warn("[DADASH] Edge Function analyze-screen unavailable:", edgeErr.message);
+      }
+
+      /* Fallback: direct Anthropic API call with Claude Vision */
+      if (!aiResult) {
+        const mediaType = base64DataUrl.match(/^data:(image\/\w+);/)?.[1] || "image/jpeg";
+        const base64Only = base64DataUrl.replace(/^data:image\/\w+;base64,/, "");
+        const resp = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+            "anthropic-dangerous-direct-browser-access": "true",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 500,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "image", source: { type: "base64", media_type: mediaType, data: base64Only } },
+                { type: "text", text: "Analyse ce screenshot de paiement. Extrais : méthode de paiement (Twint, Revolut, PayPal, virement, etc.), montant (avec devise), bénéficiaire/destinataire. Évalue le risque (safe, attention, suspect, danger). Réponds UNIQUEMENT en JSON sans backticks : {\"method\":\"...\",\"amount\":\"...\",\"currency\":\"...\",\"beneficiary\":\"...\",\"ai_risk\":\"safe|attention|suspect|danger\",\"ai_notes\":\"...\"}" }
+              ]
+            }],
+          }),
+        });
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}));
+          throw new Error(errData.error?.message || `HTTP ${resp.status}`);
+        }
+        const data = await resp.json();
+        const raw = (data.content?.[0]?.text || "").trim().replace(/```json|```/g, "").trim();
+        aiResult = JSON.parse(raw);
+      }
+
+      setDetectedInfo(aiResult);
+      localStorage.setItem("dadash_claude_key", apiKey);
+      addToast(fr ? "Analyse IA terminée" : "AI analysis complete", "success");
+    } catch (err) {
+      console.error("[DADASH] Claude Vision analysis failed:", err.message);
+      setDetectedInfo({ method: "—", amount: "—", currency: "—", beneficiary: "—", ai_risk: null, note: fr ? "Analyse IA échouée: " + err.message : "AI analysis failed: " + err.message });
+    }
+    setAnalyzing(false);
+  };
 
   // Image handling — auto-analyze on drop
   const handleFile = (file) => {
@@ -15679,9 +15748,11 @@ const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
     reader.onload = (e) => {
       setImagePreview(e.target.result);
       setImageThumb(e.target.result.substring(0, 100));
-      // Auto-analyze as soon as image is loaded
+      // Auto-analyze risk score from historical data
       const r = analyzeScreenshot({ screenshotChecks, user });
       setResult(r);
+      /* CHRISTINE FIX — auto-trigger Claude Vision analysis */
+      analyzeImageWithClaude(e.target.result);
     };
     reader.readAsDataURL(file);
   };
@@ -15703,16 +15774,20 @@ const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
     return () => document.removeEventListener("paste", handler);
   }, []);
 
-  const resetForm = () => { setImagePreview(null); setImageThumb(null); setResult(null); };
+  const resetForm = () => { setImagePreview(null); setImageThumb(null); setResult(null); setDetectedInfo(null); setAnalyzing(false); };
 
   const saveCheck = async (status) => {
     setSaving(true);
     try {
+      /* CHRISTINE FIX — include detected info from Claude Vision in saved check */
       const checkData = {
         checked_by: user.id, checked_by_role: user.role,
         risk_score: result ? result.score : 0,
         red_flags: result ? result.reds : [], green_flags: result ? result.greens : [],
-        status, image_thumb: imageThumb || null
+        status, image_thumb: imageThumb || null,
+        claimed_method: detectedInfo?.method || null,
+        claimed_amount: detectedInfo?.amount ? parseFloat(String(detectedInfo.amount).replace(/[^\d.,]/g, "").replace(",", ".")) || null : null,
+        claimed_currency: detectedInfo?.currency || null,
       };
       const { error } = await sb.from("screenshot_checks").insert(checkData);
       if (error) throw error;
@@ -15727,13 +15802,6 @@ const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
     } catch (e) { addToast("Erreur: " + (e.message || e), "error"); }
     setSaving(false);
   };
-
-  // Detected info (simulated visual detection from screenshot)
-  const detectedInfo = imagePreview ? {
-    method: "Twint",
-    amount: "–",
-    beneficiary: "–",
-  } : null;
 
   return (
     <div>
@@ -15772,23 +15840,49 @@ const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
         {/* RESULT ZONE — appears after image drop */}
         {imagePreview && result && (
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-            {/* Detected info */}
+            {/* CHRISTINE FIX — Claude Vision AI detection with real-time results */}
             <div style={{ background: "#1A1A2E", borderRadius: 16, border: "1px solid #2A2A3E", padding: 20 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>👁️ Détection visuelle</div>
-              <div style={{ display: "flex", gap: 12 }}>
-                {[
-                  { label: "Méthode", value: detectedInfo?.method || "–", icon: "💳" },
-                  { label: "Montant", value: detectedInfo?.amount || "–", icon: "💰" },
-                  { label: "Bénéficiaire", value: detectedInfo?.beneficiary || "–", icon: "👤" },
-                ].map(d => (
-                  <div key={d.label} style={{ flex: 1, background: "#0D0D1A", borderRadius: 12, padding: "12px 14px", textAlign: "center" }}>
-                    <div style={{ fontSize: 18, marginBottom: 4 }}>{d.icon}</div>
-                    <div style={{ fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: "#fff" }}>{d.value}</div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>🤖 {fr ? "Analyse IA (Claude Vision)" : "AI Analysis (Claude Vision)"}</div>
+              {analyzing ? (
+                <div style={{ textAlign: "center", padding: "20px 0" }}>
+                  <div className="spinner" style={{ margin: "0 auto 12px", width: 28, height: 28 }}></div>
+                  <div style={{ fontSize: 13, color: "#9CA3AF" }}>{fr ? "Analyse en cours..." : "Analyzing..."}</div>
+                </div>
+              ) : detectedInfo ? (
+                <>
+                  <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    {[
+                      { label: fr ? "Méthode" : "Method", value: detectedInfo.method || "—", icon: "💳" },
+                      { label: fr ? "Montant" : "Amount", value: detectedInfo.amount ? `${detectedInfo.amount} ${detectedInfo.currency || ""}`.trim() : "—", icon: "💰" },
+                      { label: fr ? "Bénéficiaire" : "Beneficiary", value: detectedInfo.beneficiary || "—", icon: "👤" },
+                    ].map(d => (
+                      <div key={d.label} style={{ flex: 1, minWidth: 90, background: "#0D0D1A", borderRadius: 12, padding: "12px 14px", textAlign: "center" }}>
+                        <div style={{ fontSize: 18, marginBottom: 4 }}>{d.icon}</div>
+                        <div style={{ fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: "#fff" }}>{d.value}</div>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-              <p style={{ fontSize: 11, color: "#4B5563", marginTop: 10, fontStyle: "italic" }}>Détection automatique — vérifie visuellement le screen</p>
+                  {detectedInfo.ai_risk && (
+                    <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: detectedInfo.ai_risk === "safe" ? "rgba(16,185,129,0.1)" : detectedInfo.ai_risk === "danger" ? "rgba(239,68,68,0.1)" : "rgba(245,158,11,0.1)", border: `1px solid ${detectedInfo.ai_risk === "safe" ? "rgba(16,185,129,0.3)" : detectedInfo.ai_risk === "danger" ? "rgba(239,68,68,0.3)" : "rgba(245,158,11,0.3)"}` }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: detectedInfo.ai_risk === "safe" ? "#10B981" : detectedInfo.ai_risk === "danger" ? "#EF4444" : "#F59E0B" }}>
+                        {detectedInfo.ai_risk === "safe" ? "🟢" : detectedInfo.ai_risk === "danger" ? "🔴" : detectedInfo.ai_risk === "suspect" ? "🟠" : "🟡"} IA: {detectedInfo.ai_risk.toUpperCase()}
+                      </span>
+                      {detectedInfo.ai_notes && <span style={{ fontSize: 11, color: "#9CA3AF", marginLeft: 8 }}>— {detectedInfo.ai_notes}</span>}
+                    </div>
+                  )}
+                  {detectedInfo.note && <p style={{ fontSize: 11, color: "#F59E0B", marginTop: 8, fontStyle: "italic" }}>{detectedInfo.note}</p>}
+                </>
+              ) : (
+                <div style={{ textAlign: "center", padding: "12px 0", color: "#6B7280", fontSize: 12 }}>{fr ? "En attente d'analyse..." : "Awaiting analysis..."}</div>
+              )}
+              {/* API Key input — same pattern as WA Analyzer */}
+              {!analyzing && (
+                <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center" }}>
+                  <input type="password" value={claudeKey} onChange={e => setClaudeKey(e.target.value)} placeholder={fr ? "Clé API Claude" : "Claude API Key"} style={{ flex: 1, padding: "6px 10px", background: "#0D0D1A", border: "1px solid #2A2A3E", borderRadius: 8, color: "#fff", fontSize: 11, fontFamily: "monospace" }} />
+                  {imagePreview && <button onClick={() => analyzeImageWithClaude(imagePreview)} disabled={analyzing || !claudeKey.trim()} style={{ padding: "6px 12px", borderRadius: 8, border: "none", background: claudeKey.trim() ? "#7C3AED" : "#2A2A3E", color: "#fff", fontSize: 11, fontWeight: 600, cursor: claudeKey.trim() ? "pointer" : "not-allowed", whiteSpace: "nowrap" }}>{fr ? "Ré-analyser" : "Re-analyze"}</button>}
+                </div>
+              )}
             </div>
 
             {/* Risk score */}
