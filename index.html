@@ -1300,12 +1300,12 @@ const DEBOUNCE_DELAY = 300;
 const ROLE_ACCESS = {
   gerant: ["dashboard","transactions","spenders","modeles","model_mgmt","providers","videos","products","mes_spenders","objectifs","compta","invoices","paies","competition","chatters","whatsapp","telegram","agents","admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments"],
-  chatter: ["mes_spenders"],
+  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition"],
   provider: ["provider_dashboard","transactions","provider_compta"]
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
 const getRoleTabs = (role) => ROLE_ACCESS[role] || [];
-const DEFAULT_TAB = { gerant: "dashboard", modele: "model_checklist", chatter: "mes_spenders", provider: "provider_dashboard" };
+const DEFAULT_TAB = { gerant: "dashboard", modele: "model_checklist", chatter: "chatter_dashboard", provider: "provider_dashboard" };
 
 // =============================================
 // BULLETPROOF DB HELPERS
@@ -8762,107 +8762,823 @@ const StreakBadge = ({ streak }) => {
 };
 
 // =============================================
-// MODEL ROLE — CONTENT LIST TAB
+// CHATTER ROLE — DASHBOARD
 // =============================================
-const ModelContentTab = ({user, lang, onRefresh}) => {
+const ChatterDashboardTab = ({user, lang, txs, spenders, models}) => {
+  const addToast = useToast();
+  const { fmtAmount } = useCurrency();
+  const fr = lang === "fr";
+
+  const myModelIds = user.assigned_models || [];
+  const myTxs = txs.filter(tx => myModelIds.includes(tx.model_id));
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 3600000);
+
+  const validated = myTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+  const caBrut = validated.reduce((s, tx) => s + Number(tx.amount || 0), 0);
+  const txThisMonth = myTxs.filter(tx => new Date(tx.date) >= monthStart).length;
+  const activeHandles = new Set(myTxs.filter(tx => new Date(tx.date) >= thirtyDaysAgo).map(tx => tx.spender_handle));
+  const pendingCount = myTxs.filter(tx => tx.status === "pending").length;
+
+  // Bar chart: CA per day last 7 days
+  const chartData = useMemo(() => {
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      const label = d.toLocaleDateString(fr ? "fr-FR" : "en-US", {weekday: "short"});
+      const dayTxs = validated.filter(tx => (tx.date || "").slice(0, 10) === key);
+      days.push({name: label, ca: dayTxs.reduce((s, tx) => s + Number(tx.amount || 0), 0)});
+    }
+    return days;
+  }, [myTxs, now]);
+
+  const myModels = models.filter(m => myModelIds.includes(m.id));
+
+  return (
+    <div>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4CA}"} {fr ? "Mon Dashboard" : "My Dashboard"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Vue d'ensemble de mes modèles" : "My models overview"}</p>
+      </div>
+
+      {myModelIds.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun modèle attribué. Contacte ton gérant." : "No models assigned. Contact your manager."}</div>
+      )}
+
+      {myModelIds.length > 0 && (<>
+        {/* KPIs */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:14,marginBottom:24}}>
+          {[
+            {label: fr ? "CA Brut" : "Gross Revenue", value: fmtAmount(caBrut), icon: "\u{1F4B0}", color: "var(--accent)"},
+            {label: fr ? "TX ce mois" : "TX this month", value: txThisMonth, icon: "\u{1F4B8}", color: "var(--success)"},
+            {label: fr ? "Spenders actifs" : "Active spenders", value: activeHandles.size, icon: "\u{1F465}", color: "var(--pink)"},
+            {label: fr ? "TX en attente" : "Pending TX", value: pendingCount, icon: "\u23F3", color: "var(--warning)"},
+          ].map(k => (
+            <div key={k.label} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:"18px 20px"}}>
+              <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>{k.icon} {k.label}</div>
+              <div style={{fontSize:24,fontWeight:800,color:k.color}}>{k.value}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Bar chart */}
+        {rechartsReady && chartData.length > 0 && (
+          <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:20,marginBottom:24}}>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:12}}>{fr ? "CA 7 derniers jours" : "Revenue last 7 days"}</div>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={chartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill:"var(--text-tertiary)",fontSize:11}} />
+                <YAxis axisLine={false} tickLine={false} tick={{fill:"var(--text-tertiary)",fontSize:11}} tickFormatter={v => v >= 1000 ? (v/1000).toFixed(1)+"K" : v} />
+                <RechartsTooltip contentStyle={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:8,fontSize:12}} />
+                <Bar dataKey="ca" fill="var(--accent)" radius={[6,6,0,0]} name="CA" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+
+        {/* Model cards */}
+        <div style={{fontSize:14,fontWeight:700,marginBottom:12}}>{fr ? "Mes Modèles" : "My Models"}</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:14}}>
+          {myModels.map(m => {
+            const mTxs = myTxs.filter(tx => tx.model_id === m.id);
+            const mMonthTxs = mTxs.filter(tx => new Date(tx.date) >= monthStart);
+            const mCA = mMonthTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + Number(tx.amount || 0), 0);
+            return (
+              <div key={m.id} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20}}>
+                <div style={{width:48,height:48,borderRadius:"50%",background:"var(--accent-subtle)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,marginBottom:12}}>{"\u{1F469}"}</div>
+                <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>{m.name}</div>
+                <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "CA mois" : "Monthly rev"}: <span style={{fontWeight:700,color:"var(--accent)"}}>{fmtAmount(mCA)}</span></div>
+                <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{mMonthTxs.length} TX</div>
+              </div>
+            );
+          })}
+        </div>
+      </>)}
+    </div>
+  );
+};
+
+// =============================================
+// CHATTER ROLE — TRANSACTIONS
+// =============================================
+const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, onRefresh}) => {
+  const addToast = useToast();
+  const { fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const {sort, onSort, doSort} = useSortable("date", "desc");
+  const [search, setSearch] = useState("");
+  const debouncedSearch = useDebounce(search, DEBOUNCE_DELAY);
+  const [showForm, setShowForm] = useState(false);
+  const [editingTx, setEditingTx] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [form, setForm] = useState({spender_handle:"",amount:"",currency:"EUR",model_id:"",product:"",tag:"",notes:""});
+
+  const myModelIds = user.assigned_models || [];
+  const myModels = models.filter(m => myModelIds.includes(m.id));
+  const myTxs = txs.filter(tx => myModelIds.includes(tx.model_id));
+
+  const filtered = useMemo(() => {
+    let list = myTxs;
+    if (debouncedSearch.trim()) {
+      const q = debouncedSearch.toLowerCase();
+      list = list.filter(tx =>
+        (tx.spender_handle || "").toLowerCase().includes(q) ||
+        (tx.product || "").toLowerCase().includes(q) ||
+        (tx.notes || "").toLowerCase().includes(q)
+      );
+    }
+    return doSort(list, {date: x => x.date, amount: x => Number(x.amount), spender_handle: x => x.spender_handle});
+  }, [myTxs, debouncedSearch, sort]);
+
+  const pag = usePagination(filtered);
+
+  const startEdit = (tx) => {
+    setEditingTx(tx);
+    setForm({spender_handle: tx.spender_handle || "", amount: String(tx.amount || ""), currency: tx.currency || "EUR", model_id: tx.model_id || "", product: tx.product || "", tag: tx.tag || "", notes: tx.notes || ""});
+    setShowForm(true);
+  };
+
+  const startCreate = () => {
+    setEditingTx(null);
+    setForm({spender_handle:"",amount:"",currency:"EUR",model_id: myModelIds.length === 1 ? myModelIds[0] : "",product:"",tag:"",notes:""});
+    setShowForm(true);
+  };
+
+  const handleSubmit = async () => {
+    if (!form.spender_handle.trim()) { addToast(fr ? "Spender requis" : "Spender required", "error"); return; }
+    if (!form.amount || isNaN(parseFloat(form.amount)) || parseFloat(form.amount) <= 0) { addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return; }
+    if (!form.model_id) { addToast(fr ? "Modèle requis" : "Model required", "error"); return; }
+    setSaving(true);
+    try {
+      const handle = form.spender_handle.trim().replace(/^@/, "");
+      // Upsert spender
+      try { await sb.from("spenders").upsert({handle, name: handle, status: "active"}, {onConflict: "handle"}); } catch(e) { /* Spender upsert best-effort */ }
+
+      if (editingTx) {
+        // Update existing TX
+        const updates = {spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "EUR", model_id: form.model_id, product: form.product || null, tag: form.tag || null, notes: form.notes || null};
+        const {error} = await sb.from("transactions").update(updates).eq("id", editingTx.id);
+        if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+        addToast(fr ? "TX modifiée" : "TX updated", "success");
+      } else {
+        // Create new TX
+        const now = new Date();
+        const dateUTC1 = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Paris"}));
+        const txRow = {date: dateUTC1.toISOString(), spender_handle: handle, amount: parseFloat(form.amount), status: "pending", model_id: form.model_id, chatter_id: user.id, notes: form.notes || null};
+        if (form.currency && form.currency !== "EUR") txRow.currency = form.currency;
+        if (form.product) txRow.product = form.product;
+        if (form.tag) txRow.tag = form.tag;
+        const res = await safeInsertTx(txRow);
+        if (res.error) { addToast("Erreur: " + (res.error.message || "insert failed"), "error"); setSaving(false); return; }
+        addToast(fr ? "TX créée" : "TX created", "success");
+      }
+      setSaving(false);
+      setShowForm(false);
+      setEditingTx(null);
+      await onRefresh();
+    } catch (e) {
+      // TX submit failed
+      setSaving(false);
+      addToast("Erreur: " + e.message, "error");
+    }
+  };
+
+  const statusBadge = (s) => {
+    const c = s === "validated" || s === "confirmee" ? "var(--success)" : s === "refused" ? "var(--danger)" : "var(--warning)";
+    const l = s === "validated" || s === "confirmee" ? (fr ? "Validée" : "Validated") : s === "refused" ? (fr ? "Refusée" : "Refused") : "Pending";
+    return React.createElement("span", {style:{padding:"2px 8px",borderRadius:10,background:c+"15",color:c,fontSize:10,fontWeight:700}}, l);
+  };
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div>
+          <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4B0}"} {fr ? "Mes Transactions" : "My Transactions"}</h2>
+          <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{filtered.length} TX</p>
+        </div>
+        <button className="btn btn-primary" onClick={startCreate}>{fr ? "+ Nouvelle TX" : "+ New TX"}</button>
+      </div>
+
+      {myModelIds.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun modèle attribué" : "No models assigned"}</div>
+      )}
+
+      {myModelIds.length > 0 && (<>
+        {/* Search */}
+        <input type="text" value={search} onChange={e=>setSearch(e.target.value)} placeholder={fr ? "Rechercher spender, produit..." : "Search spender, product..."} className="filter-select" style={{width:"100%",marginBottom:16,padding:"10px 14px"}} />
+
+        {/* Form */}
+        {showForm && (
+          <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20,marginBottom:20}}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:14}}>{editingTx ? (fr ? "Modifier TX" : "Edit TX") : (fr ? "Nouvelle Transaction" : "New Transaction")}</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              <div><label className="form-label">Spender</label><input className="filter-select" style={{width:"100%"}} value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle" /></div>
+              <div><label className="form-label">{fr ? "Montant" : "Amount"}</label><input className="filter-select" type="number" style={{width:"100%"}} value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} placeholder="0" /></div>
+              <div><label className="form-label">{fr ? "Devise" : "Currency"}</label><select className="filter-select" style={{width:"100%"}} value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}><option value="EUR">EUR</option><option value="USD">USD</option><option value="CHF">CHF</option><option value="GBP">GBP</option></select></div>
+              <div><label className="form-label">{fr ? "Modèle" : "Model"}</label><select className="filter-select" style={{width:"100%"}} value={form.model_id} onChange={e=>setForm({...form,model_id:e.target.value})}><option value="">{fr ? "Choisir..." : "Select..."}</option>{myModels.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></div>
+              <div><label className="form-label">{fr ? "Produit" : "Product"}</label><input className="filter-select" style={{width:"100%"}} value={form.product} onChange={e=>setForm({...form,product:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
+              <div><label className="form-label">Tag</label><input className="filter-select" style={{width:"100%"}} value={form.tag} onChange={e=>setForm({...form,tag:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
+            </div>
+            <div style={{marginTop:12}}><label className="form-label">Notes</label><input className="filter-select" style={{width:"100%"}} value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder={fr ? "Notes optionnelles" : "Optional notes"} /></div>
+            <div style={{display:"flex",gap:8,marginTop:16}}>
+              <button className="btn btn-primary" onClick={handleSubmit} disabled={saving}>{saving ? React.createElement(Spinner) : (editingTx ? (fr ? "Sauvegarder" : "Save") : (fr ? "Créer" : "Create"))}</button>
+              <button className="btn" onClick={()=>{setShowForm(false);setEditingTx(null);}}>{fr ? "Annuler" : "Cancel"}</button>
+            </div>
+          </div>
+        )}
+
+        {/* Table */}
+        <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:12,overflow:"hidden"}}>
+          <div style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr>
+                <SortTh label="Date" sortKey="date" sort={sort} onSort={onSort} />
+                <SortTh label="Spender" sortKey="spender_handle" sort={sort} onSort={onSort} />
+                <th>{fr ? "Modèle" : "Model"}</th>
+                <th>{fr ? "Produit" : "Product"}</th>
+                <SortTh label={fr ? "Montant" : "Amount"} sortKey="amount" sort={sort} onSort={onSort} />
+                <th>{fr ? "Statut" : "Status"}</th>
+                <th></th>
+              </tr></thead>
+              <tbody>
+                {pag.paginatedData.map(tx => (
+                  <tr key={tx.id}>
+                    <td>{fmtDate(tx.date)}</td>
+                    <td style={{fontWeight:600}}>@{tx.spender_handle}</td>
+                    <td>{models.find(m=>m.id===tx.model_id)?.name || "—"}</td>
+                    <td>{tx.product || "—"}{tx.tag ? ` (${tx.tag})` : ""}</td>
+                    <td style={{fontWeight:700}}>{fmtAmount(tx.amount)}</td>
+                    <td>{statusBadge(tx.status)}</td>
+                    <td><button className="btn btn-small" onClick={()=>startEdit(tx)}>{fr ? "Modifier" : "Edit"}</button></td>
+                  </tr>
+                ))}
+                {pag.paginatedData.length === 0 && <tr><td colSpan={7} style={{textAlign:"center",color:"var(--text-quaternary)",padding:30}}>{fr ? "Aucune transaction" : "No transactions"}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <PaginationControls pag={pag} lang={lang} />
+      </>)}
+    </div>
+  );
+};
+
+// =============================================
+// CHATTER ROLE — SPENDERS
+// =============================================
+const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
+  const addToast = useToast();
+  const { fmtAmount } = useCurrency();
+  const fr = lang === "fr";
+  const [search, setSearch] = useState("");
+  const debouncedSearch = useDebounce(search, DEBOUNCE_DELAY);
+  const [selectedSpender, setSelectedSpender] = useState(null);
+  const [editMode, setEditMode] = useState(false);
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createForm, setCreateForm] = useState({handle:"",first_name:"",preferences:"",chatter_notes:""});
+
+  const myModelIds = user.assigned_models || [];
+  const myTxs = txs.filter(tx => myModelIds.includes(tx.model_id));
+
+  const mySpenders = useMemo(() => {
+    const handleSet = new Set(myTxs.map(tx => tx.spender_handle));
+    let list = spenders.filter(sp => handleSet.has(sp.handle || sp.name));
+    // Enrich with TX stats
+    list = list.map(sp => {
+      const spTxs = myTxs.filter(tx => tx.spender_handle === (sp.handle || sp.name));
+      const total = spTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + Number(tx.amount || 0), 0);
+      const lastTx = spTxs.length > 0 ? spTxs.sort((a,b) => new Date(b.date) - new Date(a.date))[0] : null;
+      return {...sp, total_spent: total, tx_count: spTxs.length, last_tx_date: lastTx?.date || null};
+    });
+    // Search
+    if (debouncedSearch.trim()) {
+      const q = debouncedSearch.toLowerCase();
+      list = list.filter(sp => (sp.handle || "").toLowerCase().includes(q) || (sp.name || "").toLowerCase().includes(q) || (sp.first_name || "").toLowerCase().includes(q));
+    }
+    return list.sort((a, b) => b.total_spent - a.total_spent);
+  }, [spenders, myTxs, debouncedSearch]);
+
+  const spenderTxs = useMemo(() => {
+    if (!selectedSpender) return [];
+    return myTxs.filter(tx => tx.spender_handle === (selectedSpender.handle || selectedSpender.name)).sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [selectedSpender, myTxs]);
+
+  const openDetail = (sp) => { setSelectedSpender(sp); setForm({...sp}); setEditMode(false); };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const updates = {first_name: form.first_name || null, preferences: form.preferences || null, personality_notes: form.personality_notes || null, chatter_notes: form.chatter_notes || null, favorite_content: form.favorite_content || null, city: form.city || null, country: form.country || null, telegram_username: form.telegram_username || null, whatsapp_phone: form.whatsapp_phone || null, relationship_status: form.relationship_status || null, job: form.job || null, age: form.age ? parseInt(form.age) : null};
+      const {error} = await sb.from("spenders").update(updates).eq("id", form.id);
+      if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+      setSaving(false);
+      setEditMode(false);
+      addToast(fr ? "Fiche sauvegardée" : "Profile saved", "success");
+      await onRefresh();
+      setSelectedSpender(null);
+    } catch (e) {
+      // Spender save failed
+      setSaving(false);
+      addToast("Erreur: " + e.message, "error");
+    }
+  };
+
+  const handleCreate = async () => {
+    if (!createForm.handle.trim()) { addToast(fr ? "Handle requis" : "Handle required", "error"); return; }
+    setSaving(true);
+    try {
+      const handle = createForm.handle.trim().replace(/^@/, "");
+      const {error} = await sb.from("spenders").upsert({handle, name: handle, status: "active", first_name: createForm.first_name || null, preferences: createForm.preferences || null, chatter_notes: createForm.chatter_notes || null}, {onConflict: "handle"});
+      if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+      setSaving(false);
+      setShowCreate(false);
+      setCreateForm({handle:"",first_name:"",preferences:"",chatter_notes:""});
+      addToast(fr ? "Spender créé" : "Spender created", "success");
+      await onRefresh();
+    } catch (e) {
+      // Spender create failed
+      setSaving(false);
+      addToast("Erreur: " + e.message, "error");
+    }
+  };
+
+  // Detail view
+  if (selectedSpender) {
+    return (
+      <div>
+        <button className="btn" onClick={()=>setSelectedSpender(null)} style={{marginBottom:16}}>{"\u2190"} {fr ? "Retour" : "Back"}</button>
+        <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:24,marginBottom:20}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <h3 style={{fontSize:16,fontWeight:800,margin:0}}>@{selectedSpender.handle || selectedSpender.name}</h3>
+            <button className="btn btn-primary btn-small" onClick={()=>setEditMode(!editMode)}>{editMode ? (fr ? "Annuler" : "Cancel") : (fr ? "Modifier" : "Edit")}</button>
+          </div>
+          {editMode ? (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              <div><label className="form-label">{fr ? "Prénom" : "First name"}</label><input className="filter-select" style={{width:"100%"}} value={form.first_name||""} onChange={e=>setForm({...form,first_name:e.target.value})} /></div>
+              <div><label className="form-label">{fr ? "Ville" : "City"}</label><input className="filter-select" style={{width:"100%"}} value={form.city||""} onChange={e=>setForm({...form,city:e.target.value})} /></div>
+              <div><label className="form-label">{fr ? "Pays" : "Country"}</label><input className="filter-select" style={{width:"100%"}} value={form.country||""} onChange={e=>setForm({...form,country:e.target.value})} /></div>
+              <div><label className="form-label">{fr ? "Job" : "Job"}</label><input className="filter-select" style={{width:"100%"}} value={form.job||""} onChange={e=>setForm({...form,job:e.target.value})} /></div>
+              <div><label className="form-label">{fr ? "Âge" : "Age"}</label><input className="filter-select" type="number" style={{width:"100%"}} value={form.age||""} onChange={e=>setForm({...form,age:e.target.value})} /></div>
+              <div><label className="form-label">Telegram</label><input className="filter-select" style={{width:"100%"}} value={form.telegram_username||""} onChange={e=>setForm({...form,telegram_username:e.target.value})} /></div>
+              <div><label className="form-label">WhatsApp</label><input className="filter-select" style={{width:"100%"}} value={form.whatsapp_phone||""} onChange={e=>setForm({...form,whatsapp_phone:e.target.value})} /></div>
+              <div><label className="form-label">{fr ? "Statut relation" : "Relationship"}</label><input className="filter-select" style={{width:"100%"}} value={form.relationship_status||""} onChange={e=>setForm({...form,relationship_status:e.target.value})} /></div>
+              <div style={{gridColumn:"1/-1"}}><label className="form-label">{fr ? "Préférences" : "Preferences"}</label><input className="filter-select" style={{width:"100%"}} value={form.preferences||""} onChange={e=>setForm({...form,preferences:e.target.value})} /></div>
+              <div style={{gridColumn:"1/-1"}}><label className="form-label">{fr ? "Contenu favori" : "Favorite content"}</label><input className="filter-select" style={{width:"100%"}} value={form.favorite_content||""} onChange={e=>setForm({...form,favorite_content:e.target.value})} /></div>
+              <div style={{gridColumn:"1/-1"}}><label className="form-label">{fr ? "Notes perso" : "Personal notes"}</label><textarea className="filter-select" style={{width:"100%",minHeight:60}} value={form.chatter_notes||""} onChange={e=>setForm({...form,chatter_notes:e.target.value})} /></div>
+              <div><button className="btn btn-primary" onClick={handleSave} disabled={saving}>{saving ? React.createElement(Spinner) : (fr ? "Sauvegarder" : "Save")}</button></div>
+            </div>
+          ) : (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,fontSize:13}}>
+              {[{l:fr?"Prénom":"First name",v:selectedSpender.first_name},{l:fr?"Ville":"City",v:selectedSpender.city},{l:fr?"Pays":"Country",v:selectedSpender.country},{l:"Job",v:selectedSpender.job},{l:fr?"Âge":"Age",v:selectedSpender.age},{l:"Telegram",v:selectedSpender.telegram_username},{l:"WhatsApp",v:selectedSpender.whatsapp_phone},{l:fr?"Relation":"Relationship",v:selectedSpender.relationship_status},{l:fr?"Préférences":"Preferences",v:selectedSpender.preferences},{l:fr?"Contenu favori":"Fav content",v:selectedSpender.favorite_content}].map(f => (
+                <div key={f.l}><span style={{color:"var(--text-tertiary)",fontSize:11}}>{f.l}:</span> <span style={{fontWeight:600}}>{f.v || "—"}</span></div>
+              ))}
+              {selectedSpender.chatter_notes && <div style={{gridColumn:"1/-1"}}><span style={{color:"var(--text-tertiary)",fontSize:11}}>{fr ? "Notes" : "Notes"}:</span> <span>{selectedSpender.chatter_notes}</span></div>}
+            </div>
+          )}
+        </div>
+        {/* TX history */}
+        <div style={{fontSize:14,fontWeight:700,marginBottom:8}}>{fr ? "Historique TX" : "TX History"} ({spenderTxs.length})</div>
+        <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:12,overflow:"hidden"}}>
+          <table className="table" style={{fontSize:12}}>
+            <thead><tr><th>Date</th><th>{fr ? "Modèle" : "Model"}</th><th>{fr ? "Montant" : "Amount"}</th><th>{fr ? "Statut" : "Status"}</th></tr></thead>
+            <tbody>
+              {spenderTxs.map(tx => (
+                <tr key={tx.id}>
+                  <td>{fmtDate(tx.date)}</td>
+                  <td>{models.find(m=>m.id===tx.model_id)?.name || "—"}</td>
+                  <td style={{fontWeight:700}}>{fmtAmount(tx.amount)}</td>
+                  <td><span style={{padding:"2px 8px",borderRadius:10,background:(tx.status==="validated"||tx.status==="confirmee"?"var(--success)":tx.status==="refused"?"var(--danger)":"var(--warning)")+"15",color:tx.status==="validated"||tx.status==="confirmee"?"var(--success)":tx.status==="refused"?"var(--danger)":"var(--warning)",fontSize:10,fontWeight:700}}>{tx.status}</span></td>
+                </tr>
+              ))}
+              {spenderTxs.length === 0 && <tr><td colSpan={4} style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr ? "Aucune TX" : "No TX"}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+        <div>
+          <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F464}"} {fr ? "Mes Spenders" : "My Spenders"}</h2>
+          <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{mySpenders.length} spenders</p>
+        </div>
+        <button className="btn btn-primary" onClick={()=>setShowCreate(true)}>{fr ? "+ Nouveau Spender" : "+ New Spender"}</button>
+      </div>
+
+      {myModelIds.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun modèle attribué" : "No models assigned"}</div>
+      )}
+
+      {myModelIds.length > 0 && (<>
+        {/* Create form */}
+        {showCreate && (
+          <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20,marginBottom:20}}>
+            <div style={{fontSize:14,fontWeight:700,marginBottom:14}}>{fr ? "Nouveau Spender" : "New Spender"}</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              <div><label className="form-label">Handle *</label><input className="filter-select" style={{width:"100%"}} value={createForm.handle} onChange={e=>setCreateForm({...createForm,handle:e.target.value})} placeholder="@handle" /></div>
+              <div><label className="form-label">{fr ? "Prénom" : "First name"}</label><input className="filter-select" style={{width:"100%"}} value={createForm.first_name} onChange={e=>setCreateForm({...createForm,first_name:e.target.value})} /></div>
+              <div style={{gridColumn:"1/-1"}}><label className="form-label">{fr ? "Préférences" : "Preferences"}</label><input className="filter-select" style={{width:"100%"}} value={createForm.preferences} onChange={e=>setCreateForm({...createForm,preferences:e.target.value})} /></div>
+              <div style={{gridColumn:"1/-1"}}><label className="form-label">Notes</label><input className="filter-select" style={{width:"100%"}} value={createForm.chatter_notes} onChange={e=>setCreateForm({...createForm,chatter_notes:e.target.value})} /></div>
+            </div>
+            <div style={{display:"flex",gap:8,marginTop:14}}>
+              <button className="btn btn-primary" onClick={handleCreate} disabled={saving}>{saving ? React.createElement(Spinner) : (fr ? "Créer" : "Create")}</button>
+              <button className="btn" onClick={()=>setShowCreate(false)}>{fr ? "Annuler" : "Cancel"}</button>
+            </div>
+          </div>
+        )}
+
+        {/* Search */}
+        <input type="text" value={search} onChange={e=>setSearch(e.target.value)} placeholder={fr ? "Rechercher un spender..." : "Search spender..."} className="filter-select" style={{width:"100%",marginBottom:16,padding:"10px 14px"}} />
+
+        {/* Cards */}
+        {mySpenders.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun spender trouvé" : "No spenders found"}</div>}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:12}}>
+          {mySpenders.map(sp => (
+            <div key={sp.id || sp.handle} onClick={()=>openDetail(sp)} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:14,padding:16,cursor:"pointer",transition:"border-color 0.2s"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <span style={{fontSize:14,fontWeight:700}}>@{sp.handle || sp.name}</span>
+                {sp.first_name && <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{sp.first_name}</span>}
+              </div>
+              <div style={{display:"flex",gap:12,fontSize:11,color:"var(--text-secondary)"}}>
+                <span>{fr ? "Total" : "Total"}: <b style={{color:"var(--success)"}}>{fmtAmount(sp.total_spent)}</b></span>
+                <span>{sp.tx_count} TX</span>
+                {sp.last_tx_date && <span>{fr ? "Dernière" : "Last"}: {fmtDate(sp.last_tx_date)}</span>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </>)}
+    </div>
+  );
+};
+
+// =============================================
+// CHATTER ROLE — MESSAGERIE
+// =============================================
+const BLOCKED_KEYWORDS = ["paypal","bitcoin","virement","iban","revolut","twint","crypto","bank","compte","transfer","wire"];
+const BLOCKED_PATTERNS = [/https?:\/\//i, /www\./i, /\.com|\.fr|\.net|\.org/i, /@/i, /\b\d{8,}\b/];
+
+const ChatterMessagerieTab = ({user, lang, spenders}) => {
   const addToast = useToast();
   const fr = lang === "fr";
-  const { currencySymbol } = useCurrency();
-  const [tasks, setTasks] = useState([]);
-  const [filter, setFilter] = useState("tout");
-  const [loadingTasks, setLoadingTasks] = useState(true);
+  const [conversations, setConversations] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [selectedConv, setSelectedConv] = useState(null);
+  const [msgInput, setMsgInput] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+
+  const myModelIds = user.assigned_models || [];
 
   useEffect(() => {
     const load = async () => {
-      const { data } = await sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false });
-      setTasks(data || []);
-      setLoadingTasks(false);
+      try {
+        const {data} = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).order("updated_at", {ascending: false});
+        setConversations(data || []);
+      } catch (e) {
+        // Conversations load failed — table may not exist yet
+        setConversations([]);
+      }
+      setLoading(false);
+    };
+    if (myModelIds.length > 0) load();
+    else setLoading(false);
+  }, [user.id]);
+
+  const loadMessages = async (convId) => {
+    try {
+      const {data} = await sb.from("messages").select("*").eq("conversation_id", convId).order("created_at", {ascending: true});
+      setMessages(data || []);
+    } catch (e) {
+      // Messages load failed
+      setMessages([]);
+    }
+  };
+
+  const selectConv = (conv) => {
+    setSelectedConv(conv);
+    loadMessages(conv.id);
+  };
+
+  const isBlocked = (text) => {
+    const lower = text.toLowerCase();
+    if (BLOCKED_KEYWORDS.some(kw => lower.includes(kw))) return true;
+    if (BLOCKED_PATTERNS.some(pat => pat.test(text))) return true;
+    return false;
+  };
+
+  const sendMessage = async () => {
+    if (!msgInput.trim() || !selectedConv || sending) return;
+    if (isBlocked(msgInput)) {
+      addToast(fr ? "Message bloqué : contenu interdit" : "Message blocked: forbidden content", "error");
+      return;
+    }
+    setSending(true);
+    try {
+      const {error} = await sb.from("messages").insert({conversation_id: selectedConv.id, sender_type: "chatter", sender_id: user.id, content: msgInput.trim()});
+      if (error) { addToast("Erreur: " + error.message, "error"); setSending(false); return; }
+      // Log
+      try { await sb.from("chatter_logs").insert({chatter_id: user.id, conversation_id: selectedConv.id, action: "message_sent", content: msgInput.trim().slice(0, 200)}); } catch(e) { /* Chatter log write failed */ }
+      setMsgInput("");
+      await loadMessages(selectedConv.id);
+      // Update conversation timestamp
+      try { await sb.from("conversations").update({updated_at: new Date().toISOString()}).eq("id", selectedConv.id); } catch(e) { /* Conversation timestamp update failed */ }
+    } catch (e) {
+      // Message send failed
+      addToast("Erreur: " + e.message, "error");
+    }
+    setSending(false);
+  };
+
+  const handBackToBot = async () => {
+    if (!selectedConv) return;
+    try {
+      const {error} = await sb.from("conversations").update({status: "bot", escalated: false}).eq("id", selectedConv.id);
+      if (error) { addToast("Erreur: " + error.message, "error"); return; }
+      try { await sb.from("chatter_logs").insert({chatter_id: user.id, conversation_id: selectedConv.id, action: "hand_back_bot"}); } catch(e) { /* Chatter log write failed */ }
+      addToast(fr ? "Conversation rendue au bot" : "Conversation handed back to bot", "success");
+      setSelectedConv(null);
+      setMessages([]);
+      // Refresh conversations
+      try {
+        const {data} = await sb.from("conversations").select("*").in("model_id", myModelIds).order("updated_at", {ascending: false});
+        setConversations(data || []);
+      } catch(e) { /* Conversations refresh failed */ }
+    } catch (e) {
+      // Hand back to bot failed
+      addToast("Erreur: " + e.message, "error");
+    }
+  };
+
+  const getSpenderName = (conv) => {
+    const sp = spenders.find(s => s.handle === conv.spender_handle || s.id === conv.spender_id);
+    return sp?.first_name || sp?.handle || conv.spender_handle || "Spender";
+  };
+
+  return (
+    <div>
+      <div style={{marginBottom:20}}>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4AC}"} {fr ? "Messagerie" : "Messaging"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Conversations avec les spenders" : "Conversations with spenders"}</p>
+      </div>
+
+      {myModelIds.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun modèle attribué" : "No models assigned"}</div>
+      )}
+
+      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
+
+      {!loading && myModelIds.length > 0 && conversations.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucune conversation" : "No conversations"}</div>
+      )}
+
+      {!loading && conversations.length > 0 && (
+        <div style={{display:"grid",gridTemplateColumns:"300px 1fr",gap:16,minHeight:500}}>
+          {/* Conversation list */}
+          <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:14,overflow:"hidden"}}>
+            {conversations.map(conv => (
+              <div key={conv.id} onClick={()=>selectConv(conv)} style={{padding:"14px 16px",borderBottom:"1px solid var(--border-subtle)",cursor:"pointer",background:selectedConv?.id===conv.id?"var(--accent-subtle)":"transparent",transition:"background 0.2s"}}>
+                <div style={{fontSize:13,fontWeight:700}}>{getSpenderName(conv)}</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:3,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{conv.last_message || "..."}</div>
+                <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:2}}>{conv.updated_at ? fmtDate(conv.updated_at) : ""}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Chat area */}
+          <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:14,display:"flex",flexDirection:"column"}}>
+            {!selectedConv && (
+              <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-quaternary)"}}>{fr ? "Sélectionne une conversation" : "Select a conversation"}</div>
+            )}
+            {selectedConv && (<>
+              {/* Chat header */}
+              <div style={{padding:"14px 20px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <span style={{fontSize:14,fontWeight:700}}>{getSpenderName(selectedConv)}</span>
+                <button className="btn btn-small" onClick={handBackToBot}>{fr ? "Rendre au bot" : "Hand to bot"}</button>
+              </div>
+              {/* Messages */}
+              <div style={{flex:1,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",gap:8}}>
+                {messages.map(msg => (
+                  <div key={msg.id} style={{alignSelf:msg.sender_type==="chatter"?"flex-end":"flex-start",maxWidth:"70%"}}>
+                    <div style={{padding:"10px 14px",borderRadius:14,fontSize:13,background:msg.sender_type==="chatter"?"#3B82F6":"#2A2A3E",color:"#fff"}}>{msg.content}</div>
+                    <div style={{fontSize:9,color:"var(--text-quaternary)",marginTop:2,textAlign:msg.sender_type==="chatter"?"right":"left"}}>{msg.created_at ? new Date(msg.created_at).toLocaleTimeString(fr?"fr-FR":"en-US",{hour:"2-digit",minute:"2-digit"}) : ""}</div>
+                  </div>
+                ))}
+                {messages.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr ? "Aucun message" : "No messages"}</div>}
+              </div>
+              {/* Input */}
+              <div style={{padding:14,borderTop:"1px solid var(--border-subtle)",display:"flex",gap:8}}>
+                <textarea className="filter-select" style={{flex:1,resize:"none",minHeight:40,padding:"10px 12px"}} value={msgInput} onChange={e=>setMsgInput(e.target.value)} placeholder={fr ? "Écrire un message..." : "Write a message..."} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();}}} />
+                <button className="btn btn-primary" onClick={sendMessage} disabled={sending} style={{alignSelf:"flex-end"}}>{sending ? React.createElement(Spinner) : (fr ? "Envoyer" : "Send")}</button>
+              </div>
+            </>)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
+// CHATTER ROLE — COMPTA (Fiches de paie)
+// =============================================
+const ChatterComptaTab = ({user, lang}) => {
+  const fr = lang === "fr";
+  const { fmtAmount } = useCurrency();
+  const [payslips, setPayslips] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const {data} = await sb.from("payslips").select("*").eq("user_id", user.id).order("period", {ascending: false});
+        setPayslips(data || []);
+      } catch (e) {
+        // Payslips table may not exist yet
+        setPayslips([]);
+      }
+      setLoading(false);
     };
     load();
   }, [user.id]);
 
-  const updateStatus = async (taskId, newStatus) => {
-    const updates = { status: newStatus };
-    if (newStatus === "done") updates.completed_at = new Date().toISOString();
-    const { error } = await sb.from("content_tasks").update(updates).eq("id", taskId);
-    if (error) { addToast("Erreur: " + error.message, "error"); return; }
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, ...updates } : t));
-    if (newStatus === "done") addToast(fr ? "T\u00E2che termin\u00E9e \u2705" : "Task completed \u2705", "success");
-  };
-
-  const toggleTask = (task) => {
-    updateStatus(task.id, task.status === "done" ? "todo" : "done");
-  };
-
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const todoCount = tasks.filter(t => t.status === "todo").length;
-  const inProgressCount = tasks.filter(t => t.status === "in_progress").length;
-  const doneThisMonth = tasks.filter(t => t.status === "done" && t.completed_at && new Date(t.completed_at) >= monthStart).length;
-  const totalBonus = tasks.filter(t => t.status === "done").reduce((s, t) => s + Number(t.bonus_amount || 0), 0);
-
-  const filtered = filter === "tout" ? tasks : tasks.filter(t => t.status === filter);
-  const isOverdue = (d) => d && new Date(d) < new Date(new Date().toISOString().slice(0, 10));
-
-  const catIcon = (c) => c === "photo" ? "\u{1F4F8}" : c === "video" ? "\u{1F3A5}" : c === "live" ? "\u{1F534}" : "\u{1F4E6}";
+  const totalThisMonth = payslips.filter(p => p.status === "paid" && new Date(p.period) >= monthStart).reduce((s, p) => s + Number(p.total || 0), 0);
+  const totalAllTime = payslips.filter(p => p.status === "paid").reduce((s, p) => s + Number(p.total || 0), 0);
+  const nextPayslip = payslips.find(p => p.status === "pending");
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>{"\u{1F4CB}"} {fr ? "Ma Content List" : "My Content List"}</h2>
-        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0" }}>
-          {fr ? "Contenus \u00E0 produire" : "Content to produce"} \u2014 {todoCount} {fr ? "\u00E0 faire" : "to do"} {"\u00B7"} {doneThisMonth} {fr ? "termin\u00E9s" : "done"}
-        </p>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4C4}"} {fr ? "Ma Compta" : "My Accounting"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Mes fiches de paie" : "My payslips"}</p>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 24 }}>
+
+      {/* KPIs */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:14,marginBottom:24}}>
         {[
-          { label: fr ? "\u00C0 faire" : "To do", value: todoCount, icon: "\u{1F4DD}", color: "var(--warning)" },
-          { label: fr ? "En cours" : "In progress", value: inProgressCount, icon: "\u{1F504}", color: "var(--accent)" },
-          { label: fr ? "Termin\u00E9s ce mois" : "Done this month", value: doneThisMonth, icon: "\u2705", color: "var(--success)" },
-          { label: fr ? "Bonus accumul\u00E9" : "Bonus earned", value: totalBonus + currencySymbol, icon: "\u{1F4B0}", color: "var(--pink)" },
-        ].map((k, i) => (
-          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 18, padding: "14px 16px" }}>
-            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{k.icon} {k.label}</div>
-            <div style={{ fontSize: 22, fontWeight: 800, color: k.color }}>{k.value}</div>
+          {label: fr ? "Reçu ce mois" : "Received this month", value: fmtAmount(totalThisMonth), icon: "\u{1F4C5}", color: "var(--accent)"},
+          {label: fr ? "Total reçu" : "Total received", value: fmtAmount(totalAllTime), icon: "\u{1F4B0}", color: "var(--success)"},
+          {label: fr ? "Prochain paiement" : "Next payment", value: nextPayslip ? fmtAmount(nextPayslip.total) : "—", icon: "\u{1F4E8}", color: "var(--pink)"},
+        ].map(k => (
+          <div key={k.label} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:"18px 20px"}}>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>{k.icon} {k.label}</div>
+            <div style={{fontSize:24,fontWeight:800,color:k.color}}>{k.value}</div>
           </div>
         ))}
       </div>
-      <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
-        {[{k:"tout",l:fr?"Tout":"All"},{k:"todo",l:fr?"\u00C0 faire":"To do"},{k:"in_progress",l:fr?"En cours":"In progress"},{k:"review",l:fr?"En review":"In review"},{k:"done",l:fr?"Fait":"Done"}].map(f => (
-          <button key={f.k} onClick={() => setFilter(f.k)} className={`filter-chip ${filter===f.k?"active":""}`}>{f.l}</button>
-        ))}
+
+      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
+
+      {!loading && payslips.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>
+          <div style={{fontSize:32,marginBottom:12}}>{"\u{1F4C4}"}</div>
+          {fr ? "Fiches de paie bientôt disponibles" : "Payslips coming soon"}
+        </div>
+      )}
+
+      {!loading && payslips.length > 0 && (
+        <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:12,overflow:"hidden"}}>
+          <div style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr>
+                <th>{fr ? "Période" : "Period"}</th>
+                <th>Base</th>
+                <th>Bonus</th>
+                <th>Total</th>
+                <th>{fr ? "Statut" : "Status"}</th>
+              </tr></thead>
+              <tbody>
+                {payslips.map(p => (
+                  <tr key={p.id}>
+                    <td>{p.period}</td>
+                    <td>{fmtAmount(p.base || 0)}</td>
+                    <td>{fmtAmount(p.bonus || 0)}</td>
+                    <td style={{fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total || 0)}</td>
+                    <td><span style={{padding:"2px 8px",borderRadius:10,background:(p.status==="paid"?"var(--success)":"var(--warning)")+"15",color:p.status==="paid"?"var(--success)":"var(--warning)",fontSize:10,fontWeight:700}}>{p.status === "paid" ? (fr ? "Payé" : "Paid") : (fr ? "En attente" : "Pending")}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
+// CHATTER ROLE — COMPETITION (Placeholder PR #13B)
+// =============================================
+const ChatterCompetitionTab = ({user, lang}) => {
+  const fr = lang === "fr";
+  return (
+    <div>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F3C6}"} {fr ? "Compétition" : "Competition"}</h2>
       </div>
-      {loadingTasks && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>Chargement...</div>}
-      {!loadingTasks && filtered.length === 0 && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>{fr ? "Aucune t\u00E2che" : "No tasks"}</div>}
-      {filtered.map(task => (
-        <div key={task.id} style={{
-          display: "flex", alignItems: "center", gap: 16, padding: "16px 20px",
-          background: "var(--card-bg)",
-          border: "1px solid " + (task.priority === "urgent" ? "var(--danger-muted)" : task.priority === "high" ? "var(--warning-muted)" : "var(--border-subtle)"),
-          borderRadius: 16, marginBottom: 8,
-          borderLeft: "4px solid " + (task.status === "done" ? "var(--success)" : task.status === "in_progress" ? "var(--accent)" : task.status === "review" ? "var(--pink)" : "var(--warning)"),
+      <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:60}}>
+        <div style={{fontSize:48,marginBottom:16}}>{"\u{1F3C6}"}</div>
+        <div style={{fontSize:16,fontWeight:700,marginBottom:8}}>{fr ? "Bientôt disponible" : "Coming soon"}</div>
+        <div style={{fontSize:13}}>{fr ? "La page compétition arrive dans une prochaine mise à jour." : "The competition page is coming in a future update."}</div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// MODEL ROLE — CONTENT LIST TAB
+// =============================================
+const ModelContentTab = ({user, lang, contentList}) => {
+  const fr = lang === "fr";
+  const [weekOffset, setWeekOffset] = useState(0);
+
+  const getWeekRange = (offset) => {
+    const now = new Date();
+    const day = now.getDay();
+    const mondayDiff = day === 0 ? -6 : 1 - day;
+    const monday = new Date(now);
+    monday.setDate(now.getDate() + mondayDiff + offset * 7);
+    monday.setHours(0, 0, 0, 0);
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    sunday.setHours(23, 59, 59, 999);
+    return {start: monday, end: sunday};
+  };
+
+  const {start, end} = getWeekRange(weekOffset);
+  const fmtShort = (d) => d.toLocaleDateString(fr ? "fr-FR" : "en-US", {day:"numeric", month:"short"});
+
+  const myContent = (contentList || []).filter(c => c.model_id === user.id);
+  const weekContent = myContent.filter(c => {
+    if (!c.due_date) return false;
+    const d = new Date(c.due_date);
+    return d >= start && d <= end;
+  }).sort((a, b) => new Date(a.due_date) - new Date(b.due_date));
+
+  const typeIcon = (t) => t === "photo" ? "\u{1F4F8}" : t === "video" ? "\u{1F3A5}" : t === "reel" ? "\u{1F3AC}" : t === "story" ? "\u{1F4F1}" : t === "live" ? "\u{1F534}" : "\u{1F4E6}";
+  const statusColor = (s) => s === "published" ? "var(--success)" : s === "ready" ? "#10B981" : s === "editing" ? "var(--pink)" : s === "shooting" ? "var(--accent)" : "var(--warning)";
+  const statusLabel = (s) => {
+    if (s === "published") return fr ? "Publié" : "Published";
+    if (s === "ready") return fr ? "Prêt" : "Ready";
+    if (s === "editing") return fr ? "Montage" : "Editing";
+    if (s === "shooting") return "Shooting";
+    return fr ? "En attente" : "Pending";
+  };
+
+  return (
+    <div>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4DD}"} {fr ? "Mon Planning Contenu" : "My Content Schedule"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Semaine par semaine" : "Week by week"}</p>
+      </div>
+
+      {/* Week navigation */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:16,marginBottom:24}}>
+        <button className="btn" onClick={() => setWeekOffset(w => w - 1)} style={{padding:"6px 14px",fontSize:13}}>{"\u2190"}</button>
+        <span style={{fontSize:14,fontWeight:700,minWidth:200,textAlign:"center"}}>{fmtShort(start)} — {fmtShort(end)}{weekOffset === 0 ? (fr ? " (cette semaine)" : " (this week)") : ""}</span>
+        <button className="btn" onClick={() => setWeekOffset(w => w + 1)} style={{padding:"6px 14px",fontSize:13}}>{"\u2192"}</button>
+      </div>
+
+      {weekContent.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun contenu prévu cette semaine" : "No content scheduled this week"}</div>
+      )}
+
+      {weekContent.map(item => (
+        <div key={item.id} style={{
+          display:"flex",alignItems:"center",gap:16,padding:"16px 20px",
+          background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,marginBottom:8,
+          borderLeft:"4px solid "+statusColor(item.status),
         }}>
-          <input type="checkbox" checked={task.status === "done"} onChange={() => toggleTask(task)}
-            style={{ width: 20, height: 20, accentColor: "var(--success)", cursor: "pointer", flexShrink: 0 }} />
-          <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, textDecoration: task.status === "done" ? "line-through" : "none", opacity: task.status === "done" ? 0.5 : 1 }}>{task.title}</div>
-            {task.description && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 3 }}>{task.description}</div>}
-            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-              <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 6, background: "var(--accent-subtle)", color: "var(--accent)", fontWeight: 600 }}>{catIcon(task.category)} {task.category}</span>
-              {task.due_date && <span style={{ fontSize: 10, color: isOverdue(task.due_date) && task.status !== "done" ? "var(--danger)" : "var(--text-quaternary)" }}>{"\u{1F4C5}"} {fmtDate(task.due_date)}</span>}
-              {task.bonus_amount > 0 && <span style={{ fontSize: 10, color: "var(--success)", fontWeight: 600 }}>{"\u{1F4B0}"} +{task.bonus_amount}{task.bonus_currency === "EUR" ? "\u20AC" : " CHF"}</span>}
-              {task.priority === "urgent" && <span style={{ fontSize: 10, color: "var(--danger)", fontWeight: 700 }}>{"\u{1F6A8}"} URGENT</span>}
-              {task.priority === "high" && <span style={{ fontSize: 10, color: "var(--warning)", fontWeight: 600 }}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
+          <div style={{flex:1}}>
+            <div style={{fontSize:14,fontWeight:700}}>{item.title}</div>
+            {item.description && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:3}}>{item.description}</div>}
+            <div style={{display:"flex",gap:8,marginTop:6,flexWrap:"wrap"}}>
+              <span style={{fontSize:10,padding:"1px 6px",borderRadius:6,background:"var(--accent-subtle)",color:"var(--accent)",fontWeight:600}}>{typeIcon(item.content_type)} {item.content_type}</span>
+              {item.platform && <span style={{fontSize:10,padding:"1px 6px",borderRadius:6,background:"var(--bg-overlay)",color:"var(--text-secondary)",fontWeight:600}}>{item.platform}</span>}
+              {item.due_date && <span style={{fontSize:10,color:"var(--text-quaternary)"}}>{"\u{1F4C5}"} {fmtDate(item.due_date)}</span>}
             </div>
           </div>
-          <select value={task.status} onChange={e => updateStatus(task.id, e.target.value)} className="filter-select" style={{ fontSize: 11, padding: "5px 8px" }}>
-            <option value="todo">{fr ? "\u00C0 faire" : "To do"}</option>
-            <option value="in_progress">{fr ? "En cours" : "In progress"}</option>
-            <option value="review">{fr ? "En review" : "In review"}</option>
-            <option value="done">{fr ? "Fait \u2705" : "Done \u2705"}</option>
-          </select>
+          <span style={{padding:"3px 10px",borderRadius:10,background:statusColor(item.status)+"15",color:statusColor(item.status),fontSize:11,fontWeight:700}}>{statusLabel(item.status)}</span>
         </div>
       ))}
+
+      {/* Upload placeholder */}
+      <div style={{marginTop:24,textAlign:"center"}}>
+        <button disabled style={{padding:"10px 24px",fontSize:13,fontWeight:600,background:"var(--bg-overlay)",color:"var(--text-quaternary)",border:"1px solid var(--border-subtle)",borderRadius:12,cursor:"not-allowed"}}>
+          {fr ? "Upload — bientôt disponible" : "Upload — coming soon"}
+        </button>
+      </div>
     </div>
   );
 };
@@ -8976,81 +9692,57 @@ const ModelDashboardTab = ({user, lang}) => {
 // =============================================
 // MODEL ROLE — MES PAIES
 // =============================================
-const ModelPaymentsTab = ({user, lang, invoices}) => {
+const ModelPaymentsTab = ({user, lang, payouts}) => {
   const fr = lang === "fr";
-  const { currencySymbol } = useCurrency();
-  const [payments, setPayments] = useState([]);
-  const [loadingP, setLoadingP] = useState(true);
-  const [modelPaySubTab, setModelPaySubTab] = useState("paies");
+  const { fmtAmount } = useCurrency();
 
-  useEffect(() => {
-    const load = async () => {
-      const { data } = await sb.from("model_payments").select("*").eq("model_id", user.id).order("date", { ascending: false });
-      setPayments(data || []);
-      setLoadingP(false);
-    };
-    load();
-  }, [user.id]);
-
+  const myPayouts = (payouts || []).filter(p => p.user_id === user.id);
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const salaryThisMonth = payments.filter(p => p.type === "salary" && p.status === "paid" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount), 0);
-  const bonusThisMonth = payments.filter(p => p.type === "bonus" && p.status === "paid" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount), 0);
-  const totalPaid = payments.filter(p => p.status === "paid").reduce((s, p) => s + Number(p.amount), 0);
+  const totalThisMonth = myPayouts.filter(p => p.status === "done" && new Date(p.date) >= monthStart).reduce((s, p) => s + Number(p.amount || 0), 0);
+  const totalAllTime = myPayouts.filter(p => p.status === "done").reduce((s, p) => s + Number(p.amount || 0), 0);
 
-  const typeLabel = (t) => t === "salary" ? (fr ? "\u{1F4B5} Salaire" : "\u{1F4B5} Salary") : t === "bonus" ? (fr ? "\u{1F381} Bonus" : "\u{1F381} Bonus") : (fr ? "\u{1F4B8} Autre" : "\u{1F4B8} Other");
-  const statusColor = (s) => s === "paid" ? "var(--success)" : s === "cancelled" ? "var(--danger)" : "var(--warning)";
-  const statusLabel = (s) => s === "paid" ? (fr ? "Pay\u00E9" : "Paid") : s === "cancelled" ? (fr ? "Annul\u00E9" : "Cancelled") : "Pending";
-
-  const myModelInvoices = (invoices||[]).filter(inv => inv.profile_id === user.id && inv.type === "outgoing_model");
+  const statusColor = (s) => s === "done" ? "var(--success)" : "var(--warning)";
+  const statusLabel = (s) => s === "done" ? (fr ? "Payé" : "Paid") : (fr ? "En attente" : "Pending");
 
   return (
     <div>
-      <div style={{ marginBottom: 24 }}>
-        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>{"\u{1F4B0}"} {fr ? "Mes Paies" : "My Payments"}</h2>
-        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0", fontStyle: "italic" }}>{fr ? "Historique de tes paiements" : "Your payment history"}</p>
+      <div style={{marginBottom:24}}>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4B0}"} {fr ? "Mes Paiements" : "My Payments"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Historique de tes paiements" : "Your payment history"}</p>
       </div>
-      {/* Sub-tabs */}
-      <div style={{display:"flex",gap:4,marginBottom:20}}>
-        {[{id:"paies",label:fr?"Mes Paies":"My Payments"},{id:"factures",label:fr?"Mes Factures":"My Invoices"}].map(tb=>(
-          <button key={tb.id} className="btn" style={{padding:"6px 16px",fontSize:12,fontWeight:modelPaySubTab===tb.id?800:600,background:modelPaySubTab===tb.id?"var(--accent)":"var(--card-bg)",color:modelPaySubTab===tb.id?"#fff":"var(--text-secondary)",border:"1px solid "+(modelPaySubTab===tb.id?"var(--accent)":"var(--border-subtle)"),borderRadius:20}} onClick={()=>setModelPaySubTab(tb.id)}>{tb.label}</button>
-        ))}
-      </div>
-      {modelPaySubTab === "factures" ? (
-        <MyInvoicesPanel invoices={myModelInvoices} lang={lang} />
-      ) : (
-      <>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 24 }}>
+
+      {/* KPIs */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(2, 1fr)",gap:14,marginBottom:24}}>
         {[
-          { label: fr ? "Salaire ce mois" : "Salary this month", value: salaryThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B5}", color: "var(--accent)" },
-          { label: fr ? "Bonus ce mois" : "Bonus this month", value: bonusThisMonth.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F381}", color: "var(--success)" },
-          { label: fr ? "Total vers\u00E9" : "Total paid", value: totalPaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + currencySymbol, icon: "\u{1F4B0}", color: "var(--pink)" },
-        ].map((k, i) => (
-          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 18, padding: "18px 20px" }}>
-            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>{k.icon} {k.label}</div>
-            <div style={{ fontSize: 26, fontWeight: 800, color: k.color }}>{k.value}</div>
+          {label: fr ? "Reçu ce mois" : "Received this month", value: fmtAmount(totalThisMonth), icon: "\u{1F4C5}", color: "var(--accent)"},
+          {label: fr ? "Total reçu" : "Total received", value: fmtAmount(totalAllTime), icon: "\u{1F4B0}", color: "var(--success)"},
+        ].map(k => (
+          <div key={k.label} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:"18px 20px"}}>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:8}}>{k.icon} {k.label}</div>
+            <div style={{fontSize:26,fontWeight:800,color:k.color}}>{k.value}</div>
           </div>
         ))}
       </div>
-      <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12, overflow: "hidden" }}>
-        <div style={{ padding: "14px 20px", borderBottom: "1px solid var(--border-subtle)", fontSize: 13, fontWeight: 700 }}>{"\u{1F4CA}"} {fr ? "Historique des paiements" : "Payment history"}</div>
-        {loadingP && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>Chargement...</div>}
-        {!loadingP && payments.length === 0 && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40 }}>{fr ? "Aucun paiement" : "No payments"}</div>}
-        {!loadingP && payments.length > 0 && (
-          <div style={{ overflowX: "auto" }}>
-            <table className="table" style={{ fontSize: 12 }}>
+
+      {/* Payment table */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:12,overflow:"hidden"}}>
+        <div style={{padding:"14px 20px",borderBottom:"1px solid var(--border-subtle)",fontSize:13,fontWeight:700}}>{"\u{1F4CA}"} {fr ? "Historique" : "History"}</div>
+        {myPayouts.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr ? "Aucun paiement" : "No payments"}</div>}
+        {myPayouts.length > 0 && (
+          <div style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
               <thead><tr>
-                <th>Date</th><th>Type</th><th>{fr ? "Montant" : "Amount"}</th><th>{fr ? "Devise" : "Currency"}</th><th>Notes</th><th>{fr ? "Statut" : "Status"}</th>
+                <th>Date</th>
+                <th>{fr ? "Montant" : "Amount"}</th>
+                <th>{fr ? "Statut" : "Status"}</th>
               </tr></thead>
               <tbody>
-                {payments.map(p => (
+                {myPayouts.map(p => (
                   <tr key={p.id}>
                     <td>{fmtDate(p.date)}</td>
-                    <td>{typeLabel(p.type)}</td>
-                    <td style={{ fontWeight: 800, color: "var(--success)" }}>+{Number(p.amount).toLocaleString("fr-FR", { maximumFractionDigits: 0 })}{p.currency === "EUR" ? "\u20AC" : " CHF"}</td>
-                    <td>{p.currency}</td>
-                    <td style={{ color: "var(--text-secondary)" }}>{p.notes || "\u2014"}</td>
-                    <td><span style={{ padding: "2px 8px", borderRadius: 10, background: statusColor(p.status) + "15", color: statusColor(p.status), fontSize: 10, fontWeight: 700 }}>{statusLabel(p.status)}</span></td>
+                    <td style={{fontWeight:800,color:"var(--success)"}}>+{fmtAmount(p.amount)}</td>
+                    <td><span style={{padding:"2px 8px",borderRadius:10,background:statusColor(p.status)+"15",color:statusColor(p.status),fontSize:10,fontWeight:700}}>{statusLabel(p.status)}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -9058,8 +9750,6 @@ const ModelPaymentsTab = ({user, lang, invoices}) => {
           </div>
         )}
       </div>
-      </>
-      )}
     </div>
   );
 };
@@ -9649,105 +10339,106 @@ const ModelManagementTab = ({user, lang, models, profiles, modelTasks, contentLi
 // =============================================
 // MODEL ROLE — MA CHECKLIST DU JOUR
 // =============================================
-const ModelChecklistTab = ({user, lang}) => {
+const ModelChecklistTab = ({user, lang, checklistInstances, onRefresh}) => {
   const addToast = useToast();
   const fr = lang === "fr";
-  const [instances, setInstances] = useState([]);
-  const [templates, setTemplates] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const today = new Date().toISOString().slice(0, 10);
+  const [localItems, setLocalItems] = useState(null);
+  const [instanceId, setInstanceId] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const ONBOARDING_ITEMS = [
+    {title: fr ? "Photo profil uploadée" : "Profile photo uploaded"},
+    {title: fr ? "Bio rédigée" : "Bio written"},
+    {title: fr ? "Tarifs validés par le gérant" : "Rates validated by manager"},
+    {title: fr ? "Première vidéo envoyée" : "First video sent"},
+    {title: fr ? "Premier post publié" : "First post published"},
+    {title: fr ? "Compte vérifié" : "Account verified"},
+  ];
 
   useEffect(() => {
-    const load = async () => {
-      const [tplR, instR] = await Promise.all([
-        sb.from("checklist_templates").select("*").eq("active", true),
-        sb.from("checklist_instances").select("*").eq("model_id", user.id).eq("date", today),
-      ]);
-      const tpls = tplR.data || [];
-      let insts = instR.data || [];
-      setTemplates(tpls);
-      // Auto-generate missing instances
-      for (const tpl of tpls) {
-        if (!insts.find(i => i.template_id === tpl.id)) {
-          const items = (tpl.items || []).map(it => ({title: it.title, checked: false}));
-          const {data} = await sb.from("checklist_instances").insert({model_id: user.id, template_id: tpl.id, date: today, items}).select().single();
-          if (data) insts = [...insts, data];
-        }
-      }
-      setInstances(insts);
-      setLoading(false);
-    };
-    load();
-  }, [user.id, today]);
+    const myInstances = (checklistInstances || []).filter(ci => ci.model_id === user.id);
+    if (myInstances.length > 0) {
+      const inst = myInstances[0];
+      setInstanceId(inst.id);
+      setLocalItems(inst.items || ONBOARDING_ITEMS.map(it => ({...it, checked: false})));
+    } else {
+      setLocalItems(null);
+      setInstanceId(null);
+    }
+  }, [checklistInstances, user.id]);
 
-  const toggleItem = async (instanceId, itemIdx) => {
-    const inst = instances.find(ci => ci.id === instanceId);
-    if (!inst) return;
-    const updatedItems = inst.items.map((it, i) => i === itemIdx ? {...it, checked: !it.checked} : it);
-    await sb.from("checklist_instances").update({items: updatedItems}).eq("id", instanceId);
-    setInstances(prev => prev.map(ci => ci.id === instanceId ? {...ci, items: updatedItems} : ci));
+  const initChecklist = async () => {
+    const items = ONBOARDING_ITEMS.map(it => ({title: it.title, checked: false}));
+    try {
+      const {data, error} = await sb.from("checklist_instances").insert({model_id: user.id, date: new Date().toISOString().slice(0, 10), items}).select().single();
+      if (error) { addToast(fr ? "Erreur création checklist" : "Checklist creation error", "error"); return; }
+      setInstanceId(data.id);
+      setLocalItems(data.items);
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      // Checklist instance creation failed
+      addToast(fr ? "Erreur création checklist" : "Checklist creation error", "error");
+    }
   };
 
-  const totalItems = instances.reduce((s, ci) => s + (ci.items || []).length, 0);
-  const totalChecked = instances.reduce((s, ci) => s + (ci.items || []).filter(i => i.checked).length, 0);
-  const globalPct = totalItems > 0 ? Math.round((totalChecked / totalItems) * 100) : 0;
+  const toggleItem = async (itemIdx) => {
+    if (!instanceId || !localItems || saving) return;
+    const updatedItems = localItems.map((it, i) => i === itemIdx ? {...it, checked: !it.checked} : it);
+    setSaving(true);
+    try {
+      const {error} = await sb.from("checklist_instances").update({items: updatedItems}).eq("id", instanceId);
+      if (error) { addToast(fr ? "Erreur mise à jour" : "Update error", "error"); setSaving(false); return; }
+      setLocalItems(updatedItems);
+    } catch (e) {
+      // Checklist item toggle failed
+      addToast(fr ? "Erreur mise à jour" : "Update error", "error");
+    }
+    setSaving(false);
+  };
+
+  const items = localItems || ONBOARDING_ITEMS.map(it => ({...it, checked: false}));
+  const totalChecked = items.filter(i => i.checked).length;
+  const pct = Math.round((totalChecked / items.length) * 100);
 
   return (
     <div>
       <div style={{marginBottom:24}}>
-        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u2705"} {fr?"Ma Checklist du Jour":"My Daily Checklist"}</h2>
-        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{today}</p>
+        <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u2705"} {fr ? "Ma Checklist Onboarding" : "My Onboarding Checklist"}</h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{fr ? "Complète ces étapes pour démarrer" : "Complete these steps to get started"}</p>
       </div>
 
-      {/* Global progress */}
+      {/* Progress bar */}
       <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:18,padding:"18px 20px",marginBottom:24}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-          <span style={{fontSize:13,fontWeight:700}}>{fr?"Progression globale":"Overall progress"}</span>
-          <span style={{fontSize:15,fontWeight:800,color:globalPct===100?"var(--success)":globalPct>=50?"var(--accent)":"var(--warning)"}}>{globalPct}%</span>
+          <span style={{fontSize:13,fontWeight:700}}>{fr ? "Progression" : "Progress"}</span>
+          <span style={{fontSize:15,fontWeight:800,color:pct===100?"#10B981":"var(--text-secondary)"}}>{pct}%</span>
         </div>
-        <div style={{height:8,borderRadius:4,background:"var(--bg-overlay)"}}>
-          <div style={{height:8,borderRadius:4,background:globalPct===100?"var(--success)":globalPct>=50?"var(--accent)":"var(--warning)",width:globalPct+"%",transition:"width 0.3s"}}/>
+        <div style={{height:10,borderRadius:5,background:"var(--bg-overlay)"}}>
+          <div style={{height:10,borderRadius:5,background:"#10B981",width:pct+"%",transition:"width 0.3s"}}/>
         </div>
-        <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:6}}>{totalChecked}/{totalItems} {fr?"complétés":"completed"}</div>
+        <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:6}}>{totalChecked}/{items.length} {fr ? "complétés" : "completed"}</div>
       </div>
 
-      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
+      {!instanceId && !localItems && (
+        <div style={{textAlign:"center",padding:40}}>
+          <p style={{color:"var(--text-quaternary)",marginBottom:16}}>{fr ? "Aucune checklist. Clique pour démarrer ton onboarding." : "No checklist. Click to start your onboarding."}</p>
+          <button className="btn btn-primary" onClick={initChecklist}>{fr ? "Démarrer ma checklist" : "Start my checklist"}</button>
+        </div>
+      )}
 
-      {!loading && instances.map(inst => {
-        const tpl = templates.find(t => t.id === inst.template_id);
-        const items = inst.items || [];
-        const checked = items.filter(i => i.checked).length;
-        const pct = items.length > 0 ? Math.round((checked / items.length) * 100) : 0;
-        return (
-          <div key={inst.id} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20,marginBottom:16}}>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-              <span style={{fontSize:14,fontWeight:700}}>{tpl?.name || "Checklist"}</span>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                {pct===100&&<span style={{fontSize:12}}>{"\u{1F389}"}</span>}
-                <span style={{fontSize:12,fontWeight:700,color:pct===100?"var(--success)":pct>=50?"var(--accent)":"var(--warning)"}}>{checked}/{items.length}</span>
+      {items.length > 0 && instanceId && (
+        <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20}}>
+          {items.map((item, idx) => (
+            <div key={idx} onClick={() => toggleItem(idx)} style={{
+              display:"flex",alignItems:"center",gap:14,padding:"14px 16px",cursor:saving?"not-allowed":"pointer",
+              borderRadius:12,marginBottom:4,background:item.checked?"rgba(16,185,129,0.08)":"transparent",transition:"background 0.2s",
+            }}>
+              <div style={{width:24,height:24,borderRadius:8,border:"2px solid "+(item.checked?"#10B981":"var(--border-default)"),background:item.checked?"#10B981":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.2s"}}>
+                {item.checked && <span style={{color:"#fff",fontSize:14,fontWeight:800}}>{"\u2713"}</span>}
               </div>
+              <span style={{fontSize:14,fontWeight:500,textDecoration:item.checked?"line-through":"none",opacity:item.checked?0.6:1,transition:"all 0.2s"}}>{item.title}</span>
             </div>
-            <div style={{height:5,borderRadius:3,background:"var(--bg-overlay)",marginBottom:16}}>
-              <div style={{height:5,borderRadius:3,background:pct===100?"var(--success)":pct>=50?"var(--accent)":"var(--warning)",width:pct+"%",transition:"width 0.3s"}}/>
-            </div>
-            {items.map((item, idx) => (
-              <div key={`${item.title}-${idx}`} onClick={() => toggleItem(inst.id, idx)} style={{
-                display:"flex",alignItems:"center",gap:14,padding:"12px 16px",cursor:"pointer",
-                borderRadius:12,marginBottom:4,background:item.checked?"var(--accent-subtle)":"transparent",transition:"background 0.2s",
-              }}>
-                <div style={{width:22,height:22,borderRadius:7,border:"2px solid "+(item.checked?"var(--success)":"var(--border-default)"),background:item.checked?"var(--success)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.2s"}}>
-                  {item.checked&&<span style={{color:"#fff",fontSize:13,fontWeight:800}}>{"\u2713"}</span>}
-                </div>
-                <span style={{fontSize:14,fontWeight:500,textDecoration:item.checked?"line-through":"none",opacity:item.checked?0.5:1,transition:"all 0.2s"}}>{item.title}</span>
-              </div>
-            ))}
-          </div>
-        );
-      })}
-
-      {!loading && instances.length === 0 && (
-        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>
-          {fr?"Aucune checklist configurée. Contacte ton gérant.":"No checklist configured. Contact your manager."}
+          ))}
         </div>
       )}
     </div>
@@ -9757,80 +10448,95 @@ const ModelChecklistTab = ({user, lang}) => {
 // =============================================
 // MODEL ROLE — MES TÂCHES (from model_tasks)
 // =============================================
-const ModelTasksTab = ({user, lang}) => {
+const ModelTasksTab = ({user, lang, modelTasks, onRefresh}) => {
   const addToast = useToast();
   const fr = lang === "fr";
-  const [tasks, setTasks] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [filter, setFilter] = useState("active");
+  const [saving, setSaving] = useState(false);
 
-  useEffect(() => {
-    const load = async () => {
-      const {data} = await sb.from("model_tasks").select("*").eq("model_id", user.id).order("created_at", {ascending: false});
-      setTasks(data || []);
-      setLoading(false);
-    };
-    load();
-  }, [user.id]);
+  const myTasks = (modelTasks || []).filter(t => t.model_id === user.id);
+  const sortByDue = (arr) => [...arr].sort((a, b) => {
+    if (!a.due_date && !b.due_date) return 0;
+    if (!a.due_date) return 1;
+    if (!b.due_date) return -1;
+    return new Date(a.due_date) - new Date(b.due_date);
+  });
+  const todo = sortByDue(myTasks.filter(t => t.status === "todo"));
+  const inProgress = sortByDue(myTasks.filter(t => t.status === "in_progress"));
+  const done = sortByDue(myTasks.filter(t => t.status === "done"));
 
   const updateStatus = async (taskId, newStatus) => {
+    if (saving) return;
+    setSaving(true);
     const updates = {status: newStatus};
     if (newStatus === "done") updates.completed_at = new Date().toISOString();
     else updates.completed_at = null;
-    const {error} = await sb.from("model_tasks").update(updates).eq("id", taskId);
-    if (error) { addToast("Erreur: " + error.message, "error"); return; }
-    setTasks(prev => prev.map(t => t.id === taskId ? {...t, ...updates} : t));
-    if (newStatus === "done") addToast(fr ? "Tâche terminée" : "Task completed", "success");
+    try {
+      const {error} = await sb.from("model_tasks").update(updates).eq("id", taskId);
+      if (error) { addToast(fr ? "Erreur mise à jour" : "Update error", "error"); setSaving(false); return; }
+      if (onRefresh) onRefresh();
+      if (newStatus === "done") addToast(fr ? "Tâche terminée" : "Task completed", "success");
+    } catch (e) {
+      // Task status update failed
+      addToast(fr ? "Erreur mise à jour" : "Update error", "error");
+    }
+    setSaving(false);
   };
 
-  const filtered = filter === "active" ? tasks.filter(t => t.status !== "done") : filter === "done" ? tasks.filter(t => t.status === "done") : tasks;
-  const todoCount = tasks.filter(t => t.status === "todo").length;
-  const inProgressCount = tasks.filter(t => t.status === "in_progress").length;
-  const doneCount = tasks.filter(t => t.status === "done").length;
   const isOverdue = (d) => d && new Date(d) < new Date(new Date().toISOString().slice(0, 10));
   const catIcon = (c) => c === "social" ? "\u{1F4F1}" : c === "admin" ? "\u{1F4CB}" : c === "content" ? "\u{1F4F8}" : c === "communication" ? "\u{1F4AC}" : "\u{1F4CC}";
+
+  const renderTask = (task) => (
+    <div key={task.id} style={{
+      display:"flex",alignItems:"center",gap:14,padding:"14px 18px",
+      background:"var(--card-bg)",border:"1px solid "+(task.priority==="urgent"?"var(--danger-muted)":task.priority==="high"?"var(--warning-muted)":"var(--border-subtle)"),
+      borderRadius:14,marginBottom:8,
+    }}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:14,fontWeight:700,textDecoration:task.status==="done"?"line-through":"none",opacity:task.status==="done"?0.5:1}}>{task.title}</div>
+        {task.description && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:3}}>{task.description}</div>}
+        <div style={{display:"flex",gap:8,marginTop:6,flexWrap:"wrap"}}>
+          {task.category && <span style={{fontSize:10,padding:"1px 6px",borderRadius:6,background:"var(--accent-subtle)",color:"var(--accent)",fontWeight:600}}>{catIcon(task.category)} {task.category}</span>}
+          {task.due_date && <span style={{fontSize:10,color:isOverdue(task.due_date)&&task.status!=="done"?"var(--danger)":"var(--text-quaternary)"}}>{"\u{1F4C5}"} {fmtDate(task.due_date)}</span>}
+          {task.priority==="urgent"&&<span style={{fontSize:10,color:"var(--danger)",fontWeight:700}}>{"\u{1F6A8}"} URGENT</span>}
+          {task.priority==="high"&&<span style={{fontSize:10,color:"var(--warning)",fontWeight:600}}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
+        </div>
+      </div>
+      <select value={task.status} onChange={e=>updateStatus(task.id,e.target.value)} disabled={saving} className="filter-select" style={{fontSize:11,padding:"5px 8px"}}>
+        <option value="todo">{fr?"À faire":"To do"}</option>
+        <option value="in_progress">{fr?"En cours":"In progress"}</option>
+        <option value="done">{fr?"Terminé":"Done"}</option>
+      </select>
+    </div>
+  );
+
+  const renderSection = (title, icon, color, tasks) => (
+    <div style={{marginBottom:24}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+        <span>{icon}</span>
+        <span style={{fontSize:14,fontWeight:700,color}}>{title}</span>
+        <span style={{fontSize:12,color:"var(--text-quaternary)",fontWeight:600}}>({tasks.length})</span>
+      </div>
+      {tasks.length === 0 && <div style={{fontSize:12,color:"var(--text-quaternary)",padding:"12px 18px",background:"var(--card-bg)",borderRadius:12,border:"1px solid var(--border-subtle)"}}>{fr?"Aucune tâche":"No tasks"}</div>}
+      {tasks.map(renderTask)}
+    </div>
+  );
 
   return (
     <div>
       <div style={{marginBottom:24}}>
         <h2 style={{fontSize:18,fontWeight:800,margin:0}}>{"\u{1F4CB}"} {fr?"Mes Tâches":"My Tasks"}</h2>
-        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{todoCount} {fr?"à faire":"to do"} {"\u00B7"} {inProgressCount} {fr?"en cours":"in progress"} {"\u00B7"} {doneCount} {fr?"terminées":"done"}</p>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",margin:"3px 0 0"}}>{todo.length} {fr?"à faire":"to do"} {"\u00B7"} {inProgress.length} {fr?"en cours":"in progress"} {"\u00B7"} {done.length} {fr?"terminées":"done"}</p>
       </div>
 
-      <div style={{display:"flex",gap:6,marginBottom:18}}>
-        {[{k:"active",l:fr?"Actives":"Active"},{k:"done",l:fr?"Terminées":"Done"},{k:"all",l:fr?"Toutes":"All"}].map(f => (
-          <button key={f.k} onClick={() => setFilter(f.k)} className={`filter-chip ${filter===f.k?"active":""}`}>{f.l}</button>
-        ))}
-      </div>
+      {myTasks.length === 0 && (
+        <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr?"Aucune tâche assignée":"No tasks assigned"}</div>
+      )}
 
-      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>Chargement...</div>}
-      {!loading && filtered.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{fr?"Aucune tâche":"No tasks"}</div>}
-      {filtered.map(task => (
-        <div key={task.id} style={{
-          display:"flex",alignItems:"center",gap:16,padding:"16px 20px",
-          background:"var(--card-bg)",border:"1px solid "+(task.priority==="urgent"?"var(--danger-muted)":task.priority==="high"?"var(--warning-muted)":"var(--border-subtle)"),
-          borderRadius:16,marginBottom:8,
-          borderLeft:"4px solid "+(task.status==="done"?"var(--success)":task.status==="in_progress"?"var(--accent)":"var(--warning)"),
-        }}>
-          <input type="checkbox" checked={task.status==="done"} onChange={()=>updateStatus(task.id,task.status==="done"?"todo":"done")}
-            style={{width:20,height:20,accentColor:"var(--success)",cursor:"pointer",flexShrink:0}} />
-          <div style={{flex:1}}>
-            <div style={{fontSize:14,fontWeight:700,textDecoration:task.status==="done"?"line-through":"none",opacity:task.status==="done"?0.5:1}}>{task.title}</div>
-            {task.description && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:3}}>{task.description}</div>}
-            <div style={{display:"flex",gap:8,marginTop:6}}>
-              <span style={{fontSize:10,padding:"1px 6px",borderRadius:6,background:"var(--accent-subtle)",color:"var(--accent)",fontWeight:600}}>{catIcon(task.category)} {task.category}</span>
-              {task.due_date && <span style={{fontSize:10,color:isOverdue(task.due_date)&&task.status!=="done"?"var(--danger)":"var(--text-quaternary)"}}>{"\u{1F4C5}"} {fmtDate(task.due_date)}</span>}
-              {task.priority==="urgent"&&<span style={{fontSize:10,color:"var(--danger)",fontWeight:700}}>{"\u{1F6A8}"} URGENT</span>}
-              {task.priority==="high"&&<span style={{fontSize:10,color:"var(--warning)",fontWeight:600}}>{"\u26A0\uFE0F"} {fr?"Prioritaire":"High"}</span>}
-            </div>
-          </div>
-          <select value={task.status} onChange={e=>updateStatus(task.id,e.target.value)} className="filter-select" style={{fontSize:11,padding:"5px 8px"}}>
-            <option value="todo">{fr?"À faire":"To do"}</option>
-            <option value="in_progress">{fr?"En cours":"In progress"}</option>
-            <option value="done">{fr?"Terminé":"Done"}</option>
-          </select>
-        </div>
-      ))}
+      {myTasks.length > 0 && (<>
+        {renderSection(fr?"À faire":"To do", "\u{1F4DD}", "var(--warning)", todo)}
+        {renderSection(fr?"En cours":"In progress", "\u{1F504}", "var(--accent)", inProgress)}
+        {renderSection(fr?"Terminées":"Done", "\u2705", "var(--success)", done)}
+      </>)}
     </div>
   );
 };
@@ -12492,6 +13198,23 @@ const App = () => {
   const [selectedSpenderKey, setSelectedSpenderKey] = useState(null);
   const addToast = useToast();
 
+  // ── SESSION TIMEOUT (chatter only — 30 min inactivity) ──
+  const lastActivity = useRef(Date.now());
+  useEffect(() => {
+    if (user?.role !== "chatter") return;
+    const handler = () => { lastActivity.current = Date.now(); };
+    window.addEventListener("mousemove", handler);
+    window.addEventListener("keydown", handler);
+    const interval = setInterval(() => {
+      if (Date.now() - lastActivity.current > 30 * 60 * 1000) {
+        sb.auth.signOut();
+        setUser(null);
+        addToast("Session expirée après 30 minutes d'inactivité", "warning");
+      }
+    }, 60000);
+    return () => { window.removeEventListener("mousemove", handler); window.removeEventListener("keydown", handler); clearInterval(interval); };
+  }, [user]);
+
   // Navigate to spender page from anywhere
   const navigateToSpender = (key) => {
     closeDrill();
@@ -12667,6 +13390,7 @@ const App = () => {
     setUser(u);
     if(u.role === "provider") setTab("transactions");
     if(u.role === "modele") setTab("model_checklist");
+    if(u.role === "chatter") setTab("chatter_dashboard");
     setLoading(true);
     await loadData(u);
     setLoading(false);
@@ -12726,10 +13450,17 @@ const App = () => {
   const tabs = [
     // ── Modele-only tabs ──
     {id:"model_checklist",icon:"\u2705",label:lang==="fr"?"Ma Checklist":"My Checklist",show:isModele},
+    {id:"model_content",icon:"\u{1F4DD}",label:lang==="fr"?"Mon Contenu":"My Content",show:isModele},
     {id:"model_tasks",icon:"\u{1F4CB}",label:lang==="fr"?"Mes Tâches":"My Tasks",show:isModele},
-    {id:"model_content",icon:"\u{1F4F8}",label:lang==="fr"?"Ma Content List":"My Content List",show:isModele},
+    {id:"model_payments",icon:"\u{1F4B0}",label:lang==="fr"?"Mes Paiements":"My Payments",show:isModele},
     {id:"model_dashboard",icon:"\u{1F469}\u200D\u{1F4BC}",label:lang==="fr"?"Mon Espace":"My Space",show:isModele},
-    {id:"model_payments",icon:"\u{1F4B0}",label:lang==="fr"?"Mes Paies":"My Payments",show:isModele},
+    // ── Chatter-only tabs ──
+    {id:"chatter_dashboard",icon:"\u{1F4CA}",label:lang==="fr"?"Dashboard":"Dashboard",show:user.role==="chatter"},
+    {id:"chatter_transactions",icon:"\u{1F4B0}",label:lang==="fr"?"Transactions":"Transactions",show:user.role==="chatter"},
+    {id:"chatter_spenders",icon:"\u{1F464}",label:lang==="fr"?"Spenders":"Spenders",show:user.role==="chatter"},
+    {id:"chatter_messagerie",icon:"\u{1F4AC}",label:lang==="fr"?"Messagerie":"Messaging",show:user.role==="chatter"},
+    {id:"chatter_compta",icon:"\u{1F4C4}",label:lang==="fr"?"Compta":"Accounting",show:user.role==="chatter"},
+    {id:"chatter_competition",icon:"\u{1F3C6}",label:lang==="fr"?"Compétition":"Competition",show:user.role==="chatter"},
     // ── Standard tabs (hidden from modele) ──
     {id:"dashboard",icon:"\u{1F4CA}",label:t(lang,"dashboard"),show:!isModele&&user.role!=="provider"},
     {id:"transactions",icon:"\u{1F4B8}",label:user.role==="provider"?"Mes Transactions":t(lang,"transactions"),show:!isModele},
@@ -12835,11 +13566,18 @@ const App = () => {
             <DrillDownView drillDown={drillDown} user={user} txs={txs} models={models} profiles={profiles} payouts={payouts} lang={lang} />
           ) : (<>
           {/* ── Modele-only pages ── */}
-          {tab==="model_checklist"&&user.role==="modele"&&<ModelChecklistTab user={user} lang={lang} />}
-          {tab==="model_tasks"&&user.role==="modele"&&<ModelTasksTab user={user} lang={lang} />}
-          {tab==="model_content"&&user.role==="modele"&&<ModelContentTab user={user} lang={lang} onRefresh={onRefresh} />}
+          {tab==="model_checklist"&&user.role==="modele"&&<ModelChecklistTab user={user} lang={lang} checklistInstances={checklistInstances} onRefresh={onRefresh} />}
+          {tab==="model_tasks"&&user.role==="modele"&&<ModelTasksTab user={user} lang={lang} modelTasks={modelTasks} onRefresh={onRefresh} />}
+          {tab==="model_content"&&user.role==="modele"&&<ModelContentTab user={user} lang={lang} contentList={contentList} />}
           {tab==="model_dashboard"&&user.role==="modele"&&<ModelDashboardTab user={user} lang={lang} />}
-          {tab==="model_payments"&&user.role==="modele"&&<ModelPaymentsTab user={user} lang={lang} invoices={invoices} />}
+          {tab==="model_payments"&&user.role==="modele"&&<ModelPaymentsTab user={user} lang={lang} payouts={payouts} />}
+          {/* ── Chatter-only pages ── */}
+          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ChatterDashboardTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} />}
+          {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} products={products} productTags={productTags} onRefresh={onRefresh} />}
+          {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txs} models={models} onRefresh={onRefresh} />}
+          {tab==="chatter_messagerie"&&user.role==="chatter"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
+          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} />}
+          {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} />}
           {/* ── Standard pages ── */}
           {tab==="dashboard"&&user.role!=="provider"&&user.role!=="modele"&&<DashboardTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} />}
           {tab==="modeles"&&user.role==="gerant"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} />}
