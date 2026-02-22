@@ -810,7 +810,16 @@
     .profile-row { display: flex; justify-content: space-between; padding: 8px 0; font-size: 13px; color: var(--text-secondary); }
     .form-group-modal { margin-bottom: 16px; }
     .error-msg { color: var(--danger); font-size: 12px; text-align: center; margin-top: 10px; }
-    .loading-wrap { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg-base); }
+    .loading-wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: var(--bg-base); gap: 16px; }
+    /* DB FIX — retry button on loading error */
+    .loading-retry-btn { background: var(--accent); color: #fff; border: none; padding: 10px 28px; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 8px; transition: opacity 0.2s; }
+    .loading-retry-btn:hover { opacity: 0.85; }
+    /* DB FIX — empty state for sections with no data */
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; color: var(--text-tertiary); text-align: center; }
+    .empty-state-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
+    .empty-state-msg { font-size: 14px; max-width: 300px; line-height: 1.5; }
+    .empty-state-retry { background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.12); color: var(--text-secondary); padding: 8px 20px; border-radius: 8px; font-size: 13px; cursor: pointer; margin-top: 12px; transition: background 0.2s; }
+    .empty-state-retry:hover { background: rgba(255,255,255,0.14); }
     .spinner { width: 40px; height: 40px; border: 4px solid var(--accent-muted); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes breathe { 0%, 100% { opacity: 0.3; transform: translateX(-50%) scale(1); } 50% { opacity: 0.6; transform: translateX(-50%) scale(1.1); } }
@@ -1411,6 +1420,13 @@
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
       }
+      /* DB FIX — all tables get overflow scroll on mobile */
+      .content table:not(.table) {
+        display: block;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .table-wrap { margin: 0 -8px; padding: 0 8px 8px; }
 
       /* --- Tabs: scrollable on mobile --- */
       .content div[style*="borderBottom:\"1px solid #2A2A3E\""],
@@ -1486,6 +1502,15 @@ const {useState, useEffect, useMemo, useCallback, useContext, createContext, use
 // ═══ MOBILE DETECTION (performance optimizations) ═══
 const _isMobile = window.innerWidth < 768;
 const _isLowPower = _isMobile || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4);
+
+/* DB FIX — EmptyState component: shown when a section has no data */
+const EmptyState = ({icon, message, onRetry}) => (
+  <div className="empty-state">
+    <div className="empty-state-icon">{icon || "\u{1F4ED}"}</div>
+    <div className="empty-state-msg">{message || "Aucune donn\u00e9e disponible"}</div>
+    {onRetry && <button className="empty-state-retry" onClick={onRetry}>{"\u{1F504}"} R\u00e9essayer</button>}
+  </div>
+);
 
 const _Recharts = window.Recharts || {};
 const {ResponsiveContainer, AreaChart, Area, BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, CartesianGrid, XAxis, YAxis, Tooltip: RechartsTooltip, Legend, ComposedChart} = _Recharts;
@@ -19637,6 +19662,9 @@ const App = () => {
     return () => window.removeEventListener("popstate", onPopState);
   }, [setDrillDown, user]);
   const [loading, setLoading] = useState(true);
+  const [loadTimeout, setLoadTimeout] = useState(false); /* DB FIX — timeout flag */
+  const [loadError, setLoadError] = useState(null); /* DB FIX — error message */
+  const [retryCount, setRetryCount] = useState(0); /* DB FIX — triggers re-init */
   const _loadVersion = useRef(0); // race condition guard: discard stale loadData results
   const [txs, setTxs] = useState([]);
   const [profiles, setProfiles] = useState([]);
@@ -19679,6 +19707,13 @@ const App = () => {
   const [timezone, setTimezone] = useState("Europe/Paris");
   const [displayCurrency, setDisplayCurrency] = useState("CHF");
   const [exchangeRate, setExchangeRate] = useState(EXCHANGE_RATE_EUR_CHF);
+
+  /* DB FIX — 5s loading timeout: show error + retry after 5 seconds */
+  useEffect(() => {
+    if (!loading) { setLoadTimeout(false); return; }
+    const timer = setTimeout(() => { setLoadTimeout(true); }, 5000);
+    return () => clearTimeout(timer);
+  }, [loading]);
 
   // Keep global _tz in sync with state
   useEffect(() => { _tz.current = timezone; }, [timezone]);
@@ -19746,7 +19781,9 @@ const App = () => {
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
     try {
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR] = await Promise.all([
+      /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
+      const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR] = await Promise.race([Promise.all([
         safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
         safe(sb.from("spenders").select("*"), "spenders"),
         safe(sb.from("profiles").select("*"), "profiles"),
@@ -19772,8 +19809,8 @@ const App = () => {
         safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200), "broadcasts"),
         safe(sb.from("payslips").select("*").order("period",{ascending:false}), "payslips"),
         safe(sb.from("transactions").select("id,amount,currency,date,model_id,spender_id,spender_handle,status,chatter_id,provider_id,created_at,payment_method,product,product_id,product_tag_id,tag,provider_payment_method_id").order("date",{ascending:false}), "tx_summary"),
-      ]);
-    } catch(e) { /* loadData critical failure */ console.error("loadData crash:", e); return; }
+      ]), _dataTimeout]);
+    } catch(e) { /* DB FIX — loadData timeout or critical failure */ console.error("[DADASH] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
     // Discard results if a newer loadData call was started while we were awaiting
     if (thisVersion !== _loadVersion.current) return;
     let txData = txR.data||[];
@@ -19905,22 +19942,27 @@ const App = () => {
     return `${days}j`;
   };
 
+  /* DB FIX — init with retry support */
   useEffect(()=>{
     const init = async () => {
+      setLoadError(null);
+      setLoadTimeout(false);
       // ── Connection health check ──
       if (window.__sbError) {
         console.error("[DADASH] Supabase not available:", window.__sbError);
-        addToast("Erreur connexion Supabase: " + window.__sbError, "error");
+        setLoadError("Supabase non connecté: " + window.__sbError);
         setLoading(false);
         return;
       }
       try {
-        const {data:{session}} = await sb.auth.getSession();
+        /* DB FIX — 8s timeout on getSession to avoid indefinite hang */
+        const sessionPromise = sb.auth.getSession();
+        const sessionTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout: impossible de joindre Supabase")), 8000));
+        const {data:{session}} = await Promise.race([sessionPromise, sessionTimeout]);
         if(session) {
           const {data:profile, error:profileErr} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
           if (profileErr) {
             console.error("[DADASH] Profile fetch error:", profileErr.message);
-            // Session exists but profile query failed — could be RLS or missing table
             addToast("Erreur chargement profil: " + profileErr.message, "error");
           }
           if(profile) {
@@ -19933,12 +19975,20 @@ const App = () => {
         }
       } catch(e) {
         console.error("[DADASH] Init failed:", e.message || e);
-        addToast("Erreur initialisation: " + (e.message || "connexion impossible"), "error");
+        setLoadError(e.message || "Connexion impossible");
       }
       setLoading(false);
     };
     init();
-  },[]);
+  },[retryCount]);
+
+  /* DB FIX — retry function: resets state and re-triggers init */
+  const retryInit = () => {
+    setLoadTimeout(false);
+    setLoadError(null);
+    setLoading(true);
+    setRetryCount(c => c + 1);
+  };
 
   // ── CMD+K Global Search ──
   useEffect(() => {
@@ -20018,13 +20068,20 @@ const App = () => {
     return () => { sb.removeChannel(channel); };
   }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
 
+  /* DB FIX — handleLogin with error resilience */
   const handleLogin = async (u) => {
     setUser(u);
     if(u.role === "provider") setTab("transactions");
     if(u.role === "modele") setTab("model_checklist");
     if(u.role === "chatter") setTab("chatter_dashboard");
     setLoading(true);
-    await loadData(u);
+    setLoadError(null);
+    try {
+      await loadData(u);
+    } catch(e) {
+      console.error("[DADASH] Post-login loadData failed:", e.message || e);
+      setLoadError(e.message || "Erreur de chargement des donn\u00e9es");
+    }
     setLoading(false);
   };
 
@@ -20057,10 +20114,15 @@ const App = () => {
     setUnreadCount(0);
   };
 
-  // fn_afterMutationOrImportRefresh — global orchestrator
+  /* DB FIX — global refresh with error handling */
   const fn_afterMutationOrImportRefresh = async () => {
-    await loadData(user);
-    // Any tab-specific invalidation is handled by React re-render since all state lives here
+    try {
+      setLoadError(null);
+      await loadData(user);
+    } catch(e) {
+      console.error("[DADASH] Refresh failed:", e.message || e);
+      addToast("Erreur rechargement: " + (e.message || "connexion impossible"), "error");
+    }
   };
   const onRefresh = fn_afterMutationOrImportRefresh;
 
@@ -20076,7 +20138,39 @@ const App = () => {
     }
   };
 
-  if(loading) return <div className="loading-wrap"><div className="spinner"></div>{window.__sbError && <div style={{marginTop:20,padding:"12px 20px",background:"rgba(239,68,68,0.15)",border:"1px solid rgba(239,68,68,0.3)",borderRadius:12,color:"#EF4444",fontSize:13,maxWidth:400,textAlign:"center"}}>{"\u26A0\uFE0F"} Supabase: {window.__sbError}</div>}</div>;
+  /* DB FIX — loading screen with timeout, error feedback, and retry button */
+  if(loading) return (
+    <div className="loading-wrap">
+      {!loadTimeout && <div className="spinner"></div>}
+      {!loadTimeout && <div style={{color:"var(--text-tertiary)",fontSize:13,marginTop:4}}>Chargement des donn\u00e9es...</div>}
+      {loadTimeout && (
+        <div style={{textAlign:"center",maxWidth:400,padding:"0 20px"}}>
+          <div className="spinner" style={{margin:"0 auto 16px",borderTopColor:"#EF4444"}}></div>
+          <div style={{fontSize:36,marginBottom:8}}>{"\u26A0\uFE0F"}</div>
+          <div style={{color:"#EF4444",fontSize:15,fontWeight:600,marginBottom:8}}>
+            Le chargement prend trop de temps...
+          </div>
+          <div style={{color:"var(--text-tertiary)",fontSize:13,marginBottom:16}}>
+            V\u00e9rifiez votre connexion internet et r\u00e9essayez.
+          </div>
+          <button className="loading-retry-btn" onClick={retryInit}>
+            {"\u{1F504}"} R\u00e9essayer
+          </button>
+        </div>
+      )}
+    </div>
+  );
+  /* DB FIX — if no user but we have a loadError, show error screen with retry */
+  if(!user && loadError) return (
+    <div className="loading-wrap">
+      <div style={{textAlign:"center",maxWidth:400,padding:"0 20px"}}>
+        <div style={{fontSize:36,marginBottom:8}}>{"\u274C"}</div>
+        <div style={{color:"#EF4444",fontSize:15,fontWeight:600,marginBottom:8}}>{loadError}</div>
+        <div style={{color:"var(--text-tertiary)",fontSize:13,marginBottom:16}}>Impossible de se connecter au serveur.</div>
+        <button className="loading-retry-btn" onClick={retryInit}>{"\u{1F504}"} R\u00e9essayer</button>
+      </div>
+    </div>
+  );
   if(!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
 
   const isModele = user.role === "modele";
@@ -20439,6 +20533,13 @@ const App = () => {
             <button onClick={handleLogout} title={t(lang,"logout")} style={{background:"var(--danger-muted)",color:"var(--danger)",border:"1px solid var(--danger-muted)",borderRadius:12,padding:_isMobile?"4px 8px":"6px 12px",cursor:"pointer",fontSize:_isMobile?11:13,fontWeight:600,display:"flex",alignItems:"center",gap:4}}>{"\u{1F6AA}"}{!_isMobile && (" " + t(lang,"logout"))}</button>
           </div>
         </div>
+        {/* DB FIX — data error banner (visible inside app, non-blocking) */}
+        {loadError && !loading && (
+          <div style={{margin:"0 12px",padding:"10px 16px",background:"rgba(239,68,68,0.12)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:10,display:"flex",alignItems:"center",gap:10,fontSize:13,color:"#EF4444",flexWrap:"wrap"}}>
+            <span>{"\u26A0\uFE0F"} {loadError}</span>
+            <button onClick={()=>{setLoadError(null);onRefresh();}} style={{background:"rgba(239,68,68,0.2)",border:"1px solid rgba(239,68,68,0.3)",color:"#EF4444",padding:"4px 12px",borderRadius:6,fontSize:12,cursor:"pointer",fontWeight:600}}>{"\u{1F504}"} R\u00e9essayer</button>
+          </div>
+        )}
         {/* ── CONTENT AREA ── */}
         <div className="content fade-in" key={drillDown?`drill-${drillDown.type}-${drillDown.id}`:`${tab}-${subTab||""}`}>
           {drillDown ? (
