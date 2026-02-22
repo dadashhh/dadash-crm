@@ -2806,7 +2806,7 @@ const EXPENSE_CATS = [
   {id:"autre",label:"Autre",icon:"📦"},
 ];
 
-const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, onRefresh, onNotify, providerPaymentMethods}) => {
+const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, onRefresh, onNotify, providerPaymentMethods, modelTasks, contentList, checklistTemplates, checklistInstances}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
@@ -2815,6 +2815,16 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, onR
   const [view, setView] = useState("global");
   const [selectedModel, setSelectedModel] = useState(null);
   const [showExpenseForm, setShowExpenseForm] = useState(false);
+  // Modal state (PR #16)
+  const [modalModel, setModalModel] = useState(null);
+  const [modalTab, setModalTab] = useState("onboarding");
+  const [taskForm, setTaskForm] = useState({title:"",description:"",category:"general",priority:"medium",due_date:""});
+  const [showTaskForm, setShowTaskForm] = useState(false);
+  const [contentForm, setContentForm] = useState({title:"",description:"",content_type:"photo",platform:"onlyfans",due_date:"",bonus_amount:""});
+  const [showContentForm, setShowContentForm] = useState(false);
+  const [modalSaving, setModalSaving] = useState(false);
+  const [contentWeekOffset, setContentWeekOffset] = useState(0);
+  const avatarColors = ["#8B5CF6","#EC4899","#F59E0B","#10B981","#3B82F6","#EF4444","#6366F1","#14B8A6"];
   const [expForm, setExpForm] = useState({model_id:"",amount:"",currency:"EUR",category:"contenu",description:"",date:new Date().toISOString().slice(0,10)});
   const [editingTx, setEditingTx] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -2993,54 +3003,82 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, onR
           </div>
         </div>}
 
-        {/* Model Cards Grid */}
+        {/* Model Cards Grid (PR #16 — 3-4 per line) */}
         <div>
-          <div className="section-title" style={{marginBottom:16}}><div className="section-bar"></div>{fr?"Tous les mod\u00E8les":"All models"}</div>
-          <div className="cards-grid">
+          <div className="section-title" style={{marginBottom:16}}><div className="section-bar"></div>{fr?"Tous les mod\u00e8les":"All models"}</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:16}}>
             {mPag.paginatedData.map(m => {
-              const avatarColors = ["#8B5CF6","#EC4899","#F59E0B","#10B981","#3B82F6","#EF4444","#6366F1","#14B8A6"];
               const avatarBg = avatarColors[(m.name||"").charCodeAt(0) % avatarColors.length];
-              const totalForBar = m.validatedCount + (m.pending?.length||0) + (m.mTxs.length - m.validatedCount - (m.pending?.length||0));
-              const pctValidated = totalForBar > 0 ? Math.round((m.validatedCount / totalForBar) * 100) : 0;
-              const refusedCount = m.mTxs.length - m.validatedCount - (m.pending?.length||0);
+              // Onboarding %
+              const mChecklists = (checklistInstances||[]).filter(ci=>ci.model_id===m.id);
+              const onboardPct = (()=>{ if(mChecklists.length===0) return 0; const latest=mChecklists[0]; if(!latest.items||!Array.isArray(latest.items)) return 0; const total=latest.items.length; const done=latest.items.filter(it=>it.checked).length; return total>0?Math.round((done/total)*100):0; })();
+              // Tasks in progress
+              const mTasks = (modelTasks||[]).filter(t=>t.model_id===m.id);
+              const tasksInProgress = mTasks.filter(t=>t.status==="todo"||t.status==="in_progress").length;
+              // Top product
+              const prodMap = {};
+              m.mTxs.forEach(tx=>{ if(tx.product) prodMap[tx.product]=(prodMap[tx.product]||0)+1; });
+              const topProduct = Object.entries(prodMap).sort((a,b)=>b[1]-a[1])[0];
+              // Content this week
+              const now = Date.now();
+              const weekContent = (contentList||[]).filter(c=>c.model_id===m.id && c.created_at && (now-new Date(c.created_at).getTime())<7*86400000);
+              const publishedCount = weekContent.filter(c=>c.status==="published"||c.status==="ready").length;
+              const avgTicket = m.validatedCount>0?Math.round(m.ca/m.validatedCount):0;
               return (
-                <div key={m.id} className="card card-hover" onClick={()=>{setSelectedModel(m.id);setView("model");}} style={{cursor:"pointer",padding:20}}>
-                  <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:14}}>
-                    <div className="avatar" style={{background:avatarBg,color:"#fff"}}>{(m.name||"?")[0]}</div>
-                    <div style={{flex:1}}>
-                      <div style={{fontWeight:700,fontSize:14}}>{m.name}</div>
-                      <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{m.txCount} TX {"\u00B7"} {m.chatters.length} chatters</div>
+                <div key={m.id} className="spender-card card-hover" onClick={()=>{setModalModel(m.id);setModalTab("onboarding");}} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:20,cursor:"pointer",transition:"all 0.2s"}}>
+                  {/* Header */}
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0,flex:1}}>
+                      <div style={{width:42,height:42,borderRadius:"50%",background:avatarBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff",flexShrink:0}}>{(m.name||"?")[0]}</div>
+                      <div style={{minWidth:0}}>
+                        <div style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.name}</div>
+                        <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>{m.chatters.length} chatter{m.chatters.length>1?"s":""} · {m.txCount} TX {fr?"ce mois":"this mo."}</div>
+                      </div>
                     </div>
-                    <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-                      {m.margin>80&&<Badge color="var(--success)" text="\u{1F525}"/>}
-                      {m.streak>2&&<Badge color="var(--warning)" text={`${m.streak}j`}/>}
-                      {m.convRate>85&&<Badge color="var(--pink)" text="\u{1F48E}"/>}
-                    </div>
-                  </div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:12}}>
-                    <div>
-                      <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5}}>CA</div>
-                      <div style={{fontSize:20,fontWeight:700,color:"var(--success)"}}>{Math.round(m.ca).toLocaleString()}{currencySymbol}</div>
-                    </div>
-                    <div>
-                      <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5}}>TX</div>
-                      <div style={{fontSize:20,fontWeight:700}}>{m.txCount}</div>
+                    <div style={{flexShrink:0}}>
+                      {m.margin>80&&<span style={{padding:"3px 10px",borderRadius:12,background:"var(--success-muted)",color:"var(--success)",fontSize:10,fontWeight:700}}>{"\ud83d\udd25"} Top</span>}
+                      {m.margin<=80&&m.streak>2&&<span style={{padding:"3px 10px",borderRadius:12,background:"var(--warning-muted)",color:"var(--warning)",fontSize:10,fontWeight:700}}>{m.streak}j streak</span>}
                     </div>
                   </div>
-                  <div style={{height:4,borderRadius:2,background:"#2A2A3E",marginBottom:8}}>
-                    <div style={{height:"100%",borderRadius:2,background:"var(--success)",width:pctValidated+"%",transition:"width 0.3s"}}/>
+                  {/* KPI Grid 2×3 */}
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"CA CE MOIS":"REVENUE"}</div>
+                      <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{Math.round(m.ca).toLocaleString()}{currencySymbol}</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"PANIER MOYEN":"AVG TICKET"}</div>
+                      <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{avgTicket}{currencySymbol}</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>ONBOARDING</div>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <div style={{flex:1,height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}><div style={{width:`${onboardPct}%`,height:"100%",borderRadius:3,background:onboardPct>=80?"var(--success)":onboardPct>=50?"var(--warning)":"var(--danger)"}}/></div>
+                        <span style={{fontSize:11,fontWeight:700,color:"var(--text-secondary)"}}>{onboardPct}%</span>
+                      </div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"T\u00c2CHES":"TASKS"}</div>
+                      <div style={{fontSize:16,fontWeight:800,color:tasksInProgress>0?"var(--warning)":"var(--text-primary)"}}>{tasksInProgress}</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"TOP PRODUIT":"TOP PRODUCT"}</div>
+                      <div style={{fontSize:12,fontWeight:700,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{topProduct?topProduct[0]:"\u2014"}</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"CONTENU SEMAINE":"CONTENT/WEEK"}</div>
+                      <div style={{fontSize:12,fontWeight:700,color:publishedCount>=4?"var(--success)":"var(--text-secondary)"}}>{publishedCount}/{weekContent.length} {fr?"publi\u00e9s":"published"} {publishedCount>=4?"\ud83d\udfe2":""}</div>
+                    </div>
                   </div>
-                  <div style={{display:"flex",gap:12,fontSize:11,color:"var(--text-tertiary)"}}>
-                    <span>{"\u2705"} {m.validatedCount}</span>
-                    <span>{"\u23F3"} {m.pending?.length||0}</span>
-                    <span>{"\u274C"} {refusedCount>0?refusedCount:0}</span>
-                    <span style={{marginLeft:"auto",fontWeight:600}}><span style={{padding:"2px 8px",borderRadius:12,fontSize:10,fontWeight:700,background:m.margin>=70?"var(--success-muted)":m.margin>=40?"var(--warning-muted)":"var(--danger-muted)",color:m.margin>=70?"var(--success)":m.margin>=40?"var(--warning)":"var(--danger)"}}>{m.margin}%</span></span>
+                  {/* Onboarding bar bottom */}
+                  <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                    <div style={{width:`${onboardPct}%`,height:"100%",borderRadius:3,background:onboardPct>=80?"var(--success)":onboardPct>=50?"var(--warning)":"var(--danger)",transition:"width 0.3s"}}/>
                   </div>
                 </div>
               );
             })}
           </div>
-          {mPag.paginatedData.length===0&&<div style={{padding:60,textAlign:"center",color:"var(--text-tertiary)"}}><div style={{fontSize:32,marginBottom:8}}>{"\u{1F4CA}"}</div><div style={{fontSize:14}}>{lang==="fr"?"Aucun mod\u00E8le trouv\u00E9":"No models found"}</div></div>}
+          {mPag.paginatedData.length===0&&<div style={{padding:60,textAlign:"center",color:"var(--text-tertiary)"}}><div style={{fontSize:32,marginBottom:8}}>{"\u{1F4CA}"}</div><div style={{fontSize:14}}>{lang==="fr"?"Aucun mod\u00e8le trouv\u00e9":"No models found"}</div></div>}
           <PaginationControls pag={mPag} lang={lang}/>
         </div>
       </>}
@@ -3137,6 +3175,311 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, onR
         </>}
         {!sel&&<div className="card" style={{textAlign:"center",padding:40,color:"var(--text-quaternary)"}}>{fr?"Sélectionnez un modèle ci-dessus":"Select a model above"}</div>}
       </>}
+
+      {/* ── MODEL DETAIL MODAL (PR #16 — 4 tabs) ── */}
+      {modalModel && (()=>{
+        const sel = modelStats.find(m=>m.id===modalModel);
+        if(!sel) return null;
+        const mTasks = (modelTasks||[]).filter(t=>t.model_id===modalModel);
+        const mContent = (contentList||[]).filter(c=>c.model_id===modalModel);
+        const mChecklists = (checklistInstances||[]).filter(ci=>ci.model_id===modalModel);
+        const mTemplates = (checklistTemplates||[]).filter(ct=>ct.active!==false);
+
+        // Onboarding: latest checklist or default
+        const onboardItems = (()=>{
+          if(mChecklists.length>0 && mChecklists[0].items && Array.isArray(mChecklists[0].items)) return {instance:mChecklists[0], items:mChecklists[0].items};
+          return {instance:null, items:[{title:fr?"Photo profil uploadée":"Profile photo uploaded",checked:false},{title:fr?"Bio rédigée":"Bio written",checked:false},{title:fr?"Tarifs validés par manager":"Rates validated by manager",checked:false},{title:fr?"Première vidéo envoyée":"First video sent",checked:false},{title:fr?"Premier post publié":"First post published",checked:false},{title:fr?"Compte vérifié":"Account verified",checked:false}]};
+        })();
+        const onboardPct = onboardItems.items.length>0?Math.round(onboardItems.items.filter(it=>it.checked).length/onboardItems.items.length*100):0;
+
+        // Content week navigation
+        const weekStart = new Date(); weekStart.setDate(weekStart.getDate()-weekStart.getDay()+1+(contentWeekOffset*7)); weekStart.setHours(0,0,0,0);
+        const weekEnd = new Date(weekStart); weekEnd.setDate(weekEnd.getDate()+6); weekEnd.setHours(23,59,59,999);
+        const weekLabel = `${weekStart.toLocaleDateString(fr?"fr-FR":"en-US",{day:"numeric",month:"short"})} - ${weekEnd.toLocaleDateString(fr?"fr-FR":"en-US",{day:"numeric",month:"short"})}`;
+        const weekContentItems = mContent.filter(c=>{ const d=new Date(c.due_date||c.created_at); return d>=weekStart&&d<=weekEnd; });
+
+        // Task CRUD handlers
+        const handleSaveTask = async () => {
+          if(!taskForm.title.trim()) return;
+          setModalSaving(true);
+          try {
+            await sb.from("model_tasks").insert({model_id:modalModel,assigned_by:user.id,title:taskForm.title.trim(),description:taskForm.description,category:taskForm.category,priority:taskForm.priority,due_date:taskForm.due_date||null});
+            setTaskForm({title:"",description:"",category:"general",priority:"medium",due_date:""});
+            setShowTaskForm(false);
+            await onRefresh();
+          } catch(e){ addToast("Erreur: "+e.message,"error"); }
+          setModalSaving(false);
+        };
+        const handleTaskStatus = async (taskId,newStatus) => {
+          try {
+            await sb.from("model_tasks").update({status:newStatus,completed_at:newStatus==="done"?new Date().toISOString():null}).eq("id",taskId);
+            await onRefresh();
+          } catch(e){ addToast("Erreur: "+e.message,"error"); }
+        };
+        const handleDeleteTask = async (taskId) => {
+          try { await sb.from("model_tasks").delete().eq("id",taskId); await onRefresh(); } catch(e){ addToast("Erreur","error"); }
+        };
+
+        // Content CRUD handlers
+        const handleSaveContent = async () => {
+          if(!contentForm.title.trim()) return;
+          setModalSaving(true);
+          try {
+            await sb.from("content_list").insert({model_id:modalModel,assigned_by:user.id,title:contentForm.title.trim(),description:contentForm.description,content_type:contentForm.content_type,platform:contentForm.platform,due_date:contentForm.due_date||null,bonus_amount:contentForm.bonus_amount?Number(contentForm.bonus_amount):null});
+            setContentForm({title:"",description:"",content_type:"photo",platform:"onlyfans",due_date:"",bonus_amount:""});
+            setShowContentForm(false);
+            await onRefresh();
+          } catch(e){ addToast("Erreur: "+e.message,"error"); }
+          setModalSaving(false);
+        };
+        const handleContentStatus = async (cId,newStatus) => {
+          try {
+            await sb.from("content_list").update({status:newStatus,completed_at:newStatus==="published"?new Date().toISOString():null}).eq("id",cId);
+            await onRefresh();
+          } catch(e){ addToast("Erreur: "+e.message,"error"); }
+        };
+        const handleDeleteContent = async (cId) => {
+          try { await sb.from("content_list").delete().eq("id",cId); await onRefresh(); } catch(e){ addToast("Erreur","error"); }
+        };
+
+        // Onboarding toggle handler
+        const handleToggleOnboard = async (idx) => {
+          const updated = [...onboardItems.items];
+          updated[idx] = {...updated[idx], checked:!updated[idx].checked};
+          if(onboardItems.instance) {
+            try { await sb.from("checklist_instances").update({items:updated}).eq("id",onboardItems.instance.id); await onRefresh(); } catch(e){}
+          } else {
+            // Create new instance
+            const tpl = mTemplates[0];
+            try { await sb.from("checklist_instances").insert({model_id:modalModel,template_id:tpl?.id||null,date:new Date().toISOString().slice(0,10),items:updated}); await onRefresh(); } catch(e){}
+          }
+        };
+
+        // Performance: top 5 spenders
+        const spenderMap = {};
+        sel.validated.forEach(tx=>{ const h=tx.spender_handle; if(!h) return; spenderMap[h]=(spenderMap[h]||0)+convertAmount(Number(tx.amount),tx.currency); });
+        const topSpenders = Object.entries(spenderMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
+
+        // Performance: weekly CA (last 8 weeks)
+        const weeklyCA = [];
+        for(let w=7;w>=0;w--){
+          const ws = new Date(); ws.setDate(ws.getDate()-ws.getDay()+1-w*7); ws.setHours(0,0,0,0);
+          const we = new Date(ws); we.setDate(we.getDate()+6); we.setHours(23,59,59,999);
+          const wCA = sel.validated.filter(tx=>{const d=new Date(tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+          weeklyCA.push({label:`S${8-w}`,ca:Math.round(wCA)});
+        }
+        const maxWeekCA = Math.max(...weeklyCA.map(w=>w.ca),1);
+
+        const modalTabs = [{id:"onboarding",label:"Onboarding",icon:"\u2705"},{id:"contenu",label:fr?"Planning Contenu":"Content Plan",icon:"\ud83d\udcf8"},{id:"taches",label:fr?"T\u00e2ches":"Tasks",icon:"\ud83d\udcdd"},{id:"performance",label:"Performance",icon:"\ud83d\udcca"}];
+        const contentStatuses = [{id:"pending",label:fr?"En attente":"Pending",color:"var(--text-quaternary)"},{id:"shooting",label:"Shooting",color:"var(--warning)"},{id:"editing",label:fr?"Montage":"Editing",color:"var(--blue-accent,#60A5FA)"},{id:"ready",label:fr?"Pr\u00eat":"Ready",color:"var(--accent)"},{id:"published",label:fr?"Publi\u00e9":"Published",color:"var(--success)"}];
+        const taskPriColors = {urgent:"var(--danger)",high:"var(--warning)",medium:"var(--text-tertiary)",low:"var(--text-quaternary)"};
+
+        return (
+          <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:5000}} onClick={()=>{setModalModel(null);setShowTaskForm(false);setShowContentForm(false);}}>
+            <div style={{width:860,maxHeight:"90vh",overflowY:"auto",background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:24,boxShadow:"var(--shadow-lg)"}} onClick={e=>e.stopPropagation()}>
+              {/* Modal Header */}
+              <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div style={{display:"flex",alignItems:"center",gap:12}}>
+                  <div style={{width:48,height:48,borderRadius:"50%",background:avatarColors[(sel.name||"").charCodeAt(0)%avatarColors.length],display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff"}}>{(sel.name||"?")[0]}</div>
+                  <div>
+                    <div style={{fontSize:18,fontWeight:800}}>{sel.name}</div>
+                    <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{sel.chatters.length} chatter{sel.chatters.length>1?"s":""} · {Math.round(sel.ca).toLocaleString()}{currencySymbol} CA</div>
+                  </div>
+                </div>
+                <button onClick={()=>setModalModel(null)} style={{background:"none",border:"none",fontSize:20,cursor:"pointer",color:"var(--text-tertiary)",padding:8}}>{"\u2715"}</button>
+              </div>
+              {/* Tab bar */}
+              <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border-subtle)"}}>
+                {modalTabs.map(mt=>(
+                  <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{flex:1,padding:"12px 16px",border:"none",borderBottom:modalTab===mt.id?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:modalTab===mt.id?"var(--accent)":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>{mt.icon} {mt.label}</button>
+                ))}
+              </div>
+              {/* Tab Content */}
+              <div style={{padding:24}}>
+
+                {/* ═══ TAB: ONBOARDING ═══ */}
+                {modalTab==="onboarding"&&(
+                  <div>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                      <div style={{fontSize:14,fontWeight:700}}>{fr?"Checklist Onboarding":"Onboarding Checklist"}</div>
+                      <span style={{fontSize:13,fontWeight:700,color:onboardPct>=80?"var(--success)":onboardPct>=50?"var(--warning)":"var(--danger)"}}>{onboardPct}%</span>
+                    </div>
+                    <div style={{height:8,borderRadius:4,background:"rgba(255,255,255,0.06)",overflow:"hidden",marginBottom:20}}>
+                      <div style={{width:`${onboardPct}%`,height:"100%",borderRadius:4,background:onboardPct>=80?"var(--success)":onboardPct>=50?"var(--warning)":"var(--danger)",transition:"width 0.3s"}}/>
+                    </div>
+                    <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                      {onboardItems.items.map((item,i)=>(
+                        <div key={i} onClick={()=>handleToggleOnboard(i)} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderRadius:12,background:item.checked?"rgba(52,211,153,0.08)":"rgba(255,255,255,0.03)",border:`1px solid ${item.checked?"rgba(52,211,153,0.2)":"var(--border-subtle)"}`,cursor:"pointer",transition:"all 0.2s"}}>
+                          <div style={{width:22,height:22,borderRadius:6,border:`2px solid ${item.checked?"var(--success)":"var(--text-quaternary)"}`,display:"flex",alignItems:"center",justifyContent:"center",background:item.checked?"var(--success)":"transparent",flexShrink:0}}>
+                            {item.checked&&<span style={{color:"#fff",fontSize:12,fontWeight:800}}>{"\u2713"}</span>}
+                          </div>
+                          <span style={{fontSize:13,fontWeight:600,color:item.checked?"var(--success)":"var(--text-primary)",textDecoration:item.checked?"line-through":"none"}}>{item.title}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ═══ TAB: PLANNING CONTENU ═══ */}
+                {modalTab==="contenu"&&(
+                  <div>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                      <div style={{display:"flex",alignItems:"center",gap:12}}>
+                        <button onClick={()=>setContentWeekOffset(p=>p-1)} style={{background:"none",border:"1px solid var(--border-subtle)",borderRadius:8,padding:"4px 10px",cursor:"pointer",color:"var(--text-secondary)",fontSize:14,fontFamily:"'DM Sans',sans-serif"}}>{"\u2190"}</button>
+                        <span style={{fontSize:13,fontWeight:700}}>{weekLabel}</span>
+                        <button onClick={()=>setContentWeekOffset(p=>p+1)} style={{background:"none",border:"1px solid var(--border-subtle)",borderRadius:8,padding:"4px 10px",cursor:"pointer",color:"var(--text-secondary)",fontSize:14,fontFamily:"'DM Sans',sans-serif"}}>{"\u2192"}</button>
+                      </div>
+                      <button className="btn btn-primary btn-small" onClick={()=>{setContentForm({title:"",description:"",content_type:"photo",platform:"onlyfans",due_date:weekStart.toISOString().slice(0,10),bonus_amount:""});setShowContentForm(true);}}>{"\u2795"} {fr?"Ajouter":"Add"}</button>
+                    </div>
+                    {showContentForm&&(
+                      <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid var(--border-subtle)",borderRadius:12,padding:16,marginBottom:16}}>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                          <input className="filter-select" style={{width:"100%"}} placeholder={fr?"Titre *":"Title *"} value={contentForm.title} onChange={e=>setContentForm({...contentForm,title:e.target.value})}/>
+                          <select className="filter-select" style={{width:"100%"}} value={contentForm.content_type} onChange={e=>setContentForm({...contentForm,content_type:e.target.value})}>
+                            <option value="photo">Photo</option><option value="video">{fr?"Vid\u00e9o":"Video"}</option><option value="live">Live</option><option value="custom">Custom</option>
+                          </select>
+                          <select className="filter-select" style={{width:"100%"}} value={contentForm.platform} onChange={e=>setContentForm({...contentForm,platform:e.target.value})}>
+                            <option value="onlyfans">OnlyFans</option><option value="fansly">Fansly</option><option value="mym">MYM</option><option value="other">{fr?"Autre":"Other"}</option>
+                          </select>
+                          <input className="filter-select" style={{width:"100%"}} type="date" value={contentForm.due_date} onChange={e=>setContentForm({...contentForm,due_date:e.target.value})}/>
+                        </div>
+                        <div style={{display:"flex",gap:8}}>
+                          <button className="btn btn-primary btn-small" onClick={handleSaveContent} disabled={modalSaving}>{modalSaving?React.createElement(Spinner):fr?"Cr\u00e9er":"Create"}</button>
+                          <button className="btn btn-small" onClick={()=>setShowContentForm(false)}>{fr?"Annuler":"Cancel"}</button>
+                        </div>
+                      </div>
+                    )}
+                    {weekContentItems.length===0&&<div style={{textAlign:"center",color:"var(--text-quaternary)",padding:30}}>{fr?"Aucun contenu cette semaine":"No content this week"}</div>}
+                    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                      {weekContentItems.map(c=>{
+                        const cSt = contentStatuses.find(s=>s.id===c.status)||contentStatuses[0];
+                        return (
+                          <div key={c.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",borderRadius:10,background:"rgba(255,255,255,0.03)",border:"1px solid var(--border-subtle)"}}>
+                            <span style={{fontSize:16}}>{c.content_type==="photo"?"\ud83d\udcf7":c.content_type==="video"?"\ud83c\udfa5":c.content_type==="live"?"\ud83d\udfe2":"\ud83d\udccc"}</span>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontSize:13,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.title}</div>
+                              <div style={{fontSize:10,color:"var(--text-quaternary)"}}>{c.platform} {c.due_date?`· ${c.due_date.slice(5)}`:""}</div>
+                            </div>
+                            <select value={c.status} onChange={e=>handleContentStatus(c.id,e.target.value)} onClick={e=>e.stopPropagation()} style={{padding:"4px 8px",borderRadius:8,border:"1px solid var(--border-subtle)",background:"transparent",color:cSt.color,fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>
+                              {contentStatuses.map(s=><option key={s.id} value={s.id}>{s.label}</option>)}
+                            </select>
+                            <button onClick={()=>handleDeleteContent(c.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text-quaternary)",fontSize:14}}>{"\ud83d\uddd1"}</button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* ═══ TAB: TÂCHES (Kanban 3 cols) ═══ */}
+                {modalTab==="taches"&&(
+                  <div>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                      <div style={{fontSize:14,fontWeight:700}}>{fr?"T\u00e2ches":"Tasks"} ({mTasks.length})</div>
+                      <button className="btn btn-primary btn-small" onClick={()=>{setTaskForm({title:"",description:"",category:"general",priority:"medium",due_date:""});setShowTaskForm(true);}}>{"\u2795"} {fr?"Ajouter":"Add"}</button>
+                    </div>
+                    {showTaskForm&&(
+                      <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid var(--border-subtle)",borderRadius:12,padding:16,marginBottom:16}}>
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+                          <input className="filter-select" style={{width:"100%",gridColumn:"1/-1"}} placeholder={fr?"Titre de la t\u00e2che *":"Task title *"} value={taskForm.title} onChange={e=>setTaskForm({...taskForm,title:e.target.value})}/>
+                          <select className="filter-select" style={{width:"100%"}} value={taskForm.category} onChange={e=>setTaskForm({...taskForm,category:e.target.value})}>
+                            <option value="general">{fr?"G\u00e9n\u00e9ral":"General"}</option><option value="content">{fr?"Contenu":"Content"}</option><option value="social">Social</option><option value="admin">Admin</option><option value="communication">Communication</option>
+                          </select>
+                          <select className="filter-select" style={{width:"100%"}} value={taskForm.priority} onChange={e=>setTaskForm({...taskForm,priority:e.target.value})}>
+                            <option value="low">{fr?"Basse":"Low"}</option><option value="medium">{fr?"Moyenne":"Medium"}</option><option value="high">{fr?"Haute":"High"}</option><option value="urgent">Urgent</option>
+                          </select>
+                          <input className="filter-select" style={{width:"100%"}} type="date" value={taskForm.due_date} onChange={e=>setTaskForm({...taskForm,due_date:e.target.value})}/>
+                        </div>
+                        <div style={{display:"flex",gap:8}}>
+                          <button className="btn btn-primary btn-small" onClick={handleSaveTask} disabled={modalSaving}>{modalSaving?React.createElement(Spinner):fr?"Cr\u00e9er":"Create"}</button>
+                          <button className="btn btn-small" onClick={()=>setShowTaskForm(false)}>{fr?"Annuler":"Cancel"}</button>
+                        </div>
+                      </div>
+                    )}
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
+                      {[{id:"todo",label:fr?"\u00c0 faire":"To Do",color:"var(--text-quaternary)"},{id:"in_progress",label:fr?"En cours":"In Progress",color:"var(--warning)"},{id:"done",label:fr?"Fait":"Done",color:"var(--success)"}].map(col=>(
+                        <div key={col.id} style={{background:"rgba(255,255,255,0.02)",borderRadius:12,padding:12,minHeight:200}}>
+                          <div style={{fontSize:11,fontWeight:700,color:col.color,textTransform:"uppercase",letterSpacing:0.5,marginBottom:10,display:"flex",justifyContent:"space-between"}}>
+                            <span>{col.label}</span>
+                            <span style={{fontSize:10,fontWeight:600}}>{mTasks.filter(t=>t.status===col.id).length}</span>
+                          </div>
+                          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                            {mTasks.filter(t=>t.status===col.id).map(task=>(
+                              <div key={task.id} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:10,padding:"10px 12px"}}>
+                                <div style={{display:"flex",justifyContent:"space-between",alignItems:"start",gap:6}}>
+                                  <div style={{fontSize:12,fontWeight:600,color:"var(--text-primary)",flex:1}}>{task.title}</div>
+                                  <button onClick={()=>handleDeleteTask(task.id)} style={{background:"none",border:"none",cursor:"pointer",color:"var(--text-quaternary)",fontSize:11,flexShrink:0,padding:0}}>{"\u2715"}</button>
+                                </div>
+                                {task.due_date&&<div style={{fontSize:9,color:"var(--text-quaternary)",marginTop:4}}>{task.due_date.slice(0,10)}</div>}
+                                <div style={{display:"flex",gap:4,marginTop:6}}>
+                                  <span style={{fontSize:8,padding:"1px 6px",borderRadius:4,background:"rgba(255,255,255,0.05)",color:taskPriColors[task.priority]||"var(--text-quaternary)",fontWeight:700}}>{task.priority}</span>
+                                  <select value={task.status} onChange={e=>handleTaskStatus(task.id,e.target.value)} style={{fontSize:9,padding:"1px 4px",borderRadius:4,border:"1px solid var(--border-subtle)",background:"transparent",color:"var(--text-secondary)",cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>
+                                    <option value="todo">{fr?"\u00c0 faire":"To Do"}</option><option value="in_progress">{fr?"En cours":"In Progress"}</option><option value="done">{fr?"Fait":"Done"}</option>
+                                  </select>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* ═══ TAB: PERFORMANCE ═══ */}
+                {modalTab==="performance"&&(
+                  <div>
+                    {/* KPIs */}
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+                      {[
+                        {label:"CA",value:`${Math.round(sel.ca).toLocaleString()}${currencySymbol}`,color:"var(--success)"},
+                        {label:fr?"D\u00e9penses":"Expenses",value:`${Math.round(sel.totalExp).toLocaleString()}${currencySymbol}`,color:"var(--danger)"},
+                        {label:fr?"B\u00e9n\u00e9fice":"Profit",value:`${Math.round(sel.benefice).toLocaleString()}${currencySymbol}`,color:sel.benefice>=0?"var(--success)":"var(--danger)"},
+                        {label:"Marge",value:`${sel.margin}%`,color:sel.margin>=70?"var(--success)":sel.margin>=40?"var(--warning)":"var(--danger)"},
+                        {label:"TX",value:`${sel.txCount}`,color:"var(--text-primary)"},
+                        {label:fr?"Panier moyen":"Avg Ticket",value:`${sel.avgTicket}${currencySymbol}`,color:"var(--text-primary)"},
+                      ].map((k,i)=>(
+                        <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                          <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{k.label}</div>
+                          <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.value}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {/* CA/Week bar chart */}
+                    <div style={{marginBottom:20}}>
+                      <div style={{fontSize:12,fontWeight:700,marginBottom:10}}>{fr?"CA par semaine (8 derni\u00e8res)":"Revenue per week (last 8)"}</div>
+                      <div style={{display:"flex",alignItems:"flex-end",gap:6,height:100}}>
+                        {weeklyCA.map((w,i)=>(
+                          <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+                            <span style={{fontSize:9,color:"var(--text-quaternary)"}}>{w.ca>0?`${w.ca}`:""}</span>
+                            <div style={{width:"100%",height:Math.max(4,Math.round((w.ca/maxWeekCA)*80)),borderRadius:4,background:i===weeklyCA.length-1?"var(--accent)":"var(--success)",transition:"height 0.3s"}}/>
+                            <span style={{fontSize:8,color:"var(--text-quaternary)"}}>{w.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    {/* Top 5 spenders */}
+                    <div>
+                      <div style={{fontSize:12,fontWeight:700,marginBottom:10}}>{fr?"Top 5 spenders":"Top 5 spenders"}</div>
+                      {topSpenders.length===0&&<div style={{fontSize:11,color:"var(--text-quaternary)"}}>{fr?"Aucun spender":"No spenders"}</div>}
+                      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                        {topSpenders.map(([handle,amount],i)=>(
+                          <div key={handle} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 12px",borderRadius:10,background:"rgba(255,255,255,0.03)"}}>
+                            <span style={{fontSize:12,fontWeight:800,color:"var(--text-quaternary)",width:20}}>{i+1}.</span>
+                            <span style={{fontSize:13,fontWeight:700,flex:1}}>@{handle}</span>
+                            <span style={{fontSize:13,fontWeight:800,color:"var(--success)"}}>{Math.round(amount).toLocaleString()}{currencySymbol}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── EXPENSE FORM MODAL ── */}
       {showExpenseForm&&<div className="modal-overlay" onClick={()=>setShowExpenseForm(false)}>
@@ -15686,7 +16029,7 @@ const App = () => {
       case "equipe":
         return (<>{renderGerantTabBar("equipe")}
           {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} />}
-          {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
+          {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} />}
           {subTab==="providers"&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} />}
         </>);
       case "messagerie":
