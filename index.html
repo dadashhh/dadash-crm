@@ -1559,6 +1559,212 @@ const FAB_ACTIONS_CHATTER = [
   { id: "verify_screen", label: "Vérifier Screen", icon: "\u{1F4F8}", color: "#F59E0B" },
 ];
 
+// =============================================
+// LOGS & AUDIT TIMELINE (PR#23)
+// =============================================
+const LogsAuditTab = ({lang, txs, chatterLogs, screenshotChecks, broadcasts, profiles, spenders}) => {
+  const { convertAmount, fmtAmount } = useCurrency();
+  const fr = lang === "fr";
+  const PAGE_SIZE = 40;
+  const [filterType, setFilterType] = useState("all");
+  const [filterSearch, setFilterSearch] = useState("");
+  const [page, setPage] = useState(0);
+
+  // ── Build unified timeline from all sources ──
+  const timeline = useMemo(() => {
+    const items = [];
+    // TX events
+    (txs || []).forEach(tx => {
+      const profile = (profiles || []).find(p => p.id === tx.chatter_id);
+      items.push({
+        type: "tx",
+        icon: "\u{1F4B0}",
+        color: tx.status === "validated" ? "var(--success)" : tx.status === "refused" ? "var(--danger)" : "var(--warning)",
+        date: tx.date || tx.created_at,
+        title: (fr ? "Transaction " : "Transaction ") + (tx.status === "validated" ? (fr ? "validée" : "validated") : tx.status === "refused" ? (fr ? "refusée" : "refused") : (fr ? "en attente" : "pending")),
+        detail: "@" + (tx.spender_handle || "?") + " \u2192 " + fmtAmount(convertAmount(Number(tx.amount), tx.currency)),
+        sub: (profile ? profile.name : "") + (tx.model_id ? "" : ""),
+        badge: tx.status,
+        badgeColor: tx.status === "validated" ? "var(--success)" : tx.status === "refused" ? "var(--danger)" : "var(--warning)",
+        amount: convertAmount(Number(tx.amount), tx.currency),
+        raw: tx,
+      });
+    });
+    // Chatter logs (messages)
+    (chatterLogs || []).forEach(log => {
+      const profile = (profiles || []).find(p => p.id === log.chatter_id);
+      items.push({
+        type: "message",
+        icon: "\u{1F4AC}",
+        color: log.action === "message_sent" ? "var(--info)" : log.action === "hand_back_bot" ? "var(--warning)" : "var(--accent)",
+        date: log.created_at,
+        title: (profile ? profile.name : "Chatter") + " \u2014 " + (log.action || "log"),
+        detail: log.content ? log.content.slice(0, 80) + (log.content.length > 80 ? "..." : "") : log.action,
+        sub: log.conversation_id ? "Conv " + String(log.conversation_id).slice(0, 8) : "",
+        badge: log.action,
+        badgeColor: "var(--info)",
+        amount: 0,
+        raw: log,
+      });
+    });
+    // Scans (screenshot checks)
+    (screenshotChecks || []).forEach(sc => {
+      const profile = (profiles || []).find(p => p.id === sc.checker_id || p.id === sc.chatter_id);
+      items.push({
+        type: "scan",
+        icon: "\u{1F4F8}",
+        color: sc.status === "validated" ? "var(--success)" : sc.status === "rejected" ? "var(--danger)" : "var(--warning)",
+        date: sc.created_at,
+        title: (fr ? "Scan " : "Scan ") + (sc.status === "validated" ? (fr ? "validé" : "validated") : sc.status === "rejected" ? (fr ? "rejeté" : "rejected") : (fr ? "en attente" : "pending")),
+        detail: (sc.spender_handle || sc.spender_id || "") + (sc.amount ? " \u2014 " + fmtAmount(convertAmount(Number(sc.amount), sc.currency)) : ""),
+        sub: profile ? profile.name : "",
+        badge: sc.status,
+        badgeColor: sc.status === "validated" ? "var(--success)" : sc.status === "rejected" ? "var(--danger)" : "var(--warning)",
+        amount: sc.amount ? convertAmount(Number(sc.amount), sc.currency) : 0,
+        raw: sc,
+      });
+    });
+    // Broadcasts
+    (broadcasts || []).forEach(bc => {
+      items.push({
+        type: "broadcast",
+        icon: "\u{1F4E2}",
+        color: bc.status === "sent" ? "var(--success)" : bc.status === "scheduled" ? "var(--warning)" : "var(--text-tertiary)",
+        date: bc.created_at,
+        title: (fr ? "Broadcast" : "Broadcast") + (bc.status ? " \u2014 " + bc.status : ""),
+        detail: (bc.message || bc.content || "").slice(0, 80) + ((bc.message || bc.content || "").length > 80 ? "..." : ""),
+        sub: bc.segment ? "Segment: " + bc.segment : "",
+        badge: bc.status || "sent",
+        badgeColor: bc.status === "sent" ? "var(--success)" : "var(--warning)",
+        amount: 0,
+        raw: bc,
+      });
+    });
+    return items.sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [txs, chatterLogs, screenshotChecks, broadcasts, profiles, convertAmount, fmtAmount, fr]);
+
+  // ── Filter ──
+  const filtered = useMemo(() => {
+    let list = timeline;
+    if (filterType !== "all") list = list.filter(i => i.type === filterType);
+    if (filterSearch.trim()) {
+      const q = filterSearch.toLowerCase();
+      list = list.filter(i => (i.title + " " + i.detail + " " + i.sub).toLowerCase().includes(q));
+    }
+    return list;
+  }, [timeline, filterType, filterSearch]);
+
+  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+  const pageItems = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+  // ── KPIs ──
+  const txCount = timeline.filter(i => i.type === "tx").length;
+  const msgCount = timeline.filter(i => i.type === "message").length;
+  const scanCount = timeline.filter(i => i.type === "scan").length;
+  const bcCount = timeline.filter(i => i.type === "broadcast").length;
+  const totalTxAmount = timeline.filter(i => i.type === "tx").reduce((s, i) => s + i.amount, 0);
+
+  // ── CSV Export ──
+  const exportCSV = () => {
+    const headers = ["Date", "Type", "Title", "Detail", "Badge", "Amount"];
+    const rows = filtered.map(i => [
+      i.date ? new Date(i.date).toISOString().slice(0, 19).replace("T", " ") : "",
+      i.type,
+      '"' + (i.title || "").replace(/"/g, '""') + '"',
+      '"' + (i.detail || "").replace(/"/g, '""') + '"',
+      i.badge || "",
+      i.amount ? i.amount.toFixed(2) : "0",
+    ]);
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "logs-audit-" + new Date().toISOString().slice(0, 10) + ".csv";
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  const TYPE_FILTERS = [
+    { id: "all", label: fr ? "Tout" : "All", icon: "\u{1F4CB}", count: timeline.length },
+    { id: "tx", label: fr ? "Transactions" : "Transactions", icon: "\u{1F4B0}", count: txCount },
+    { id: "message", label: "Messages", icon: "\u{1F4AC}", count: msgCount },
+    { id: "scan", label: "Scans", icon: "\u{1F4F8}", count: scanCount },
+    { id: "broadcast", label: "Broadcasts", icon: "\u{1F4E2}", count: bcCount },
+  ];
+
+  return (
+    <div>
+      {/* ── KPI CARDS ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: 14, marginBottom: 24 }}>
+        {[
+          { label: fr ? "Total événements" : "Total events", value: String(timeline.length), color: "var(--accent)", icon: "\u{1F4CB}" },
+          { label: "Transactions", value: String(txCount), color: "var(--success)", icon: "\u{1F4B0}" },
+          { label: "Messages", value: String(msgCount), color: "var(--info)", icon: "\u{1F4AC}" },
+          { label: "Scans", value: String(scanCount), color: "var(--warning)", icon: "\u{1F4F8}" },
+          { label: "Broadcasts", value: String(bcCount), color: "var(--pink)", icon: "\u{1F4E2}" },
+          { label: fr ? "Volume TX" : "TX Volume", value: fmtAmount(totalTxAmount), color: "var(--accent)", icon: "\u{1F4B0}" },
+        ].map(k => (
+          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: "16px 18px" }}>
+            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: k.color }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── FILTERS BAR ── */}
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 20 }}>
+        {TYPE_FILTERS.map(f => (
+          <button key={f.id} onClick={() => { setFilterType(f.id); setPage(0); }} style={{ padding: "6px 14px", fontSize: 12, fontWeight: filterType === f.id ? 800 : 600, background: filterType === f.id ? "var(--accent)" : "var(--card-bg)", color: filterType === f.id ? "#fff" : "var(--text-secondary)", border: "1px solid " + (filterType === f.id ? "var(--accent)" : "var(--border-subtle)"), borderRadius: 20, cursor: "pointer", transition: "all .15s" }}>
+            {f.icon} {f.label} <span style={{ opacity: 0.7, marginLeft: 4 }}>({f.count})</span>
+          </button>
+        ))}
+        <div style={{ flex: 1 }} />
+        <input type="text" placeholder={fr ? "Rechercher..." : "Search..."} value={filterSearch} onChange={e => { setFilterSearch(e.target.value); setPage(0); }} style={{ padding: "6px 14px", fontSize: 12, borderRadius: 20, border: "1px solid var(--border-subtle)", background: "var(--card-bg)", color: "var(--text)", width: 180 }} />
+        <button onClick={exportCSV} style={{ padding: "6px 14px", fontSize: 12, fontWeight: 700, background: "var(--card-bg)", color: "var(--accent)", border: "1px solid var(--accent)", borderRadius: 20, cursor: "pointer" }}>
+          {"\u{1F4E4}"} CSV ({filtered.length})
+        </button>
+      </div>
+
+      {/* ── TIMELINE FEED ── */}
+      {pageItems.length === 0 && (
+        <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 60 }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>{"\u{1F4CB}"}</div>
+          {fr ? "Aucun événement trouvé" : "No events found"}
+        </div>
+      )}
+
+      {pageItems.map((item, idx) => (
+        <div key={idx} style={{ display: "flex", gap: 14, padding: "14px 18px", background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 14, marginBottom: 6, alignItems: "flex-start", transition: "background .15s" }}>
+          {/* Icon */}
+          <div style={{ width: 38, height: 38, borderRadius: 10, background: item.color + "15", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>{item.icon}</div>
+          {/* Content */}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{item.title}</span>
+              <span style={{ padding: "2px 8px", borderRadius: 10, background: item.badgeColor + "15", color: item.badgeColor, fontSize: 10, fontWeight: 700 }}>{item.badge}</span>
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.detail}</div>
+            {item.sub && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>{item.sub}</div>}
+          </div>
+          {/* Right: amount + date */}
+          <div style={{ textAlign: "right", flexShrink: 0 }}>
+            {item.amount > 0 && <div style={{ fontSize: 14, fontWeight: 800, color: "var(--accent)" }}>{fmtAmount(item.amount)}</div>}
+            <div style={{ fontSize: 10, color: "var(--text-quaternary)", marginTop: 2 }}>{item.date ? fmtDate(item.date) : ""}</div>
+          </div>
+        </div>
+      ))}
+
+      {/* ── PAGINATION ── */}
+      {totalPages > 1 && (
+        <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, marginTop: 20 }}>
+          <button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0} style={{ padding: "6px 14px", fontSize: 12, borderRadius: 10, border: "1px solid var(--border-subtle)", background: page === 0 ? "var(--bg-overlay)" : "var(--card-bg)", color: page === 0 ? "var(--text-quaternary)" : "var(--text)", cursor: page === 0 ? "default" : "pointer" }}>{"\u2190"}</button>
+          <span style={{ fontSize: 12, color: "var(--text-secondary)", fontWeight: 600 }}>{page + 1} / {totalPages}</span>
+          <button onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1} style={{ padding: "6px 14px", fontSize: 12, borderRadius: 10, border: "1px solid var(--border-subtle)", background: page >= totalPages - 1 ? "var(--bg-overlay)" : "var(--card-bg)", color: page >= totalPages - 1 ? "var(--text-quaternary)" : "var(--text)", cursor: page >= totalPages - 1 ? "default" : "pointer" }}>{"\u2192"}</button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const PlaceholderTab = ({ title }) => (
   React.createElement("div", {style:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:400,color:"#6B7280",background:"#1A1A2E",borderRadius:16,border:"1px solid #2A2A3E",margin:"24px 0"}},
     React.createElement("span", {style:{fontSize:48,marginBottom:16}}, "\u{1F6A7}"),
@@ -18813,7 +19019,7 @@ const App = () => {
               </table>
             </div>
           )}
-          {subTab==="logs"&&<PlaceholderTab title={lang==="fr"?"Logs & Audit":"Logs & Audit"} />}
+          {subTab==="logs"&&<LogsAuditTab lang={lang} txs={txs} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} profiles={profiles} spenders={spenders} />}
           {subTab==="export"&&<PlaceholderTab title={lang==="fr"?"Export & Rapports":"Export & Reports"} />}
           {subTab==="settings"&&<PlaceholderTab title={lang==="fr"?"Paramètres":"Settings"} />}
         </>);
