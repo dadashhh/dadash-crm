@@ -6006,107 +6006,281 @@ const PayesTab = ({user, lang, txs, payouts, profiles, onRefresh, invoices}) => 
 // =============================================
 // CHATTERS TAB (gerant only)
 // =============================================
-const ChattersTab = ({user, lang, txs, profiles, models}) => {
+const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}) => {
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
-  const [selectedId, setSelectedId] = useState(null);
+  const fr = lang === "fr";
+  const [modalChatter, setModalChatter] = useState(null);
+  const [modalTab, setModalTab] = useState("performance");
+  const [assignForm, setAssignForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const addToast = useToast();
   const chatters = profiles.filter(u=>u.role==="chatter");
-  const getStats = (chatterId) => {
-    const chTx = txs.filter(tx=>tx.chatter_id===chatterId);
-    const validTx = chTx.filter(tx=>tx.status==="validated");
-    const validCA = validTx.reduce((s,tx)=>s+Number(tx.amount),0);
-    const pendingCA = chTx.filter(tx=>tx.status==="pending").reduce((s,tx)=>s+Number(tx.amount),0);
-    const refusedCount = chTx.filter(tx=>tx.status==="refused").length;
-    const commDue = validTx.reduce((s,tx)=>s+Number(tx.chatter_commission||0),0);
-    const avgTicket = validTx.length ? validCA/validTx.length : 0;
-    const spenders = [...new Set(chTx.map(tx=>tx.spender_handle))];
-    return {validCA, validCount:validTx.length, pendingCA, pendingCount:chTx.filter(tx=>tx.status==="pending").length, refusedCount, commDue, avgTicket, spenders};
+  const avatarColors = ["#8B5CF6","#EC4899","#F59E0B","#10B981","#3B82F6","#EF4444","#6366F1","#14B8A6"];
+
+  const chatterStats = useMemo(()=>{
+    return chatters.map(ch => {
+      const chTx = txs.filter(tx=>tx.chatter_id===ch.id);
+      const validTx = chTx.filter(tx=>tx.status==="validated"||tx.status==="confirmee");
+      const pendingTx = chTx.filter(tx=>tx.status==="pending");
+      const validCA = validTx.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+      const pendingCA = pendingTx.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+      const refusedCount = chTx.filter(tx=>tx.status==="refused").length;
+      const convRate = chTx.length>0?Math.round((validTx.length/chTx.length)*100):0;
+      const avgTicket = validTx.length>0?Math.round(validCA/validTx.length):0;
+      const commDue = validTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
+      const spenders = [...new Set(chTx.map(tx=>tx.spender_handle).filter(Boolean))];
+      const assignedModels = (ch.assigned_models||[]).map(mid=>models.find(m=>m.id===mid)).filter(Boolean);
+      const xp = calculateXP(ch.id,txs,convertAmount);
+      const streak = calculateStreak(ch.id,txs);
+      // Blocked messages from logs
+      const myLogs = (chatterLogs||[]).filter(l=>l.chatter_id===ch.id);
+      const msgCount = myLogs.filter(l=>l.action==="message_sent").length;
+      // Score = XP (revenue-based)
+      const score = xp;
+      // Weekly CA (last 8 weeks)
+      const weeklyCA = [];
+      for(let w=7;w>=0;w--){
+        const ws=new Date(); ws.setDate(ws.getDate()-ws.getDay()+1-w*7); ws.setHours(0,0,0,0);
+        const we=new Date(ws); we.setDate(we.getDate()+6); we.setHours(23,59,59,999);
+        const wCA = validTx.filter(tx=>{const d=new Date(tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+        weeklyCA.push({label:`S${8-w}`,ca:Math.round(wCA)});
+      }
+      // CA per model
+      const caByModel = {};
+      assignedModels.forEach(m=>{
+        const mCA = validTx.filter(tx=>tx.model_id===m.id).reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+        caByModel[m.id] = {name:m.name,ca:mCA};
+      });
+      return {...ch,chTx,validTx,pendingTx,validCA,pendingCA,refusedCount,convRate,avgTicket,commDue,spenders,assignedModels,xp,streak,myLogs,msgCount,score,weeklyCA,caByModel};
+    }).sort((a,b)=>b.validCA-a.validCA);
+  },[chatters,txs,models,chatterLogs,convertAmount]);
+
+  const totalValidCA = chatterStats.reduce((s,ch)=>s+ch.validCA,0);
+  const avgCA = chatterStats.length>0?totalValidCA/chatterStats.length:0;
+
+  // Model assign/unassign handler
+  const handleModelToggle = async (chatterId, modelId) => {
+    const ch = profiles.find(p=>p.id===chatterId);
+    if(!ch) return;
+    const current = ch.assigned_models||[];
+    const updated = current.includes(modelId)?current.filter(m=>m!==modelId):[...current,modelId];
+    setSaving(true);
+    try {
+      const {error} = await sb.from("profiles").update({assigned_models:updated}).eq("id",chatterId);
+      if(error){ addToast("Erreur: "+error.message,"error"); } else { addToast(fr?"Mis \u00e0 jour":"Updated","success"); await onRefresh(); }
+    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+    setSaving(false);
   };
-  const totalValidCA = chatters.reduce((s,ch)=>s+getStats(ch.id).validCA,0);
-  const totalCommOwed = chatters.reduce((s,ch)=>s+getStats(ch.id).commDue,0);
-  const totalPendingCA = chatters.reduce((s,ch)=>s+getStats(ch.id).pendingCA,0);
-  const selected = selectedId ? chatters.find(c=>c.id===selectedId) : null;
-  const selStats = selected ? getStats(selected.id) : null;
-  const medals = ["🥇","🥈","🥉"];
+
+  const selCh = modalChatter ? chatterStats.find(c=>c.id===modalChatter) : null;
+  const maxWeekCA = selCh ? Math.max(...selCh.weeklyCA.map(w=>w.ca),1) : 1;
+  const modalTabs = [{id:"performance",label:"Performance",icon:"\ud83d\udcca"},{id:"modeles",label:fr?"Mod\u00e8les assign\u00e9s":"Assigned Models",icon:"\ud83d\udc64"},{id:"logs",label:fr?"Messages bloqu\u00e9s":"Blocked Messages",icon:"\u26a0\ufe0f"}];
+
   return (
     <div>
+      {/* Global KPIs */}
       <div className="kpi-grid">
-        <KPICard label={t(lang,"active_chatters")} value={String(chatters.length)} icon="💬"/>
-        <KPICard label={t(lang,"ca_validated")} value={String(totalValidCA)+currencySymbol} icon="✅"/>
-        <KPICard label={t(lang,"total_comm_owed")} value={totalCommOwed.toFixed(0)+currencySymbol} icon="💸"/>
-        <KPICard label={t(lang,"ca_pending")} value={String(totalPendingCA)+currencySymbol} icon="⏳" className="warning" />
+        <KPICard label={t(lang,"active_chatters")} value={String(chatters.length)} icon="\ud83d\udcac"/>
+        <KPICard label={t(lang,"ca_validated")} value={Math.round(totalValidCA).toLocaleString()+currencySymbol} icon="\u2705"/>
+        <KPICard label={fr?"Moy. CA/chatter":"Avg CA/chatter"} value={Math.round(avgCA).toLocaleString()+currencySymbol} icon="\ud83d\udcb0"/>
+        <KPICard label={t(lang,"ca_pending")} value={Math.round(chatterStats.reduce((s,ch)=>s+ch.pendingCA,0)).toLocaleString()+currencySymbol} icon="\u23f3" className="warning" />
       </div>
-      <div style={{display:"grid",gridTemplateColumns:selected?"300px 1fr":"1fr",gap:16}}>
-        <div>
-          {chatters.map((ch,i)=>{
-            const stats = getStats(ch.id);
-            const chXP = calculateXP(ch.id, txs, convertAmount);
-            const chStreak = calculateStreak(ch.id, txs);
-            return (
-              <div key={ch.id} className="spender-card" onClick={()=>setSelectedId(selectedId===ch.id?null:ch.id)}
-                style={{border:selectedId===ch.id?"1px solid var(--accent)":""}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:10}}>
-                    <span style={{fontSize:20}}>{medals[i]||("#"+(i+1))}</span>
-                    <div>
-                      <div className="spender-name"><Tag type="chatter" label={ch.name} id={ch.id}/></div>
-                      <div style={{display:"flex",alignItems:"center",gap:6,marginTop:2}}>
-                        <LevelBadge xp={chXP} />
-                        {chStreak > 0 && <StreakBadge streak={chStreak} />}
-                      </div>
-                    </div>
-                  </div>
-                  <div style={{textAlign:"right"}}>
-                    <div className="spender-ltv">{stats.validCA}{currencySymbol}</div>
-                    <div style={{fontSize:10,color:"var(--text2)"}}>{stats.validCount} ventes</div>
+
+      {/* Chatter Cards Grid (PR #17) */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:16}}>
+        {chatterStats.map((ch,i) => {
+          const avatarBg = avatarColors[(ch.name||"").charCodeAt(0)%avatarColors.length];
+          const level = XP_LEVELS.slice().reverse().find(l=>ch.xp>=l.min)||XP_LEVELS[0];
+          return (
+            <div key={ch.id} className="spender-card card-hover" onClick={()=>{setModalChatter(ch.id);setModalTab("performance");}} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:20,cursor:"pointer",transition:"all 0.2s"}}>
+              {/* Header */}
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0,flex:1}}>
+                  <div style={{width:42,height:42,borderRadius:"50%",background:avatarBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff",flexShrink:0}}>{(ch.name||"?")[0]}</div>
+                  <div style={{minWidth:0}}>
+                    <div style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ch.name}</div>
+                    <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>{ch.assignedModels.length} {fr?"mod\u00e8le":"model"}{ch.assignedModels.length>1?"s":""} · {ch.chTx.length} TX {fr?"ce mois":"this mo."}</div>
                   </div>
                 </div>
-                <XPProgressBar xp={chXP} />
+                <div style={{flexShrink:0}}>
+                  <span style={{padding:"3px 10px",borderRadius:12,background:level.color+"15",color:level.color,fontSize:10,fontWeight:700}}>{level.icon} {level.name}</span>
+                </div>
               </div>
-            );
-          })}
-        </div>
-        {selected && selStats && (
-          <div className="profile-panel">
-            <div className="profile-header">
-              <div className="profile-name">{selected.name}</div>
-              <button className="profile-close" onClick={()=>setSelectedId(null)}>X</button>
-            </div>
-            <div style={{fontSize:12,color:"var(--text2)",marginBottom:8}}>Commission: {selected.commission_pct}%</div>
-            <div style={{marginBottom:12}}>
-              <LevelBadge xp={calculateXP(selected.id, txs, convertAmount)} />
-              <XPProgressBar xp={calculateXP(selected.id, txs, convertAmount)} />
-              <div style={{display:"flex",gap:8,marginTop:6}}>
-                <StreakBadge streak={calculateStreak(selected.id, txs)} />
-                {getStreakBadges(calculateStreak(selected.id, txs)).map(b => (
-                  <span key={b.name} style={{padding:"2px 8px",borderRadius:8,background:b.color+"15",color:b.color,fontSize:10,fontWeight:600}}>{b.icon} {b.name}</span>
-                ))}
+              {/* KPI Grid 2×3 */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"CA G\u00c9N\u00c9R\u00c9":"REVENUE"}</div>
+                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{Math.round(ch.validCA).toLocaleString()}{currencySymbol}</div>
+                </div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"TAUX CONVERSION":"CONV. RATE"}</div>
+                  <div style={{fontSize:16,fontWeight:800,color:ch.convRate>=50?"var(--success)":"var(--text-primary)"}}>{ch.convRate}%</div>
+                </div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"MSGS ENVOY\u00c9S":"MSGS SENT"}</div>
+                  <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{ch.msgCount}</div>
+                </div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>SCORE</div>
+                  <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{ch.score.toLocaleString()}</div>
+                </div>
+              </div>
+              {/* Models + Score bar */}
+              <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:8,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                {fr?"Mod\u00e8les":"Models"}: {ch.assignedModels.length>0?ch.assignedModels.map(m=>m.name).join(", "):"\u2014"}
+              </div>
+              <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                <div style={{width:`${Math.min(ch.score/500,100)}%`,height:"100%",borderRadius:3,background:level.color,transition:"width 0.3s"}}/>
               </div>
             </div>
-            <BadgeBar badges={getBadges(txs, selected.id).badges}/>
-            <div className="profile-section">
-              <div className="profile-section-title">KPIs</div>
-              <div className="profile-row"><span>{t(lang,"ca_validated")}</span><span style={{color:"var(--accent)",fontWeight:700}}>{selStats.validCA}{currencySymbol}</span></div>
-              <div className="profile-row"><span>{t(lang,"ca_pending")}</span><span style={{color:"var(--warning)",fontWeight:700}}>{selStats.pendingCA}{currencySymbol}</span></div>
-              <div className="profile-row"><span>{t(lang,"total_comm_owed")}</span><span style={{color:selStats.commDue>0?"var(--warning)":"var(--success)",fontWeight:700}}>{selStats.commDue.toFixed(0)}{currencySymbol}</span></div>
-              <div className="profile-row"><span>Panier moyen</span><span>{selStats.avgTicket.toFixed(0)}{currencySymbol}</span></div>
-            </div>
-            <div className="profile-section">
-              <div className="profile-section-title">{t(lang,"stats")}</div>
-              <div className="profile-row"><span>{t(lang,"validated")}</span><span>{selStats.validCount}</span></div>
-              <div className="profile-row"><span>{t(lang,"pending")}</span><span>{selStats.pendingCount}</span></div>
-              <div className="profile-row"><span>{t(lang,"refused")}</span><span>{selStats.refusedCount}</span></div>
-            </div>
-            <div className="profile-section">
-              <div className="profile-section-title">{t(lang,"managed_spenders")} ({selStats.spenders.length})</div>
-              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                {selStats.spenders.map(sp=>(
-                  <Tag key={sp} type="spender" label={sp} id={sp}/>
-                ))}
+          );
+        })}
+      </div>
+      {chatters.length===0&&<div style={{padding:60,textAlign:"center",color:"var(--text-tertiary)"}}><div style={{fontSize:32,marginBottom:8}}>{"\ud83d\udcac"}</div><div style={{fontSize:14}}>{fr?"Aucun chatter":"No chatters"}</div></div>}
+
+      {/* ═══ CHATTER DETAIL MODAL (PR #17 — 3 tabs) ═══ */}
+      {selCh && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:5000}} onClick={()=>setModalChatter(null)}>
+          <div style={{width:800,maxHeight:"90vh",overflowY:"auto",background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:24,boxShadow:"var(--shadow-lg)"}} onClick={e=>e.stopPropagation()}>
+            {/* Modal Header */}
+            <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:12}}>
+                <div style={{width:48,height:48,borderRadius:"50%",background:avatarColors[(selCh.name||"").charCodeAt(0)%avatarColors.length],display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff"}}>{(selCh.name||"?")[0]}</div>
+                <div>
+                  <div style={{fontSize:18,fontWeight:800}}>{selCh.name}</div>
+                  <div style={{display:"flex",gap:6,alignItems:"center",marginTop:2}}>
+                    <LevelBadge xp={selCh.xp}/>
+                    {selCh.streak>0&&<StreakBadge streak={selCh.streak}/>}
+                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>Commission: {selCh.commission_pct||0}%</span>
+                  </div>
+                </div>
               </div>
+              <button onClick={()=>setModalChatter(null)} style={{background:"none",border:"none",fontSize:20,cursor:"pointer",color:"var(--text-tertiary)",padding:8}}>{"\u2715"}</button>
+            </div>
+            {/* Tab bar */}
+            <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border-subtle)"}}>
+              {modalTabs.map(mt=>(
+                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{flex:1,padding:"12px 16px",border:"none",borderBottom:modalTab===mt.id?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:modalTab===mt.id?"var(--accent)":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>{mt.icon} {mt.label}</button>
+              ))}
+            </div>
+            <div style={{padding:24}}>
+
+              {/* ═══ TAB: PERFORMANCE ═══ */}
+              {modalTab==="performance"&&(
+                <div>
+                  {/* Achievement badges */}
+                  <div style={{marginBottom:16}}><BadgeBar badges={getBadges(txs,selCh.id).badges}/></div>
+                  {/* KPIs */}
+                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+                    {[
+                      {label:fr?"CA G\u00e9n\u00e9r\u00e9":"Revenue",value:`${Math.round(selCh.validCA).toLocaleString()}${currencySymbol}`,color:"var(--success)"},
+                      {label:"Pending",value:`${Math.round(selCh.pendingCA).toLocaleString()}${currencySymbol}`,color:"var(--warning)"},
+                      {label:"Commission",value:`${Math.round(selCh.commDue).toLocaleString()}${currencySymbol}`,color:selCh.commDue>0?"var(--warning)":"var(--success)"},
+                      {label:fr?"Taux Conv.":"Conv. Rate",value:`${selCh.convRate}%`,color:selCh.convRate>=50?"var(--success)":"var(--text-primary)"},
+                      {label:fr?"Panier moyen":"Avg Ticket",value:`${selCh.avgTicket}${currencySymbol}`,color:"var(--text-primary)"},
+                      {label:"Streak",value:`${selCh.streak}j`,color:selCh.streak>=7?"var(--warning)":"var(--text-primary)"},
+                    ].map((k,i)=>(
+                      <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                        <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{k.label}</div>
+                        <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {/* CA/Week bar chart */}
+                  <div style={{marginBottom:20}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                      <span style={{fontSize:12,fontWeight:700}}>{fr?"CA par semaine":"Revenue per week"}</span>
+                      <span style={{fontSize:10,color:"var(--text-quaternary)"}}>{fr?"Moyenne":"Avg"}: {Math.round(avgCA).toLocaleString()}{currencySymbol}</span>
+                    </div>
+                    <div style={{display:"flex",alignItems:"flex-end",gap:6,height:100}}>
+                      {selCh.weeklyCA.map((w,i)=>(
+                        <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+                          <span style={{fontSize:9,color:"var(--text-quaternary)"}}>{w.ca>0?w.ca:""}</span>
+                          <div style={{width:"100%",height:Math.max(4,Math.round((w.ca/maxWeekCA)*80)),borderRadius:4,background:i===selCh.weeklyCA.length-1?"var(--accent)":"var(--success)",transition:"height 0.3s"}}/>
+                          <span style={{fontSize:8,color:"var(--text-quaternary)"}}>{w.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                    {/* Avg line indicator */}
+                    <div style={{fontSize:10,color:"var(--text-quaternary)",textAlign:"center",marginTop:6}}>{fr?"vs moyenne \u00e9quipe":"vs team average"}: <b style={{color:selCh.validCA>avgCA?"var(--success)":"var(--danger)"}}>{selCh.validCA>avgCA?"+":""}{Math.round(selCh.validCA-avgCA).toLocaleString()}{currencySymbol}</b></div>
+                  </div>
+                  {/* Managed spenders */}
+                  <div>
+                    <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{fr?"Spenders g\u00e9r\u00e9s":"Managed spenders"} ({selCh.spenders.length})</div>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{selCh.spenders.slice(0,15).map(sp=><Tag key={sp} type="spender" label={sp} id={sp}/>)}{selCh.spenders.length>15&&<span style={{fontSize:10,color:"var(--text-quaternary)"}}>+{selCh.spenders.length-15}</span>}</div>
+                  </div>
+                </div>
+              )}
+
+              {/* ═══ TAB: MODÈLES ASSIGNÉS ═══ */}
+              {modalTab==="modeles"&&(
+                <div>
+                  <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{fr?"Mod\u00e8les assign\u00e9s":"Assigned Models"} ({selCh.assignedModels.length})</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                    {models.map(m=>{
+                      const isAssigned = (selCh.assigned_models||[]).includes(m.id);
+                      const mCA = selCh.caByModel[m.id];
+                      return (
+                        <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderRadius:12,background:isAssigned?"rgba(139,92,246,0.08)":"rgba(255,255,255,0.03)",border:`1px solid ${isAssigned?"rgba(139,92,246,0.2)":"var(--border-subtle)"}`,transition:"all 0.2s"}}>
+                          <div style={{width:36,height:36,borderRadius:"50%",background:avatarColors[(m.name||"").charCodeAt(0)%avatarColors.length],display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:800,color:"#fff",flexShrink:0}}>{(m.name||"?")[0]}</div>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontSize:13,fontWeight:700}}>{m.name}</div>
+                            {mCA&&<div style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{Math.round(mCA.ca).toLocaleString()}{currencySymbol} CA</div>}
+                          </div>
+                          <button onClick={()=>handleModelToggle(selCh.id,m.id)} disabled={saving} style={{padding:"6px 14px",borderRadius:8,border:"none",background:isAssigned?"var(--danger)":"var(--success)",color:"#fff",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",opacity:saving?0.5:1}}>
+                            {isAssigned?(fr?"Retirer":"Remove"):(fr?"Assigner":"Assign")}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* ═══ TAB: MESSAGES BLOQUÉS / LOGS ═══ */}
+              {modalTab==="logs"&&(
+                <div>
+                  {/* KPI row */}
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:20}}>
+                    <div style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"TOTAL LOGS":"TOTAL LOGS"}</div>
+                      <div style={{fontSize:18,fontWeight:800}}>{selCh.myLogs.length}</div>
+                    </div>
+                    <div style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"MESSAGES":"MESSAGES"}</div>
+                      <div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{selCh.msgCount}</div>
+                    </div>
+                    <div style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"ACTIONS BOT":"BOT ACTIONS"}</div>
+                      <div style={{fontSize:18,fontWeight:800,color:"var(--warning)"}}>{selCh.myLogs.filter(l=>l.action==="hand_back_bot").length}</div>
+                    </div>
+                  </div>
+                  {/* Log list */}
+                  <div style={{fontSize:12,fontWeight:700,marginBottom:10}}>{fr?"Historique chronologique":"Chronological log"}</div>
+                  {selCh.myLogs.length===0&&<div style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr?"Aucun log":"No logs"}</div>}
+                  <div style={{maxHeight:350,overflowY:"auto",display:"flex",flexDirection:"column",gap:6}}>
+                    {selCh.myLogs.slice(0,50).map((log,i)=>{
+                      const actionColors = {message_sent:{icon:"\ud83d\udcac",color:"var(--success)"},hand_back_bot:{icon:"\ud83e\udd16",color:"var(--warning)"},assign_chatter:{icon:"\ud83d\udc64",color:"var(--accent)"},gerant_message:{icon:"\ud83d\udc51",color:"var(--accent)"}};
+                      const ac = actionColors[log.action]||{icon:"\ud83d\udcdd",color:"var(--text-quaternary)"};
+                      return (
+                        <div key={log.id||i} style={{display:"flex",gap:10,padding:"8px 12px",borderRadius:8,background:"rgba(255,255,255,0.02)",border:"1px solid var(--border-subtle)"}}>
+                          <span style={{fontSize:14,flexShrink:0}}>{ac.icon}</span>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontSize:11,fontWeight:600,color:ac.color}}>{log.action}</div>
+                            {log.content&&<div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginTop:2}}>{log.content}</div>}
+                          </div>
+                          <span style={{fontSize:9,color:"var(--text-quaternary)",flexShrink:0,whiteSpace:"nowrap"}}>{log.created_at?new Date(log.created_at).toLocaleString(fr?"fr-FR":"en-US",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):""}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
             </div>
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -16028,7 +16202,7 @@ const App = () => {
         </>);
       case "equipe":
         return (<>{renderGerantTabBar("equipe")}
-          {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} />}
+          {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txs} profiles={profiles} models={models} chatterLogs={chatterLogs} onRefresh={onRefresh} />}
           {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} expenses={expenses} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} />}
           {subTab==="providers"&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} />}
         </>);
