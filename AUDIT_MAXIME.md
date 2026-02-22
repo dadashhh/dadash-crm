@@ -61,7 +61,7 @@ Le CRM entier tient dans `index.html` : **21,074 lignes** contenant :
 
 **Problemes identifies :**
 
-1. **Inline styles massifs** — Des centaines de `style={{...}}` dans le JSX. Pas de classes CSS reutilisables pour les composants React. Exemple typique (ligne 2262) :
+1. **Inline styles massifs** — **3,034 instances** de `style={{...}}` dans le JSX. Pas de classes CSS reutilisables pour les composants React. Exemple typique (ligne 2262) :
    ```jsx
    <div style={{ display:"flex", gap:14, padding:"14px 18px", background:"var(--card-bg)",
      border:"1px solid var(--border-subtle)", borderRadius:14, marginBottom:6, ... }}>
@@ -73,7 +73,13 @@ Le CRM entier tient dans `index.html` : **21,074 lignes** contenant :
 
 4. **Constants dupliquees** — `PRODUCTS` defini deux fois : une fois comme `HARDCODED_PRODUCTS` (ligne 1623) et une fois comme `PRODUCTS` (ligne 2335) avec des valeurs differentes.
 
-5. **Magic numbers** — `PAGE_SIZE = 50` puis `PAGE_SIZE = 40` (redefini dans LogsAuditTab ligne 2094). `EXCHANGE_RATE_EUR_CHF = 0.94` hardcode (ligne 1613).
+5. **Magic numbers** — `PAGE_SIZE = 50` puis `PAGE_SIZE = 40` (redefini dans LogsAuditTab ligne 2094). `EXCHANGE_RATE_EUR_CHF = 0.94` hardcode (ligne 1613). 30+ magic numbers repetes (timeouts 3000/5000/8000/12000ms, seuils 1000/5000 CHF, durees 7/30 jours).
+
+6. **91 composants React dans un seul fichier** — Avec **150+ useState** au total. Le formulaire TX a 13 useState consecutifs (lignes 2825-2837) qui pourraient etre un seul `useReducer`.
+
+7. **useCallback quasi absent** — Seulement 5 `useCallback` pour 100+ event handlers. Chaque handler est recree a chaque render.
+
+8. **Memory leaks potentiels** — 3 `setTimeout` sans cleanup dans les callbacks (toast provider ligne 1556, export functions lignes 1866/1880/1902). Si le composant unmount avant le timeout, l'etat est mis a jour sur un composant demonte.
 
 6. **Error handling inconsistant** — Certaines fonctions ont `try/catch` (safeInsertTx), d'autres ignorent les erreurs silencieusement (`catch(e) { /* notif insert fail */ }`).
 
