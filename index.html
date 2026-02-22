@@ -1560,6 +1560,275 @@ const FAB_ACTIONS_CHATTER = [
 ];
 
 // =============================================
+// EXPORT & RAPPORTS (PR#29)
+// =============================================
+const ExportRapportsTab = ({lang, txs, spenders, expenses, models, profiles, payslips, payouts, invoices, chatterLogs, screenshotChecks, broadcasts}) => {
+  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const [generating, setGenerating] = useState(null);
+
+  // ── CSV helper ──
+  const downloadCSV = (filename, headers, rows) => {
+    const esc = (v) => '"' + String(v || "").replace(/"/g, '""') + '"';
+    const csv = [headers.join(","), ...rows.map(r => r.map(esc).join(","))].join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ── PDF helper (html2pdf) ──
+  const downloadPDF = (htmlContent, filename) => {
+    if (typeof html2pdf === "undefined") { alert("html2pdf.js not loaded"); return; }
+    const el = document.createElement("div"); el.innerHTML = htmlContent; document.body.appendChild(el);
+    html2pdf().set({ margin: 10, filename, image: { type: "jpeg", quality: 0.98 }, html2canvas: { scale: 2 }, jsPDF: { unit: "mm", format: "a4", orientation: "portrait" } }).from(el).save().then(() => { document.body.removeChild(el); });
+  };
+
+  // ── DADASH PDF header ──
+  const pdfHeader = (title, subtitle) => `
+    <div style="font-family:'Helvetica Neue',Arial,sans-serif;max-width:700px;margin:0 auto;">
+      <div style="background:linear-gradient(135deg,#7C3AED,#8B5CF6,#A78BFA);padding:28px 32px;border-radius:16px;margin-bottom:24px;color:#fff;">
+        <div style="font-size:28px;font-weight:900;letter-spacing:-0.5px;">DADASH</div>
+        <div style="font-size:14px;opacity:0.85;margin-top:4px;">${title}</div>
+        ${subtitle ? `<div style="font-size:11px;opacity:0.7;margin-top:2px;">${subtitle}</div>` : ""}
+      </div>`;
+  const pdfFooter = `<div style="margin-top:32px;padding-top:16px;border-top:1px solid #e5e5e5;text-align:center;font-size:10px;color:#999;">
+    DADASH Agency &middot; Export généré le ${new Date().toLocaleDateString("fr-CH")}
+  </div></div>`;
+
+  // ── 1. EXPORT TX CSV ──
+  const exportTxCSV = () => {
+    setGenerating("tx-csv");
+    const headers = ["Date", "Spender", "Amount", "Currency", "Net", "Provider Fee", "Dada Fee", "Commission", "Status", "Model", "Chatter"];
+    const rows = (txs || []).map(tx => {
+      const model = (models || []).find(m => m.id === tx.model_id);
+      const chatter = (profiles || []).find(p => p.id === tx.chatter_id);
+      return [tx.date, tx.spender_handle, convertAmount(Number(tx.amount), tx.currency).toFixed(2), currencySymbol, convertAmount(Number(tx.net_amount || 0), tx.currency).toFixed(2), convertAmount(Number(tx.provider_fee || 0), tx.currency).toFixed(2), convertAmount(Number(tx.dada_fee || 0), tx.currency).toFixed(2), convertAmount(Number(tx.chatter_commission || 0), tx.currency).toFixed(2), tx.status, model ? model.name : "", chatter ? chatter.name : ""];
+    });
+    downloadCSV("dadash-transactions-" + new Date().toISOString().slice(0, 10) + ".csv", headers, rows);
+    setTimeout(() => setGenerating(null), 500);
+  };
+
+  // ── 2. EXPORT SPENDERS CSV ──
+  const exportSpendersCSV = () => {
+    setGenerating("sp-csv");
+    const headers = ["Handle", "Prenom", "Langue", "LTV", "TX Count", "Last Purchase", "Segment", "Timewaster"];
+    const rows = (spenders || []).map(sp => {
+      const sTxs = (txs || []).filter(tx => (tx.spender_handle || "").toLowerCase() === (sp.handle || sp.name || "").toLowerCase());
+      const ltv = sTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const last = sTxs.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      return [sp.handle || sp.name, sp.prenom || "", sp.langue || "", ltv.toFixed(2), sTxs.length, last ? last.date : "", sp.segment || "", sp.is_timewaster ? "YES" : ""];
+    });
+    downloadCSV("dadash-spenders-" + new Date().toISOString().slice(0, 10) + ".csv", headers, rows);
+    setTimeout(() => setGenerating(null), 500);
+  };
+
+  // ── 3. EXPORT P&L CSV ──
+  const exportPnlCSV = () => {
+    setGenerating("pnl-csv");
+    const valid = (txs || []).filter(tx => tx.status === "validated");
+    const grossRev = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+    const provFees = valid.reduce((s, tx) => s + convertAmount(Number(tx.provider_fee || 0), tx.currency), 0);
+    const dadaFees = valid.reduce((s, tx) => s + convertAmount(Number(tx.dada_fee || 0), tx.currency), 0);
+    const net = valid.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
+    const comms = valid.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
+    const exp = (expenses || []).reduce((s, e) => s + convertAmount(Number(e.amount), e.currency), 0);
+    const headers = ["Line", "Amount " + currencySymbol];
+    const rows = [["Gross Revenue", grossRev.toFixed(2)], ["Provider Fees", "-" + provFees.toFixed(2)], ["Dada Fees", "-" + dadaFees.toFixed(2)], ["Net Revenue", net.toFixed(2)], ["Commissions", "-" + comms.toFixed(2)], ["Gross Margin", (net - comms).toFixed(2)], ["Expenses", "-" + exp.toFixed(2)], ["Net Profit", (net - comms - exp).toFixed(2)]];
+    // Add model breakdown
+    rows.push(["", ""]); rows.push(["--- MODEL BREAKDOWN ---", ""]);
+    (models || []).forEach(m => {
+      const ca = valid.filter(tx => tx.model_id === m.id).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      if (ca > 0) rows.push([m.name, ca.toFixed(2)]);
+    });
+    downloadCSV("dadash-pnl-" + new Date().toISOString().slice(0, 10) + ".csv", headers, rows);
+    setTimeout(() => setGenerating(null), 500);
+  };
+
+  // ── 4. EXPORT LOGS CSV ──
+  const exportLogsCSV = () => {
+    setGenerating("logs-csv");
+    const items = [];
+    (txs || []).forEach(tx => items.push({ date: tx.date || tx.created_at, type: "TX", detail: "@" + (tx.spender_handle || "") + " " + convertAmount(Number(tx.amount), tx.currency).toFixed(2) + currencySymbol, status: tx.status }));
+    (chatterLogs || []).forEach(l => { const p = (profiles || []).find(pr => pr.id === l.chatter_id); items.push({ date: l.created_at, type: "Message", detail: (p ? p.name : "") + " " + (l.action || ""), status: l.action }); });
+    (screenshotChecks || []).forEach(sc => items.push({ date: sc.created_at, type: "Scan", detail: (sc.spender_handle || sc.spender_id || "") + " " + (sc.amount ? convertAmount(Number(sc.amount), sc.currency).toFixed(2) + currencySymbol : ""), status: sc.status }));
+    (broadcasts || []).forEach(bc => items.push({ date: bc.created_at, type: "Broadcast", detail: (bc.message || bc.content || "").slice(0, 100), status: bc.status }));
+    items.sort((a, b) => new Date(b.date) - new Date(a.date));
+    const headers = ["Date", "Type", "Detail", "Status"];
+    const rows = items.map(i => [i.date ? new Date(i.date).toISOString().slice(0, 19).replace("T", " ") : "", i.type, i.detail, i.status || ""]);
+    downloadCSV("dadash-logs-" + new Date().toISOString().slice(0, 10) + ".csv", headers, rows);
+    setTimeout(() => setGenerating(null), 500);
+  };
+
+  // ── 5. PDF FICHE DE PAIE ──
+  const exportPayslipPDF = (ps) => {
+    setGenerating("payslip-" + ps.id);
+    const profile = (profiles || []).find(p => p.id === ps.user_id);
+    const html = pdfHeader(fr ? "Fiche de paie" : "Payslip", ps.period + " \u2014 " + (profile ? profile.name : "")) + `
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+        <tr style="background:#f8f8fa;"><td style="padding:10px 14px;font-weight:600;">${fr ? "Collaborateur" : "Employee"}</td><td style="padding:10px 14px;">${profile ? profile.name : "N/A"}</td></tr>
+        <tr><td style="padding:10px 14px;font-weight:600;">${fr ? "Période" : "Period"}</td><td style="padding:10px 14px;">${ps.period || ""}</td></tr>
+        <tr style="background:#f8f8fa;"><td style="padding:10px 14px;font-weight:600;">Base</td><td style="padding:10px 14px;">${fmtAmount(ps.base || 0)}</td></tr>
+        <tr><td style="padding:10px 14px;font-weight:600;">Bonus</td><td style="padding:10px 14px;">${fmtAmount(ps.bonus || 0)}</td></tr>
+        <tr style="background:linear-gradient(90deg,rgba(124,58,237,0.08),transparent);"><td style="padding:12px 14px;font-weight:800;font-size:15px;">TOTAL</td><td style="padding:12px 14px;font-weight:800;font-size:15px;color:#7C3AED;">${fmtAmount(ps.total || 0)}</td></tr>
+        <tr><td style="padding:10px 14px;font-weight:600;">Status</td><td style="padding:10px 14px;"><span style="padding:3px 10px;border-radius:8px;background:${ps.status === "paid" ? "rgba(16,185,129,0.1);color:#10B981" : "rgba(245,158,11,0.1);color:#F59E0B"};font-size:12px;font-weight:700;">${ps.status === "paid" ? (fr ? "Payé" : "Paid") : (fr ? "En attente" : "Pending")}</span></td></tr>
+      </table>` + pdfFooter;
+    downloadPDF(html, "fiche-paie-" + (profile ? profile.name.replace(/\s/g, "-") : "chatter") + "-" + (ps.period || "") + ".pdf");
+    setTimeout(() => setGenerating(null), 1500);
+  };
+
+  // ── 6. PDF FACTURE ──
+  const exportInvoicePDF = (inv) => {
+    setGenerating("inv-" + inv.id);
+    // Use existing downloadInvoicePDF if available
+    if (typeof downloadInvoicePDF === "function") { downloadInvoicePDF(inv); setTimeout(() => setGenerating(null), 1500); return; }
+    const html = pdfHeader("Facture / Invoice", inv.invoice_number || "N/A") + `
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+        <tr style="background:#f8f8fa;"><td style="padding:10px 14px;font-weight:600;">N°</td><td style="padding:10px 14px;">${inv.invoice_number || inv.id}</td></tr>
+        <tr><td style="padding:10px 14px;font-weight:600;">Date</td><td style="padding:10px 14px;">${inv.date || inv.created_at || ""}</td></tr>
+        <tr style="background:#f8f8fa;"><td style="padding:10px 14px;font-weight:600;">Type</td><td style="padding:10px 14px;">${inv.type || ""}</td></tr>
+        <tr><td style="padding:10px 14px;font-weight:600;">${fr ? "Client" : "Client"}</td><td style="padding:10px 14px;">${inv.client_name || inv.profile_id || ""}</td></tr>
+        <tr style="background:linear-gradient(90deg,rgba(124,58,237,0.08),transparent);"><td style="padding:12px 14px;font-weight:800;font-size:15px;">TOTAL</td><td style="padding:12px 14px;font-weight:800;font-size:15px;color:#7C3AED;">${fmtAmount(inv.total || inv.amount || 0)}</td></tr>
+        <tr><td style="padding:10px 14px;font-weight:600;">Status</td><td style="padding:10px 14px;"><span style="padding:3px 10px;border-radius:8px;background:${inv.status === "paid" ? "rgba(16,185,129,0.1);color:#10B981" : "rgba(245,158,11,0.1);color:#F59E0B"};font-size:12px;font-weight:700;">${inv.status === "paid" ? (fr ? "Payé" : "Paid") : (fr ? "En attente" : "Pending")}</span></td></tr>
+      </table>` + pdfFooter;
+    downloadPDF(html, "facture-" + (inv.invoice_number || inv.id) + ".pdf");
+    setTimeout(() => setGenerating(null), 1500);
+  };
+
+  // ── 7. PDF P&L RAPPORT ──
+  const exportPnlPDF = () => {
+    setGenerating("pnl-pdf");
+    const valid = (txs || []).filter(tx => tx.status === "validated");
+    const grossRev = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+    const provFees = valid.reduce((s, tx) => s + convertAmount(Number(tx.provider_fee || 0), tx.currency), 0);
+    const net = valid.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
+    const comms = valid.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
+    const exp = (expenses || []).reduce((s, e) => s + convertAmount(Number(e.amount), e.currency), 0);
+    const profit = net - comms - exp;
+    const row = (label, val, bold, color) => `<tr${bold ? ' style="background:' + (color ? "rgba(124,58,237,0.06)" : "#f8f8fa") + ';"' : ""}><td style="padding:10px 14px;font-weight:${bold ? 800 : 600};${color ? "color:" + color + ";" : ""}">${label}</td><td style="padding:10px 14px;text-align:right;font-weight:${bold ? 800 : 400};${color ? "color:" + color + ";" : ""}">${val}</td></tr>`;
+    let modelRows = "";
+    (models || []).forEach(m => {
+      const ca = valid.filter(tx => tx.model_id === m.id).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      if (ca > 0) modelRows += row(m.name, fmtAmount(ca), false, "");
+    });
+    const html = pdfHeader("P&L Report", new Date().toLocaleDateString("fr-CH")) + `
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:24px;">
+        ${row(fr ? "CA Brut" : "Gross Revenue", fmtAmount(grossRev), false, "")}
+        ${row(fr ? "Frais providers" : "Provider Fees", "-" + fmtAmount(provFees), false, "#EF4444")}
+        ${row("Net", fmtAmount(net), true, "")}
+        ${row("Commissions", "-" + fmtAmount(comms), false, "#F59E0B")}
+        ${row(fr ? "Marge brute" : "Gross Margin", fmtAmount(net - comms), true, "")}
+        ${row(fr ? "Dépenses" : "Expenses", "-" + fmtAmount(exp), false, "#EC4899")}
+        ${row(fr ? "Profit net" : "Net Profit", fmtAmount(profit), true, profit >= 0 ? "#10B981" : "#EF4444")}
+      </table>
+      <div style="font-size:12px;font-weight:700;margin-bottom:10px;color:#6B7280;">${fr ? "Détail par modèle" : "Model Breakdown"}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px;">${modelRows}</table>` + pdfFooter;
+    downloadPDF(html, "dadash-pnl-" + new Date().toISOString().slice(0, 10) + ".pdf");
+    setTimeout(() => setGenerating(null), 1500);
+  };
+
+  const allPayslips = (payslips || []).sort((a, b) => (b.period || "").localeCompare(a.period || ""));
+  const allInvoices = (invoices || []).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
+  const EXPORTS = [
+    { id: "tx-csv", label: fr ? "Transactions CSV" : "Transactions CSV", icon: "\u{1F4B0}", desc: fr ? "Toutes les TX avec montants, statut, modèle, chatter" : "All TX with amounts, status, model, chatter", action: exportTxCSV, format: "CSV", count: (txs || []).length },
+    { id: "sp-csv", label: fr ? "Spenders CSV" : "Spenders CSV", icon: "\u{1F464}", desc: fr ? "Tous les spenders avec LTV, langue, segment" : "All spenders with LTV, language, segment", action: exportSpendersCSV, format: "CSV", count: (spenders || []).length },
+    { id: "pnl-csv", label: "P&L CSV", icon: "\u{1F4CA}", desc: fr ? "Compte de résultat + breakdown modèles" : "P&L statement + model breakdown", action: exportPnlCSV, format: "CSV" },
+    { id: "logs-csv", label: fr ? "Logs CSV" : "Logs CSV", icon: "\u{1F4CB}", desc: fr ? "Tous les événements: TX, messages, scans, broadcasts" : "All events: TX, messages, scans, broadcasts", action: exportLogsCSV, format: "CSV" },
+    { id: "pnl-pdf", label: fr ? "Rapport P&L PDF" : "P&L Report PDF", icon: "\u{1F4C4}", desc: fr ? "Rapport complet avec header DADASH violet" : "Full report with DADASH purple header", action: exportPnlPDF, format: "PDF" },
+  ];
+
+  return (
+    <div>
+      {/* ── HEADER ── */}
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>{"\u{1F4E4}"} {fr ? "Export & Rapports" : "Export & Reports"}</h2>
+        <p style={{ fontSize: 12, color: "var(--text-tertiary)", margin: "3px 0 0" }}>{fr ? "Télécharger CSV et PDF" : "Download CSV and PDF files"}</p>
+      </div>
+
+      {/* ── EXPORT CARDS ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 14, marginBottom: 32 }}>
+        {EXPORTS.map(ex => (
+          <div key={ex.id} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: "20px 22px", display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 40, height: 40, borderRadius: 12, background: ex.format === "PDF" ? "rgba(124,58,237,0.12)" : "rgba(16,185,129,0.12)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, flexShrink: 0 }}>{ex.icon}</div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 14, fontWeight: 700 }}>{ex.label}</div>
+                <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{ex.desc}</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span style={{ padding: "2px 8px", borderRadius: 8, background: ex.format === "PDF" ? "rgba(124,58,237,0.12)" : "rgba(16,185,129,0.12)", color: ex.format === "PDF" ? "#8B5CF6" : "#10B981", fontSize: 10, fontWeight: 700 }}>{ex.format}</span>
+                {ex.count !== undefined && <span style={{ fontSize: 11, color: "var(--text-quaternary)" }}>{ex.count} {fr ? "entrées" : "entries"}</span>}
+              </div>
+              <button onClick={ex.action} disabled={generating === ex.id} style={{ padding: "6px 16px", fontSize: 12, fontWeight: 700, borderRadius: 10, border: "none", background: "var(--accent)", color: "#fff", cursor: generating === ex.id ? "wait" : "pointer", opacity: generating === ex.id ? 0.6 : 1 }}>
+                {generating === ex.id ? "..." : (fr ? "Télécharger" : "Download")}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── FICHES DE PAIE (PDF) ── */}
+      <div style={{ marginBottom: 32 }}>
+        <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 14 }}>{"\u{1F4C4}"} {fr ? "Fiches de paie" : "Payslips"} <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-tertiary)" }}>PDF</span></div>
+        {allPayslips.length === 0 ? (
+          <div style={{ color: "var(--text-quaternary)", fontSize: 12, padding: 24, textAlign: "center" }}>{fr ? "Aucune fiche de paie" : "No payslips"}</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {allPayslips.slice(0, 20).map(ps => {
+              const profile = (profiles || []).find(p => p.id === ps.user_id);
+              const isPaid = ps.status === "paid";
+              return (
+                <div key={ps.id} style={{ display: "flex", alignItems: "center", gap: 14, padding: "12px 18px", background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12 }}>
+                  <div style={{ width: 34, height: 34, borderRadius: 9, background: isPaid ? "rgba(16,185,129,0.1)" : "rgba(245,158,11,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}>{isPaid ? "\u2705" : "\u23F3"}</div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{profile ? profile.name : "?"} — {ps.period}</div>
+                    <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>Base: {fmtAmount(ps.base || 0)} + Bonus: {fmtAmount(ps.bonus || 0)}</div>
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: "var(--accent)", marginRight: 12 }}>{fmtAmount(ps.total || 0)}</div>
+                  <button onClick={() => exportPayslipPDF(ps)} disabled={generating === "payslip-" + ps.id} style={{ padding: "5px 12px", fontSize: 11, fontWeight: 700, borderRadius: 8, border: "1px solid #8B5CF6", background: "rgba(139,92,246,0.1)", color: "#8B5CF6", cursor: "pointer" }}>
+                    {generating === "payslip-" + ps.id ? "..." : "PDF"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ── FACTURES (PDF) ── */}
+      <div style={{ marginBottom: 20 }}>
+        <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 14 }}>{"\u{1F9FE}"} {fr ? "Factures" : "Invoices"} <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-tertiary)" }}>PDF</span></div>
+        {allInvoices.length === 0 ? (
+          <div style={{ color: "var(--text-quaternary)", fontSize: 12, padding: 24, textAlign: "center" }}>{fr ? "Aucune facture" : "No invoices"}</div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {allInvoices.slice(0, 20).map(inv => {
+              const profile = (profiles || []).find(p => p.id === inv.profile_id);
+              return (
+                <div key={inv.id} style={{ display: "flex", alignItems: "center", gap: 14, padding: "12px 18px", background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12 }}>
+                  <div style={{ width: 34, height: 34, borderRadius: 9, background: "rgba(124,58,237,0.1)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}>{"\u{1F9FE}"}</div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{inv.invoice_number || inv.id}</div>
+                    <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{profile ? profile.name : inv.client_name || ""} {"\u00B7"} {inv.type || ""} {"\u00B7"} {inv.date || (inv.created_at || "").slice(0, 10)}</div>
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: "var(--success)", marginRight: 12 }}>{fmtAmount(inv.total || inv.amount || 0)}</div>
+                  <button onClick={() => exportInvoicePDF(inv)} disabled={generating === "inv-" + inv.id} style={{ padding: "5px 12px", fontSize: 11, fontWeight: 700, borderRadius: 8, border: "1px solid #8B5CF6", background: "rgba(139,92,246,0.1)", color: "#8B5CF6", cursor: "pointer" }}>
+                    {generating === "inv-" + inv.id ? "..." : "PDF"}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
 // LOGS & AUDIT TIMELINE (PR#23)
 // =============================================
 const LogsAuditTab = ({lang, txs, chatterLogs, screenshotChecks, broadcasts, profiles, spenders}) => {
@@ -19020,7 +19289,7 @@ const App = () => {
             </div>
           )}
           {subTab==="logs"&&<LogsAuditTab lang={lang} txs={txs} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} profiles={profiles} spenders={spenders} />}
-          {subTab==="export"&&<PlaceholderTab title={lang==="fr"?"Export & Rapports":"Export & Reports"} />}
+          {subTab==="export"&&<ExportRapportsTab lang={lang} txs={txs} spenders={spenders} expenses={expenses} models={models} profiles={profiles} payslips={payslips} payouts={payouts} invoices={invoices} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} />}
           {subTab==="settings"&&<PlaceholderTab title={lang==="fr"?"Paramètres":"Settings"} />}
         </>);
       default:
