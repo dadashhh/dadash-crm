@@ -19027,10 +19027,172 @@ const VideosTab = ({user, lang, models, modelVideos, videoSessions, dbSpenders, 
 };
 
 // =============================================
+// GLOBAL SEARCH — CMD+K MODAL
+// =============================================
+const SearchModal = ({open, onClose, lang, user, txs, spenders, profiles, models, invoices, products, onNavigate, onDrill}) => {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef(null);
+  const {fmtAmount, convertAmount} = useCurrency();
+  useEffect(() => { if (open && inputRef.current) setTimeout(() => inputRef.current.focus(), 50); }, [open]);
+  useEffect(() => { if (!open) setQuery(""); }, [open]);
+  // Close on Escape
+  useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [open, onClose]);
+
+  const results = useMemo(() => {
+    const q = (query || "").trim().toLowerCase();
+    if (!q || q.length < 2) return [];
+    const out = [];
+    // Pages
+    const allPages = [
+      ...GERANT_NAV.map(p => ({id:p.id, label:p.label, icon:p.icon, type:"page", sub:null})),
+      ...Object.entries(PAGE_TABS).flatMap(([pid, tabs]) => tabs.map(tb => ({id:pid, label:tb.label, icon:tb.icon, type:"page", sub:tb.id})))
+    ];
+    allPages.forEach(p => { if (p.label.toLowerCase().includes(q)) out.push({...p, cat:"pages"}); });
+    // Spenders
+    (spenders||[]).forEach(s => {
+      const name = s.handle || s.name || "";
+      if (name.toLowerCase().includes(q) || (s.telegram_username||"").toLowerCase().includes(q)) {
+        const ltv = convertAmount(s.ltv || s.total_spent || 0, "EUR");
+        out.push({cat:"spenders", type:"spender", id:s.handle||s.name, label:name, icon:"\u{1F464}", sub:fmtAmount(s.ltv||s.total_spent||0,"EUR"), meta:s.langue?LANG_FLAGS[s.langue]:""});
+      }
+    });
+    // Profiles (users)
+    (profiles||[]).forEach(p => {
+      if ((p.name||"").toLowerCase().includes(q) || (p.email||"").toLowerCase().includes(q)) {
+        const roleIcon = p.role==="modele"?"\u{1F469}\u200D\u{1F4BC}":p.role==="chatter"?"\u{1F4AC}":p.role==="provider"?"\u{1F3E2}":"\u{1F464}";
+        out.push({cat:"users", type:"profile", id:p.id, label:p.name||p.email, icon:roleIcon, sub:p.role, meta:p.email});
+      }
+    });
+    // Models
+    (models||[]).forEach(m => {
+      if ((m.name||"").toLowerCase().includes(q)) {
+        out.push({cat:"models", type:"model", id:m.id, label:m.name, icon:"\u{1F469}", sub:m.platform||""});
+      }
+    });
+    // Transactions
+    (txs||[]).slice(0,500).forEach(tx => {
+      const handle = tx.spender_handle || "";
+      const notes = tx.notes || "";
+      if (handle.toLowerCase().includes(q) || notes.toLowerCase().includes(q) || String(tx.amount).includes(q)) {
+        out.push({cat:"transactions", type:"tx", id:tx.id, label:handle + " — " + fmtAmount(tx.amount, tx.currency), icon:"\u{1F4B0}", sub:tx.status, meta:(tx.date||"").slice(0,10)});
+      }
+    });
+    // Products
+    (products||[]).forEach(p => {
+      if ((p.name||"").toLowerCase().includes(q) || (p.tag||"").toLowerCase().includes(q)) {
+        out.push({cat:"products", type:"product", id:p.id, label:p.name||p.tag, icon:"\u{1F4E6}", sub:p.tag||""});
+      }
+    });
+    return out.slice(0, 40);
+  }, [query, spenders, profiles, models, txs, products, fmtAmount, convertAmount]);
+
+  const grouped = useMemo(() => {
+    const map = {};
+    const catLabels = {pages:"\u{1F4C4} "+t(lang,"dashboard"),spenders:"\u{1F464} Spenders",users:"\u{1F465} "+t(lang,"users"),models:"\u{1F469} "+t(lang,"models"),transactions:"\u{1F4B0} "+t(lang,"transactions"),products:"\u{1F4E6} "+t(lang,"product")};
+    results.forEach(r => {
+      const key = r.cat;
+      if (!map[key]) map[key] = {label:catLabels[key]||key, items:[]};
+      map[key].items.push(r);
+    });
+    return Object.values(map);
+  }, [results, lang]);
+
+  const [selectedIdx, setSelectedIdx] = useState(0);
+  useEffect(() => setSelectedIdx(0), [query]);
+  const flatResults = results;
+  useEffect(() => {
+    if (!open) return;
+    const h = (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); setSelectedIdx(i => Math.min(i+1, flatResults.length-1)); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); setSelectedIdx(i => Math.max(i-1, 0)); }
+      else if (e.key === "Enter" && flatResults[selectedIdx]) { e.preventDefault(); handleSelect(flatResults[selectedIdx]); }
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [open, flatResults, selectedIdx]);
+
+  const handleSelect = (item) => {
+    onClose();
+    if (item.type === "page") { onNavigate(item.id, item.sub); }
+    else if (item.type === "spender") { onDrill("spender", item.id); }
+    else if (item.type === "profile") {
+      const p = (profiles||[]).find(pr=>pr.id===item.id);
+      if (p && p.role === "modele") onDrill("model", item.id);
+      else if (p && p.role === "chatter") onDrill("chatter", item.id);
+      else if (p && p.role === "provider") onDrill("provider", item.id);
+    }
+    else if (item.type === "model") { onDrill("model", item.id); }
+    else if (item.type === "tx") { onNavigate("business", "transactions"); }
+    else if (item.type === "product") { onNavigate("business", "catalogue"); }
+  };
+
+  if (!open) return null;
+  const statusColors = {pending:"#F59E0B",validated:"#10B981",refused:"#EF4444",en_attente:"#F59E0B",validee:"#10B981",refusee:"#EF4444"};
+  let flatIdx = -1;
+  return ReactDOM.createPortal(
+    React.createElement("div", {onClick:onClose, style:{position:"fixed",inset:0,zIndex:99999,background:"rgba(0,0,0,0.6)",backdropFilter:"blur(4px)",display:"flex",justifyContent:"center",paddingTop:80}},
+      React.createElement("div", {onClick:e=>e.stopPropagation(), style:{width:"100%",maxWidth:620,maxHeight:"70vh",background:"var(--bg-card)",borderRadius:16,border:"1px solid var(--border-default)",boxShadow:"0 25px 60px rgba(0,0,0,0.5)",display:"flex",flexDirection:"column",overflow:"hidden"}},
+        // Search input
+        React.createElement("div", {style:{padding:"16px 20px",borderBottom:"1px solid var(--border-default)",display:"flex",alignItems:"center",gap:10}},
+          React.createElement("span", {style:{fontSize:18,opacity:0.5}}, "\u{1F50D}"),
+          React.createElement("input", {ref:inputRef, value:query, onChange:e=>setQuery(e.target.value), placeholder:t(lang,"search_input"), style:{flex:1,background:"transparent",border:"none",outline:"none",color:"var(--text-primary)",fontSize:15,fontFamily:"'DM Sans',sans-serif"}}),
+          React.createElement("kbd", {style:{padding:"2px 8px",borderRadius:6,background:"var(--bg-overlay)",border:"1px solid var(--border-default)",color:"var(--text-tertiary)",fontSize:11,fontWeight:600}}, "ESC")
+        ),
+        // Results
+        React.createElement("div", {style:{flex:1,overflowY:"auto",padding:"8px 0"}},
+          query.length < 2
+            ? React.createElement("div", {style:{padding:"40px 20px",textAlign:"center",color:"var(--text-tertiary)"}},
+                React.createElement("div", {style:{fontSize:32,marginBottom:8}}, "\u{1F50E}"),
+                React.createElement("div", {style:{fontSize:13}}, t(lang,"search_input")+".."),
+                React.createElement("div", {style:{fontSize:11,marginTop:8,color:"var(--text-quaternary)"}}, "Spenders, transactions, models, pages...")
+              )
+            : results.length === 0
+              ? React.createElement("div", {style:{padding:"40px 20px",textAlign:"center",color:"var(--text-tertiary)"}},
+                  React.createElement("div", {style:{fontSize:32,marginBottom:8}}, "\u{1F6AB}"),
+                  React.createElement("div", {style:{fontSize:13}}, t(lang,"no_data"))
+                )
+              : grouped.map((group, gi) => React.createElement("div", {key:gi},
+                  React.createElement("div", {style:{padding:"8px 20px 4px",fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:1,color:"var(--text-quaternary)"}}, group.label),
+                  group.items.map((item) => {
+                    flatIdx++;
+                    const idx = flatIdx;
+                    const isActive = idx === selectedIdx;
+                    return React.createElement("div", {key:item.type+"-"+item.id+"-"+idx, onClick:()=>handleSelect(item), onMouseEnter:()=>setSelectedIdx(idx), style:{padding:"8px 20px",display:"flex",alignItems:"center",gap:10,cursor:"pointer",background:isActive?"var(--accent-muted)":"transparent",borderLeft:isActive?"3px solid var(--accent)":"3px solid transparent",transition:"all 0.1s"}},
+                      React.createElement("span", {style:{width:32,height:32,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,background:isActive?"var(--accent-muted)":"var(--bg-overlay)"}}, item.icon),
+                      React.createElement("div", {style:{flex:1,minWidth:0}},
+                        React.createElement("div", {style:{fontSize:13,fontWeight:600,color:"var(--text-primary)",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}, item.label),
+                        (item.meta||item.sub) && React.createElement("div", {style:{fontSize:11,color:"var(--text-tertiary)",marginTop:1}},
+                          item.sub && React.createElement("span", {style:{padding:"1px 6px",borderRadius:4,fontSize:10,fontWeight:600,background:statusColors[item.sub]?"rgba(0,0,0,0.2)":"var(--bg-overlay)",color:statusColors[item.sub]||"var(--text-secondary)",marginRight:4}}, item.sub),
+                          item.meta && React.createElement("span", null, item.meta)
+                        )
+                      ),
+                      React.createElement("span", {style:{fontSize:11,color:"var(--text-quaternary)"}}, "\u21B5")
+                    );
+                  })
+                ))
+        ),
+        // Footer
+        React.createElement("div", {style:{padding:"10px 20px",borderTop:"1px solid var(--border-default)",display:"flex",gap:16,fontSize:11,color:"var(--text-quaternary)"}},
+          React.createElement("span", null, "\u2191\u2193 ", t(lang,"actions")),
+          React.createElement("span", null, "\u21B5 ", t(lang,"validate")),
+          React.createElement("span", null, "ESC ", t(lang,"cancel"))
+        )
+      )
+    ),
+    document.body
+  );
+};
+
+// =============================================
 // MAIN APP
 // =============================================
 const App = () => {
-  const {drillDown, closeDrill} = useNav();
+  const {drillDown, closeDrill, openEntity} = useNav();
   const [user, setUser] = useState(null);
   const [lang, setLang] = useState(() => { try { const s=localStorage.getItem("dadash-lang"); return s&&["fr","de","en","ru","uk","es"].includes(s)?s:"fr"; } catch { return "fr"; } });
   const [theme, setTheme] = useState(() => {
@@ -19047,6 +19209,7 @@ const App = () => {
   const [fabMoForm, setFabMoForm] = useState({ name: "", email: "", language: "fr" });
   const [fabAssignModel, setFabAssignModel] = useState("");
   const [fabAssignChatter, setFabAssignChatter] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
   const [fabSaving, setFabSaving] = useState(false);
   const {setDrillDown} = useNav();
   // Wrap setTab with pushState for browser history
@@ -19381,6 +19544,15 @@ const App = () => {
     init();
   },[]);
 
+  // ── CMD+K Global Search ──
+  useEffect(() => {
+    const handler = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") { e.preventDefault(); setShowSearch(s => !s); }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   // ── SUPABASE REALTIME: Notifications + TX + Scans + Broadcasts ──
   useEffect(() => {
     if (!user) return;
@@ -19707,8 +19879,8 @@ const App = () => {
             </div>
           </div>
           <div className="topbar-right">
-            {/* Search placeholder */}
-            {isGerant&&<button onClick={()=>addToast(t(lang,"search_cmd"),"info")} style={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:12,padding:"5px 14px",cursor:"pointer",color:"var(--text-quaternary)",fontSize:12,fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6}}>
+            {/* Search CMD+K */}
+            {isGerant&&<button onClick={()=>setShowSearch(true)} style={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:12,padding:"5px 14px",cursor:"pointer",color:"var(--text-quaternary)",fontSize:12,fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6}}>
               {"\u{1F50D}"} {t(lang,"search_cmd")}
             </button>}
             <div style={{display:"flex",alignItems:"center",gap:6}}>
@@ -19888,6 +20060,7 @@ const App = () => {
       )}
     </div>
     </TimezoneContext.Provider>
+    {user&&isGerant&&<SearchModal open={showSearch} onClose={()=>setShowSearch(false)} lang={lang} user={user} txs={txs} spenders={spenders} profiles={profiles} models={models} invoices={invoices} products={products} onNavigate={(pid,sid)=>navigateTo(pid,sid)} onDrill={(type,id)=>{if(type==="spender"){closeDrill();setSelectedSpenderKey(id);navigateTo("business","spenders");}else{closeDrill();navigateTo("equipe",type==="model"?"modeles":type==="chatter"?"chatters":"providers");}}} />}
     </CurrencyContext.Provider>
   );
 };
