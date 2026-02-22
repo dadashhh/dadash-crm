@@ -7144,101 +7144,304 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
 // =============================================
 // COMPTA TAB (gerant only)
 // =============================================
-const ComptaTab = ({user, lang, txs, expenses, models, profiles, onRefresh}) => {
+const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRefresh}) => {
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const addToast = useToast();
   const dr = useDateRange("all");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({name:"",amount:"",category:"ops"});
+  const fr = lang === "fr";
+  const cs = currencySymbol;
   const comptaFiltered = dr.filterByDate(txs, "date");
   const validTxs = comptaFiltered.filter(tx=>tx.status==="validated");
-  const grossRev = validTxs.reduce((s,tx)=>s+Number(tx.amount),0);
-  const totalProvFees = validTxs.reduce((s,tx)=>s+Number(tx.provider_fee||0),0);
-  const totalDadaFees = validTxs.reduce((s,tx)=>s+Number(tx.dada_fee||0),0);
-  const totalNet = validTxs.reduce((s,tx)=>s+Number(tx.net_amount||0),0);
-  const totalComms = validTxs.reduce((s,tx)=>s+Number(tx.chatter_commission||0),0);
-  const totalExpenses = expenses.reduce((s,e)=>s+Number(e.amount),0);
-  const netProfit = totalNet - totalComms - totalExpenses;
+
+  // ── P&L KPIs (CHF via convertAmount) ──
+  const grossRev = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+  const totalProvFees = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.provider_fee||0),tx.currency),0);
+  const totalDadaFees = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.dada_fee||0),tx.currency),0);
+  const totalNet = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+  const totalComms = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
+  const totalExpenses = expenses.reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0);
+  const grossMargin = totalNet - totalComms;
+  const netProfit = grossMargin - totalExpenses;
+  const marginPct = grossRev > 0 ? ((grossMargin / grossRev) * 100).toFixed(1) : "0";
+  const profitPct = grossRev > 0 ? ((netProfit / grossRev) * 100).toFixed(1) : "0";
+
+  // ── Breakdown par modèle ──
+  const modelBreakdown = useMemo(() => {
+    return models.map(m => {
+      const mTxs = validTxs.filter(tx => tx.model_id === m.id);
+      const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const net = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
+      const comm = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
+      const fees = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.provider_fee || 0), tx.currency), 0);
+      return { name: m.name, id: m.id, ca, net, comm, fees, txCount: mTxs.length, margin: net - comm };
+    }).filter(m => m.ca > 0).sort((a, b) => b.ca - a.ca);
+  }, [validTxs, models, convertAmount]);
+
+  // ── Breakdown par langue ──
+  const langBreakdown = useMemo(() => {
+    const byLang = {};
+    validTxs.forEach(tx => {
+      const sp = (spenders || []).find(s => (s.handle || s.name || "").toLowerCase() === (tx.spender_handle || "").toLowerCase());
+      const lng = sp && sp.langue ? sp.langue : "N/A";
+      if (!byLang[lng]) byLang[lng] = { code: lng, ca: 0, net: 0, txCount: 0, flag: LANG_FLAGS[lng] || "" };
+      byLang[lng].ca += convertAmount(Number(tx.amount), tx.currency);
+      byLang[lng].net += convertAmount(Number(tx.net_amount || 0), tx.currency);
+      byLang[lng].txCount++;
+    });
+    return Object.values(byLang).sort((a, b) => b.ca - a.ca);
+  }, [validTxs, spenders, convertAmount]);
+
+  // ── Chart data: CA par jour (30 derniers jours) ──
+  const dailyRevData = useMemo(() => {
+    const map = {};
+    const now = new Date();
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(now); d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      map[key] = { date: key, label: key.slice(5), ca: 0, net: 0, profit: 0 };
+    }
+    validTxs.forEach(tx => {
+      const key = (tx.date || "").slice(0, 10);
+      if (map[key]) {
+        map[key].ca += convertAmount(Number(tx.amount), tx.currency);
+        map[key].net += convertAmount(Number(tx.net_amount || 0), tx.currency);
+        map[key].profit += convertAmount(Number(tx.net_amount || 0), tx.currency) - convertAmount(Number(tx.chatter_commission || 0), tx.currency);
+      }
+    });
+    return Object.values(map).map(d => ({ ...d, ca: Math.round(d.ca), net: Math.round(d.net), profit: Math.round(d.profit) }));
+  }, [validTxs, convertAmount]);
+
+  // ── Chart data: modèle bar chart ──
+  const modelChartData = modelBreakdown.slice(0, 8).map(m => ({ name: m.name.length > 10 ? m.name.slice(0, 10) + ".." : m.name, CA: Math.round(m.ca), Net: Math.round(m.net), Comm: Math.round(m.comm) }));
+
+  // ── Chart data: langue pie ──
+  const langChartData = langBreakdown.map(l => ({ name: (l.flag ? l.flag + " " : "") + l.code, value: Math.round(l.ca) }));
+  const PIE_COLORS = ["#8B5CF6", "#EC4899", "#F59E0B", "#10B981", "#3B82F6", "#EF4444", "#6366F1", "#14B8A6"];
+
+  // ── Add expense ──
   const handleAdd = async () => {
-    if(!form.name||!form.amount) return;
+    if (!form.name || !form.amount) return;
     setSaving(true);
     try {
-      const {error} = await sb.from("expenses").insert({name:form.name, amount:parseFloat(form.amount), category:form.category});
-      if(error) { addToast("Erreur dépense: " + error.message, "error"); setSaving(false); return; }
-      setForm({name:"",amount:"",category:"ops"});
+      const { error } = await sb.from("expenses").insert({ name: form.name, amount: parseFloat(form.amount), category: form.category });
+      if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+      setForm({ name: "", amount: "", category: "ops" });
       setShowForm(false);
       await onRefresh();
-      addToast(t(lang,"expense_added")||"Dépense ajoutée ✓","success");
-    } catch(e) { /* Expense operation failed */ addToast("Erreur dépense: " + e.message, "error"); }
+      addToast(t(lang, "expense_added") || "Dépense ajoutée", "success");
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
     setSaving(false);
   };
+
   return (
     <div>
       <GlobalFilterBar lang={lang} dr={dr} />
-      <div className="card" style={{marginBottom:20}}>
+
+      {/* ── KPI CARDS ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 14, marginBottom: 24 }}>
+        {[
+          { label: fr ? "CA Brut" : "Gross Rev", value: fmtAmount(grossRev), color: "var(--accent)", icon: "\u{1F4B0}" },
+          { label: fr ? "Frais providers" : "Provider fees", value: "-" + fmtAmount(totalProvFees), color: "var(--danger)", icon: "\u{1F3E6}" },
+          { label: "Net", value: fmtAmount(totalNet), color: "var(--info)", icon: "\u{1F4C8}" },
+          { label: "Commissions", value: "-" + fmtAmount(totalComms), color: "var(--warning)", icon: "\u{1F4AC}" },
+          { label: fr ? "Marge brute" : "Gross margin", value: fmtAmount(grossMargin) + " (" + marginPct + "%)", color: grossMargin >= 0 ? "var(--success)" : "var(--danger)", icon: "\u{1F4CA}" },
+          { label: fr ? "Dépenses" : "Expenses", value: "-" + fmtAmount(totalExpenses), color: "var(--pink)", icon: "\u{1F4C9}" },
+          { label: fr ? "Profit net" : "Net profit", value: fmtAmount(netProfit) + " (" + profitPct + "%)", color: netProfit >= 0 ? "var(--success)" : "var(--danger)", icon: "\u2728" },
+        ].map(k => (
+          <div key={k.label} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: "16px 18px" }}>
+            <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: k.color }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── P&L TABLE ── */}
+      <div className="card" style={{ marginBottom: 20 }}>
         <div className="section-title"><div className="section-bar"></div>P&L Statement</div>
         <div className="table-wrap">
-          <table className="table" style={{fontSize:13}}>
+          <table className="table" style={{ fontSize: 13 }}>
             <tbody>
-              <tr><td>{t(lang,"gross_rev")}</td><td>{grossRev}</td></tr>
-              <tr><td>{t(lang,"provider_fees")}</td><td>-{totalProvFees.toFixed(0)}</td></tr>
-              <tr><td>{t(lang,"dada_fee")}</td><td>-{totalDadaFees.toFixed(0)}</td></tr>
-              <tr><td style={{fontWeight:600}}>{t(lang,"net")}</td><td style={{fontWeight:600}}>{totalNet.toFixed(0)}</td></tr>
-              <tr><td>{t(lang,"chatter_comms")}</td><td>-{totalComms.toFixed(0)}</td></tr>
-              <tr><td style={{fontWeight:600}}>{t(lang,"gross_margin")}</td><td style={{fontWeight:600}}>{(totalNet-totalComms).toFixed(0)}</td></tr>
-              <tr><td>{t(lang,"expenses")}</td><td>-{totalExpenses.toFixed(0)}</td></tr>
-              <tr><td style={{fontWeight:600,color:"var(--success)"}}>{t(lang,"net_profit")}</td><td style={{fontWeight:600,color:"var(--success)"}}>{netProfit.toFixed(0)}</td></tr>
+              <tr><td>{t(lang, "gross_rev") || "CA Brut"}</td><td style={{ fontWeight: 600 }}>{fmtAmount(grossRev)}</td></tr>
+              <tr><td>{t(lang, "provider_fees") || "Frais providers"}</td><td style={{ color: "var(--danger)" }}>-{fmtAmount(totalProvFees)}</td></tr>
+              <tr><td>{t(lang, "dada_fee") || "Fee Dada"}</td><td style={{ color: "var(--danger)" }}>-{fmtAmount(totalDadaFees)}</td></tr>
+              <tr style={{ background: "var(--bg-overlay)" }}><td style={{ fontWeight: 700 }}>{t(lang, "net") || "Net"}</td><td style={{ fontWeight: 700 }}>{fmtAmount(totalNet)}</td></tr>
+              <tr><td>{t(lang, "chatter_comms") || "Commissions chatters"}</td><td style={{ color: "var(--warning)" }}>-{fmtAmount(totalComms)}</td></tr>
+              <tr style={{ background: "var(--bg-overlay)" }}><td style={{ fontWeight: 700 }}>{t(lang, "gross_margin") || "Marge brute"}</td><td style={{ fontWeight: 700 }}>{fmtAmount(grossMargin)} <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>({marginPct}%)</span></td></tr>
+              <tr><td>{t(lang, "expenses") || "Dépenses"}</td><td style={{ color: "var(--pink)" }}>-{fmtAmount(totalExpenses)}</td></tr>
+              <tr style={{ background: netProfit >= 0 ? "rgba(16,185,129,0.06)" : "rgba(239,68,68,0.06)" }}><td style={{ fontWeight: 800, color: netProfit >= 0 ? "var(--success)" : "var(--danger)" }}>{t(lang, "net_profit") || "Profit net"}</td><td style={{ fontWeight: 800, color: netProfit >= 0 ? "var(--success)" : "var(--danger)" }}>{fmtAmount(netProfit)} <span style={{ fontSize: 11 }}>({profitPct}%)</span></td></tr>
             </tbody>
           </table>
         </div>
       </div>
-      <div className="grid-2">
-        <div className="card">
-          <div className="section-title"><div className="section-bar"></div>{t(lang,"revenue_by_model")}</div>
-          <div className="table-wrap">
-            <table className="table"><thead><tr><th>Model</th><th>CA</th></tr></thead>
-            <tbody>
-              {models.map(m=>{
-                const ca = validTxs.filter(tx=>tx.model_id===m.id).reduce((s,tx)=>s+Number(tx.amount),0);
-                return <tr key={m.id}><td>{m.name}</td><td>{ca}</td></tr>;
-              })}
-            </tbody></table>
+
+      {/* ── GRAPH 1: CA / Net / Profit par jour (AreaChart) ── */}
+      {rechartsReady && dailyRevData.length > 0 && (
+        <div className="card" style={{ marginBottom: 20 }}>
+          <div className="section-title"><div className="section-bar"></div>{fr ? "CA / Net / Profit — 30 derniers jours" : "Revenue / Net / Profit — Last 30 days"}</div>
+          <div style={{ width: "100%", height: 260 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={dailyRevData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} interval={4} />
+                <YAxis tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(0) + "k" : v} />
+                <RechartsTooltip contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 10, fontSize: 12 }} formatter={(v) => fmtAmount(v)} />
+                <Area type="monotone" dataKey="ca" name={fr ? "CA Brut" : "Gross"} stroke="#8B5CF6" fill="#8B5CF620" strokeWidth={2} />
+                <Area type="monotone" dataKey="net" name="Net" stroke="#3B82F6" fill="#3B82F620" strokeWidth={2} />
+                <Area type="monotone" dataKey="profit" name="Profit" stroke="#10B981" fill="#10B98120" strokeWidth={2} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
         </div>
-        <div className="card">
-          <div className="section-title"><div className="section-bar"></div>Commission Distribution</div>
-          <table className="table"><thead><tr><th>Chatter</th><th>Comm</th></tr></thead>
-          <tbody>
-            {profiles.filter(u=>u.role==="chatter").map(u=>{
-              const comm = validTxs.filter(tx=>tx.chatter_id===u.id).reduce((s,tx)=>s+Number(tx.chatter_commission||0),0);
-              return <tr key={u.id}><td><Tag type="chatter" label={u.name} id={u.id}/></td><td>{comm.toFixed(0)}</td></tr>;
-            })}
-          </tbody></table>
+      )}
+
+      {/* ── GRAPH 2: Breakdown par modèle (BarChart) ── */}
+      {rechartsReady && modelChartData.length > 0 && (
+        <div className="card" style={{ marginBottom: 20 }}>
+          <div className="section-title"><div className="section-bar"></div>{fr ? "CA par modèle" : "Revenue by model"}</div>
+          <div style={{ width: "100%", height: 260 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={modelChartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }} barCategoryGap="20%">
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                <XAxis dataKey="name" tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} />
+                <YAxis tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(0) + "k" : v} />
+                <RechartsTooltip contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 10, fontSize: 12 }} formatter={(v) => fmtAmount(v)} />
+                <Bar dataKey="CA" fill="#8B5CF6" radius={[6, 6, 0, 0]} />
+                <Bar dataKey="Net" fill="#3B82F6" radius={[6, 6, 0, 0]} />
+                <Bar dataKey="Comm" fill="#F59E0B" radius={[6, 6, 0, 0]} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
+      {/* ── GRAPH 3: Breakdown par langue (PieChart) ── */}
+      {rechartsReady && langChartData.length > 0 && (
+        <div className="card" style={{ marginBottom: 20 }}>
+          <div className="section-title"><div className="section-bar"></div>{fr ? "CA par langue" : "Revenue by language"}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+            <div style={{ width: 220, height: 220, flexShrink: 0 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={langChartData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={90} innerRadius={50} paddingAngle={3} label={({ name, percent }) => name + " " + (percent * 100).toFixed(0) + "%"} labelLine={false} style={{ fontSize: 10 }}>
+                    {langChartData.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                  </Pie>
+                  <RechartsTooltip contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 10, fontSize: 12 }} formatter={(v) => fmtAmount(v)} />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              {langBreakdown.map((l, i) => (
+                <div key={l.code} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "var(--bg-overlay)", borderRadius: 10, marginBottom: 6 }}>
+                  <div style={{ width: 10, height: 10, borderRadius: 3, background: PIE_COLORS[i % PIE_COLORS.length], flexShrink: 0 }} />
+                  <span style={{ fontSize: 16 }}>{l.flag}</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, flex: 1 }}>{l.code}</span>
+                  <span style={{ fontSize: 13, fontWeight: 800, color: "var(--accent)" }}>{fmtAmount(l.ca)}</span>
+                  <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{l.txCount} tx</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── BREAKDOWN PAR MODÈLE (table) ── */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="section-title"><div className="section-bar"></div>{fr ? "Détail par modèle" : "Model breakdown"}</div>
+        <div className="table-wrap">
+          <table className="table" style={{ fontSize: 12 }}>
+            <thead><tr><th>{fr ? "Modèle" : "Model"}</th><th>CA</th><th>Net</th><th>Comm</th><th>{fr ? "Marge" : "Margin"}</th><th>TX</th></tr></thead>
+            <tbody>
+              {modelBreakdown.map(m => (
+                <tr key={m.id}>
+                  <td style={{ fontWeight: 600 }}>{m.name}</td>
+                  <td>{fmtAmount(m.ca)}</td>
+                  <td>{fmtAmount(m.net)}</td>
+                  <td style={{ color: "var(--warning)" }}>{fmtAmount(m.comm)}</td>
+                  <td style={{ fontWeight: 700, color: m.margin >= 0 ? "var(--success)" : "var(--danger)" }}>{fmtAmount(m.margin)}</td>
+                  <td>{m.txCount}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
-      <div className="card" style={{marginBottom:20}}>
-        <div className="section-title"><div className="section-bar"></div>{t(lang,"expenses")}</div>
-        <button className="btn btn-primary" style={{marginBottom:12,width:"auto"}} onClick={()=>setShowForm(!showForm)}>+ Add Expense</button>
-        {showForm&&(
-          <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12,marginBottom:12}}>
-            <input className="form-input" placeholder="Name" value={form.name} onChange={e=>setForm({...form,name:e.target.value})} />
-            <input className="form-input" type="number" placeholder="Amount" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} />
-            <select className="filter-select" value={form.category} onChange={e=>setForm({...form,category:e.target.value})}>
-              <option value="ops">Operations</option><option value="modele">Model Salary</option><option value="marketing">Marketing</option><option value="autre">Autre</option>
+
+      {/* ── BREAKDOWN PAR LANGUE (table) ── */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="section-title"><div className="section-bar"></div>{fr ? "Détail par langue" : "Language breakdown"}</div>
+        <div className="table-wrap">
+          <table className="table" style={{ fontSize: 12 }}>
+            <thead><tr><th></th><th>{fr ? "Langue" : "Language"}</th><th>CA</th><th>Net</th><th>TX</th><th>% CA</th></tr></thead>
+            <tbody>
+              {langBreakdown.map(l => (
+                <tr key={l.code}>
+                  <td style={{ fontSize: 16 }}>{l.flag}</td>
+                  <td style={{ fontWeight: 600 }}>{l.code}</td>
+                  <td style={{ fontWeight: 700 }}>{fmtAmount(l.ca)}</td>
+                  <td>{fmtAmount(l.net)}</td>
+                  <td>{l.txCount}</td>
+                  <td style={{ color: "var(--accent)", fontWeight: 700 }}>{grossRev > 0 ? ((l.ca / grossRev) * 100).toFixed(1) : 0}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── COMMISSION DISTRIBUTION ── */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="section-title"><div className="section-bar"></div>{fr ? "Distribution commissions" : "Commission distribution"}</div>
+        <div className="table-wrap">
+          <table className="table" style={{ fontSize: 12 }}>
+            <thead><tr><th>Chatter</th><th>Commission</th><th>% total</th></tr></thead>
+            <tbody>
+              {profiles.filter(u => u.role === "chatter").map(u => {
+                const comm = validTxs.filter(tx => tx.chatter_id === u.id).reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
+                return (
+                  <tr key={u.id}>
+                    <td><Tag type="chatter" label={u.name} id={u.id} /></td>
+                    <td style={{ fontWeight: 700, color: "var(--warning)" }}>{fmtAmount(comm)}</td>
+                    <td style={{ color: "var(--text-tertiary)" }}>{totalComms > 0 ? ((comm / totalComms) * 100).toFixed(1) : 0}%</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── EXPENSES ── */}
+      <div className="card" style={{ marginBottom: 20 }}>
+        <div className="section-title"><div className="section-bar"></div>{t(lang, "expenses") || "Dépenses"}</div>
+        <button className="btn btn-primary" style={{ marginBottom: 12, width: "auto" }} onClick={() => setShowForm(!showForm)}>+ {fr ? "Ajouter dépense" : "Add Expense"}</button>
+        {showForm && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 12, marginBottom: 12 }}>
+            <input className="form-input" placeholder={fr ? "Nom" : "Name"} value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+            <input className="form-input" type="number" step="0.01" placeholder={fr ? "Montant" : "Amount"} value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} />
+            <select className="filter-select" value={form.category} onChange={e => setForm({ ...form, category: e.target.value })}>
+              <option value="ops">Operations</option><option value="modele">{fr ? "Salaire modèle" : "Model Salary"}</option><option value="marketing">Marketing</option><option value="autre">{fr ? "Autre" : "Other"}</option>
             </select>
-            <div style={{display:"flex",gap:8}}>
-              <button className="btn btn-success" onClick={handleAdd} disabled={saving} style={{flex:1}}>{saving?"...":"Add"}</button>
-              <button className="btn btn-danger" onClick={()=>setShowForm(false)} style={{flex:1}}>Cancel</button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn-success" onClick={handleAdd} disabled={saving} style={{ flex: 1 }}>{saving ? "..." : (fr ? "Ajouter" : "Add")}</button>
+              <button className="btn btn-danger" onClick={() => setShowForm(false)} style={{ flex: 1 }}>{fr ? "Annuler" : "Cancel"}</button>
             </div>
           </div>
         )}
-        <table className="table"><thead><tr><th>Name</th><th>Category</th><th>Amount</th></tr></thead>
-        <tbody>
-          {expenses.map(e=>(
-            <tr key={e.id}><td>{e.name}</td><td>{e.category}</td><td>{e.amount}</td></tr>
-          ))}
-        </tbody></table>
+        <div className="table-wrap">
+          <table className="table" style={{ fontSize: 12 }}>
+            <thead><tr><th>{fr ? "Nom" : "Name"}</th><th>{fr ? "Catégorie" : "Category"}</th><th>{fr ? "Montant" : "Amount"}</th></tr></thead>
+            <tbody>
+              {expenses.map(e => (
+                <tr key={e.id}><td>{e.name}</td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.category}</span></td><td style={{ fontWeight: 700 }}>{fmtAmount(e.amount)}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
@@ -18583,7 +18786,7 @@ const App = () => {
         return <GerantMessagerieTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />;
       case "compta":
         return (<>{renderGerantTabBar("compta")}
-          {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
+          {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
           {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} payslips={payslips} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txs} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txs} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
