@@ -598,6 +598,17 @@
     .table tr:hover { background: var(--table-row-hover); }
     .table tr.pending-row { background: var(--warning-muted); }
     .table tr.pending-row:hover { background: rgba(251,191,36,0.1); }
+    .table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; transition: color 0.15s; }
+    .table th.sortable:hover { color: var(--accent); }
+    .table th.sortable .sort-icon { font-size: 10px; margin-left: 3px; opacity: 0.3; }
+    .table th.sortable.sort-active .sort-icon { opacity: 1; color: var(--accent); }
+    .pagination-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-top: 1px solid var(--border-subtle); margin-top: 8px; }
+    .pagination-info { font-size: 11px; color: var(--text-tertiary); }
+    .pagination-controls { display: flex; gap: 4px; align-items: center; }
+    .pagination-btn { padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border-default); background: var(--accent-subtle); color: var(--accent); font-size: 12px; font-weight: 700; cursor: pointer; font-family: 'DM Sans', sans-serif; transition: all 0.15s; line-height: 1; }
+    .pagination-btn:hover:not(:disabled) { background: var(--accent-muted); border-color: var(--border-accent); }
+    .pagination-btn:disabled { background: transparent; color: var(--text-quaternary); border-color: var(--border-subtle); cursor: default; }
+    .pagination-page { padding: 5px 8px; font-size: 11px; color: var(--text-secondary); font-family: 'DM Sans', sans-serif; }
     .progress {
       width: 100%; height: 4px;
       background: var(--bg-overlay);
@@ -1634,17 +1645,16 @@ const EditTxModal = ({tx, lang, onSave, onCancel, saving, models, profiles, prod
   );
 };
 
-// =============================================
-// SORTABLE TABLE HEADER + HOOK
-// =============================================
-const SortTh = ({label, sortKey, sort, onSort}) => {
-  const active = sort.key===sortKey;
-  const arrow = active?(sort.dir==="asc"?"▲":"▼"):"▽";
-  return <th className="sort-th" onClick={()=>onSort(sortKey)}>{label} <span className={`sort-arrow ${active?"active":""}`}>{arrow}</span></th>;
-};
+// Legacy sortable hook (used by drill-down detail views)
 const useSortable = (defaultKey="date", defaultDir="desc") => {
   const [sort, setSort] = useState({key:defaultKey, dir:defaultDir});
-  const onSort = (key) => setSort(prev=>({key, dir:prev.key===key&&prev.dir==="desc"?"asc":"desc"}));
+  const onSort = (keyOrObj) => {
+    if (typeof keyOrObj === "object" && keyOrObj !== null && "key" in keyOrObj) {
+      setSort(keyOrObj);
+    } else {
+      setSort(prev=>({key:keyOrObj, dir:prev.key===keyOrObj&&prev.dir==="desc"?"asc":"desc"}));
+    }
+  };
   const doSort = (data, getters={}) => {
     return [...data].sort((a,b)=>{
       const g = getters[sort.key]||(x=>x[sort.key]);
@@ -1831,6 +1841,74 @@ const filterByModel = (items, modelId) => modelId ? items.filter(i => i.model_id
 const filterByProvider = (items, providerId) => providerId ? items.filter(i => i.provider_id === providerId) : items;
 const filterByChatter = (items, chatterId) => chatterId ? items.filter(i => i.chatter_id === chatterId) : items;
 const filterByStatus = (items, status) => status ? items.filter(i => i.status === status) : items;
+
+// =============================================
+// PAGINATION + SORT COMPONENTS
+// =============================================
+const PAGE_SIZE = 50;
+
+const Pagination = ({currentPage, setPage, totalItems, pageSize = PAGE_SIZE, lang = "fr"}) => {
+  if (totalItems <= pageSize) return null;
+  const totalPages = Math.ceil(totalItems / pageSize);
+  const from = currentPage * pageSize + 1;
+  const to = Math.min((currentPage + 1) * pageSize, totalItems);
+  const fr = lang === "fr";
+  return (
+    <div className="pagination-bar">
+      <span className="pagination-info">
+        {fr ? `Résultats ${from} à ${to} sur ${totalItems} total` : `Results ${from} to ${to} of ${totalItems} total`}
+      </span>
+      <div className="pagination-controls">
+        <button className="pagination-btn" disabled={currentPage===0} onClick={()=>setPage(0)} title={fr?"Première page":"First page"}>«</button>
+        <button className="pagination-btn" disabled={currentPage===0} onClick={()=>setPage(p=>Math.max(0,p-1))} title={fr?"Page précédente":"Previous page"}>‹</button>
+        <span className="pagination-page">{currentPage+1} / {totalPages}</span>
+        <button className="pagination-btn" disabled={currentPage>=totalPages-1} onClick={()=>setPage(p=>Math.min(totalPages-1,p+1))} title={fr?"Page suivante":"Next page"}>›</button>
+        <button className="pagination-btn" disabled={currentPage>=totalPages-1} onClick={()=>setPage(totalPages-1)} title={fr?"Dernière page":"Last page"}>»</button>
+      </div>
+    </div>
+  );
+};
+
+const SortTh = ({label, sortKey, sort, onSort, style, children}) => {
+  const active = sort && sort.key === sortKey;
+  const dir = active ? sort.dir : null;
+  const handleClick = () => {
+    if (!active) onSort({key: sortKey, dir: "asc"});
+    else if (dir === "asc") onSort({key: sortKey, dir: "desc"});
+    else onSort({key: null, dir: null});
+  };
+  return (
+    <th className={`sortable${active?" sort-active":""}`} style={style} onClick={handleClick}>
+      {label || children}
+      <span className="sort-icon">{dir === "asc" ? "↑" : dir === "desc" ? "↓" : "↕"}</span>
+    </th>
+  );
+};
+
+const sortData = (data, sort, getters = {}) => {
+  if (!sort || !sort.key || !sort.dir) return data;
+  const getter = getters[sort.key] || (item => item[sort.key]);
+  return [...data].sort((a, b) => {
+    let va = getter(a), vb = getter(b);
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    // Date strings
+    if (typeof va === "string" && typeof vb === "string" && /^\d{4}-\d{2}/.test(va) && /^\d{4}-\d{2}/.test(vb)) {
+      return sort.dir === "asc" ? new Date(va) - new Date(vb) : new Date(vb) - new Date(va);
+    }
+    // Numbers
+    if (typeof va === "number" && typeof vb === "number") {
+      return sort.dir === "asc" ? va - vb : vb - va;
+    }
+    // Strings
+    va = String(va).toLowerCase();
+    vb = String(vb).toLowerCase();
+    return sort.dir === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
+  });
+};
+
+const paginate = (data, page, pageSize = PAGE_SIZE) => data.slice(page * pageSize, (page + 1) * pageSize);
 
 // =============================================
 // GAMIFICATION: BADGES
@@ -2417,6 +2495,12 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
   const [expForm, setExpForm] = useState({model_id:"",amount:"",currency:"EUR",category:"contenu",description:"",date:new Date().toISOString().slice(0,10)});
   const [editingTx, setEditingTx] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [mCompSort, setMCompSort] = useState({key: null, dir: null});
+  const [mCompPage, setMCompPage] = useState(0);
+  const [mTxPage, setMTxPage] = useState(0);
+  const [mTxSort, setMTxSort] = useState({key: null, dir: null});
+  const [mExpPage, setMExpPage] = useState(0);
+  const [mExpSort, setMExpSort] = useState({key: null, dir: null});
   const filteredTxs = useMemo(() => {
     return filterByProvider(dr.filterByDate(txs, "date"), mfProvider);
   }, [txs, dr.startDate, dr.endDate, dr.activePreset, mfProvider]);
@@ -2513,6 +2597,7 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
     } catch(e){setSaving(false);addToast("Erreur: "+e.message,"error");}
   };
 
+  useEffect(() => { setMTxPage(0); setMTxSort({key:null,dir:null}); }, [selectedModel]);
   const sel = selectedModel ? modelStats.find(m=>m.id===selectedModel) : null;
   const Badge = ({color,text}) => <span style={{fontSize:9,padding:"3px 8px",borderRadius:12,background:`${color}22`,color,fontWeight:700,whiteSpace:"nowrap"}}>{text}</span>;
 
@@ -2585,9 +2670,9 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
           <div className="section-title"><div className="section-bar"></div>{fr?"Tableau Comparatif":"Comparative Table"}</div>
           <div className="table-wrap">
             <table className="table">
-              <thead><tr><th>{t(lang,"model")}</th><th>CA</th><th>{fr?"Dépenses":"Expenses"}</th><th>{fr?"Bénéf":"Profit"}</th><th>Marge</th><th>TX</th><th>Conv %</th><th>Badges</th></tr></thead>
+              <thead><tr><SortTh label={t(lang,"model")} sortKey="name" sort={mCompSort} onSort={setMCompSort}/><SortTh label="CA" sortKey="ca" sort={mCompSort} onSort={setMCompSort}/><SortTh label={fr?"Dépenses":"Expenses"} sortKey="totalExp" sort={mCompSort} onSort={setMCompSort}/><SortTh label={fr?"Bénéf":"Profit"} sortKey="benefice" sort={mCompSort} onSort={setMCompSort}/><SortTh label="Marge" sortKey="margin" sort={mCompSort} onSort={setMCompSort}/><SortTh label="TX" sortKey="txCount" sort={mCompSort} onSort={setMCompSort}/><SortTh label="Conv %" sortKey="convRate" sort={mCompSort} onSort={setMCompSort}/><th>Badges</th></tr></thead>
               <tbody>
-                {modelStats.map(m => (
+                {paginate(sortData(modelStats, mCompSort), mCompPage).map(m => (
                   <tr key={m.id} style={{cursor:"pointer"}} onClick={()=>{setSelectedModel(m.id);setView("model");}}>
                     <td style={{fontWeight:600}}><Tag type="model" label={m.name} id={m.id}/></td>
                     <td style={{color:"var(--success)",fontWeight:700}}>{Math.round(m.ca)}{currencySymbol}</td>
@@ -2607,6 +2692,7 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
               </tbody>
             </table>
           </div>
+          <Pagination currentPage={mCompPage} setPage={setMCompPage} totalItems={modelStats.length} lang={lang}/>
         </div>
       </>}
 
@@ -2647,9 +2733,9 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
               <div style={{fontWeight:700,fontSize:14,marginBottom:14}}>📋 {sel.name} — TX ({sel.txCount})</div>
               <div className="table-wrap" style={{maxHeight:400,overflowY:"auto"}}>
                 <table className="table">
-                  <thead><tr><th>{t(lang,"date")}</th><th>Spender</th><th>{t(lang,"amount")}</th><th>{lang==="fr"?"Produit":"Product"}</th><th>Tag</th><th>Chatter</th><th>Provider</th><th>{t(lang,"status")}</th><th>{t(lang,"actions")}</th></tr></thead>
+                  <thead><tr><SortTh label={t(lang,"date")} sortKey="date" sort={mTxSort} onSort={setMTxSort}/><th>Spender</th><SortTh label={t(lang,"amount")} sortKey="amount" sort={mTxSort} onSort={setMTxSort}/><th>{lang==="fr"?"Produit":"Product"}</th><th>Tag</th><th>Chatter</th><th>Provider</th><SortTh label={t(lang,"status")} sortKey="status" sort={mTxSort} onSort={setMTxSort}/><th>{t(lang,"actions")}</th></tr></thead>
                   <tbody>
-                    {sel.mTxs.slice(0,30).map(tx => (
+                    {paginate(sortData(sel.mTxs, mTxSort, {date:tx=>tx.date,amount:tx=>Number(tx.amount),status:tx=>tx.status}), mTxPage).map(tx => (
                       <tr key={tx.id} className={tx.status==="pending"?"pending-row":""}>
                         <td style={{fontFamily:"monospace",fontSize:11,color:"var(--text-secondary)"}}>{fmtDate(tx.date)}</td>
                         <td><Tag type="spender" label={tx.spender_handle} id={tx.spender_handle}/></td>
@@ -2669,6 +2755,7 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
                   </tbody>
                 </table>
               </div>
+              <Pagination currentPage={mTxPage} setPage={setMTxPage} totalItems={sel.mTxs.length} lang={lang}/>
             </div>
             <div className="card">
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
@@ -2753,9 +2840,9 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
         </div>
         <div className="table-wrap">
           <table className="table">
-            <thead><tr><th>Date</th><th>{t(lang,"model")}</th><th>{fr?"Catégorie":"Category"}</th><th>Description</th><th>{t(lang,"amount")}</th></tr></thead>
+            <thead><tr><SortTh label="Date" sortKey="date" sort={mExpSort} onSort={setMExpSort}/><SortTh label={t(lang,"model")} sortKey="model_id" sort={mExpSort} onSort={setMExpSort}/><th>{fr?"Catégorie":"Category"}</th><th>Description</th><SortTh label={t(lang,"amount")} sortKey="amount" sort={mExpSort} onSort={setMExpSort}/></tr></thead>
             <tbody>
-              {(expenses||[]).slice(0,20).map((e,i) => {
+              {paginate(sortData(expenses||[], mExpSort, {date:e=>e.date||e.created_at||"",model_id:e=>models.find(m=>m.id===e.model_id)?.name||"",amount:e=>Number(e.amount)}), mExpPage).map((e,i) => {
                 const mName = models.find(m=>m.id===e.model_id)?.name||(fr?"Agence":"Agency");
                 const cat = EXPENSE_CATS.find(c=>c.id===e.category);
                 return <tr key={e.id||i}>
@@ -2770,6 +2857,7 @@ const ModelesTab = ({user, lang, txs, models, profiles, expenses, onRefresh, onN
             </tbody>
           </table>
         </div>
+        <Pagination currentPage={mExpPage} setPage={setMExpPage} totalItems={(expenses||[]).length} lang={lang}/>
       </div>
 
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={()=>setEditingTx(null)} saving={saving} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} />}
@@ -2794,7 +2882,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
   const [editingTx, setEditingTx] = useState(null);
   const [processingTxId, setProcessingTxId] = useState(null);
   const [txPage, setTxPage] = useState(0);
-  const TX_PER_PAGE = 50;
+  const [txSort, setTxSort] = useState({key: null, dir: null});
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
   let filtered = filterByStatus(filterByChatter(filterByProvider(filterByModel(dr.filterByDate(txs, "date"), model), txProvider), chatter), status);
@@ -2803,8 +2891,19 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
   const filteredLen = filtered.length;
   useEffect(() => { setTxPage(0); }, [filteredLen]);
 
-  const totalTxPages = Math.max(1, Math.ceil(filtered.length / TX_PER_PAGE));
-  const paginatedTxs = filtered.slice(txPage * TX_PER_PAGE, (txPage + 1) * TX_PER_PAGE);
+  const txSortGetters = useMemo(() => ({
+    date: tx => tx.date,
+    spender_handle: tx => tx.spender_handle,
+    amount: tx => Number(tx.amount),
+    currency: tx => tx.currency || "EUR",
+    model_id: tx => models.find(m=>m.id===tx.model_id)?.name || "",
+    provider_id: tx => profiles.find(p=>p.id===tx.provider_id)?.name || "",
+    chatter_id: tx => profiles.find(p=>p.id===tx.chatter_id)?.name || "",
+    product: tx => tx.product || "",
+    status: tx => tx.status,
+  }), [models, profiles]);
+  const sortedFiltered = sortData(filtered, txSort, txSortGetters);
+  const paginatedTxs = paginate(sortedFiltered, txPage);
 
   // Build spender list for autocomplete
   const spenderOptions = React.useMemo(() => {
@@ -3028,7 +3127,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
         <div className="table-wrap">
           <table className="table">
             <thead>
-              <tr><th>{t(lang,"date")}</th><th>{lang==="fr"?"Heure":"Time"}</th><th>Spender</th><th>{t(lang,"amount")}</th><th>{lang==="fr"?"Devise":"Cur."}</th><th>Model</th><th>Provider</th><th>Chatter</th><th>{lang==="fr"?"Produit":"Product"}</th><th>{t(lang,"notes")}</th><th>{t(lang,"status")}</th>{(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&<th>{t(lang,"actions")}</th>}</tr>
+              <tr><SortTh label={t(lang,"date")} sortKey="date" sort={txSort} onSort={setTxSort}/><th>{lang==="fr"?"Heure":"Time"}</th><SortTh label="Spender" sortKey="spender_handle" sort={txSort} onSort={setTxSort}/><SortTh label={t(lang,"amount")} sortKey="amount" sort={txSort} onSort={setTxSort}/><SortTh label={lang==="fr"?"Devise":"Cur."} sortKey="currency" sort={txSort} onSort={setTxSort}/><SortTh label="Model" sortKey="model_id" sort={txSort} onSort={setTxSort}/><SortTh label="Provider" sortKey="provider_id" sort={txSort} onSort={setTxSort}/><SortTh label="Chatter" sortKey="chatter_id" sort={txSort} onSort={setTxSort}/><SortTh label={lang==="fr"?"Produit":"Product"} sortKey="product" sort={txSort} onSort={setTxSort}/><th>{t(lang,"notes")}</th><SortTh label={t(lang,"status")} sortKey="status" sort={txSort} onSort={setTxSort}/>{(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&<th>{t(lang,"actions")}</th>}</tr>
             </thead>
             <tbody>
               {paginatedTxs.map(tx=>{
@@ -3067,15 +3166,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
             </tbody>
           </table>
         </div>
-        {totalTxPages > 1 && (
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 0",borderTop:"1px solid var(--border-subtle)",marginTop:8}}>
-            <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{filtered.length} {lang==="fr"?"transactions":"transactions"} — page {txPage+1}/{totalTxPages}</span>
-            <div style={{display:"flex",gap:6}}>
-              <button disabled={txPage===0} onClick={()=>setTxPage(p=>p-1)} style={{padding:"5px 12px",borderRadius:8,border:"1px solid var(--border-default)",background:txPage===0?"transparent":"var(--accent-subtle)",color:txPage===0?"var(--text-quaternary)":"var(--accent)",fontSize:11,fontWeight:600,cursor:txPage===0?"default":"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Prec.":"Prev"}</button>
-              <button disabled={txPage>=totalTxPages-1} onClick={()=>setTxPage(p=>p+1)} style={{padding:"5px 12px",borderRadius:8,border:"1px solid var(--border-default)",background:txPage>=totalTxPages-1?"transparent":"var(--accent-subtle)",color:txPage>=totalTxPages-1?"var(--text-quaternary)":"var(--accent)",fontSize:11,fontWeight:600,cursor:txPage>=totalTxPages-1?"default":"pointer",fontFamily:"'DM Sans',sans-serif"}}>{lang==="fr"?"Suiv.":"Next"}</button>
-            </div>
-          </div>
-        )}
+        <Pagination currentPage={txPage} setPage={setTxPage} totalItems={sortedFiltered.length} lang={lang}/>
       </div>
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={() => setEditingTx(null)} saving={saving} models={models} profiles={profiles} />}
     </div>
@@ -3097,6 +3188,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
   const [detailTab, setDetailTab] = useState("models");
   const [editingTx, setEditingTx] = useState(null);
   const [spSaving, setSpSaving] = useState(false);
+  const [spPage, setSpPage] = useState(0);
   const handleSpStatus = async (txId, newStatus) => {
     try {
       const currentTx = txs.find(tx=>tx.id===txId);
@@ -3225,6 +3317,10 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
   else if(sortBy==="model_ca" && filterModel) sorted.sort((a,b)=>(b.byModel[filterModel]?.ca||0)-(a.byModel[filterModel]?.ca||0));
   else sorted.sort((a,b)=>b.ltv-a.ltv);
 
+  const spSortedLen = sorted.length;
+  useEffect(() => { setSpPage(0); }, [spSortedLen, sortBy, filterModel]);
+  const paginatedSpenders = paginate(sorted, spPage);
+
   const avgLtv = sorted.length>0 ? sorted.reduce((s,x)=>s+x.ltv,0)/sorted.length : 0;
   const multiModelCount = sorted.filter(s=>s.modelCount>1).length;
   const totalValidated = sorted.reduce((s,x)=>s+x.validCA,0);
@@ -3254,7 +3350,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
 
       <div className="grid-55-45">
         <div>
-          {sorted.map(s=>(
+          {paginatedSpenders.map(s=>(
             <div key={s.name} className="spender-card" onClick={()=>{setSelected(s);setDetailModel("");setDetailTab("models");}}>
               <div className="spender-top">
                 <div className="spender-name"><Tag type="spender" label={s.name} id={s.name}/></div>
@@ -3288,6 +3384,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
             </div>
           ))}
           {sorted.length===0 && <div style={{color:"var(--text2)",textAlign:"center",padding:40}}>{fr?"Aucun spender":"No spenders"}</div>}
+          <Pagination currentPage={spPage} setPage={setSpPage} totalItems={sorted.length} lang={lang}/>
         </div>
 
         {/* Detail Panel */}
@@ -6553,6 +6650,12 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
   const [rejectId, setRejectId] = useState(null);
   const [rejectNotes, setRejectNotes] = useState("");
   const [actionLoading, setActionLoading] = useState(null);
+  const [pCompSort, setPCompSort] = useState({key: null, dir: null});
+  const [pCompPage, setPCompPage] = useState(0);
+  const [pBalSort, setPBalSort] = useState({key: null, dir: null});
+  const [pBalPage, setPBalPage] = useState(0);
+  const [pHistSort, setPHistSort] = useState({key: null, dir: null});
+  const [pHistPage, setPHistPage] = useState(0);
 
   const providers = profiles.filter(p => p.role === "provider");
   const filteredTxs = useMemo(() => {
@@ -6697,19 +6800,19 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
           <div style={{ overflowX: "auto" }}>
             <table className="table" style={{ fontSize: 12 }}>
               <thead><tr>
-                <th>{fr ? "Prestataire" : "Provider"}</th>
-                <th>CA Trait\u00E9</th>
-                <th>TX Total</th>
-                <th>{fr ? "Valid\u00E9es" : "Validated"}</th>
-                <th>{fr ? "En attente" : "Pending"}</th>
-                <th>{fr ? "Refus\u00E9es" : "Refused"}</th>
-                <th>{fr ? "Taux Valid." : "Valid. Rate"}</th>
-                <th>{fr ? "Panier Moyen" : "Avg Ticket"}</th>
-                <th>{fr ? "Montant Pending" : "Pending Amount"}</th>
+                <SortTh label={fr ? "Prestataire" : "Provider"} sortKey="provider_name" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={"CA Trait\u00E9"} sortKey="totalCA" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label="TX Total" sortKey="txCount" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={fr ? "Valid\u00E9es" : "Validated"} sortKey="validatedCount" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={fr ? "En attente" : "Pending"} sortKey="pendingCount" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={fr ? "Refus\u00E9es" : "Refused"} sortKey="refusedCount" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={fr ? "Taux Valid." : "Valid. Rate"} sortKey="validationRate" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={fr ? "Panier Moyen" : "Avg Ticket"} sortKey="avgTicket" sort={pCompSort} onSort={setPCompSort}/>
+                <SortTh label={fr ? "Montant Pending" : "Pending Amount"} sortKey="pendingAmount" sort={pCompSort} onSort={setPCompSort}/>
                 <th>{fr ? "Mod\u00E8les" : "Models"}</th>
               </tr></thead>
               <tbody>
-                {providerStats.map((ps, i) => (
+                {paginate(sortData(providerStats, pCompSort, {provider_name:ps=>ps.provider.name}), pCompPage).map((ps, i) => (
                   <tr key={ps.provider.id} style={{ cursor: "pointer" }} onClick={() => setSelectedProv(ps)}>
                     <td>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -6744,6 +6847,7 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
               </tbody>
             </table>
           </div>
+          <div style={{padding:"0 20px"}}><Pagination currentPage={pCompPage} setPage={setPCompPage} totalItems={providerStats.length} lang={lang}/></div>
         </div>
       )}
 
@@ -6903,14 +7007,14 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
             <div className="table-wrap">
               <table className="table" style={{fontSize:12}}>
                 <thead><tr>
-                  <th>{fr?"Prestataire":"Provider"}</th>
-                  <th>CA {fr?"Validé":"Validated"}</th>
-                  <th>{fr?"Payé (validé)":"Paid (validated)"}</th>
-                  <th>{fr?"En attente":"Pending"}</th>
-                  <th>{fr?"Solde dû":"Balance due"}</th>
+                  <SortTh label={fr?"Prestataire":"Provider"} sortKey="provider_name" sort={pBalSort} onSort={setPBalSort}/>
+                  <SortTh label={`CA ${fr?"Validé":"Validated"}`} sortKey="caValide" sort={pBalSort} onSort={setPBalSort}/>
+                  <SortTh label={fr?"Payé (validé)":"Paid (validated)"} sortKey="paid" sort={pBalSort} onSort={setPBalSort}/>
+                  <SortTh label={fr?"En attente":"Pending"} sortKey="pending" sort={pBalSort} onSort={setPBalSort}/>
+                  <SortTh label={fr?"Solde dû":"Balance due"} sortKey="solde" sort={pBalSort} onSort={setPBalSort}/>
                 </tr></thead>
                 <tbody>
-                  {providerBalances.map(pb=>(
+                  {paginate(sortData(providerBalances, pBalSort, {provider_name:pb=>pb.provider.name}), pBalPage).map(pb=>(
                     <tr key={pb.provider.id}>
                       <td style={{fontWeight:700}}>{pb.provider.name}</td>
                       <td>{pb.caValide.toLocaleString("fr-FR",{maximumFractionDigits:0})}{currencySymbol}</td>
@@ -6926,6 +7030,7 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
                 </tbody>
               </table>
             </div>
+            <Pagination currentPage={pBalPage} setPage={setPBalPage} totalItems={providerBalances.length} lang={lang}/>
           </div>
 
           {/* Pending payouts — validate/reject */}
@@ -6973,12 +7078,15 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
               <div className="table-wrap">
                 <table className="table" style={{fontSize:12}}>
                   <thead><tr>
-                    <th>{t(lang,"date")}</th><th>{fr?"Prestataire":"Provider"}</th><th>{t(lang,"amount")}</th>
+                    <SortTh label={t(lang,"date")} sortKey="created_at" sort={pHistSort} onSort={setPHistSort}/>
+                    <SortTh label={fr?"Prestataire":"Provider"} sortKey="provider_id" sort={pHistSort} onSort={setPHistSort}/>
+                    <SortTh label={t(lang,"amount")} sortKey="amount" sort={pHistSort} onSort={setPHistSort}/>
                     <th>{fr?"Période":"Period"}</th><th>{fr?"Méthode":"Method"}</th><th>{fr?"Référence":"Ref"}</th>
-                    <th>{t(lang,"status")}</th><th>{fr?"Validé par":"Validated by"}</th><th>Notes</th>
+                    <SortTh label={t(lang,"status")} sortKey="status" sort={pHistSort} onSort={setPHistSort}/>
+                    <th>{fr?"Validé par":"Validated by"}</th><th>Notes</th>
                   </tr></thead>
                   <tbody>
-                    {allPP.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).map(pp=>{
+                    {paginate(sortData(allPP.slice().sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)), pHistSort, {created_at:pp=>pp.created_at,provider_id:pp=>profiles.find(p=>p.id===pp.provider_id)?.name||"",amount:pp=>Number(pp.amount),status:pp=>pp.status}), pHistPage).map(pp=>{
                       const provName=profiles.find(p=>p.id===pp.provider_id)?.name||"?";
                       const validatorName=pp.validated_by?profiles.find(p=>p.id===pp.validated_by)?.name||"?":"—";
                       const stMap={pending:{bg:"var(--warning-muted)",color:"var(--warning)",icon:"⏳"},validated:{bg:"var(--success-muted)",color:"var(--success)",icon:"✅"},rejected:{bg:"var(--danger-muted)",color:"var(--danger)",icon:"❌"}};
@@ -7001,6 +7109,7 @@ const PrestatairesTab = ({user, lang, txs, models, profiles, onRefresh, provider
                 </table>
               </div>
             )}
+            <Pagination currentPage={pHistPage} setPage={setPHistPage} totalItems={allPP.length} lang={lang}/>
           </div>
         </div>);
       })()}
@@ -11272,6 +11381,8 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
   const [showEmail, setShowEmail] = useState(null);
   const [emailTo, setEmailTo] = useState("");
   const [saving, setSaving] = useState(false);
+  const [invSort, setInvSort] = useState({key: null, dir: null});
+  const [invPage, setInvPage] = useState(0);
   const [createForm, setCreateForm] = useState({
     type: "outgoing_chatter",
     profile_id: "",
@@ -11297,6 +11408,12 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
 
   // Apply status filter
   if (statusFilter !== "all") filtered = filtered.filter(i => i.status === statusFilter);
+
+  const invFilteredLen = filtered.length;
+  useEffect(() => { setInvPage(0); }, [invFilteredLen]);
+  const invSortGetters = {created_at:i=>i.created_at,invoice_number:i=>i.invoice_number,type:i=>i.type,total:i=>Number(i.total||0),status:i=>i.status,to_name:i=>(i.from_name||"")+" "+(i.to_name||"")};
+  const sortedInvoices = sortData(filtered, invSort, invSortGetters);
+  const paginatedInvoices = paginate(sortedInvoices, invPage);
 
   // KPIs
   const totalFacture = filteredByDate.reduce((s, i) => s + Number(i.total || 0), 0);
@@ -11550,41 +11667,44 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
     // Table
     filtered.length === 0
       ? React.createElement("div", { className: "card", style: { textAlign: "center", padding: 40, color: "var(--text-tertiary)" } }, fr ? "Aucune facture trouvée" : "No invoices found")
-      : React.createElement("div", { className: "table-wrap" },
-          React.createElement("table", { className: "table", style: { fontSize: 12 } },
-            React.createElement("thead", null,
-              React.createElement("tr", null,
-                React.createElement("th", null, "N° Facture"),
-                React.createElement("th", null, "Date"),
-                React.createElement("th", null, "Type"),
-                React.createElement("th", null, fr ? "De → À" : "From → To"),
-                React.createElement("th", null, fr ? "Montant" : "Amount"),
-                React.createElement("th", null, "Status"),
-                React.createElement("th", null, "Actions"),
+      : React.createElement("div", null,
+          React.createElement("div", { className: "table-wrap" },
+            React.createElement("table", { className: "table", style: { fontSize: 12 } },
+              React.createElement("thead", null,
+                React.createElement("tr", null,
+                  React.createElement(SortTh, { label: "N° Facture", sortKey: "invoice_number", sort: invSort, onSort: setInvSort }),
+                  React.createElement(SortTh, { label: "Date", sortKey: "created_at", sort: invSort, onSort: setInvSort }),
+                  React.createElement(SortTh, { label: "Type", sortKey: "type", sort: invSort, onSort: setInvSort }),
+                  React.createElement("th", null, fr ? "De → À" : "From → To"),
+                  React.createElement(SortTh, { label: fr ? "Montant" : "Amount", sortKey: "total", sort: invSort, onSort: setInvSort }),
+                  React.createElement(SortTh, { label: "Status", sortKey: "status", sort: invSort, onSort: setInvSort }),
+                  React.createElement("th", null, "Actions"),
+                )
+              ),
+              React.createElement("tbody", null,
+                paginatedInvoices.map(inv => {
+                  const st = invoiceStatusConfig[inv.status] || invoiceStatusConfig.draft;
+                  const tp = invoiceTypeLabels[inv.type] || { label: inv.type, icon: "•", color: "var(--text-secondary)" };
+                  return React.createElement("tr", { key: inv.id },
+                    React.createElement("td", { style: { fontFamily: "monospace", fontWeight: 700, fontSize: 11 } }, inv.invoice_number),
+                    React.createElement("td", null, fmtDate(inv.created_at)),
+                    React.createElement("td", null, React.createElement("span", { style: { padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 700, color: tp.color, background: tp.color + "18" } }, tp.icon + " " + tp.label)),
+                    React.createElement("td", { style: { fontSize: 11 } }, inv.from_name + " → " + inv.to_name),
+                    React.createElement("td", { style: { fontWeight: 800, whiteSpace: "nowrap" } }, Number(inv.total).toFixed(2) + " " + (inv.currency || "EUR")),
+                    React.createElement("td", null, React.createElement("span", { style: { padding: "3px 10px", borderRadius: 12, background: st.bg, color: st.color, fontSize: 11, fontWeight: 700 } }, st.icon + " " + st.label)),
+                    React.createElement("td", null,
+                      React.createElement("div", { style: { display: "flex", gap: 4, flexWrap: "wrap" } },
+                        React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px" }, onClick: () => downloadInvoicePDF(inv), title: "PDF" }, "📄"),
+                        React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px" }, onClick: () => { setShowEmail(inv); setEmailTo(inv.to_details?.email || inv.sent_to_email || ""); }, title: "Email" }, "📧"),
+                        (inv.status === "draft" || inv.status === "sent") && React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px", color: "var(--danger)" }, onClick: () => handleCancel(inv), title: fr ? "Annuler" : "Cancel" }, "❌"),
+                      )
+                    ),
+                  );
+                })
               )
-            ),
-            React.createElement("tbody", null,
-              filtered.map(inv => {
-                const st = invoiceStatusConfig[inv.status] || invoiceStatusConfig.draft;
-                const tp = invoiceTypeLabels[inv.type] || { label: inv.type, icon: "•", color: "var(--text-secondary)" };
-                return React.createElement("tr", { key: inv.id },
-                  React.createElement("td", { style: { fontFamily: "monospace", fontWeight: 700, fontSize: 11 } }, inv.invoice_number),
-                  React.createElement("td", null, fmtDate(inv.created_at)),
-                  React.createElement("td", null, React.createElement("span", { style: { padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 700, color: tp.color, background: tp.color + "18" } }, tp.icon + " " + tp.label)),
-                  React.createElement("td", { style: { fontSize: 11 } }, inv.from_name + " → " + inv.to_name),
-                  React.createElement("td", { style: { fontWeight: 800, whiteSpace: "nowrap" } }, Number(inv.total).toFixed(2) + " " + (inv.currency || "EUR")),
-                  React.createElement("td", null, React.createElement("span", { style: { padding: "3px 10px", borderRadius: 12, background: st.bg, color: st.color, fontSize: 11, fontWeight: 700 } }, st.icon + " " + st.label)),
-                  React.createElement("td", null,
-                    React.createElement("div", { style: { display: "flex", gap: 4, flexWrap: "wrap" } },
-                      React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px" }, onClick: () => downloadInvoicePDF(inv), title: "PDF" }, "📄"),
-                      React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px" }, onClick: () => { setShowEmail(inv); setEmailTo(inv.to_details?.email || inv.sent_to_email || ""); }, title: "Email" }, "📧"),
-                      (inv.status === "draft" || inv.status === "sent") && React.createElement("button", { className: "btn", style: { fontSize: 10, padding: "3px 8px", color: "var(--danger)" }, onClick: () => handleCancel(inv), title: fr ? "Annuler" : "Cancel" }, "❌"),
-                    )
-                  ),
-                );
-              })
             )
-          )
+          ),
+          React.createElement(Pagination, { currentPage: invPage, setPage: setInvPage, totalItems: sortedInvoices.length, lang: lang })
         ),
   );
 };
