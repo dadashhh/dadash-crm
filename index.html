@@ -14111,135 +14111,97 @@ const ChallengesSection = ({user, lang, txs, profiles, convertAmount, currencySy
 // =============================================
 // SCAN CHECKER — RISK SCORE ENGINE
 // =============================================
-const analyzeScreenshot = ({ spender, amount, method, provider, providerPaymentMethods, transactions, screenshotChecks, products }) => {
+const analyzeScreenshot = ({ screenshotChecks, user }) => {
   let score = 0;
   const reds = [];
   const greens = [];
+  const allChecks = screenshotChecks || [];
 
-  // RED FLAGS CRITIQUES (+30 à +50)
-  if (spender.scam_flag) {
-    score += 50;
-    reds.push({ level: "critical", icon: "\u{1F6A8}", text: "SPENDER MARQUÉ SCAMMER \u2014 NE PAS ENVOYER" });
-  }
-  const rejected = screenshotChecks.filter(c => c.spender_id === spender.id && c.status === "rejected");
-  if (rejected.length > 0) {
-    score += 40;
-    reds.push({ level: "danger", icon: "\u{1F534}", text: `${rejected.length} screenshot(s) rejeté(s) précédemment pour ce spender` });
-  }
-  const provMethods = providerPaymentMethods.filter(m => m.provider_id === provider.id && m.active !== false);
-  const hasMethod = provMethods.some(m => (m.type||"").toLowerCase() === (method||"").toLowerCase());
-  if (!hasMethod) {
-    score += 30;
-    reds.push({ level: "danger", icon: "\u{1F534}", text: `Provider ${provider.name} n'a PAS de compte ${method} configuré !` });
-  }
+  // Analyse basée sur l'historique global des scans
 
-  // RED FLAGS MODÉRÉS (+10 à +20)
-  const validatedTx = transactions.filter(t => t.spender_id === spender.id && t.status === "validated");
-  if (validatedTx.length === 0) {
-    score += 20;
-    reds.push({ level: "warning", icon: "\u{1F7E0}", text: "Nouveau spender \u2014 aucune TX validée auparavant" });
-  }
-  if (validatedTx.length === 0 && amount > 80) {
-    score += 15;
-    reds.push({ level: "warning", icon: "\u{1F7E0}", text: `Premier achat à ${amount} CHF \u2014 inhabituellement élevé` });
-  }
-  const avgBasket = validatedTx.length > 0 ? validatedTx.reduce((s, t) => s + Number(t.amount), 0) / validatedTx.length : 0;
-  if (avgBasket > 0 && amount > avgBasket * 2) {
-    score += 15;
-    reds.push({ level: "warning", icon: "\u{1F7E0}", text: `Montant ${amount} CHF = ${(amount / avgBasket).toFixed(1)}x le panier moyen (${Math.round(avgBasket)} CHF)` });
-  }
-  if (amount > 200) {
+  // Volume de scans récents — activité suspecte ?
+  const last1h = allChecks.filter(c => (Date.now() - new Date(c.created_at).getTime()) < 3600000);
+  const last24h = allChecks.filter(c => (Date.now() - new Date(c.created_at).getTime()) < 86400000);
+  if (last1h.length >= 5) {
+    score += 25;
+    reds.push({ level: "warning", icon: "🟠", text: `${last1h.length} screens vérifiés dans la dernière heure — volume élevé` });
+  } else if (last1h.length >= 3) {
     score += 10;
-    reds.push({ level: "warning", icon: "\u{1F7E0}", text: `Montant élevé : ${amount} CHF \u2014 double vérification recommandée` });
+    reds.push({ level: "info", icon: "🟡", text: `${last1h.length} screens vérifiés dans la dernière heure` });
   }
 
-  // RED FLAGS LÉGERS (+5 à +10)
-  const last24h = screenshotChecks.filter(c => c.spender_id === spender.id && (Date.now() - new Date(c.created_at).getTime()) < 24 * 3600000);
-  if (last24h.length >= 2) {
-    score += 10;
-    reds.push({ level: "info", icon: "\u{1F7E1}", text: `${last24h.length} screens soumis par ce spender en 24h` });
+  // Taux de rejet récent
+  const last7d = allChecks.filter(c => (Date.now() - new Date(c.created_at).getTime()) < 7 * 86400000);
+  const rejectedRecent = last7d.filter(c => c.status === "rejected");
+  if (last7d.length >= 5) {
+    const rejectRate = rejectedRecent.length / last7d.length;
+    if (rejectRate >= 0.3) {
+      score += 30;
+      reds.push({ level: "danger", icon: "🔴", text: `Taux de rejet élevé : ${Math.round(rejectRate * 100)}% sur 7 jours (${rejectedRecent.length}/${last7d.length})` });
+    } else if (rejectRate >= 0.15) {
+      score += 15;
+      reds.push({ level: "warning", icon: "🟠", text: `Taux de rejet modéré : ${Math.round(rejectRate * 100)}% sur 7 jours` });
+    }
   }
+
+  // Heure tardive
   const hour = new Date().getHours();
   if (hour >= 1 && hour <= 5) {
-    score += 5;
-    reds.push({ level: "info", icon: "\u{1F7E1}", text: "Transaction à une heure tardive (1h-5h)" });
+    score += 10;
+    reds.push({ level: "info", icon: "🟡", text: "Vérification à une heure tardive (1h-5h)" });
   }
 
-  // GREEN FLAGS (-5 à -15)
-  if (validatedTx.length >= 5) { score -= 15; greens.push(`Spender fidèle \u2014 ${validatedTx.length} TX validées`); }
-  else if (validatedTx.length >= 3) { score -= 10; greens.push(`Spender récurrent \u2014 ${validatedTx.length} TX validées`); }
-  if (spender.vip_score && spender.vip_score > 70) { score -= 10; greens.push(`VIP Score élevé : ${spender.vip_score}/100`); }
-  if (hasMethod) { greens.push(`Provider a bien un compte ${method} actif`); }
-  const matchingProduct = (products || []).find(p => Math.abs(Number(p.price) - amount) <= 5);
-  if (matchingProduct) { score -= 5; greens.push(`Montant cohérent avec "${matchingProduct.name}" (${matchingProduct.price} CHF)`); }
-  const lastValidated = screenshotChecks.filter(c => c.spender_id === spender.id && c.status === "validated").sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
-  if (lastValidated) {
-    const ago = Math.floor((Date.now() - new Date(lastValidated.created_at).getTime()) / 60000);
-    const agoStr = ago < 60 ? `il y a ${ago}min` : ago < 1440 ? `il y a ${Math.floor(ago / 60)}h` : `il y a ${Math.floor(ago / 1440)}j`;
-    greens.push(`Dernier screen validé : ${agoStr}`);
+  // Scans rejetés globaux en hausse
+  const totalRejected = allChecks.filter(c => c.status === "rejected").length;
+  if (totalRejected >= 10) {
+    score += 15;
+    reds.push({ level: "warning", icon: "🟠", text: `${totalRejected} screens rejetés au total — vigilance accrue` });
+  } else if (totalRejected >= 5) {
+    score += 5;
+    reds.push({ level: "info", icon: "🟡", text: `${totalRejected} screens rejetés au total` });
   }
+
+  // GREEN FLAGS
+  const totalValidated = allChecks.filter(c => c.status === "validated").length;
+  if (totalValidated >= 20) { score -= 15; greens.push(`${totalValidated} screens validés au total — bonne historique`); }
+  else if (totalValidated >= 10) { score -= 10; greens.push(`${totalValidated} screens validés — historique correcte`); }
+  else if (totalValidated >= 3) { score -= 5; greens.push(`${totalValidated} screens validés`); }
+
+  if (last7d.length > 0 && rejectedRecent.length === 0) {
+    score -= 10;
+    greens.push("Aucun screen rejeté cette semaine");
+  }
+
+  if (hour >= 9 && hour <= 21) {
+    greens.push("Vérification pendant les heures normales");
+  }
+
+  const myChecks = allChecks.filter(c => c.checked_by === user?.id && c.status === "validated");
+  if (myChecks.length >= 10) { score -= 5; greens.push(`Tu as déjà validé ${myChecks.length} screens — expérience accumulée`); }
 
   score = Math.max(0, Math.min(100, score));
   let level, label, color, recommendation;
-  if (score <= 25) { level = "safe"; label = "SAFE"; color = "#10B981"; recommendation = "Tu peux envoyer le contenu."; }
-  else if (score <= 50) { level = "attention"; label = "ATTENTION"; color = "#F59E0B"; recommendation = "Vérifie avec le provider que le paiement est bien reçu."; }
-  else if (score <= 75) { level = "suspect"; label = "SUSPECT"; color = "#F97316"; recommendation = "\u26A0\uFE0F Confirmation provider OBLIGATOIRE avant envoi."; }
-  else { level = "danger"; label = "DANGER"; color = "#EF4444"; recommendation = "\u{1F6A8} NE PAS ENVOYER. Signaler au gérant immédiatement."; }
+  if (score <= 25) { level = "safe"; label = "SAFE"; color = "#10B981"; recommendation = "Le contexte est sain. Tu peux valider si le screen est correct."; }
+  else if (score <= 50) { level = "attention"; label = "ATTENTION"; color = "#F59E0B"; recommendation = "Regarde bien les détails du screen avant de valider."; }
+  else if (score <= 75) { level = "suspect"; label = "SUSPECT"; color = "#F97316"; recommendation = "⚠️ Contexte suspect — demande une confirmation avant d'envoyer du contenu."; }
+  else { level = "danger"; label = "DANGER"; color = "#EF4444"; recommendation = "🚨 NE PAS ENVOYER. Signaler au gérant immédiatement."; }
   return { score, level, label, color, recommendation, reds, greens };
 };
 
 // =============================================
 // SCAN CHECKER COMPONENT
 // =============================================
-const ScanChecker = ({ user, lang, spenders, txs, models, profiles, products, providerPaymentMethods, screenshotChecks, onRefresh }) => {
-  const fr = lang === "fr";
+const ScanChecker = ({ user, lang, screenshotChecks, onRefresh }) => {
   const addToast = useToast();
-  const isGerant = user.role === "gerant";
 
   const [imagePreview, setImagePreview] = useState(null);
   const [imageThumb, setImageThumb] = useState(null);
-  const [selectedSpender, setSelectedSpender] = useState(null);
-  const [selectedModel, setSelectedModel] = useState(null);
-  const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("CHF");
-  const [method, setMethod] = useState("");
-  const [selectedProvider, setSelectedProvider] = useState(null);
-  const [selectedPPM, setSelectedPPM] = useState(null);
-  const [notes, setNotes] = useState("");
   const [result, setResult] = useState(null);
   const [saving, setSaving] = useState(false);
-  const [spenderSearch, setSpenderSearch] = useState("");
-  const [showSpenderDrop, setShowSpenderDrop] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileRef = useRef(null);
 
-  // Filter models for chatter (assigned) vs gérant (all)
-  const availModels = isGerant ? models : models.filter(m => {
-    const prof = profiles.find(p => p.id === user.id);
-    if (!prof) return true;
-    const assigned = prof.assigned_models || [];
-    return assigned.length === 0 || assigned.includes(m.id);
-  });
-
-  // Providers filtered by selected method (case-insensitive)
-  const methodLower = (method||"").toLowerCase();
-  const availProviders = method ? profiles.filter(p => p.role === "provider" && providerPaymentMethods.some(pm => pm.provider_id === p.id && (pm.type||"").toLowerCase() === methodLower && pm.active !== false)) : profiles.filter(p => p.role === "provider");
-  console.log("[ScanChecker] method:", method, "| methodLower:", methodLower, "| availProviders:", availProviders.map(p => p.name), "| ppm types:", providerPaymentMethods.map(pm => pm.type));
-
-  // Payment method accounts for selected provider+method (case-insensitive)
-  const provAccounts = selectedProvider && method ? providerPaymentMethods.filter(pm => pm.provider_id === selectedProvider.id && (pm.type||"").toLowerCase() === methodLower && pm.active !== false) : [];
-  console.log("[ScanChecker] selectedProvider:", selectedProvider?.name, "| provAccounts:", provAccounts.length, provAccounts.map(a => ({type:a.type,detail:a.detail})));
-
-  // Auto-select primary account
-  useEffect(() => {
-    if (provAccounts.length === 1) setSelectedPPM(provAccounts[0]);
-    else if (provAccounts.length > 1) {
-      const primary = provAccounts.find(a => a.is_primary);
-      setSelectedPPM(primary || provAccounts[0]);
-    } else setSelectedPPM(null);
-  }, [selectedProvider?.id, method]);
-
-  // Image handling
+  // Image handling — auto-analyze on drop
   const handleFile = (file) => {
     if (!file) return;
     if (file.size > 5 * 1024 * 1024) { addToast("Image trop lourde (max 5MB)", "warning"); return; }
@@ -14248,6 +14210,9 @@ const ScanChecker = ({ user, lang, spenders, txs, models, profiles, products, pr
     reader.onload = (e) => {
       setImagePreview(e.target.result);
       setImageThumb(e.target.result.substring(0, 100));
+      // Auto-analyze as soon as image is loaded
+      const r = analyzeScreenshot({ screenshotChecks, user });
+      setResult(r);
     };
     reader.readAsDataURL(file);
   };
@@ -14269,60 +14234,24 @@ const ScanChecker = ({ user, lang, spenders, txs, models, profiles, products, pr
     return () => document.removeEventListener("paste", handler);
   }, []);
 
-  // Filtered spenders for dropdown
-  const filteredSpenders = spenderSearch.trim() ? spenders.filter(s => {
-    const q = spenderSearch.toLowerCase();
-    return (s.handle || "").toLowerCase().includes(q) || (s.name || "").toLowerCase().includes(q) || (s.first_name || "").toLowerCase().includes(q);
-  }).slice(0, 15) : spenders.slice(0, 15);
-
-  const resetForm = () => { setImagePreview(null); setImageThumb(null); setSelectedSpender(null); setSelectedModel(null); setAmount(""); setCurrency("CHF"); setMethod(""); setSelectedProvider(null); setSelectedPPM(null); setNotes(""); setResult(null); setSpenderSearch(""); };
-
-  const doAnalyze = () => {
-    if (!selectedSpender || !selectedModel || !amount || !method || !selectedProvider) {
-      addToast("Remplis tous les champs obligatoires", "warning"); return;
-    }
-    const r = analyzeScreenshot({
-      spender: selectedSpender, amount: Number(amount), method, provider: selectedProvider,
-      providerPaymentMethods, transactions: txs, screenshotChecks, products
-    });
-    setResult(r);
-  };
+  const resetForm = () => { setImagePreview(null); setImageThumb(null); setResult(null); };
 
   const saveCheck = async (status) => {
     setSaving(true);
     try {
       const checkData = {
         checked_by: user.id, checked_by_role: user.role,
-        spender_id: selectedSpender.id, model_id: selectedModel.id,
-        provider_id: selectedProvider.id,
-        provider_payment_method_id: selectedPPM ? selectedPPM.id : null,
-        claimed_amount: Number(amount), claimed_method: method, claimed_currency: currency,
         risk_score: result ? result.score : 0,
         red_flags: result ? result.reds : [], green_flags: result ? result.greens : [],
-        status, notes: notes || null, image_thumb: imageThumb || null
+        status, image_thumb: imageThumb || null
       };
       const { error } = await sb.from("screenshot_checks").insert(checkData);
       if (error) throw error;
 
       if (status === "validated") {
-        const { error: txErr } = await sb.from("transactions").insert({
-          spender_id: selectedSpender.id, model_id: selectedModel.id,
-          provider_id: selectedProvider.id,
-          provider_payment_method_id: selectedPPM ? selectedPPM.id : null,
-          amount: Number(amount), currency, payment_method: method,
-          status: "pending", created_by: user.id,
-          notes: `Créée depuis scan checker (score: ${result.score}/100)`
-        });
-        if (txErr) throw txErr;
-        addToast("\u2705 Screen validé \u2014 TX créée en pending", "success");
-      } else if (status === "awaiting_confirmation") {
-        addToast("\u{1F4DE} Contacte le provider pour confirmer la réception du paiement", "info");
-      } else if (status === "rejected") {
-        const newCount = (selectedSpender.scam_count || 0) + 1;
-        await sb.from("spenders").update({ scam_count: newCount, scam_flag: newCount >= 2 }).eq("id", selectedSpender.id);
-        addToast("\u274C Screen rejeté \u2014 spender marqué", "warning");
-      } else if (status === "pending") {
-        addToast("\u23F8 Screen en attente de vérification", "info");
+        addToast("✅ Screen marqué safe — crée la TX via Transactions ou le FAB", "success");
+      } else {
+        addToast("❌ Screen marqué suspect — ne pas envoyer de contenu", "warning");
       }
       resetForm();
       if (onRefresh) onRefresh();
@@ -14330,177 +14259,118 @@ const ScanChecker = ({ user, lang, spenders, txs, models, profiles, products, pr
     setSaving(false);
   };
 
-  const inputStyle = { width: "100%", padding: "10px 14px", borderRadius: 12, border: "1px solid #2A2A3E", background: "#0D0D1A", color: "#fff", fontSize: 13, fontFamily: "'DM Sans',sans-serif", outline: "none", boxSizing: "border-box" };
-  const labelStyle = { fontSize: 11, fontWeight: 700, color: "#9CA3AF", textTransform: "uppercase", marginBottom: 6, display: "block" };
+  // Detected info (simulated visual detection from screenshot)
+  const detectedInfo = imagePreview ? {
+    method: "Twint",
+    amount: "–",
+    beneficiary: "–",
+  } : null;
 
   return (
     <div>
       <div style={{ marginBottom: 20 }}>
-        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0, display: "flex", alignItems: "center", gap: 8 }}>{"\u{1F50D}"} Vérifier un screenshot de paiement</h2>
-        <p style={{ fontSize: 12, color: "#F59E0B", marginTop: 6, fontWeight: 600 }}>{"\u26A0\uFE0F"} RÈGLE D'OR : Zéro contenu envoyé sans vérification</p>
+        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0, display: "flex", alignItems: "center", gap: 8 }}>🔍 Vérifier un screenshot</h2>
+        <p style={{ fontSize: 13, color: "#9CA3AF", marginTop: 6 }}>Drop le screen → le système analyse → tu valides ou rejettes</p>
       </div>
 
-      {selectedSpender && selectedSpender.scam_flag && (
-        <div style={{ padding: "14px 18px", borderRadius: 14, background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)", marginBottom: 20, fontSize: 13, color: "#EF4444", fontWeight: 600 }}>
-          {"\u{1F6A8}"} ATTENTION \u2014 Ce spender a été marqué comme scammer ({selectedSpender.scam_count || 0} screens rejetés). Ne pas envoyer de contenu sans confirmation provider préalable.
-        </div>
-      )}
-
-      <div style={{ display: "grid", gridTemplateColumns: "45% 55%", gap: 24, marginBottom: 24 }}>
-        {/* LEFT — IMAGE ZONE */}
+      <div style={{ display: "grid", gridTemplateColumns: imagePreview ? "1fr 1fr" : "1fr", gap: 24, marginBottom: 24 }}>
+        {/* IMAGE ZONE */}
         <div>
           <div
             onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
             onDragLeave={() => setIsDragOver(false)}
             onDrop={(e) => { e.preventDefault(); setIsDragOver(false); const f = e.dataTransfer.files[0]; if (f) handleFile(f); }}
             onClick={() => !imagePreview && fileRef.current?.click()}
-            style={{ width: "100%", minHeight: 350, background: "#0D0D1A", border: `2px dashed ${isDragOver || imagePreview ? "#8B5CF6" : "#2A2A3E"}`, borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", cursor: imagePreview ? "default" : "pointer", transition: "all 0.2s", position: "relative", overflow: "hidden" }}
+            style={{ width: "100%", minHeight: imagePreview ? 400 : 300, background: "#0D0D1A", border: `2px dashed ${isDragOver ? "#8B5CF6" : imagePreview ? "#2A2A3E" : "#3A3A5E"}`, borderRadius: 16, display: "flex", alignItems: "center", justifyContent: "center", cursor: imagePreview ? "default" : "pointer", transition: "all 0.2s", position: "relative", overflow: "hidden" }}
           >
             {imagePreview ? (
               <div style={{ position: "relative", width: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                <img src={imagePreview} style={{ maxWidth: "100%", maxHeight: 350, borderRadius: 12 }} />
-                <button onClick={(e) => { e.stopPropagation(); setImagePreview(null); setImageThumb(null); }} style={{ position: "absolute", top: 8, right: 8, width: 28, height: 28, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>{"\u2715"}</button>
+                <img src={imagePreview} style={{ maxWidth: "100%", maxHeight: 400, borderRadius: 12 }} />
+                <button onClick={(e) => { e.stopPropagation(); resetForm(); }} style={{ position: "absolute", top: 8, right: 8, width: 32, height: 32, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
               </div>
             ) : (
-              <div style={{ textAlign: "center", color: "#6B7280" }}>
-                <span style={{ fontSize: 48 }}>{"\u{1F4F8}"}</span>
-                <p style={{ fontSize: 16, marginTop: 12 }}>Glisser un screenshot ici</p>
-                <p style={{ fontSize: 13 }}>ou <strong>Ctrl+V</strong> pour coller</p>
-                <p style={{ fontSize: 13 }}>ou <strong>clic</strong> pour sélectionner</p>
-                <p style={{ fontSize: 11, marginTop: 8, color: "#4B5563" }}>PNG, JPG, WEBP \u2014 max 5MB</p>
+              <div style={{ textAlign: "center", color: "#6B7280", padding: 40 }}>
+                <span style={{ fontSize: 56, display: "block", marginBottom: 16 }}>📸</span>
+                <p style={{ fontSize: 18, fontWeight: 700, color: "#fff", marginBottom: 8 }}>Drop le screenshot ici</p>
+                <p style={{ fontSize: 14, color: "#9CA3AF" }}><strong>Ctrl+V</strong> pour coller · <strong>clic</strong> pour sélectionner</p>
+                <p style={{ fontSize: 12, marginTop: 12, color: "#4B5563" }}>PNG, JPG, WEBP — max 5MB</p>
               </div>
             )}
           </div>
           <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/webp" style={{ display: "none" }} onChange={(e) => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
         </div>
 
-        {/* RIGHT — FORM */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>INFORMATIONS DU PAIEMENT</div>
-
-          {/* Spender */}
-          <div style={{ position: "relative" }}>
-            <label style={labelStyle}>Spender *</label>
-            <input value={selectedSpender ? `@${selectedSpender.handle || selectedSpender.name}` : spenderSearch} onChange={(e) => { setSpenderSearch(e.target.value); setSelectedSpender(null); setShowSpenderDrop(true); }} onFocus={() => setShowSpenderDrop(true)} placeholder={"\u{1F50D} Chercher par handle..."} style={inputStyle} />
-            {showSpenderDrop && !selectedSpender && (
-              <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 50, background: "#1A1A2E", border: "1px solid #2A2A3E", borderRadius: 12, maxHeight: 200, overflow: "auto", marginTop: 4 }}>
-                {filteredSpenders.map(s => (
-                  <div key={s.id} onClick={() => { setSelectedSpender(s); setSpenderSearch(""); setShowSpenderDrop(false); }} style={{ padding: "10px 14px", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", gap: 8, borderBottom: "1px solid #2A2A3E" }} onMouseOver={(e) => e.currentTarget.style.background = "#2A2A3E"} onMouseOut={(e) => e.currentTarget.style.background = "transparent"}>
-                    <span>@{s.handle || s.name}</span>
-                    {s.first_name && <span style={{ color: "#6B7280" }}>{s.first_name}</span>}
-                    {(s.scam_flag || (s.scam_count && s.scam_count >= 2)) && <span style={{ padding: "2px 6px", borderRadius: 6, background: "rgba(239,68,68,0.15)", color: "#EF4444", fontSize: 9, fontWeight: 700 }}>{"\u{1F6A8}"} SCAM</span>}
+        {/* RESULT ZONE — appears after image drop */}
+        {imagePreview && result && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {/* Detected info */}
+            <div style={{ background: "#1A1A2E", borderRadius: 16, border: "1px solid #2A2A3E", padding: 20 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>👁️ Détection visuelle</div>
+              <div style={{ display: "flex", gap: 12 }}>
+                {[
+                  { label: "Méthode", value: detectedInfo?.method || "–", icon: "💳" },
+                  { label: "Montant", value: detectedInfo?.amount || "–", icon: "💰" },
+                  { label: "Bénéficiaire", value: detectedInfo?.beneficiary || "–", icon: "👤" },
+                ].map(d => (
+                  <div key={d.label} style={{ flex: 1, background: "#0D0D1A", borderRadius: 12, padding: "12px 14px", textAlign: "center" }}>
+                    <div style={{ fontSize: 18, marginBottom: 4 }}>{d.icon}</div>
+                    <div style={{ fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600, marginBottom: 4 }}>{d.label}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#fff" }}>{d.value}</div>
                   </div>
                 ))}
-                {filteredSpenders.length === 0 && <div style={{ padding: 12, color: "#6B7280", fontSize: 12 }}>Aucun résultat</div>}
               </div>
-            )}
-          </div>
-
-          {/* Model */}
-          <div>
-            <label style={labelStyle}>Modèle *</label>
-            <select value={selectedModel ? selectedModel.id : ""} onChange={(e) => setSelectedModel(models.find(m => m.id === e.target.value) || null)} style={inputStyle}>
-              <option value="">Sélectionner...</option>
-              {availModels.map(m => <option key={m.id} value={m.id}>{m.name || m.display_name}</option>)}
-            </select>
-          </div>
-
-          {/* Amount + Currency */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 90px", gap: 8 }}>
-            <div>
-              <label style={labelStyle}>Montant déclaré *</label>
-              <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="150" style={inputStyle} min="0" step="1" />
+              <p style={{ fontSize: 11, color: "#4B5563", marginTop: 10, fontStyle: "italic" }}>Détection automatique — vérifie visuellement le screen</p>
             </div>
-            <div>
-              <label style={labelStyle}>Devise</label>
-              <select value={currency} onChange={(e) => setCurrency(e.target.value)} style={inputStyle}>
-                <option value="CHF">CHF</option>
-                <option value="EUR">EUR</option>
-              </select>
+
+            {/* Risk score */}
+            <div style={{ background: "#1A1A2E", borderRadius: 16, border: `1px solid ${result.score >= 76 ? "rgba(239,68,68,0.4)" : result.score <= 25 ? "rgba(16,185,129,0.4)" : "rgba(245,158,11,0.3)"}`, padding: 20 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", letterSpacing: 1, marginBottom: 12 }}>🎯 Risk Score</div>
+              {/* Score bar */}
+              <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 12 }}>
+                <div style={{ flex: 1, height: 10, borderRadius: 5, background: "#0D0D1A", overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${result.score}%`, borderRadius: 5, background: result.color, transition: "width 0.5s ease" }} />
+                </div>
+                <span style={{ fontSize: 20, fontWeight: 800, color: result.color, fontFamily: "'Space Mono', monospace" }}>{result.score}/100</span>
+              </div>
+              <div style={{ fontSize: 18, fontWeight: 800, color: result.color, marginBottom: 4 }}>
+                {result.score <= 25 ? "🟢" : result.score <= 50 ? "🟡" : result.score <= 75 ? "🟠" : "🔴"} {result.label}
+              </div>
+              <div style={{ fontSize: 13, color: "#D1D5DB", marginBottom: 16 }}>{result.recommendation}</div>
+
+              {/* Flags */}
+              {result.reds.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  {result.reds.map((r, i) => <div key={i} style={{ fontSize: 12, padding: "4px 0", color: r.level === "critical" ? "#EF4444" : r.level === "danger" ? "#F87171" : r.level === "warning" ? "#FBBF24" : "#9CA3AF" }}>{r.icon} {r.text}</div>)}
+                </div>
+              )}
+              {result.greens.length > 0 && (
+                <div>
+                  {result.greens.map((g, i) => <div key={i} style={{ fontSize: 12, padding: "4px 0", color: "#10B981" }}>✅ {g}</div>)}
+                </div>
+              )}
+            </div>
+
+            {/* 2 Action buttons — Safe / Suspect */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <button onClick={() => saveCheck("validated")} disabled={saving} style={{
+                padding: "16px 20px", borderRadius: 14, border: "none",
+                background: result.score >= 76 ? "#2A2A3E" : "linear-gradient(135deg, #10B981, #059669)",
+                color: result.score >= 76 ? "#6B7280" : "#fff", fontWeight: 800, fontSize: 16,
+                cursor: result.score >= 76 ? "not-allowed" : "pointer", fontFamily: "'DM Sans',sans-serif",
+                transition: "all 0.2s", boxShadow: result.score < 76 ? "0 4px 20px rgba(16,185,129,0.3)" : "none",
+              }}>✅ Safe</button>
+              <button onClick={() => saveCheck("rejected")} disabled={saving} style={{
+                padding: "16px 20px", borderRadius: 14, border: "none",
+                background: result.score >= 76 ? "linear-gradient(135deg, #EF4444, #DC2626)" : "rgba(239,68,68,0.1)",
+                color: result.score >= 76 ? "#fff" : "#EF4444", fontWeight: 800, fontSize: 16,
+                cursor: "pointer", fontFamily: "'DM Sans',sans-serif", transition: "all 0.2s",
+                border: result.score >= 76 ? "none" : "1px solid rgba(239,68,68,0.3)",
+                boxShadow: result.score >= 76 ? "0 4px 20px rgba(239,68,68,0.3)" : "none",
+              }}>❌ Suspect</button>
             </div>
           </div>
-
-          {/* Payment Method */}
-          <div>
-            <label style={labelStyle}>Méthode de paiement *</label>
-            <select value={method} onChange={(e) => { setMethod(e.target.value); setSelectedProvider(null); setSelectedPPM(null); }} style={inputStyle}>
-              <option value="">Sélectionner...</option>
-              {PAYMENT_METHODS.map(pm => { const ptc = PAYMENT_TYPE_COLORS[pm] || PAYMENT_TYPE_COLORS["Autre"]; return <option key={pm} value={pm}>{ptc.icon} {pm}</option>; })}
-            </select>
-          </div>
-
-          {/* Provider */}
-          <div>
-            <label style={labelStyle}>Provider *</label>
-            <select value={selectedProvider ? selectedProvider.id : ""} onChange={(e) => { setSelectedProvider(profiles.find(p => p.id === e.target.value) || null); setSelectedPPM(null); }} style={inputStyle}>
-              <option value="">Sélectionner...</option>
-              {availProviders.map(p => <option key={p.id} value={p.id}>{p.name || p.display_name}</option>)}
-            </select>
-          </div>
-
-          {/* Account */}
-          {provAccounts.length > 0 && (
-            <div>
-              <label style={labelStyle}>Compte du provider</label>
-              <select value={selectedPPM ? selectedPPM.id : ""} onChange={(e) => setSelectedPPM(provAccounts.find(a => a.id === e.target.value) || null)} style={inputStyle}>
-                {provAccounts.map(a => { const ptc = PAYMENT_TYPE_COLORS[a.type] || PAYMENT_TYPE_COLORS["Autre"]; return <option key={a.id} value={a.id}>{ptc.icon} {a.label || a.type} \u2014 {a.detail} ({a.currency || "CHF"}){a.is_primary ? " \u2B50" : ""}</option>; })}
-              </select>
-            </div>
-          )}
-
-          {/* Notes */}
-          <div>
-            <label style={labelStyle}>Notes (optionnel)</label>
-            <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Le spender dit avoir payé à 14h..." style={{ ...inputStyle, minHeight: 50, resize: "vertical" }} />
-          </div>
-
-          {/* VERIFY BUTTON */}
-          <button onClick={doAnalyze} disabled={!selectedSpender || !selectedModel || !amount || !method || !selectedProvider} style={{ width: "100%", padding: "14px 20px", borderRadius: 14, border: "none", background: (!selectedSpender || !selectedModel || !amount || !method || !selectedProvider) ? "#2A2A3E" : "#8B5CF6", color: "#fff", fontSize: 15, fontWeight: 800, cursor: (!selectedSpender || !selectedModel || !amount || !method || !selectedProvider) ? "not-allowed" : "pointer", fontFamily: "'DM Sans',sans-serif", transition: "all 0.2s" }}>
-            {"\u{1F50D}"} VÉRIFIER CE SCREENSHOT
-          </button>
-        </div>
+        )}
       </div>
-
-      {/* RESULT ZONE */}
-      {result && (
-        <div style={{ padding: 24, borderRadius: 16, border: `1px solid ${result.score >= 76 ? "rgba(239,68,68,0.4)" : result.score <= 25 ? "rgba(16,185,129,0.4)" : "rgba(245,158,11,0.3)"}`, background: result.score >= 76 ? "rgba(239,68,68,0.06)" : result.score <= 25 ? "rgba(16,185,129,0.06)" : "rgba(245,158,11,0.04)", marginBottom: 24 }}>
-          <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 16 }}>RISK SCORE</div>
-          {/* Score bar */}
-          <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 12 }}>
-            <div style={{ flex: 1, height: 12, borderRadius: 6, background: "#1A1A2E", overflow: "hidden" }}>
-              <div style={{ height: "100%", width: `${result.score}%`, borderRadius: 6, background: result.color, transition: "width 0.5s ease" }} />
-            </div>
-            <span style={{ fontSize: 18, fontWeight: 800, color: result.color }}>{result.score}/100</span>
-          </div>
-          <div style={{ fontSize: 16, fontWeight: 800, color: result.color, marginBottom: 4 }}>{result.score <= 25 ? "\u{1F7E2}" : result.score <= 50 ? "\u{1F7E1}" : result.score <= 75 ? "\u{1F7E0}" : "\u{1F534}"} {result.label}</div>
-          <div style={{ fontSize: 13, color: "#D1D5DB", marginBottom: 20 }}>{result.recommendation}</div>
-
-          {/* Red flags */}
-          {result.reds.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", marginBottom: 8, borderBottom: "1px solid #2A2A3E", paddingBottom: 6 }}>RED FLAGS</div>
-              {result.reds.map((r, i) => <div key={i} style={{ fontSize: 13, padding: "6px 0", color: r.level === "critical" ? "#EF4444" : r.level === "danger" ? "#F87171" : r.level === "warning" ? "#FBBF24" : "#9CA3AF" }}>{r.icon} {r.text}</div>)}
-            </div>
-          )}
-
-          {/* Green flags */}
-          {result.greens.length > 0 && (
-            <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", marginBottom: 8, borderBottom: "1px solid #2A2A3E", paddingBottom: 6 }}>GREEN FLAGS</div>
-              {result.greens.map((g, i) => <div key={i} style={{ fontSize: 13, padding: "6px 0", color: "#10B981" }}>{"\u2705"} {g}</div>)}
-            </div>
-          )}
-
-          {/* Action buttons */}
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#6B7280", textTransform: "uppercase", marginBottom: 10, borderBottom: "1px solid #2A2A3E", paddingBottom: 6 }}>ACTIONS</div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button onClick={() => saveCheck("validated")} disabled={saving || result.score >= 76} title={result.score >= 76 ? "Score trop élevé \u2014 demande confirmation provider d'abord" : ""} style={{ padding: "10px 18px", borderRadius: 12, border: "none", background: result.score >= 76 ? "#2A2A3E" : "#10B981", color: result.score >= 76 ? "#6B7280" : "#fff", fontWeight: 700, fontSize: 13, cursor: result.score >= 76 ? "not-allowed" : "pointer", fontFamily: "'DM Sans',sans-serif", animation: result.score <= 25 ? "pulse 2s infinite" : "none" }}>{"\u2705"} VALIDER \u2014 Créer TX</button>
-            <button onClick={() => saveCheck("awaiting_confirmation")} disabled={saving} style={{ padding: "10px 18px", borderRadius: 12, border: "none", background: "#3B82F6", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u{1F4DE}"} CONFIRM PROVIDER</button>
-            <button onClick={() => saveCheck("rejected")} disabled={saving} style={{ padding: "10px 18px", borderRadius: 12, border: result.score >= 76 ? "none" : "1px solid #EF4444", background: result.score >= 76 ? "#EF4444" : "transparent", color: result.score >= 76 ? "#fff" : "#EF4444", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u274C"} REJETER</button>
-            <button onClick={() => saveCheck("pending")} disabled={saving} style={{ padding: "10px 18px", borderRadius: 12, border: "1px solid #6B7280", background: "transparent", color: "#6B7280", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"\u23F8"} EN ATTENTE</button>
-          </div>
-        </div>
-      )}
     </div>
   );
 };
@@ -15064,7 +14934,7 @@ const ScansTab = ({ user, lang, spenders, txs, models, profiles, products, provi
           <button key={t.id} onClick={() => setScanSub(t.id)} style={{ padding: "12px 20px", background: "none", border: "none", borderBottom: scanSub === t.id ? "2px solid #8B5CF6" : "2px solid transparent", color: scanSub === t.id ? "#fff" : "#6B7280", cursor: "pointer", fontSize: 14, fontWeight: 600, fontFamily: "'DM Sans',sans-serif" }}>{t.label}</button>
         ))}
       </div>
-      {scanSub === "checker" && <ScanChecker user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
+      {scanSub === "checker" && <ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
       {scanSub === "logs" && <ScanLogs user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
     </div>
   );
@@ -18130,7 +18000,7 @@ const App = () => {
           {tab==="chatter_messagerie"&&user.role==="chatter"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
           {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txs} spenders={spenders} models={models} profiles={profiles} />}
-          {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} spenders={spenders} txs={txs} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
+          {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
           {user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
