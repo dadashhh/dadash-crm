@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <script>try{document.documentElement.setAttribute("data-theme",localStorage.getItem("dadash-theme")||"dark")}catch(e){}</script>
+  <script>try{document.documentElement.setAttribute("data-theme",localStorage.getItem("dadash-theme")||"dark")}catch(e){/* localStorage unavailable (incognito/iframe) – default theme applied */}</script>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -628,6 +628,8 @@
     .confirm-dialog h3 { font-size: 16px; font-weight: 700; margin: 0 0 8px; color: var(--text-primary); }
     .confirm-dialog p { font-size: 13px; color: var(--text-secondary); margin: 0 0 24px; line-height: 1.5; }
     .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
+    .field-error { color: var(--danger); font-size: 11px; margin-top: 4px; font-weight: 600; }
+    .form-input.input-error, .filter-select.input-error { border-color: var(--danger); box-shadow: 0 0 0 2px rgba(239,68,68,0.15); }
     .progress {
       width: 100%; height: 4px;
       background: var(--bg-overlay);
@@ -1260,7 +1262,7 @@ const ToastProvider = ({children}) => {
   const addToast = useCallback((msg, type="success") => {
     const id = Date.now() + Math.random();
     setToasts(prev => [...prev, {id, msg, type}]);
-    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 3000);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), TOAST_TIMEOUT_MS);
   }, []);
   return (
     <ToastContext.Provider value={addToast}>
@@ -1345,6 +1347,21 @@ const safeUpsertSpender = async (spenderData) => {
 const PRODUCTS = ["Pack de contenu","Cam live","Contenu/discussion"];
 const TAGS = ["Douche 5min","Douche 10min","Chambre 5min","Chambre 10min","Chambre 15min","Lingerie","Custom","Pieds","JOI","Sexting"];
 const DADA_FEE_PCT = 10;
+const DEFAULT_EXCHANGE_RATE = 0.94;
+const TOAST_TIMEOUT_MS = 3000;
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+
+// ── XSS PROTECTION HELPERS ──
+const escapeHTML = (str) => {
+  if (str == null) return "";
+  return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+};
+const sanitizeURL = (url) => {
+  if (!url) return "";
+  const s = String(url).trim();
+  if (/^https?:\/\//i.test(s)) return s;
+  return "";
+};
 
 // =============================================
 // TIMEZONE CONSTANTS & CONTEXT
@@ -1363,7 +1380,7 @@ const useTimezone = () => useContext(TimezoneContext);
 // =============================================
 // CURRENCY CONSTANTS & CONTEXT
 // =============================================
-const CurrencyContext = createContext({ displayCurrency: "EUR", exchangeRate: 0.94, convertAmount: (a) => a, fmtAmount: (a) => a + "\u20AC" });
+const CurrencyContext = createContext({ displayCurrency: "EUR", exchangeRate: DEFAULT_EXCHANGE_RATE, convertAmount: (a) => a, fmtAmount: (a) => a + "\u20AC" });
 const useCurrency = () => useContext(CurrencyContext);
 
 // =============================================
@@ -2972,6 +2989,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [confirmAction, setConfirmAction] = useState(null);
+  const [formErrors, setFormErrors] = useState({});
   const [form, setForm] = useState({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:""});
   const [editingTx, setEditingTx] = useState(null);
   const [processingTxId, setProcessingTxId] = useState(null);
@@ -3007,8 +3025,18 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
     return [...set].sort();
   }, [dbSpenders, txs]);
 
+  const validateForm = () => {
+    const errs = {};
+    const fr = lang === "fr";
+    if (!form.spender_handle.trim()) errs.spender_handle = fr ? "Le spender est requis" : "Spender is required";
+    if (!form.amount || isNaN(parseFloat(form.amount))) errs.amount = fr ? "Montant invalide" : "Invalid amount";
+    else if (parseFloat(form.amount) <= 0) errs.amount = fr ? "Le montant doit être > 0" : "Amount must be > 0";
+    if (!form.model_id) errs.model_id = fr ? "Le modèle est requis" : "Model is required";
+    setFormErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
   const handleCreate = async () => {
-    if(!form.spender_handle||!form.amount||isNaN(parseFloat(form.amount))||parseFloat(form.amount)<=0) return;
+    if (!validateForm()) return;
     setSaving(true);
     try {
       // Step 1: UPSERT le Spender en DB
@@ -3041,6 +3069,7 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
 
       if(!res.error) {
         setForm({spender_handle:"",amount:"",currency:"EUR",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:""});
+        setFormErrors({});
         setShowForm(false);
         setSaving(false);
         await onRefresh();
@@ -3142,13 +3171,15 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
         <div className="card" style={{marginBottom:20}}>
           <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12}}>
             <div className="form-group-modal">
-              <label className="form-label">{t(lang,"spender")}</label>
-              <input className="form-input" list="spender-list" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle ou choisir existant" autoComplete="off" />
+              <label className="form-label">{t(lang,"spender")} *</label>
+              <input className={`form-input${formErrors.spender_handle?" input-error":""}`} list="spender-list" value={form.spender_handle} onChange={e=>{setForm({...form,spender_handle:e.target.value});if(formErrors.spender_handle)setFormErrors(p=>({...p,spender_handle:null}));}} placeholder="@handle ou choisir existant" autoComplete="off" />
               <datalist id="spender-list">{spenderOptions.map(s=><option key={s} value={s}/>)}</datalist>
+              {formErrors.spender_handle&&<div className="field-error">{formErrors.spender_handle}</div>}
             </div>
             <div className="form-group-modal">
-              <label className="form-label">{t(lang,"amount")}</label>
-              <input className="form-input" type="number" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} />
+              <label className="form-label">{t(lang,"amount")} *</label>
+              <input className={`form-input${formErrors.amount?" input-error":""}`} type="number" value={form.amount} onChange={e=>{setForm({...form,amount:e.target.value});if(formErrors.amount)setFormErrors(p=>({...p,amount:null}));}} />
+              {formErrors.amount&&<div className="field-error">{formErrors.amount}</div>}
             </div>
             <div className="form-group-modal">
               <label className="form-label">{t(lang,"currency")}</label>
@@ -3157,11 +3188,12 @@ const TransactionsTab = ({user, lang, txs, models, profiles, dbSpenders, onRefre
               </select>
             </div>
             <div className="form-group-modal">
-              <label className="form-label">{t(lang,"model")}</label>
-              <select className="filter-select" value={form.model_id} onChange={e=>setForm({...form,model_id:e.target.value})}>
+              <label className="form-label">{t(lang,"model")} *</label>
+              <select className={`filter-select${formErrors.model_id?" input-error":""}`} value={form.model_id} onChange={e=>{setForm({...form,model_id:e.target.value});if(formErrors.model_id)setFormErrors(p=>({...p,model_id:null}));}}>
                 <option value="">Select</option>
                 {models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
               </select>
+              {formErrors.model_id&&<div className="field-error">{formErrors.model_id}</div>}
             </div>
             <div className="form-group-modal">
               <label className="form-label">{t(lang,"provider")}</label>
@@ -3328,7 +3360,7 @@ const SpendersTab = ({user, lang, txs, models, profiles, dbSpenders, selectedSpe
       const h = dbSp.handle || dbSp.name;
       if (!h) return;
       let contactInfo = {};
-      try { contactInfo = typeof dbSp.contact_info === "string" ? JSON.parse(dbSp.contact_info) : (dbSp.contact_info || {}); } catch(e) {}
+      try { contactInfo = typeof dbSp.contact_info === "string" ? JSON.parse(dbSp.contact_info) : (dbSp.contact_info || {}); } catch(e) { /* malformed JSON in contact_info – use empty object */ }
       map[h] = {
         name: h,
         dbId: dbSp.id,
@@ -4236,8 +4268,8 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, products
               )}
               {/* Row 5: Quick actions */}
               <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
-                {sp.telegram_username && (
-                  <a href={`https://t.me/${sp.telegram_username}`} target="_blank" rel="noopener"
+                {sp.telegram_username && /^[a-zA-Z0-9_]+$/.test(sp.telegram_username) && (
+                  <a href={`https://t.me/${encodeURIComponent(sp.telegram_username)}`} target="_blank" rel="noopener noreferrer"
                     onClick={(e) => e.stopPropagation()}
                     style={{ padding: "5px 12px", borderRadius: 10, background: "var(--accent-muted)",
                       border: "1px solid var(--border-accent)", color: "var(--accent)", fontSize: 10, fontWeight: 700, textDecoration: "none" }}>
@@ -4686,7 +4718,7 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, products
                   ) : (
                     <div style={{ fontSize: 14, fontWeight: 600, padding: "8px 0" }}>
                       {form.telegram_username ? (
-                        <a href={`https://t.me/${form.telegram_username}`} target="_blank" rel="noopener" style={{ color: "var(--accent)", textDecoration: "none" }}>@{form.telegram_username}</a>
+                        <a href={/^[a-zA-Z0-9_]+$/.test(form.telegram_username)?`https://t.me/${encodeURIComponent(form.telegram_username)}`:"#"} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)", textDecoration: "none" }}>@{form.telegram_username}</a>
                       ) : "\u2014"}
                     </div>
                   )}
@@ -8228,7 +8260,7 @@ const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeR
         <div className="section-title"><div className="section-bar"></div>{lang==="fr"?"Taux de change":"Exchange Rate"}</div>
         <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 0"}}>
           <span style={{fontSize:13,fontWeight:600}}>1 EUR =</span>
-          <input type="number" step="0.01" value={exchangeRate||0.94} onChange={(e)=>setExchangeRate&&setExchangeRate(Number(e.target.value))} style={{width:80,padding:"6px 10px",borderRadius:8,border:"1px solid var(--border-default)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:14,fontWeight:700,textAlign:"center"}} />
+          <input type="number" step="0.01" value={exchangeRate||DEFAULT_EXCHANGE_RATE} onChange={(e)=>setExchangeRate&&setExchangeRate(Number(e.target.value))} style={{width:80,padding:"6px 10px",borderRadius:8,border:"1px solid var(--border-default)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:14,fontWeight:700,textAlign:"center"}} />
           <span style={{fontSize:13,fontWeight:600}}>CHF</span>
           <span style={{fontSize:11,color:"var(--text2)",marginLeft:8}}>{lang==="fr"?"(modifiable en temps réel)":"(live editable)"}</span>
         </div>
@@ -10398,7 +10430,7 @@ RÈGLES :
         : participants[0]?.name || "inconnu";
       const phone = extractPhoneFromFilename(fileName || "");
 
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      const resp = await fetch(ANTHROPIC_API_URL, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -11248,29 +11280,30 @@ const generateInvoiceHTML = (invoice) => {
   const fmtN = (n) => Number(n||0).toFixed(2);
   const fmtDateFR = (d) => d ? new Date(d).toLocaleDateString("fr-FR") : "";
 
+  const e = escapeHTML;
   return `<div style="font-family:'DM Sans',Helvetica,Arial,sans-serif;padding:40px;max-width:800px;margin:0 auto;color:#1a1a2e;">
     <div style="display:flex;justify-content:space-between;margin-bottom:40px;">
       <div>
-        ${agency.logo_url ? `<img src="${agency.logo_url}" style="height:40px;margin-bottom:8px;" />` : ""}
-        <h1 style="font-size:28px;font-weight:800;margin:0;color:#0a0a0f;">${fromName}</h1>
-        <p style="color:#666;font-size:12px;margin:4px 0 0;">${fromDetails.address||""}</p>
-        <p style="color:#666;font-size:12px;margin:2px 0;">${fromDetails.email||""}</p>
-        <p style="color:#666;font-size:12px;margin:2px 0;">${fromDetails.phone||""}</p>
-        ${fromDetails.company_id?`<p style="color:#666;font-size:11px;margin:2px 0;">SIRET: ${fromDetails.company_id}</p>`:""}
-        ${fromDetails.vat_number?`<p style="color:#666;font-size:11px;margin:2px 0;">TVA: ${fromDetails.vat_number}</p>`:""}
+        ${sanitizeURL(agency.logo_url) ? `<img src="${sanitizeURL(agency.logo_url)}" style="height:40px;margin-bottom:8px;" />` : ""}
+        <h1 style="font-size:28px;font-weight:800;margin:0;color:#0a0a0f;">${e(fromName)}</h1>
+        <p style="color:#666;font-size:12px;margin:4px 0 0;">${e(fromDetails.address)}</p>
+        <p style="color:#666;font-size:12px;margin:2px 0;">${e(fromDetails.email)}</p>
+        <p style="color:#666;font-size:12px;margin:2px 0;">${e(fromDetails.phone)}</p>
+        ${fromDetails.company_id?`<p style="color:#666;font-size:11px;margin:2px 0;">SIRET: ${e(fromDetails.company_id)}</p>`:""}
+        ${fromDetails.vat_number?`<p style="color:#666;font-size:11px;margin:2px 0;">TVA: ${e(fromDetails.vat_number)}</p>`:""}
       </div>
       <div style="text-align:right;">
         <h2 style="font-size:24px;font-weight:700;color:#6366f1;margin:0;">FACTURE</h2>
-        <p style="font-size:14px;color:#333;margin:4px 0;">${invoice.invoice_number}</p>
+        <p style="font-size:14px;color:#333;margin:4px 0;">${e(invoice.invoice_number)}</p>
         <p style="font-size:12px;color:#666;margin:4px 0;">Date : ${fmtDateFR(invoice.created_at)}</p>
         ${invoice.due_date?`<p style="font-size:12px;color:#666;">Échéance : ${fmtDateFR(invoice.due_date)}</p>`:""}
       </div>
     </div>
     <div style="background:#f8f8fa;padding:20px;border-radius:8px;margin-bottom:30px;">
       <p style="font-size:10px;color:#999;text-transform:uppercase;margin:0 0 4px;">Facturé à</p>
-      <p style="font-size:16px;font-weight:700;margin:0;">${toName}</p>
-      <p style="font-size:12px;color:#666;margin:4px 0;">${toDetails.email||""}</p>
-      <p style="font-size:12px;color:#666;margin:4px 0;">${toDetails.address||""}</p>
+      <p style="font-size:16px;font-weight:700;margin:0;">${e(toName)}</p>
+      <p style="font-size:12px;color:#666;margin:4px 0;">${e(toDetails.email)}</p>
+      <p style="font-size:12px;color:#666;margin:4px 0;">${e(toDetails.address)}</p>
     </div>
     ${invoice.period_from?`<p style="font-size:12px;color:#666;margin-bottom:20px;">Période : ${fmtDateFR(invoice.period_from)} → ${fmtDateFR(invoice.period_to)}</p>`:""}
     <table style="width:100%;border-collapse:collapse;margin-bottom:30px;">
@@ -11281,10 +11314,10 @@ const generateInvoiceHTML = (invoice) => {
         <th style="text-align:right;padding:10px 0;font-size:11px;text-transform:uppercase;color:#999;">Total</th>
       </tr></thead>
       <tbody>${items.map(item=>`<tr style="border-bottom:1px solid #f0f0f0;">
-        <td style="padding:12px 0;font-size:13px;">${item.description||""}</td>
-        <td style="text-align:center;padding:12px 0;font-size:13px;">${item.quantity||1}</td>
-        <td style="text-align:right;padding:12px 0;font-size:13px;">${fmtN(item.unit_price)} ${cur}</td>
-        <td style="text-align:right;padding:12px 0;font-size:13px;font-weight:600;">${fmtN(item.total)} ${cur}</td>
+        <td style="padding:12px 0;font-size:13px;">${e(item.description)}</td>
+        <td style="text-align:center;padding:12px 0;font-size:13px;">${e(item.quantity||1)}</td>
+        <td style="text-align:right;padding:12px 0;font-size:13px;">${fmtN(item.unit_price)} ${e(cur)}</td>
+        <td style="text-align:right;padding:12px 0;font-size:13px;font-weight:600;">${fmtN(item.total)} ${e(cur)}</td>
       </tr>`).join("")}</tbody>
     </table>
     <div style="display:flex;justify-content:flex-end;">
@@ -11302,18 +11335,18 @@ const generateInvoiceHTML = (invoice) => {
     </div>
     ${invoice.payment_method?`<div style="margin-top:30px;padding:16px;background:#f0fdf4;border-radius:8px;border-left:3px solid #34d399;">
       <p style="font-size:12px;font-weight:600;color:#166534;margin:0 0 4px;">Paiement</p>
-      <p style="font-size:12px;color:#333;margin:0;">Méthode : ${invoice.payment_method}${invoice.payment_reference?` · Réf : ${invoice.payment_reference}`:""}${invoice.payment_date?` · Date : ${fmtDateFR(invoice.payment_date)}`:""}</p>
+      <p style="font-size:12px;color:#333;margin:0;">Méthode : ${e(invoice.payment_method)}${invoice.payment_reference?` · Réf : ${e(invoice.payment_reference)}`:""}${invoice.payment_date?` · Date : ${fmtDateFR(invoice.payment_date)}`:""}</p>
     </div>`:""}
     ${agency.bank_iban?`<div style="margin-top:16px;padding:16px;background:#f8f8fa;border-radius:8px;">
       <p style="font-size:11px;color:#999;margin:0 0 4px;">Coordonnées bancaires</p>
-      <p style="font-size:12px;color:#333;margin:0;">IBAN : ${agency.bank_iban}${agency.bank_bic?` · BIC : ${agency.bank_bic}`:""}</p>
+      <p style="font-size:12px;color:#333;margin:0;">IBAN : ${e(agency.bank_iban)}${agency.bank_bic?` · BIC : ${e(agency.bank_bic)}`:""}</p>
     </div>`:""}
     ${invoice.notes?`<div style="margin-top:16px;padding:16px;background:#f8f8fa;border-radius:8px;">
       <p style="font-size:11px;color:#999;margin:0 0 4px;">Notes</p>
-      <p style="font-size:12px;color:#333;margin:0;">${invoice.notes}</p>
+      <p style="font-size:12px;color:#333;margin:0;">${e(invoice.notes)}</p>
     </div>`:""}
     <div style="margin-top:40px;padding-top:20px;border-top:1px solid #e5e5e5;text-align:center;">
-      <p style="font-size:10px;color:#999;">${agency.name} · Facture générée automatiquement · ${invoice.invoice_number}</p>
+      <p style="font-size:10px;color:#999;">${e(agency.name)} · Facture générée automatiquement · ${e(invoice.invoice_number)}</p>
     </div>
   </div>`;
 };
@@ -12410,7 +12443,7 @@ const App = () => {
   const [user, setUser] = useState(null);
   const [lang, setLang] = useState("fr");
   const [theme, setTheme] = useState(() => {
-    try { return localStorage.getItem("dadash-theme") || "dark"; } catch { return "dark"; }
+    try { return localStorage.getItem("dadash-theme") || "dark"; } catch(e) { /* localStorage unavailable */ return "dark"; }
   });
   const [tab, _setTab] = useState("dashboard");
   const {setDrillDown} = useNav();
@@ -12480,7 +12513,7 @@ const App = () => {
   // ── TIMEZONE & CURRENCY STATE ──
   const [timezone, setTimezone] = useState("Europe/Paris");
   const [displayCurrency, setDisplayCurrency] = useState("EUR");
-  const [exchangeRate, setExchangeRate] = useState(0.94);
+  const [exchangeRate, setExchangeRate] = useState(DEFAULT_EXCHANGE_RATE);
 
   // Keep global _tz in sync with state
   useEffect(() => { _tz.current = timezone; }, [timezone]);
@@ -12520,7 +12553,7 @@ const App = () => {
   // Theme toggle effect + localStorage persistence
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    try { localStorage.setItem("dadash-theme", theme); } catch {}
+    try { localStorage.setItem("dadash-theme", theme); } catch(e) { /* localStorage unavailable – theme persists only in memory */ }
   }, [theme]);
   const toggleTheme = () => setTheme(prev => prev === "dark" ? "light" : "dark");
 
@@ -12546,9 +12579,9 @@ const App = () => {
         sb.from("checklist_instances").select("*").order("date",{ascending:false}),
         sb.from("alerts").select("*").order("created_at",{ascending:false}).limit(100),
         sb.from("bot_stats").select("*").order("timestamp",{ascending:false}).limit(200),
-        sb.from("invoices").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})),
-        sb.from("model_videos").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})),
-        sb.from("video_sessions").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})),
+        sb.from("invoices").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})), /* table may not exist yet – graceful fallback */
+        sb.from("model_videos").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})), /* table may not exist yet */
+        sb.from("video_sessions").select("*").order("created_at",{ascending:false}).catch(()=>({data:[]})), /* table may not exist yet */
       ]);
     } catch(e) { setLoadError(e.message||"Network error"); setLoading(false); return; }
     setLoadError(null);
