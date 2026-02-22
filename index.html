@@ -16683,6 +16683,334 @@ const MyInvoicesPanel = ({ invoices, lang }) => {
   );
 };
 
+// =============================================
+// COMPTA PROVIDERS TAB (Gérant — Compta > Reversements)
+// =============================================
+const ComptaProvidersTab = ({ user, lang, txs, profiles, providerPayouts, providerPaymentMethods, onRefresh }) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [selectedProv, setSelectedProv] = useState(null);
+  const [showPayoutForm, setShowPayoutForm] = useState(false);
+  const [showInvoiceForm, setShowInvoiceForm] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [payoutForm, setPayoutForm] = useState({ amount: "", period_from: "", period_to: "", payment_method: "Twint", reference: "", notes: "" });
+  const [invoiceForm, setInvoiceForm] = useState({ period_from: "", period_to: "", notes: "" });
+  const [confirmId, setConfirmId] = useState(null);
+  const [rejectId, setRejectId] = useState(null);
+
+  const providers = profiles.filter(p => p.role === "provider");
+
+  // Build provider cards data
+  const providerCards = providers.map(prov => {
+    const provTxs = txs.filter(tx => tx.provider_id === prov.id && (tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee"));
+    const totalCA = provTxs.reduce((s, tx) => s + Number(tx.amount || 0), 0);
+    const myPayouts = (providerPayouts || []).filter(p => p.provider_id === prov.id);
+    const validatedPayouts = myPayouts.filter(p => p.status === "validated");
+    const pendingPayouts = myPayouts.filter(p => p.status === "pending");
+    const totalReversed = validatedPayouts.reduce((s, p) => s + Number(p.amount || 0), 0);
+    const totalPending = pendingPayouts.reduce((s, p) => s + Number(p.amount || 0), 0);
+    const balance = totalCA - totalReversed;
+    const methods = (providerPaymentMethods || []).filter(pm => pm.provider_id === prov.id && pm.active !== false);
+    const primaryMethod = methods.find(m => m.is_primary) || methods[0];
+    return { provider: prov, totalCA, totalReversed, totalPending, balance, payouts: myPayouts, validatedPayouts, pendingPayouts, methods, primaryMethod, txCount: provTxs.length };
+  }).sort((a, b) => b.balance - a.balance);
+
+  const totalGlobalCA = providerCards.reduce((s, p) => s + p.totalCA, 0);
+  const totalGlobalReversed = providerCards.reduce((s, p) => s + p.totalReversed, 0);
+  const totalGlobalBalance = providerCards.reduce((s, p) => s + p.balance, 0);
+
+  const fmtCHF = (n) => Math.round(n).toLocaleString("fr-CH") + " CHF";
+
+  const statusBadge = (s) => {
+    const map = { pending: { bg: "rgba(245,158,11,0.12)", color: "#F59E0B", label: "En attente" }, validated: { bg: "rgba(16,185,129,0.12)", color: "#10B981", label: "Validé" }, rejected: { bg: "rgba(239,68,68,0.12)", color: "#EF4444", label: "Rejeté" } };
+    const st = map[s] || map.pending;
+    return React.createElement("span", { style: { padding: "3px 10px", borderRadius: 12, background: st.bg, color: st.color, fontSize: 10, fontWeight: 700 } }, st.label);
+  };
+
+  const handleValidatePayout = async (payoutId) => {
+    setSaving(true);
+    try {
+      const { error } = await sb.from("provider_payouts").update({ status: "validated", validated_by: user.id, validated_at: new Date().toISOString() }).eq("id", payoutId);
+      if (error) throw error;
+      addToast("Reversement validé", "success");
+      setConfirmId(null);
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const handleRejectPayout = async (payoutId) => {
+    setSaving(true);
+    try {
+      const { error } = await sb.from("provider_payouts").update({ status: "rejected", validated_by: user.id, validated_at: new Date().toISOString() }).eq("id", payoutId);
+      if (error) throw error;
+      addToast("Reversement rejeté", "warning");
+      setRejectId(null);
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const handleCreatePayout = async () => {
+    if (!selectedProv || !payoutForm.amount || isNaN(parseFloat(payoutForm.amount)) || parseFloat(payoutForm.amount) <= 0) {
+      addToast("Montant invalide", "error"); return;
+    }
+    setSaving(true);
+    try {
+      const { error } = await sb.from("provider_payouts").insert({
+        provider_id: selectedProv.provider.id, declared_by: user.id,
+        amount: parseFloat(payoutForm.amount), currency: "CHF",
+        period_from: payoutForm.period_from || null, period_to: payoutForm.period_to || null,
+        payment_method: payoutForm.payment_method, reference: payoutForm.reference || null,
+        notes: payoutForm.notes || null, status: "validated", validated_by: user.id, validated_at: new Date().toISOString()
+      });
+      if (error) throw error;
+      addToast("Reversement créé et validé", "success");
+      setPayoutForm({ amount: "", period_from: "", period_to: "", payment_method: "Twint", reference: "", notes: "" });
+      setShowPayoutForm(false);
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const handleGenerateInvoice = async () => {
+    if (!selectedProv) return;
+    setSaving(true);
+    try {
+      const lineItems = [{ description: `Reversement provider — ${selectedProv.provider.name}`, quantity: 1, unit_price: selectedProv.balance, total: selectedProv.balance }];
+      const { error } = await sb.from("invoices").insert({
+        type: "outgoing_provider", profile_id: selectedProv.provider.id,
+        provider_id: selectedProv.provider.id,
+        amount: selectedProv.balance, currency: "CHF", status: "draft",
+        line_items: lineItems, created_by: user.id,
+        period_from: invoiceForm.period_from || null, period_to: invoiceForm.period_to || null,
+        notes: invoiceForm.notes || `Facture reversement ${selectedProv.provider.name}`
+      });
+      if (error) throw error;
+      addToast("Facture générée en brouillon", "success");
+      setInvoiceForm({ period_from: "", period_to: "", notes: "" });
+      setShowInvoiceForm(false);
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const inputS = { width: "100%", padding: "10px 14px", borderRadius: 12, border: "1px solid #2A2A3E", background: "#0D0D1A", color: "#fff", fontSize: 13, fontFamily: "'DM Sans',sans-serif", outline: "none", boxSizing: "border-box" };
+  const labelS = { fontSize: 10, fontWeight: 700, color: "#9CA3AF", textTransform: "uppercase", marginBottom: 4, display: "block" };
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 20, fontWeight: 800, margin: 0 }}>🔄 Reversements Providers</h2>
+        <p style={{ fontSize: 13, color: "#9CA3AF", marginTop: 6 }}>Suivi des reversements par provider — tous montants en CHF</p>
+      </div>
+
+      {/* Global KPIs */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16, marginBottom: 24 }}>
+        {[
+          { label: "CA Total Providers", value: fmtCHF(totalGlobalCA), icon: "💰", color: "#8B5CF6" },
+          { label: "Total Reversé", value: fmtCHF(totalGlobalReversed), icon: "✅", color: "#10B981" },
+          { label: "Solde Dû", value: fmtCHF(totalGlobalBalance), icon: "⚠️", color: totalGlobalBalance > 0 ? "#F59E0B" : "#10B981" },
+        ].map(k => (
+          <div key={k.label} style={{ background: "#1A1A2E", border: "1px solid #2A2A3E", borderRadius: 16, padding: 20, textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: "#6B7280", textTransform: "uppercase", fontWeight: 600, marginBottom: 8 }}>{k.icon} {k.label}</div>
+            <div style={{ fontSize: 24, fontWeight: 800, color: k.color }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Provider Cards */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 16, marginBottom: 24 }}>
+        {providerCards.map(pc => {
+          const pct = pc.totalCA > 0 ? Math.round((pc.totalReversed / pc.totalCA) * 100) : 0;
+          return (
+            <div key={pc.provider.id} onClick={() => setSelectedProv(pc)} style={{
+              background: "#1A1A2E", border: `1px solid ${pc.balance > 200 ? "rgba(239,68,68,0.3)" : pc.balance > 0 ? "rgba(245,158,11,0.3)" : "rgba(16,185,129,0.3)"}`,
+              borderRadius: 18, padding: 22, cursor: "pointer", transition: "all 0.2s",
+            }} onMouseOver={e => e.currentTarget.style.transform = "translateY(-2px)"} onMouseOut={e => e.currentTarget.style.transform = "translateY(0)"}>
+              {/* Provider header */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 800 }}>{pc.provider.name}</div>
+                  <div style={{ fontSize: 11, color: "#6B7280" }}>{pc.txCount} TX validées · {pc.primaryMethod ? pc.primaryMethod.type : "—"}</div>
+                </div>
+                <div style={{ fontSize: 10, fontWeight: 700, padding: "4px 10px", borderRadius: 20, background: pc.balance > 200 ? "rgba(239,68,68,0.12)" : pc.balance > 0 ? "rgba(245,158,11,0.12)" : "rgba(16,185,129,0.12)", color: pc.balance > 200 ? "#EF4444" : pc.balance > 0 ? "#F59E0B" : "#10B981" }}>
+                  {pc.balance <= 0 ? "À jour" : "Solde dû"}
+                </div>
+              </div>
+
+              {/* KPIs */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 14 }}>
+                <div style={{ background: "#0D0D1A", borderRadius: 12, padding: "10px 8px", textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>CA</div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: "#8B5CF6" }}>{fmtCHF(pc.totalCA)}</div>
+                </div>
+                <div style={{ background: "#0D0D1A", borderRadius: 12, padding: "10px 8px", textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Reversé</div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: "#10B981" }}>{fmtCHF(pc.totalReversed)}</div>
+                </div>
+                <div style={{ background: "#0D0D1A", borderRadius: 12, padding: "10px 8px", textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Solde dû</div>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: pc.balance > 0 ? "#F59E0B" : "#10B981" }}>{fmtCHF(pc.balance)}</div>
+                </div>
+              </div>
+
+              {/* Progress bar */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ flex: 1, height: 6, borderRadius: 3, background: "#0D0D1A", overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${Math.min(pct, 100)}%`, borderRadius: 3, background: pct >= 100 ? "#10B981" : "#8B5CF6", transition: "width 0.3s" }} />
+                </div>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#9CA3AF" }}>{pct}%</span>
+              </div>
+
+              {/* Pending count */}
+              {pc.pendingPayouts.length > 0 && (
+                <div style={{ marginTop: 10, fontSize: 11, color: "#F59E0B", fontWeight: 600 }}>
+                  ⏳ {pc.pendingPayouts.length} reversement(s) en attente de validation
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {providerCards.length === 0 && (
+          <div style={{ gridColumn: "1 / -1", textAlign: "center", padding: 40, color: "#6B7280" }}>Aucun provider trouvé</div>
+        )}
+      </div>
+
+      {/* PROVIDER DETAIL MODAL */}
+      {selectedProv && (
+        <div onClick={() => { setSelectedProv(null); setShowPayoutForm(false); setShowInvoiceForm(false); }} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)", zIndex: 10000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "#12121F", border: "1px solid #2A2A3E", borderRadius: 20, width: "100%", maxWidth: 750, maxHeight: "90vh", overflow: "auto", padding: 28 }}>
+            {/* Header */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+              <div>
+                <div style={{ fontSize: 20, fontWeight: 800 }}>{selectedProv.provider.name}</div>
+                <div style={{ fontSize: 12, color: "#9CA3AF" }}>Détail reversements — tous montants en CHF</div>
+              </div>
+              <button onClick={() => { setSelectedProv(null); setShowPayoutForm(false); setShowInvoiceForm(false); }} style={{ width: 36, height: 36, borderRadius: "50%", background: "rgba(255,255,255,0.06)", border: "none", color: "#fff", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+            </div>
+
+            {/* Summary KPIs */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 24 }}>
+              {[
+                { label: "CA Total", value: fmtCHF(selectedProv.totalCA), color: "#8B5CF6" },
+                { label: "Reversé", value: fmtCHF(selectedProv.totalReversed), color: "#10B981" },
+                { label: "En attente", value: fmtCHF(selectedProv.totalPending), color: "#F59E0B" },
+                { label: "Solde dû", value: fmtCHF(selectedProv.balance), color: selectedProv.balance > 0 ? "#EF4444" : "#10B981" },
+              ].map(k => (
+                <div key={k.label} style={{ background: "#0D0D1A", borderRadius: 14, padding: "14px 10px", textAlign: "center", border: "1px solid #2A2A3E" }}>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: k.color }}>{k.value}</div>
+                  <div style={{ fontSize: 9, color: "#6B7280", textTransform: "uppercase", fontWeight: 600, marginTop: 4 }}>{k.label}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Actions */}
+            <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+              <button onClick={() => { setShowPayoutForm(!showPayoutForm); setShowInvoiceForm(false); }} style={{ padding: "10px 18px", borderRadius: 12, border: "none", background: "#8B5CF6", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>💸 Créer un reversement</button>
+              <button onClick={() => { setShowInvoiceForm(!showInvoiceForm); setShowPayoutForm(false); }} style={{ padding: "10px 18px", borderRadius: 12, border: "1px solid #2A2A3E", background: "transparent", color: "#D1D5DB", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>📄 Générer facture</button>
+            </div>
+
+            {/* Payout form */}
+            {showPayoutForm && (
+              <div style={{ background: "#0D0D1A", borderRadius: 16, border: "1px solid #2A2A3E", padding: 20, marginBottom: 20 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>💸 Nouveau reversement</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div><label style={labelS}>Montant (CHF) *</label><input type="number" value={payoutForm.amount} onChange={e => setPayoutForm(f => ({ ...f, amount: e.target.value }))} placeholder="500" style={inputS} min="0" /></div>
+                  <div><label style={labelS}>Méthode *</label><select value={payoutForm.payment_method} onChange={e => setPayoutForm(f => ({ ...f, payment_method: e.target.value }))} style={inputS}>
+                    {PAYMENT_METHODS.map(pm => <option key={pm} value={pm}>{pm}</option>)}
+                  </select></div>
+                  <div><label style={labelS}>Période du</label><input type="date" value={payoutForm.period_from} onChange={e => setPayoutForm(f => ({ ...f, period_from: e.target.value }))} style={inputS} /></div>
+                  <div><label style={labelS}>Période au</label><input type="date" value={payoutForm.period_to} onChange={e => setPayoutForm(f => ({ ...f, period_to: e.target.value }))} style={inputS} /></div>
+                </div>
+                <div style={{ marginBottom: 12 }}><label style={labelS}>Référence</label><input value={payoutForm.reference} onChange={e => setPayoutForm(f => ({ ...f, reference: e.target.value }))} placeholder="Réf. virement..." style={inputS} /></div>
+                <div style={{ marginBottom: 14 }}><label style={labelS}>Notes</label><input value={payoutForm.notes} onChange={e => setPayoutForm(f => ({ ...f, notes: e.target.value }))} placeholder="Notes optionnelles..." style={inputS} /></div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button onClick={handleCreatePayout} disabled={saving} style={{ padding: "10px 20px", borderRadius: 12, border: "none", background: "#10B981", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{saving ? "..." : "✅ Valider et enregistrer"}</button>
+                  <button onClick={() => setShowPayoutForm(false)} style={{ padding: "10px 20px", borderRadius: 12, border: "1px solid #2A2A3E", background: "transparent", color: "#9CA3AF", fontWeight: 600, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>Annuler</button>
+                </div>
+              </div>
+            )}
+
+            {/* Invoice form */}
+            {showInvoiceForm && (
+              <div style={{ background: "#0D0D1A", borderRadius: 16, border: "1px solid #2A2A3E", padding: 20, marginBottom: 20 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>📄 Générer une facture pour le solde dû ({fmtCHF(selectedProv.balance)})</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                  <div><label style={labelS}>Période du</label><input type="date" value={invoiceForm.period_from} onChange={e => setInvoiceForm(f => ({ ...f, period_from: e.target.value }))} style={inputS} /></div>
+                  <div><label style={labelS}>Période au</label><input type="date" value={invoiceForm.period_to} onChange={e => setInvoiceForm(f => ({ ...f, period_to: e.target.value }))} style={inputS} /></div>
+                </div>
+                <div style={{ marginBottom: 14 }}><label style={labelS}>Notes</label><input value={invoiceForm.notes} onChange={e => setInvoiceForm(f => ({ ...f, notes: e.target.value }))} placeholder="Notes facture..." style={inputS} /></div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button onClick={handleGenerateInvoice} disabled={saving || selectedProv.balance <= 0} style={{ padding: "10px 20px", borderRadius: 12, border: "none", background: selectedProv.balance > 0 ? "#3B82F6" : "#2A2A3E", color: selectedProv.balance > 0 ? "#fff" : "#6B7280", fontWeight: 700, fontSize: 13, cursor: selectedProv.balance > 0 ? "pointer" : "not-allowed", fontFamily: "'DM Sans',sans-serif" }}>{saving ? "..." : "📄 Générer en brouillon"}</button>
+                  <button onClick={() => setShowInvoiceForm(false)} style={{ padding: "10px 20px", borderRadius: 12, border: "1px solid #2A2A3E", background: "transparent", color: "#9CA3AF", fontWeight: 600, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>Annuler</button>
+                </div>
+              </div>
+            )}
+
+            {/* Payouts history table */}
+            <div style={{ background: "#0D0D1A", borderRadius: 16, border: "1px solid #2A2A3E", padding: 20 }}>
+              <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 14 }}>📋 Historique des reversements ({selectedProv.payouts.length})</div>
+              {selectedProv.payouts.length === 0 ? (
+                <div style={{ textAlign: "center", padding: 30, color: "#6B7280", fontSize: 13 }}>Aucun reversement enregistré</div>
+              ) : (
+                <div style={{ maxHeight: 350, overflow: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr style={{ borderBottom: "1px solid #2A2A3E" }}>
+                        <th style={{ textAlign: "left", padding: "8px 10px", fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Date</th>
+                        <th style={{ textAlign: "right", padding: "8px 10px", fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Montant</th>
+                        <th style={{ textAlign: "left", padding: "8px 10px", fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Méthode</th>
+                        <th style={{ textAlign: "left", padding: "8px 10px", fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Référence</th>
+                        <th style={{ textAlign: "center", padding: "8px 10px", fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Statut</th>
+                        <th style={{ textAlign: "center", padding: "8px 10px", fontSize: 10, color: "#6B7280", textTransform: "uppercase", fontWeight: 600 }}>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {selectedProv.payouts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).map(p => (
+                        <tr key={p.id} style={{ borderBottom: "1px solid #1A1A2E" }}>
+                          <td style={{ padding: "10px", fontSize: 12, color: "#D1D5DB", fontFamily: "'Space Mono', monospace" }}>{new Date(p.created_at).toLocaleDateString("fr-CH")}</td>
+                          <td style={{ padding: "10px", fontSize: 14, fontWeight: 800, color: "#fff", textAlign: "right" }}>{fmtCHF(Number(p.amount))}</td>
+                          <td style={{ padding: "10px", fontSize: 12, color: "#9CA3AF" }}>{p.payment_method || "—"}</td>
+                          <td style={{ padding: "10px", fontSize: 12, color: "#9CA3AF" }}>{p.reference || "—"}</td>
+                          <td style={{ padding: "10px", textAlign: "center" }}>{statusBadge(p.status)}</td>
+                          <td style={{ padding: "10px", textAlign: "center", whiteSpace: "nowrap" }}>
+                            {p.status === "pending" && (
+                              <>
+                                {confirmId === p.id ? (
+                                  <span style={{ display: "inline-flex", gap: 6 }}>
+                                    <button onClick={() => handleValidatePayout(p.id)} disabled={saving} style={{ padding: "4px 10px", borderRadius: 8, border: "none", background: "#10B981", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>{saving ? "..." : "Oui"}</button>
+                                    <button onClick={() => setConfirmId(null)} style={{ padding: "4px 10px", borderRadius: 8, border: "1px solid #2A2A3E", background: "transparent", color: "#9CA3AF", fontSize: 11, cursor: "pointer" }}>Non</button>
+                                  </span>
+                                ) : rejectId === p.id ? (
+                                  <span style={{ display: "inline-flex", gap: 6 }}>
+                                    <button onClick={() => handleRejectPayout(p.id)} disabled={saving} style={{ padding: "4px 10px", borderRadius: 8, border: "none", background: "#EF4444", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>{saving ? "..." : "Confirmer"}</button>
+                                    <button onClick={() => setRejectId(null)} style={{ padding: "4px 10px", borderRadius: 8, border: "1px solid #2A2A3E", background: "transparent", color: "#9CA3AF", fontSize: 11, cursor: "pointer" }}>Non</button>
+                                  </span>
+                                ) : (
+                                  <span style={{ display: "inline-flex", gap: 6 }}>
+                                    <button onClick={() => { setConfirmId(p.id); setRejectId(null); }} style={{ padding: "4px 10px", borderRadius: 8, border: "none", background: "rgba(16,185,129,0.12)", color: "#10B981", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>✅</button>
+                                    <button onClick={() => { setRejectId(p.id); setConfirmId(null); }} style={{ padding: "4px 10px", borderRadius: 8, border: "none", background: "rgba(239,68,68,0.12)", color: "#EF4444", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>❌</button>
+                                  </span>
+                                )}
+                              </>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── INVOICES TAB (gérant) ──
 const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onRefresh }) => {
   const addToast = useToast();
@@ -18090,7 +18418,7 @@ const App = () => {
         return (<>{renderGerantTabBar("compta")}
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
           {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txs} payouts={payouts} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
-          {subTab==="reversements"&&<PlaceholderTab title={lang==="fr"?"Reversements":"Payouts"} />}
+          {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txs} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txs} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
         </>);
       case "automation":
