@@ -10673,6 +10673,347 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
 };
 
 // =============================================
+// =============================================
+// GÉRANT ROLE — MESSAGERIE (PR #15)
+// =============================================
+const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRefresh, navigateToSpender}) => {
+  const addToast = useToast();
+  const { fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const [conversations, setConversations] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [selectedConv, setSelectedConv] = useState(null);
+  const [msgInput, setMsgInput] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [assignDropdown, setAssignDropdown] = useState(null);
+  const chatEndRef = useRef(null);
+
+  // Load conversations
+  const loadConversations = async () => {
+    try {
+      const {data} = await sb.from("conversations").select("*").order("updated_at",{ascending:false});
+      setConversations(data||[]);
+    } catch(e) { setConversations([]); }
+    setLoading(false);
+  };
+
+  useEffect(()=>{ loadConversations(); },[]);
+
+  // Supabase Realtime
+  useEffect(()=>{
+    const channel = sb.channel("gerant-messagerie")
+      .on("postgres_changes",{event:"*",schema:"public",table:"conversations"},()=>loadConversations())
+      .on("postgres_changes",{event:"INSERT",schema:"public",table:"messages"},(payload)=>{
+        if(selectedConv && payload.new && payload.new.conversation_id===selectedConv.id){
+          setMessages(prev=>[...prev, payload.new]);
+        }
+      })
+      .subscribe();
+    return ()=>{ sb.removeChannel(channel); };
+  },[selectedConv?.id]);
+
+  // Auto-scroll to bottom when messages change
+  useEffect(()=>{
+    if(chatEndRef.current) chatEndRef.current.scrollIntoView({behavior:"smooth"});
+  },[messages]);
+
+  const loadMessages = async (convId) => {
+    try {
+      const {data} = await sb.from("messages").select("*").eq("conversation_id",convId).order("created_at",{ascending:true});
+      setMessages(data||[]);
+    } catch(e) { setMessages([]); }
+  };
+
+  const selectConv = (conv) => {
+    setSelectedConv(conv);
+    loadMessages(conv.id);
+    setAssignDropdown(null);
+  };
+
+  // Send message as gérant
+  const sendMessage = async () => {
+    if(!msgInput.trim()||!selectedConv||sending) return;
+    setSending(true);
+    try {
+      const {error} = await sb.from("messages").insert({conversation_id:selectedConv.id, sender_type:"human", sender_id:user.id, content:msgInput.trim()});
+      if(error){ addToast("Erreur: "+error.message,"error"); setSending(false); return; }
+      try { await sb.from("chatter_logs").insert({chatter_id:user.id, conversation_id:selectedConv.id, action:"gerant_message", content:msgInput.trim().slice(0,200)}); } catch(e){}
+      setMsgInput("");
+      await loadMessages(selectedConv.id);
+      try { await sb.from("conversations").update({updated_at:new Date().toISOString()}).eq("id",selectedConv.id); } catch(e){}
+    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+    setSending(false);
+  };
+
+  // Assign to chatter
+  const assignToChatter = async (chatterId) => {
+    if(!selectedConv) return;
+    try {
+      const {error} = await sb.from("conversations").update({chatter_id:chatterId, status:"human", escalated:false, escalation_reason:null}).eq("id",selectedConv.id);
+      if(error){ addToast("Erreur: "+error.message,"error"); return; }
+      try { await sb.from("chatter_logs").insert({chatter_id:user.id, conversation_id:selectedConv.id, action:"assign_chatter", content:`Assigned to ${chatterId}`}); } catch(e){}
+      addToast(fr?"Conversation assignée":"Conversation assigned","success");
+      setAssignDropdown(null);
+      await loadConversations();
+    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+  };
+
+  // Hand back to bot
+  const handBackToBot = async () => {
+    if(!selectedConv) return;
+    try {
+      const {error} = await sb.from("conversations").update({status:"bot", chatter_id:null, escalated:false, escalation_reason:null}).eq("id",selectedConv.id);
+      if(error){ addToast("Erreur: "+error.message,"error"); return; }
+      try { await sb.from("chatter_logs").insert({chatter_id:user.id, conversation_id:selectedConv.id, action:"hand_back_bot"}); } catch(e){}
+      addToast(fr?"Conversation rendue au bot":"Conversation handed back to bot","success");
+      await loadConversations();
+    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+  };
+
+  // Helpers
+  const getSpender = (conv) => spenders.find(s => s.handle===conv.spender_handle || s.name===conv.spender_handle || s.id===conv.spender_id);
+  const getSpenderName = (conv) => { const sp=getSpender(conv); return sp?.first_name||sp?.handle||conv.spender_handle||"Spender"; };
+  const relTime = (d) => { if(!d) return ""; const mins=Math.floor((Date.now()-new Date(d).getTime())/60000); if(mins<1) return fr?"à l'instant":"just now"; if(mins<60) return `${fr?"il y a ":""}${mins}${fr?" min":"m ago"}`; const hrs=Math.floor(mins/60); if(hrs<24) return `${fr?"il y a ":""}${hrs}${fr?"h":"h ago"}`; const days=Math.floor(hrs/24); return `${fr?"il y a ":""}${days}${fr?"j":"d ago"}`; };
+  const getConvStatus = (conv) => { if(conv.escalation_reason && !conv.chatter_id) return "escalade"; if(conv.status==="bot"&&!conv.escalated) return "bot"; return "humain"; };
+  const statusConfig = { escalade:{icon:"\ud83d\udd34",label:fr?"Escalade":"Escalation",color:"var(--danger)",bg:"rgba(248,113,113,0.15)"}, bot:{icon:"\ud83d\udfe2",label:"Bot",color:"var(--success)",bg:"rgba(52,211,153,0.15)"}, humain:{icon:"\ud83d\udd35",label:fr?"Humain":"Human",color:"var(--blue-accent,#60A5FA)",bg:"rgba(96,165,250,0.15)"} };
+  const senderColors = { spender:"#2A2A3E", bot:"#1E3A5F", chatter:"#3B82F6", human:"#7C3AED", gerant:"#7C3AED" };
+  const senderBadge = (type) => { const map={bot:{icon:"\ud83d\udfe2",label:"BOT"},chatter:{icon:"\ud83d\udd35",label:fr?"CHATTER":"CHATTER"},human:{icon:"\ud83d\udd35",label:fr?"HUMAIN":"HUMAN"},spender:{icon:"\u{1F464}",label:"SPENDER"}}; return map[type]||map.spender; };
+
+  // Available chatters
+  const chatters = profiles.filter(p => p.role==="chatter");
+
+  // Filter conversations
+  const sortedConvs = conversations.filter(c => {
+    if(filter==="escalade") return getConvStatus(c)==="escalade";
+    if(filter==="bot") return getConvStatus(c)==="bot";
+    if(filter==="humain") return getConvStatus(c)==="humain";
+    return true;
+  }).sort((a,b)=>{
+    const aEsc = getConvStatus(a)==="escalade" ? 0 : 1;
+    const bEsc = getConvStatus(b)==="escalade" ? 0 : 1;
+    if(aEsc!==bEsc) return aEsc-bEsc;
+    return new Date(b.updated_at||0)-new Date(a.updated_at||0);
+  });
+
+  // Selected spender enrichment
+  const selectedSpender = selectedConv ? getSpender(selectedConv) : null;
+  const spEnriched = useMemo(()=>{
+    if(!selectedSpender) return null;
+    const spTxs = txs.filter(tx=>tx.spender_handle===(selectedSpender.handle||selectedSpender.name));
+    const validTxs = spTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee");
+    const ltv = validTxs.reduce((s,tx)=>s+Number(tx.amount||0),0);
+    const aov = validTxs.length>0 ? ltv/validTxs.length : 0;
+    const cnt = spTxs.length;
+    const lastTx = spTxs.length>0 ? spTxs.sort((a,b)=>new Date(b.date)-new Date(a.date))[0] : null;
+    const prodMap = {};
+    spTxs.forEach(tx=>{ if(tx.product) prodMap[tx.product]=(prodMap[tx.product]||0)+1; });
+    const favProducts = Object.entries(prodMap).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([p])=>p);
+    return {...selectedSpender, ltv, aov, cnt, txs:spTxs, last_tx_date:lastTx?.date||null, favProducts};
+  },[selectedSpender, txs]);
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{marginBottom:16}}>
+        <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{"\u{1F4AC}"} {fr?"Messagerie":"Messaging"}</h2>
+        <p style={{fontSize:11,color:"var(--text-tertiary)",margin:"3px 0 0",fontStyle:"italic"}}>{fr?"Centre de conversations — escalades, assignation, contexte spender":"Conversation center — escalations, assignment, spender context"}</p>
+      </div>
+
+      {loading && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:40}}>{React.createElement(Spinner)} {fr?"Chargement...":"Loading..."}</div>}
+
+      {!loading && (
+        <div style={{display:"grid",gridTemplateColumns:"30% 45% 25%",gap:0,minHeight:"calc(100vh - 200px)",border:"1px solid var(--border-subtle)",borderRadius:16,overflow:"hidden"}}>
+
+          {/* ═══ LEFT: Conversation List ═══ */}
+          <div style={{background:"var(--card-bg)",borderRight:"1px solid var(--border-subtle)",display:"flex",flexDirection:"column"}}>
+            {/* Filters */}
+            <div style={{padding:"12px 14px",borderBottom:"1px solid var(--border-subtle)",display:"flex",gap:4,flexWrap:"wrap"}}>
+              {[{id:"all",label:fr?"Toutes":"All"},{id:"escalade",label:"\ud83d\udd34 "+( fr?"Escalades":"Escalations")},{id:"bot",label:"\ud83d\udfe2 Bot"},{id:"humain",label:"\ud83d\udd35 "+(fr?"Humain":"Human")}].map(f=>(
+                <button key={f.id} onClick={()=>setFilter(f.id)} style={{padding:"4px 10px",borderRadius:8,border:"1px solid "+(filter===f.id?"var(--accent)":"var(--border-subtle)"),background:filter===f.id?"var(--accent-muted)":"transparent",color:filter===f.id?"var(--accent)":"var(--text-tertiary)",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{f.label}</button>
+              ))}
+            </div>
+            {/* Conv list */}
+            <div style={{flex:1,overflowY:"auto"}}>
+              {sortedConvs.length===0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:30,fontSize:13}}>{fr?"Aucune conversation":"No conversations"}</div>}
+              {sortedConvs.map(conv=>{
+                const st = statusConfig[getConvStatus(conv)];
+                const sp = getSpender(conv);
+                const langFlag = sp?.langue && LANG_FLAGS[sp.langue] ? LANG_FLAGS[sp.langue] : "";
+                return (
+                  <div key={conv.id} onClick={()=>selectConv(conv)} style={{padding:"14px 16px",borderBottom:"1px solid var(--border-subtle)",cursor:"pointer",background:selectedConv?.id===conv.id?"var(--accent-subtle)":"transparent",transition:"background 0.15s"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                      <div style={{display:"flex",alignItems:"center",gap:6,minWidth:0}}>
+                        <div style={{width:32,height:32,borderRadius:"50%",background:"var(--accent-muted)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:800,color:"var(--accent)",flexShrink:0}}>
+                          {(sp?.first_name||conv.spender_handle||"?")[0].toUpperCase()}
+                        </div>
+                        <span style={{fontSize:13,fontWeight:700,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>@{conv.spender_handle||"?"}</span>
+                        {langFlag && <span style={{fontSize:12}}>{langFlag}</span>}
+                      </div>
+                      <span style={{padding:"2px 8px",borderRadius:8,background:st.bg,color:st.color,fontSize:9,fontWeight:700,whiteSpace:"nowrap",flexShrink:0}}>{st.icon} {st.label}</span>
+                    </div>
+                    <div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginBottom:2,paddingLeft:38}}>{conv.last_message||"..."}</div>
+                    <div style={{fontSize:10,color:"var(--text-quaternary)",paddingLeft:38}}>{relTime(conv.updated_at)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* ═══ CENTER: Chat Area ═══ */}
+          <div style={{background:"#111827",display:"flex",flexDirection:"column",borderRight:"1px solid var(--border-subtle)"}}>
+            {!selectedConv && (
+              <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-quaternary)",flexDirection:"column",gap:8}}>
+                <span style={{fontSize:32}}>{"\u{1F4AC}"}</span>
+                <span style={{fontSize:14}}>{fr?"Sélectionne une conversation":"Select a conversation"}</span>
+              </div>
+            )}
+            {selectedConv && (<>
+              {/* Chat header */}
+              <div style={{padding:"12px 16px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center",background:"rgba(0,0,0,0.2)"}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{fontSize:14,fontWeight:700}}>@{selectedConv.spender_handle}</span>
+                  {(()=>{const st=statusConfig[getConvStatus(selectedConv)];return <span style={{padding:"2px 8px",borderRadius:8,background:st.bg,color:st.color,fontSize:10,fontWeight:700}}>{st.icon} {st.label}</span>;})()}
+                  {selectedConv.escalation_reason && <span style={{fontSize:10,color:"var(--danger)",fontStyle:"italic"}}>{selectedConv.escalation_reason}</span>}
+                </div>
+                <div style={{display:"flex",gap:6,alignItems:"center",position:"relative"}}>
+                  <button className="btn btn-small" onClick={handBackToBot} style={{fontSize:11}}>{"\ud83e\udd16"} {fr?"Rendre au bot":"Back to bot"}</button>
+                  <div style={{position:"relative"}}>
+                    <button className="btn btn-small btn-primary" onClick={()=>setAssignDropdown(assignDropdown?null:selectedConv.id)} style={{fontSize:11}}>{"\u{1F464}"} {fr?"Assigner":"Assign"}</button>
+                    {assignDropdown===selectedConv.id && (
+                      <div style={{position:"absolute",right:0,top:"100%",marginTop:4,background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:12,padding:6,zIndex:100,minWidth:180,boxShadow:"var(--shadow-lg)"}}>
+                        {chatters.length===0 && <div style={{padding:8,fontSize:11,color:"var(--text-quaternary)"}}>{fr?"Aucun chatter":"No chatters"}</div>}
+                        {chatters.map(ch=>(
+                          <button key={ch.id} onClick={()=>assignToChatter(ch.id)} style={{display:"block",width:"100%",padding:"8px 12px",border:"none",background:"transparent",color:"var(--text-primary)",fontSize:12,fontWeight:600,cursor:"pointer",textAlign:"left",borderRadius:8,fontFamily:"'DM Sans',sans-serif"}} onMouseEnter={e=>e.target.style.background="var(--accent-muted)"} onMouseLeave={e=>e.target.style.background="transparent"}>
+                            {ch.name||ch.email}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+              {/* Messages */}
+              <div style={{flex:1,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",gap:10}}>
+                {messages.map(msg=>{
+                  const isSpender = msg.sender_type==="spender"||(!["bot","chatter","human","gerant"].includes(msg.sender_type));
+                  const badge = senderBadge(msg.sender_type);
+                  return (
+                    <div key={msg.id} style={{alignSelf:isSpender?"flex-start":"flex-end",maxWidth:"75%"}}>
+                      <div style={{padding:"10px 14px",borderRadius:isSpender?"4px 14px 14px 14px":"14px 4px 14px 14px",fontSize:13,background:senderColors[msg.sender_type]||senderColors.spender,color:"#fff",lineHeight:1.5}}>{msg.content}</div>
+                      <div style={{display:"flex",alignItems:isSpender?"flex-start":"flex-end",flexDirection:"column",gap:2,marginTop:3}}>
+                        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                          <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(255,255,255,0.1)",color:"var(--text-quaternary)",fontWeight:700}}>{badge.icon} {badge.label}</span>
+                          <span style={{fontSize:9,color:"var(--text-quaternary)"}}>{msg.created_at?new Date(msg.created_at).toLocaleTimeString(fr?"fr-FR":"en-US",{hour:"2-digit",minute:"2-digit"}):""}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {messages.length===0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:30}}>{fr?"Aucun message":"No messages"}</div>}
+                <div ref={chatEndRef}/>
+              </div>
+              {/* Input */}
+              <div style={{padding:14,borderTop:"1px solid var(--border-subtle)",display:"flex",gap:8,background:"rgba(0,0,0,0.2)"}}>
+                <textarea className="filter-select" style={{flex:1,resize:"none",minHeight:40,maxHeight:100,padding:"10px 12px"}} value={msgInput} onChange={e=>setMsgInput(e.target.value)} placeholder={fr?"Répondre en tant que gérant...":"Reply as manager..."} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();}}} />
+                <button className="btn btn-primary" onClick={sendMessage} disabled={sending} style={{alignSelf:"flex-end"}}>{sending?React.createElement(Spinner):(fr?"Envoyer":"Send")}</button>
+              </div>
+            </>)}
+          </div>
+
+          {/* ═══ RIGHT: Spender Card ═══ */}
+          <div style={{background:"var(--card-bg)",padding:20,overflowY:"auto"}}>
+            {!selectedConv && (
+              <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:20,fontSize:12}}>{fr?"Sélectionne une conversation pour voir le profil spender":"Select a conversation to see spender profile"}</div>
+            )}
+            {selectedConv && !spEnriched && (
+              <div style={{textAlign:"center",padding:20}}>
+                <div style={{fontSize:28,marginBottom:8}}>{"\u{1F464}"}</div>
+                <div style={{fontSize:13,fontWeight:700,color:"var(--text-primary)"}}>@{selectedConv.spender_handle}</div>
+                <div style={{fontSize:11,color:"var(--text-quaternary)",marginTop:4}}>{fr?"Spender inconnu":"Unknown spender"}</div>
+              </div>
+            )}
+            {selectedConv && spEnriched && (()=>{
+              const sp = spEnriched;
+              const vipScore = computeVIPScore(sp);
+              const vipColor = vipScore>=70?"var(--success)":vipScore>=40?"var(--warning)":"var(--danger)";
+              const badges = computeSpenderBadges(sp);
+              const lastRel = (()=>{ if(!sp.last_tx_date) return fr?"jamais":"never"; const d=Math.floor((Date.now()-new Date(sp.last_tx_date).getTime())/86400000); if(d===0) return fr?"aujourd'hui":"today"; if(d===1) return fr?"hier":"yesterday"; return `${fr?"il y a ":""}${d}${fr?"j":"d ago"}`; })();
+              return (
+                <div>
+                  {/* Avatar + Name + Flag */}
+                  <div style={{textAlign:"center",marginBottom:16}}>
+                    <div style={{width:56,height:56,borderRadius:"50%",background:"var(--accent-muted)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:22,fontWeight:800,color:"var(--accent)",margin:"0 auto 10px"}}>
+                      {sp.first_name?sp.first_name[0].toUpperCase():(sp.handle||sp.name||"?")[0].toUpperCase()}
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+                      <span style={{fontSize:15,fontWeight:800}}>@{sp.handle||sp.name}</span>
+                      {sp.langue && LANG_FLAGS[sp.langue] && <span style={{fontSize:14}}>{LANG_FLAGS[sp.langue]}</span>}
+                    </div>
+                    {sp.first_name && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>{sp.first_name}</div>}
+                    {/* Badges */}
+                    <div style={{display:"flex",gap:4,justifyContent:"center",marginTop:8,flexWrap:"wrap"}}>
+                      {badges.map(b=><span key={b.label} style={{padding:"3px 10px",borderRadius:12,background:b.bg,color:b.color,fontSize:9,fontWeight:700}}>{b.icon} {b.label}</span>)}
+                    </div>
+                  </div>
+
+                  {/* VIP Score Bar */}
+                  <div style={{marginBottom:16}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                      <span style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase"}}>VIP Score</span>
+                      <span style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)"}}>{vipScore}/100</span>
+                    </div>
+                    <div style={{height:6,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                      <div style={{width:`${vipScore}%`,height:"100%",borderRadius:3,background:vipColor,transition:"width 0.3s"}}/>
+                    </div>
+                  </div>
+
+                  {/* KPI Grid */}
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:16}}>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Total":"Total"}</div>
+                      <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{sp.ltv.toFixed(0)}{currencySymbol}</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>AOV</div>
+                      <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{sp.aov.toFixed(0)}{currencySymbol}</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Fréquence":"Frequency"}</div>
+                      <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{sp.cnt} TX</div>
+                    </div>
+                    <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Dernière TX":"Last TX"}</div>
+                      <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{lastRel}</div>
+                    </div>
+                  </div>
+
+                  {/* Favorite Products */}
+                  {sp.favProducts && sp.favProducts.length>0 && (
+                    <div style={{marginBottom:16}}>
+                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:6}}>{fr?"Produits favoris":"Favorite products"}</div>
+                      <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                        {sp.favProducts.map(p=><span key={p} style={{padding:"3px 8px",borderRadius:8,background:"rgba(139,92,246,0.15)",color:"var(--accent)",fontSize:10,fontWeight:600}}>{p}</span>)}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Action: See full profile */}
+                  <button className="btn btn-primary" style={{width:"100%",fontSize:12,borderRadius:10}} onClick={()=>navigateToSpender&&navigateToSpender(sp.handle||sp.name)}>
+                    {fr?"Voir fiche complète":"View full profile"}
+                  </button>
+                </div>
+              );
+            })()}
+          </div>
+
+        </div>
+      )}
+    </div>
+  );
+};
+
 // CHATTER ROLE — MESSAGERIE
 // =============================================
 const BLOCKED_KEYWORDS = ["paypal","bitcoin","virement","iban","revolut","twint","crypto","bank","compte","transfer","wire"];
@@ -14991,6 +15332,8 @@ const App = () => {
   const [alerts, setAlerts] = useState([]);
   const [botStats, setBotStats] = useState([]);
   const [providerPaymentMethods, setProviderPaymentMethods] = useState([]);
+  const [chatterLogs, setChatterLogs] = useState([]);
+  const [escalationCount, setEscalationCount] = useState(0);
   // ── NOTIFICATIONS STATE ──
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -15063,10 +15406,10 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR;
     const safe = (promise) => Promise.resolve(promise).then(r => r.error ? {data:[]} : r).catch(()=>({data:[]}));
     try {
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR] = await Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR] = await Promise.all([
         safe(sb.from("transactions").select("*").order("date",{ascending:false})),
         safe(sb.from("spenders").select("*")),
         safe(sb.from("profiles").select("*")),
@@ -15087,6 +15430,7 @@ const App = () => {
         safe(sb.from("model_videos").select("*").order("created_at",{ascending:false})),
         safe(sb.from("video_sessions").select("*").order("created_at",{ascending:false})),
         safe(sb.from("provider_payment_methods").select("*").order("sort_order",{ascending:true})),
+        safe(sb.from("chatter_logs").select("*").order("created_at",{ascending:false}).limit(500)),
       ]);
     } catch(e) { /* loadData critical failure */ console.error("loadData crash:", e); return; }
     // Discard results if a newer loadData call was started while we were awaiting
@@ -15166,6 +15510,14 @@ const App = () => {
     setModelVideos((mvR&&mvR.data)||[]);
     setVideoSessions((vsR&&vsR.data)||[]);
     setProviderPaymentMethods((ppmR&&ppmR.data)||[]);
+    setChatterLogs((chLogR&&chLogR.data)||[]);
+    // Load escalation count for messagerie badge
+    if (currentUser && currentUser.role === "gerant") {
+      try {
+        const {data:escData,count:escCount} = await sb.from("conversations").select("id",{count:"exact",head:true}).not("escalation_reason","is",null).is("chatter_id",null);
+        setEscalationCount(escCount||0);
+      } catch(e) { /* escalation count fetch failed */ }
+    }
     // Load notifications
     if (currentUser) {
       try {
@@ -15338,7 +15690,7 @@ const App = () => {
           {subTab==="providers"&&<PrestatairesTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} />}
         </>);
       case "messagerie":
-        return <TelegramTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />;
+        return <GerantMessagerieTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />;
       case "compta":
         return (<>{renderGerantTabBar("compta")}
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txs} expenses={expenses} models={models} profiles={profiles} onRefresh={onRefresh} />}
@@ -15404,7 +15756,7 @@ const App = () => {
                 <span>{n.icon}</span>
                 <span className="sidebar-btn-label">{n.label}</span>
                 {n.id==="business"&&pendingTxCount>0&&<span className="sidebar-btn-badge" style={{background:"var(--warning)",color:"#000"}}>{pendingTxCount>99?"99+":pendingTxCount}</span>}
-                {n.id==="messagerie"&&unreadCount>0&&<span className="sidebar-btn-badge" style={{background:"var(--danger)",color:"#fff"}}>{unreadCount>9?"9+":unreadCount}</span>}
+                {n.id==="messagerie"&&escalationCount>0&&<span className="sidebar-btn-badge" style={{background:"var(--danger)",color:"#fff"}}>{escalationCount>9?"9+":escalationCount}</span>}
               </button>
             ))}
           </div>
