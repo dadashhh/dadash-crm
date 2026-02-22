@@ -7,7 +7,7 @@
 
 ---
 
-## SCORE GLOBAL DADASH : 61/100
+## SCORE GLOBAL DADASH : 59/100
 
 | Domaine | Note | Poids | Score |
 |---------|------|-------|-------|
@@ -16,10 +16,10 @@
 | CRM UX/UI | 7/10 | x2 | 14 |
 | CRM Securite | 3/10 | x3 | 9 |
 | CRM Performance | 5/10 | x2 | 10 |
-| Supabase Schema | 6/10 | x2 | 12 |
+| Supabase Schema | 5/10 | x2 | 10 |
 | Bot Admin TG | 6/10 | x1 | 6 |
 | Integrations | 5/10 | x1 | 5 |
-| **TOTAL** | | **/17** | **61/100** |
+| **TOTAL** | | **/17** | **59/100** |
 
 ---
 
@@ -197,9 +197,13 @@ Le CRM entier tient dans `index.html` : **21,074 lignes** contenant :
 
 ## 3. AUDIT SUPABASE
 
-### Schema : 6/10
+### Schema : 5/10
 
-**Tables identifiees (via migrations + code frontend) :**
+**ALERTE : 12 tables fantomes** — Utilisees dans le frontend (`sb.from("table")`) mais JAMAIS definies dans aucun fichier de migration. Elles existent dans Supabase mais pas dans le controle de version. Si quelqu'un les supprime par erreur, il n'y a aucun moyen de les recreer :
+- `conversations`, `messages`, `chatter_logs`, `payouts`, `expenses`, `notifications`
+- `providers`, `broadcasts`, `screenshot_checks`, `payslips`, `provider_payment_methods`, `models`
+
+**Tables identifiees (via migrations + code frontend) — 39 au total :**
 
 | Table | Colonnes | RLS | Index | FK | Multi-tenant |
 |-------|----------|-----|-------|----|-------------|
@@ -254,7 +258,15 @@ Le CRM entier tient dans `index.html` : **21,074 lignes** contenant :
 
 6. **RLS correcte** — Toutes les tables ont RLS activee avec des politiques par role. Le pattern `(SELECT role FROM profiles WHERE id = auth.uid())` est correct mais fait une sous-requete a chaque acces. Un role claim dans le JWT serait plus performant.
 
-### Storage : Non audite (bucket `model-media` reference mais pas de code d'acces dans le CRM)
+### RPC Functions : 1 seule
+- `next_invoice_number()` — Compteur atomique de factures. Pattern correct (UPSERT + RETURNING). Format : `DADASH-2026-0001`. Bien fait.
+
+### Realtime Channels : 2
+- `gerant-messagerie` — Messagerie temps reel pour le gerant
+- `dadash-realtime-notifs-{user.id}` — Notifications push par utilisateur
+
+### Storage : 1 bucket
+- `model-videos` — Non-public, signed URLs. Pas de code d'acces direct dans le CRM frontend.
 
 ---
 
@@ -356,7 +368,7 @@ Aucun commit d'Erwan dans l'historique git de dadash-crm. Les personnalites sont
 
 ## 6. PLAN D'ACTION
 
-### Score global : 61/100
+### Score global : 59/100
 
 ### Top 10 actions critiques (par priorite)
 
