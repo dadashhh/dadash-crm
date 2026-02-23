@@ -1734,7 +1734,7 @@ const MiniSparkline = ({data, width=120, height=28, color="var(--accent)"}) => {
 
 // ═══ ROLE ACCESS ═══
 const ROLE_ACCESS = {
-  gerant: ["dashboard","business","equipe","messagerie","compta","automation","admin"],
+  gerant: ["dashboard","business","equipe","messagerie","compta","automation","bots","admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments"],
   chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition","chatter_scan"],
   provider: ["provider_dashboard","transactions","provider_compta"]
@@ -1751,6 +1751,7 @@ const GERANT_NAV = [
   { id: "messagerie", icon: "\u{1F4AC}", label: "Messagerie" },
   { id: "compta", icon: "\u{1F4CA}", label: "Compta" },
   { id: "automation", icon: "\u{1F916}", label: "Automation" },
+  { id: "bots", icon: "\u{1F4E1}", label: "Bot Manager" },
   { id: "admin", icon: "⚙️", label: "Admin" },
 ];
 
@@ -1788,6 +1789,10 @@ const PAGE_TABS = {
     { id: "bots", label: "Bots", icon: "\u{1F916}" },
     { id: "scans", label: "Scans", icon: "\u{1F4F8}" },
     { id: "broadcasts", label: "Broadcasts", icon: "\u{1F4E2}" },
+  ],
+  bots: [
+    { id: "liste", label: "Mes Bots", icon: "\u{1F916}" },
+    { id: "personalities", label: "Personnalités", icon: "\u{1F3AD}" },
   ],
   admin: [
     { id: "users", label: "Utilisateurs", icon: "\u{1F465}" },
@@ -16875,6 +16880,618 @@ const BotsControl = ({ lang, botStats }) => {
 };
 
 // =============================================
+// BOT MANAGER PAGE (GÉRANT — /bots)
+// Full bot management: list, add, configure, personalities
+// =============================================
+const PERSONALITY_PRESETS = [
+  { id: "default", label: "Default", desc: "Personnalité neutre et professionnelle", prompt: "Tu es une assistante virtuelle professionnelle. Réponds de manière polie et engageante." },
+  { id: "carla", label: "Carla", desc: "Personnalité séduisante et charmeuse", prompt: "Tu es Carla, une femme confiante et charmeuse. Tu réponds avec un ton flirteur et engageant tout en restant professionnelle pour les transactions." },
+  { id: "sofia", label: "Sofia", desc: "Personnalité mystérieuse et intrigante", prompt: "Tu es Sofia, mystérieuse et intrigante. Tu crées une atmosphère de curiosité et d'exclusivité autour de tes contenus." },
+  { id: "luna", label: "Luna", desc: "Personnalité douce et romantique", prompt: "Tu es Luna, douce et romantique. Tu crées une connexion émotionnelle avec les spenders tout en guidant vers les services payants." },
+  { id: "maya", label: "Maya", desc: "Personnalité audacieuse et directe", prompt: "Tu es Maya, audacieuse et directe. Tu n'as pas peur de proposer tes services et tu assumes pleinement ton contenu." },
+];
+
+const BotManagerPage = ({ lang, models, botConfigs, onRefresh, initialView }) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [view, setView] = useState(initialView || "list"); // list | add | config | personalities
+  const [selectedBot, setSelectedBot] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [addForm, setAddForm] = useState({ name:"", phone:"", api_id:"", api_hash:"", telegram_session:"", personality:"default", voice_id:"", twint_number:"", telegram_link:"", model_id:"" });
+  const [editForm, setEditForm] = useState(null);
+  const [showSessionHelp, setShowSessionHelp] = useState(false);
+  const [logEntries, setLogEntries] = useState([]);
+  const [loadingLogs, setLoadingLogs] = useState(false);
+  const [customPersonalities, setCustomPersonalities] = useState([]);
+  const [dupForm, setDupForm] = useState(null);
+
+  // ── Card style helper ──
+  const cardStyle = { background:"var(--card-bg)", border:"1px solid var(--card-border)", borderRadius:"var(--radius-lg)", padding:24 };
+  const inputStyle = { width:"100%", padding:"10px 12px", background:"var(--input-bg)", border:"1px solid var(--input-border)", borderRadius:"var(--radius-sm)", color:"var(--input-color)", fontSize:13, fontFamily:"'DM Sans',sans-serif", transition:"border-color 0.2s" };
+  const labelStyle = { display:"block", fontSize:12, fontWeight:600, color:"var(--text-secondary)", marginBottom:6, textTransform:"uppercase" };
+  const btnPrimary = { padding:"10px 20px", borderRadius:"var(--radius-sm)", border:"none", background:"var(--accent)", color:"#fff", fontWeight:700, fontSize:13, cursor:"pointer", fontFamily:"'DM Sans',sans-serif", transition:"all 0.2s" };
+  const btnSecondary = { padding:"10px 20px", borderRadius:"var(--radius-sm)", border:"1px solid var(--border-default)", background:"transparent", color:"var(--text-secondary)", fontWeight:600, fontSize:13, cursor:"pointer", fontFamily:"'DM Sans',sans-serif" };
+
+  // ── Status badge ──
+  const StatusBadge = ({ status }) => {
+    const conf = status === "online" ? { dot:"\u{1F7E2}", label:"Online", color:"var(--success)", bg:"var(--success-muted)" }
+      : status === "connecting" ? { dot:"\u{1F7E1}", label:"Connecting", color:"var(--warning)", bg:"var(--warning-muted)" }
+      : status === "error" ? { dot:"\u{1F534}", label:"Error", color:"var(--danger)", bg:"var(--danger-muted)" }
+      : { dot:"\u{1F534}", label:"Offline", color:"var(--text-tertiary)", bg:"var(--bg-overlay)" };
+    return React.createElement("span", { style:{ display:"inline-flex", alignItems:"center", gap:6, padding:"4px 10px", borderRadius:20, background:conf.bg, fontSize:11, fontWeight:700, color:conf.color } }, conf.dot, " ", conf.label);
+  };
+
+  // ── Load chat_logs for a bot ──
+  const loadLogs = async (botId) => {
+    setLoadingLogs(true);
+    try {
+      const { data } = await sb.from("chat_logs").select("*").eq("bot_config_id", botId).order("created_at", { ascending: false }).limit(50);
+      setLogEntries(data || []);
+    } catch (e) { setLogEntries([]); }
+    setLoadingLogs(false);
+  };
+
+  // ── Toggle bot status ──
+  const toggleBot = async (bot) => {
+    const newStatus = bot.status === "online" ? "offline" : "connecting";
+    const { error } = await sb.from("bot_configs").update({ status: newStatus }).eq("id", bot.id);
+    if (error) return addToast("Erreur: " + error.message, "error");
+    addToast(newStatus === "connecting" ? "\u{1F504} Démarrage du bot..." : "\u{23F9}\u{FE0F} Bot arrêté", "success");
+    if (onRefresh) onRefresh();
+  };
+
+  // ── Save new bot ──
+  const handleAddBot = async () => {
+    if (!addForm.name.trim() || !addForm.phone.trim() || !addForm.api_id.trim() || !addForm.api_hash.trim()) {
+      return addToast("Nom, téléphone, API ID et API Hash requis", "error");
+    }
+    setSaving(true);
+    const payload = { ...addForm, model_id: addForm.model_id || null, prices: { cam_show: { price: 70, currency: "CHF" }, sexting: { price: 30, currency: "CHF" }, pack_contenu: { price: 50, currency: "CHF" } }, payment_methods: {} };
+    delete payload.model_id_temp;
+    if (!payload.model_id) delete payload.model_id;
+    const { error } = await sb.from("bot_configs").insert(payload);
+    setSaving(false);
+    if (error) return addToast("Erreur: " + error.message, "error");
+    addToast("\u{2705} Bot ajouté avec succès !", "success");
+    setAddForm({ name:"", phone:"", api_id:"", api_hash:"", telegram_session:"", personality:"default", voice_id:"", twint_number:"", telegram_link:"", model_id:"" });
+    setView("list");
+    if (onRefresh) onRefresh();
+  };
+
+  // ── Update bot config ──
+  const handleUpdateBot = async () => {
+    if (!editForm) return;
+    setSaving(true);
+    const { id, created_at, updated_at, ...updates } = editForm;
+    const { error } = await sb.from("bot_configs").update(updates).eq("id", id);
+    setSaving(false);
+    if (error) return addToast("Erreur: " + error.message, "error");
+    addToast("\u{2705} Bot mis à jour !", "success");
+    if (onRefresh) onRefresh();
+  };
+
+  // ── Delete bot ──
+  const handleDeleteBot = async (botId) => {
+    if (!confirm("Supprimer ce bot définitivement ?")) return;
+    const { error } = await sb.from("bot_configs").delete().eq("id", botId);
+    if (error) return addToast("Erreur: " + error.message, "error");
+    addToast("\u{1F5D1}\u{FE0F} Bot supprimé", "success");
+    setView("list");
+    setSelectedBot(null);
+    setEditForm(null);
+    if (onRefresh) onRefresh();
+  };
+
+  // ── Open config view ──
+  const openConfig = (bot) => {
+    setSelectedBot(bot);
+    setEditForm({ ...bot });
+    setView("config");
+    loadLogs(bot.id);
+  };
+
+  // ═══════════════════════════════════════
+  // VIEW: LIST
+  // ═══════════════════════════════════════
+  const renderList = () => {
+    const bots = botConfigs || [];
+    return (
+      <div className="fade-in">
+        {/* Header */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24, flexWrap:"wrap", gap:12 }}>
+          <div>
+            <h2 style={{ fontSize:20, fontWeight:800, margin:0 }}>{"\u{1F4E1}"} Bot Manager</h2>
+            <p style={{ fontSize:13, color:"var(--text-tertiary)", marginTop:4 }}>Gérer les bots Telegram sans toucher Railway</p>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={()=>setView("personalities")} style={btnSecondary}>{"\u{1F3AD}"} Personnalités</button>
+            <button onClick={()=>setView("add")} style={btnPrimary}>{"\u{2795}"} Ajouter un bot</button>
+          </div>
+        </div>
+
+        {/* KPI Cards */}
+        <div style={{ display:"grid", gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4,1fr)", gap:12, marginBottom:24 }}>
+          {[
+            { label:"Total Bots", value:bots.length, icon:"\u{1F916}", color:"var(--accent)", bg:"var(--accent-muted)" },
+            { label:"Online", value:bots.filter(b=>b.status==="online").length, icon:"\u{1F7E2}", color:"var(--success)", bg:"var(--success-muted)" },
+            { label:"Messages Aujourd'hui", value:bots.reduce((s,b)=>s+(b.messages_today||0),0), icon:"\u{1F4AC}", color:"var(--brand-telegram)", bg:"var(--brand-telegram-muted)" },
+            { label:"Revenus Jour", value:`${bots.reduce((s,b)=>s+Number(b.revenue_today||0),0).toFixed(0)} CHF`, icon:"\u{1F4B0}", color:"var(--pink)", bg:"var(--pink-muted)" },
+          ].map(k=>(
+            <div key={k.label} style={{ ...cardStyle, padding:"16px 20px", display:"flex", alignItems:"center", gap:14 }}>
+              <div style={{ width:42, height:42, borderRadius:12, background:k.bg, display:"flex", alignItems:"center", justifyContent:"center", fontSize:20 }}>{k.icon}</div>
+              <div>
+                <div style={{ fontSize:10, fontWeight:600, color:"var(--text-tertiary)", textTransform:"uppercase", letterSpacing:0.5 }}>{k.label}</div>
+                <div style={{ fontSize:20, fontWeight:800, color:k.color }}>{k.value}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Bots Table */}
+        {bots.length === 0 ? (
+          <div style={{ ...cardStyle, textAlign:"center", padding:60 }}>
+            <div style={{ fontSize:48, marginBottom:12 }}>{"\u{1F916}"}</div>
+            <div style={{ fontSize:16, fontWeight:700, marginBottom:8 }}>Aucun bot configuré</div>
+            <div style={{ fontSize:13, color:"var(--text-tertiary)", marginBottom:20 }}>Ajoute ton premier bot Telegram pour commencer</div>
+            <button onClick={()=>setView("add")} style={btnPrimary}>{"\u{2795}"} Ajouter un bot</button>
+          </div>
+        ) : (
+          <div style={{ ...cardStyle, padding:0, overflow:"hidden" }}>
+            <table className="table" style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr style={{ background:"var(--table-header-bg)" }}>
+                  <th style={{ padding:"12px 16px", textAlign:"left", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase", letterSpacing:0.5 }}>Bot</th>
+                  <th style={{ padding:"12px 16px", textAlign:"left", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase" }}>Status</th>
+                  <th style={{ padding:"12px 16px", textAlign:"left", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase" }}>Personnalité</th>
+                  <th style={{ padding:"12px 16px", textAlign:"center", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase" }}>Msgs</th>
+                  <th style={{ padding:"12px 16px", textAlign:"center", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase" }}>Revenus</th>
+                  <th style={{ padding:"12px 16px", textAlign:"left", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase" }}>Dernière activité</th>
+                  <th style={{ padding:"12px 16px", textAlign:"center", fontSize:11, fontWeight:700, color:"var(--table-header-color)", textTransform:"uppercase" }}>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bots.map(bot => {
+                  const model = (models||[]).find(m=>m.id===bot.model_id);
+                  return (
+                    <tr key={bot.id} style={{ borderBottom:"1px solid var(--table-border)", cursor:"pointer", transition:"background 0.15s" }}
+                      onMouseOver={e=>e.currentTarget.style.background="var(--table-row-hover)"}
+                      onMouseOut={e=>e.currentTarget.style.background="transparent"}
+                      onClick={()=>openConfig(bot)}>
+                      <td style={{ padding:"14px 16px" }}>
+                        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                          <div style={{ width:36, height:36, borderRadius:10, background:"var(--brand-telegram-muted)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:16, flexShrink:0 }}>{"\u{2708}\u{FE0F}"}</div>
+                          <div>
+                            <div style={{ fontWeight:700, color:"var(--text-primary)" }}>{bot.name}</div>
+                            <div style={{ fontSize:11, color:"var(--text-tertiary)" }}>{model ? model.name : bot.phone}</div>
+                          </div>
+                        </div>
+                      </td>
+                      <td style={{ padding:"14px 16px" }}><StatusBadge status={bot.status}/></td>
+                      <td style={{ padding:"14px 16px" }}>
+                        <span style={{ padding:"3px 10px", borderRadius:8, background:"var(--accent-subtle)", color:"var(--accent)", fontSize:12, fontWeight:600 }}>{bot.personality || "default"}</span>
+                      </td>
+                      <td style={{ padding:"14px 16px", textAlign:"center", fontWeight:700, fontFamily:"'Space Mono',monospace" }}>{bot.messages_today || 0}</td>
+                      <td style={{ padding:"14px 16px", textAlign:"center", fontWeight:700, color:"var(--success)", fontFamily:"'Space Mono',monospace" }}>{Number(bot.revenue_today||0).toFixed(0)} CHF</td>
+                      <td style={{ padding:"14px 16px", fontSize:12, color:"var(--text-tertiary)" }}>
+                        {bot.last_activity ? new Date(bot.last_activity).toLocaleString("fr-CH",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—"}
+                      </td>
+                      <td style={{ padding:"14px 16px", textAlign:"center" }} onClick={e=>e.stopPropagation()}>
+                        <div style={{ display:"flex", gap:6, justifyContent:"center" }}>
+                          <button onClick={()=>toggleBot(bot)} title={bot.status==="online"?"Stop":"Start"} style={{
+                            width:34, height:34, borderRadius:10, border:"none", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, fontWeight:700,
+                            background: bot.status==="online" ? "var(--danger-muted)" : "var(--success-muted)",
+                            color: bot.status==="online" ? "var(--danger)" : "var(--success)"
+                          }}>{bot.status==="online" ? "\u{23F9}\u{FE0F}" : "\u{25B6}\u{FE0F}"}</button>
+                          <button onClick={()=>openConfig(bot)} title="Configurer" style={{
+                            width:34, height:34, borderRadius:10, border:"none", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14,
+                            background:"var(--accent-muted)", color:"var(--accent)"
+                          }}>{"\u{2699}\u{FE0F}"}</button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // ═══════════════════════════════════════
+  // VIEW: ADD BOT
+  // ═══════════════════════════════════════
+  const renderAdd = () => (
+    <div className="fade-in">
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:24 }}>
+        <button onClick={()=>setView("list")} style={{ ...btnSecondary, padding:"8px 12px" }}>{"\u{2190}"}</button>
+        <div>
+          <h2 style={{ fontSize:20, fontWeight:800, margin:0 }}>{"\u{2795}"} Ajouter un bot</h2>
+          <p style={{ fontSize:13, color:"var(--text-tertiary)", marginTop:2 }}>Configure un nouveau bot Telegram</p>
+        </div>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:_isMobile?"1fr":"1fr 1fr", gap:20 }}>
+        {/* Left column */}
+        <div style={cardStyle}>
+          <h3 style={{ fontSize:15, fontWeight:700, marginBottom:20, display:"flex", alignItems:"center", gap:8 }}>{"\u{1F4CB}"} Informations</h3>
+          <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+            <div>
+              <label style={labelStyle}>Nom du bot *</label>
+              <input style={inputStyle} value={addForm.name} onChange={e=>setAddForm(f=>({...f,name:e.target.value}))} placeholder="Ex: Carla Bot" />
+            </div>
+            <div>
+              <label style={labelStyle}>Modèle associé</label>
+              <select style={inputStyle} value={addForm.model_id} onChange={e=>setAddForm(f=>({...f,model_id:e.target.value}))}>
+                <option value="">— Aucun —</option>
+                {(models||[]).map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Téléphone *</label>
+              <input style={inputStyle} value={addForm.phone} onChange={e=>setAddForm(f=>({...f,phone:e.target.value}))} placeholder="+33..." />
+            </div>
+            <div>
+              <label style={labelStyle}>Personnalité</label>
+              <select style={inputStyle} value={addForm.personality} onChange={e=>setAddForm(f=>({...f,personality:e.target.value}))}>
+                {PERSONALITY_PRESETS.map(p=><option key={p.id} value={p.id}>{p.label} — {p.desc}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={labelStyle}>Voice ID (ElevenLabs)</label>
+              <input style={inputStyle} value={addForm.voice_id} onChange={e=>setAddForm(f=>({...f,voice_id:e.target.value}))} placeholder="Ex: EXAVITQu4vr4xnSDxMaL" />
+            </div>
+          </div>
+        </div>
+
+        {/* Right column */}
+        <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+          <div style={cardStyle}>
+            <h3 style={{ fontSize:15, fontWeight:700, marginBottom:20, display:"flex", alignItems:"center", gap:8 }}>{"\u{1F511}"} API Telegram</h3>
+            <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+              <div>
+                <label style={labelStyle}>API ID *</label>
+                <input style={inputStyle} value={addForm.api_id} onChange={e=>setAddForm(f=>({...f,api_id:e.target.value}))} placeholder="Ex: 32296445" />
+              </div>
+              <div>
+                <label style={labelStyle}>API Hash *</label>
+                <input style={{...inputStyle,fontFamily:"'Space Mono',monospace",fontSize:12}} value={addForm.api_hash} onChange={e=>setAddForm(f=>({...f,api_hash:e.target.value}))} placeholder="Ex: 6fe4c42252b0eb0aa835c56749dc5cb8" />
+              </div>
+              <div>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  <label style={labelStyle}>Session String</label>
+                  <button onClick={()=>setShowSessionHelp(!showSessionHelp)} style={{ background:"none", border:"none", color:"var(--accent)", fontSize:11, fontWeight:600, cursor:"pointer" }}>{showSessionHelp ? "Masquer" : "\u{2753} Comment générer ?"}</button>
+                </div>
+                <textarea style={{...inputStyle,minHeight:80,fontFamily:"'Space Mono',monospace",fontSize:11,resize:"vertical"}} value={addForm.telegram_session} onChange={e=>setAddForm(f=>({...f,telegram_session:e.target.value}))} placeholder="Colle la session string ici..." />
+                {showSessionHelp && (
+                  <div style={{ marginTop:12, padding:16, background:"var(--bg-overlay)", borderRadius:"var(--radius-sm)", border:"1px solid var(--border-subtle)", fontSize:12, color:"var(--text-secondary)", lineHeight:1.6 }}>
+                    <div style={{ fontWeight:700, marginBottom:8, color:"var(--accent)" }}>{"\u{1F4D6}"} Générer une Session String :</div>
+                    <ol style={{ paddingLeft:20, margin:0 }}>
+                      <li>Installe <code style={{ background:"var(--bg-active)", padding:"2px 6px", borderRadius:4 }}>pip install telethon</code></li>
+                      <li>Lance le script : <code style={{ background:"var(--bg-active)", padding:"2px 6px", borderRadius:4 }}>python3 generate_session.py</code></li>
+                      <li>Entre le numéro de téléphone</li>
+                      <li>Entre le code reçu sur Telegram</li>
+                      <li>Copie la session string générée</li>
+                    </ol>
+                    <div style={{ marginTop:10, padding:10, background:"var(--bg-base)", borderRadius:6, fontFamily:"'Space Mono',monospace", fontSize:11, wordBreak:"break-all" }}>
+                      <div style={{ color:"var(--text-tertiary)", marginBottom:4 }}># generate_session.py</div>
+                      from telethon.sync import TelegramClient<br/>
+                      from telethon.sessions import StringSession<br/>
+                      api_id = int(input("API ID: "))<br/>
+                      api_hash = input("API Hash: ")<br/>
+                      with TelegramClient(StringSession(), api_id, api_hash) as c:<br/>
+                      {"    "}print(c.session.save())
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div style={cardStyle}>
+            <h3 style={{ fontSize:15, fontWeight:700, marginBottom:20, display:"flex", alignItems:"center", gap:8 }}>{"\u{1F4B1}"} Paiement</h3>
+            <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+              <div>
+                <label style={labelStyle}>Numéro TWINT</label>
+                <input style={inputStyle} value={addForm.twint_number} onChange={e=>setAddForm(f=>({...f,twint_number:e.target.value}))} placeholder="+41..." />
+              </div>
+              <div>
+                <label style={labelStyle}>Lien Telegram</label>
+                <input style={inputStyle} value={addForm.telegram_link} onChange={e=>setAddForm(f=>({...f,telegram_link:e.target.value}))} placeholder="https://t.me/..." />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Submit */}
+      <div style={{ display:"flex", justifyContent:"flex-end", gap:12, marginTop:24 }}>
+        <button onClick={()=>setView("list")} style={btnSecondary}>Annuler</button>
+        <button onClick={handleAddBot} disabled={saving} style={{...btnPrimary, opacity:saving?0.6:1}}>
+          {saving ? "\u{23F3} Enregistrement..." : "\u{1F4BE} Enregistrer le bot"}
+        </button>
+      </div>
+    </div>
+  );
+
+  // ═══════════════════════════════════════
+  // VIEW: CONFIG BOT
+  // ═══════════════════════════════════════
+  const renderConfig = () => {
+    if (!editForm) return null;
+    const prices = editForm.prices || {};
+    const pm = editForm.payment_methods || {};
+    const model = (models||[]).find(m=>m.id===editForm.model_id);
+
+    const updatePrice = (key, field, val) => {
+      const p = { ...prices };
+      p[key] = { ...(p[key]||{}), [field]: field === "price" ? Number(val) : val };
+      setEditForm(f => ({ ...f, prices: p }));
+    };
+
+    const updatePayment = (key, val) => {
+      setEditForm(f => ({ ...f, payment_methods: { ...(f.payment_methods||{}), [key]: val } }));
+    };
+
+    return (
+      <div className="fade-in">
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:24, flexWrap:"wrap", gap:12 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+            <button onClick={()=>{setView("list");setSelectedBot(null);setEditForm(null);}} style={{ ...btnSecondary, padding:"8px 12px" }}>{"\u{2190}"}</button>
+            <div>
+              <h2 style={{ fontSize:20, fontWeight:800, margin:0 }}>{"\u{2699}\u{FE0F}"} {editForm.name}</h2>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:4 }}>
+                <StatusBadge status={editForm.status}/>
+                {model && <span style={{ fontSize:12, color:"var(--text-tertiary)" }}>Modèle: {model.name}</span>}
+              </div>
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={()=>handleDeleteBot(editForm.id)} style={{ ...btnSecondary, color:"var(--danger)", borderColor:"var(--danger-muted)" }}>{"\u{1F5D1}\u{FE0F}"} Supprimer</button>
+            <button onClick={handleUpdateBot} disabled={saving} style={{...btnPrimary, opacity:saving?0.6:1}}>
+              {saving ? "\u{23F3}..." : "\u{1F4BE} Sauvegarder"}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:_isMobile?"1fr":"1fr 1fr", gap:20 }}>
+          {/* Left: Personnalité + Prix */}
+          <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+            {/* Personality */}
+            <div style={cardStyle}>
+              <h3 style={{ fontSize:15, fontWeight:700, marginBottom:16 }}>{"\u{1F3AD}"} Personnalité</h3>
+              <div style={{ marginBottom:16 }}>
+                <label style={labelStyle}>Personnalité active</label>
+                <select style={inputStyle} value={editForm.personality||"default"} onChange={e=>setEditForm(f=>({...f,personality:e.target.value}))}>
+                  {PERSONALITY_PRESETS.map(p=><option key={p.id} value={p.id}>{p.label} — {p.desc}</option>)}
+                </select>
+              </div>
+              {(() => {
+                const preset = PERSONALITY_PRESETS.find(p=>p.id===(editForm.personality||"default"));
+                return preset ? (
+                  <div style={{ padding:12, background:"var(--bg-overlay)", borderRadius:"var(--radius-sm)", border:"1px solid var(--border-subtle)" }}>
+                    <div style={{ fontSize:11, fontWeight:600, color:"var(--text-tertiary)", marginBottom:6, textTransform:"uppercase" }}>System Prompt Preview</div>
+                    <div style={{ fontSize:12, color:"var(--text-secondary)", lineHeight:1.6, fontStyle:"italic" }}>{preset.prompt}</div>
+                  </div>
+                ) : null;
+              })()}
+            </div>
+
+            {/* Prices */}
+            <div style={cardStyle}>
+              <h3 style={{ fontSize:15, fontWeight:700, marginBottom:16 }}>{"\u{1F4B0}"} Prix (CHF)</h3>
+              <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+                {[
+                  { key:"cam_show", label:"Cam Show", icon:"\u{1F4F9}" },
+                  { key:"sexting", label:"Sexting", icon:"\u{1F48C}" },
+                  { key:"pack_contenu", label:"Pack Contenu", icon:"\u{1F4E6}" },
+                ].map(item => (
+                  <div key={item.key} style={{ display:"flex", alignItems:"center", gap:12 }}>
+                    <span style={{ fontSize:18, width:28, textAlign:"center" }}>{item.icon}</span>
+                    <span style={{ flex:1, fontSize:13, fontWeight:600 }}>{item.label}</span>
+                    <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+                      <input type="number" style={{...inputStyle,width:80,textAlign:"right",fontFamily:"'Space Mono',monospace"}} value={(prices[item.key]||{}).price||0} onChange={e=>updatePrice(item.key,"price",e.target.value)} />
+                      <span style={{ fontSize:12, color:"var(--text-tertiary)", fontWeight:600 }}>CHF</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Payment Methods */}
+            <div style={cardStyle}>
+              <h3 style={{ fontSize:15, fontWeight:700, marginBottom:16 }}>{"\u{1F4B3}"} Moyens de paiement</h3>
+              <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+                <div>
+                  <label style={labelStyle}>TWINT</label>
+                  <input style={inputStyle} value={pm.twint||""} onChange={e=>updatePayment("twint",e.target.value)} placeholder="+41..." />
+                </div>
+                <div>
+                  <label style={labelStyle}>Revolut</label>
+                  <input style={inputStyle} value={pm.revolut||""} onChange={e=>updatePayment("revolut",e.target.value)} placeholder="https://revolut.me/..." />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Right: Stats + Logs + API */}
+          <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+            {/* Quick Stats */}
+            <div style={cardStyle}>
+              <h3 style={{ fontSize:15, fontWeight:700, marginBottom:16 }}>{"\u{1F4CA}"} Stats du jour</h3>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10 }}>
+                {[
+                  { label:"Messages", value:editForm.messages_today||0, color:"var(--brand-telegram)" },
+                  { label:"Revenus", value:`${Number(editForm.revenue_today||0).toFixed(0)} CHF`, color:"var(--success)" },
+                  { label:"Status", value:editForm.status, color: editForm.status==="online"?"var(--success)":editForm.status==="error"?"var(--danger)":"var(--text-tertiary)" },
+                ].map(s=>(
+                  <div key={s.label} style={{ background:"var(--bg-overlay)", borderRadius:12, padding:"12px 10px", textAlign:"center" }}>
+                    <div style={{ fontSize:9, fontWeight:600, color:"var(--text-tertiary)", textTransform:"uppercase", marginBottom:4 }}>{s.label}</div>
+                    <div style={{ fontSize:18, fontWeight:800, color:s.color }}>{s.value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Logs */}
+            <div style={cardStyle}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+                <h3 style={{ fontSize:15, fontWeight:700, margin:0 }}>{"\u{1F4CB}"} Logs récents</h3>
+                <button onClick={()=>loadLogs(editForm.id)} style={{ ...btnSecondary, padding:"6px 12px", fontSize:11 }}>{"\u{1F504}"} Refresh</button>
+              </div>
+              <div style={{ maxHeight:280, overflow:"auto", borderRadius:"var(--radius-sm)", border:"1px solid var(--border-subtle)" }}>
+                {loadingLogs ? (
+                  <div style={{ padding:24, textAlign:"center", color:"var(--text-tertiary)", fontSize:12 }}>Chargement...</div>
+                ) : logEntries.length === 0 ? (
+                  <div style={{ padding:24, textAlign:"center", color:"var(--text-tertiary)", fontSize:12 }}>Aucun log disponible</div>
+                ) : logEntries.map((log, i) => (
+                  <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:10, padding:"10px 12px", borderBottom:"1px solid var(--border-subtle)", fontSize:12 }}>
+                    <span style={{ fontFamily:"'Space Mono',monospace", color:"var(--text-quaternary)", fontSize:10, minWidth:45, flexShrink:0 }}>
+                      {new Date(log.created_at).toLocaleTimeString("fr-CH",{hour:"2-digit",minute:"2-digit"})}
+                    </span>
+                    <span style={{ padding:"1px 6px", borderRadius:4, fontSize:9, fontWeight:700, textTransform:"uppercase",
+                      background: log.type==="error"?"var(--danger-muted)" : log.type==="escalation"?"var(--warning-muted)" : "var(--brand-telegram-muted)",
+                      color: log.type==="error"?"var(--danger)" : log.type==="escalation"?"var(--warning)" : "var(--brand-telegram)",
+                    }}>{log.type||"info"}</span>
+                    <span style={{ color:"var(--text-secondary)", flex:1, wordBreak:"break-word" }}>{log.message||log.text||JSON.stringify(log)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* API Info */}
+            <div style={cardStyle}>
+              <h3 style={{ fontSize:15, fontWeight:700, marginBottom:16 }}>{"\u{1F511}"} Infos API</h3>
+              <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+                <div>
+                  <label style={labelStyle}>Téléphone</label>
+                  <input style={inputStyle} value={editForm.phone||""} onChange={e=>setEditForm(f=>({...f,phone:e.target.value}))} />
+                </div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                  <div>
+                    <label style={labelStyle}>API ID</label>
+                    <input style={{...inputStyle,fontFamily:"'Space Mono',monospace",fontSize:12}} value={editForm.api_id||""} onChange={e=>setEditForm(f=>({...f,api_id:e.target.value}))} />
+                  </div>
+                  <div>
+                    <label style={labelStyle}>API Hash</label>
+                    <input style={{...inputStyle,fontFamily:"'Space Mono',monospace",fontSize:12}} value={editForm.api_hash||""} onChange={e=>setEditForm(f=>({...f,api_hash:e.target.value}))} />
+                  </div>
+                </div>
+                <div>
+                  <label style={labelStyle}>Voice ID</label>
+                  <input style={inputStyle} value={editForm.voice_id||""} onChange={e=>setEditForm(f=>({...f,voice_id:e.target.value}))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Lien Telegram</label>
+                  <input style={inputStyle} value={editForm.telegram_link||""} onChange={e=>setEditForm(f=>({...f,telegram_link:e.target.value}))} />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ═══════════════════════════════════════
+  // VIEW: PERSONALITIES
+  // ═══════════════════════════════════════
+  const renderPersonalities = () => {
+    const handleDuplicate = (preset) => {
+      setDupForm({ id: preset.id + "_copy_" + Date.now(), label: preset.label + " (copie)", desc: preset.desc, prompt: preset.prompt });
+    };
+
+    const saveDuplicate = () => {
+      if (!dupForm) return;
+      setCustomPersonalities(prev => [...prev, dupForm]);
+      addToast("\u{2705} Personnalité dupliquée !", "success");
+      setDupForm(null);
+    };
+
+    const allPersonalities = [...PERSONALITY_PRESETS, ...customPersonalities];
+
+    return (
+      <div className="fade-in">
+        <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:24 }}>
+          <button onClick={()=>setView("list")} style={{ ...btnSecondary, padding:"8px 12px" }}>{"\u{2190}"}</button>
+          <div>
+            <h2 style={{ fontSize:20, fontWeight:800, margin:0 }}>{"\u{1F3AD}"} Personnalités</h2>
+            <p style={{ fontSize:13, color:"var(--text-tertiary)", marginTop:2 }}>Gère les personnalités disponibles pour les bots</p>
+          </div>
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:_isMobile?"1fr":"repeat(2,1fr)", gap:16 }}>
+          {allPersonalities.map(p => (
+            <div key={p.id} style={{ ...cardStyle, position:"relative" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:12 }}>
+                <div>
+                  <div style={{ fontSize:16, fontWeight:800, color:"var(--text-primary)" }}>{p.label}</div>
+                  <div style={{ fontSize:12, color:"var(--text-tertiary)", marginTop:2 }}>{p.desc}</div>
+                </div>
+                <button onClick={()=>handleDuplicate(p)} style={{ ...btnSecondary, padding:"6px 12px", fontSize:11 }}>{"\u{1F4CB}"} Dupliquer</button>
+              </div>
+              <div style={{ padding:12, background:"var(--bg-overlay)", borderRadius:"var(--radius-sm)", border:"1px solid var(--border-subtle)" }}>
+                <div style={{ fontSize:10, fontWeight:600, color:"var(--text-quaternary)", textTransform:"uppercase", marginBottom:6 }}>System Prompt</div>
+                <div style={{ fontSize:12, color:"var(--text-secondary)", lineHeight:1.6, fontStyle:"italic" }}>{p.prompt}</div>
+              </div>
+              {/* Show which bots use this personality */}
+              {(() => {
+                const using = (botConfigs||[]).filter(b=>b.personality===p.id);
+                return using.length > 0 ? (
+                  <div style={{ marginTop:10, display:"flex", gap:6, flexWrap:"wrap" }}>
+                    {using.map(b=>(
+                      <span key={b.id} style={{ padding:"3px 8px", borderRadius:6, background:"var(--brand-telegram-muted)", color:"var(--brand-telegram)", fontSize:10, fontWeight:600 }}>{"\u{1F916}"} {b.name}</span>
+                    ))}
+                  </div>
+                ) : null;
+              })()}
+            </div>
+          ))}
+        </div>
+
+        {/* Duplicate modal */}
+        {dupForm && (
+          <div onClick={()=>setDupForm(null)} style={{ position:"fixed", inset:0, background:"var(--modal-backdrop)", backdropFilter:_isMobile?"none":"blur(8px)", zIndex:10000, display:"flex", alignItems:_isMobile?"flex-end":"center", justifyContent:"center", padding:_isMobile?0:20 }}>
+            <div onClick={e=>e.stopPropagation()} style={{ background:"var(--modal-bg)", border:"1px solid var(--card-border)", borderRadius:_isMobile?"20px 20px 0 0":16, width:"100%", maxWidth:500, padding:24 }}>
+              <h3 style={{ fontSize:16, fontWeight:800, marginBottom:20 }}>{"\u{1F4CB}"} Dupliquer la personnalité</h3>
+              <div style={{ display:"flex", flexDirection:"column", gap:14 }}>
+                <div>
+                  <label style={labelStyle}>Nom</label>
+                  <input style={inputStyle} value={dupForm.label} onChange={e=>setDupForm(f=>({...f,label:e.target.value}))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Description</label>
+                  <input style={inputStyle} value={dupForm.desc} onChange={e=>setDupForm(f=>({...f,desc:e.target.value}))} />
+                </div>
+                <div>
+                  <label style={labelStyle}>System Prompt</label>
+                  <textarea style={{...inputStyle,minHeight:120,resize:"vertical"}} value={dupForm.prompt} onChange={e=>setDupForm(f=>({...f,prompt:e.target.value}))} />
+                </div>
+              </div>
+              <div style={{ display:"flex", justifyContent:"flex-end", gap:10, marginTop:20 }}>
+                <button onClick={()=>setDupForm(null)} style={btnSecondary}>Annuler</button>
+                <button onClick={saveDuplicate} style={btnPrimary}>{"\u{2705}"} Créer la variante</button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // ═══ MAIN RENDER ═══
+  return (
+    <div>
+      {view === "list" && renderList()}
+      {view === "add" && renderAdd()}
+      {view === "config" && renderConfig()}
+      {view === "personalities" && renderPersonalities()}
+    </div>
+  );
+};
+
+// =============================================
 // SCANS TAB (GÉRANT — Automation > Scans)
 // =============================================
 const ScansTab = ({ user, lang, spenders, txs, models, profiles, products, providerPaymentMethods, screenshotChecks, scTotal, onRefresh }) => {
@@ -20080,6 +20697,7 @@ const App = () => {
   const [videoSessions, setVideoSessions] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [botStats, setBotStats] = useState([]);
+  const [botConfigs, setBotConfigs] = useState([]);
   const [providerPaymentMethods, setProviderPaymentMethods] = useState([]);
   const [chatterLogs, setChatterLogs] = useState([]);
   const [screenshotChecks, setScreenshotChecks] = useState([]);
@@ -20179,12 +20797,12 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, bcfR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
     try {
       /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR] = await Promise.race([Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, bcfR] = await Promise.race([Promise.all([
         safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).limit(1000), "transactions"),
         safe(sb.from("spenders").select("*").limit(500), "spenders"),
         safe(sb.from("profiles").select("*").limit(500), "profiles"),
@@ -20210,6 +20828,7 @@ const App = () => {
         safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200), "broadcasts"),
         /* CHRISTINE FIX — payslips.period may not exist, fallback to created_at */
         safe(sb.from("payslips").select("*").order("created_at",{ascending:false}).limit(500), "payslips"),
+        safe(sb.from("bot_configs").select("*").order("created_at",{ascending:false}).limit(100), "bot_configs"),
       ]), _dataTimeout]);
     } catch(e) { /* DB FIX — loadData timeout or critical failure */ console.error("[DADASH] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
     // Discard results if a newer loadData call was started while we were awaiting
@@ -20301,6 +20920,7 @@ const App = () => {
     setScreenshotChecks((scR&&scR.data)||[]); window.__screenshotChecks=(scR&&scR.data)||[];
     setScTotal(scR.count||(scR.data||[]).length||0);
     setBroadcasts((bcR&&bcR.data)||[]);
+    setBotConfigs((bcfR&&bcfR.data)||[]);
     // Load escalation count for messagerie badge
     if (currentUser && currentUser.role === "gerant") {
       try {
@@ -20511,6 +21131,7 @@ const App = () => {
     setVideoSessions([]);
     setAlerts([]);
     setBotStats([]);
+    setBotConfigs([]);
     setNotifications([]);
     setUnreadCount(0);
   };
@@ -20656,6 +21277,11 @@ const App = () => {
           {subTab==="bots"&&<BotsControl lang={lang} botStats={botStats} />}
           {subTab==="scans"&&<ScansTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} scTotal={scTotal} onRefresh={onRefresh} />}
           {subTab==="broadcasts"&&<BroadcastsTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} broadcasts={broadcasts} onRefresh={onRefresh} />}
+        </>);
+      case "bots":
+        return (<>{renderGerantTabBar("bots")}
+          {subTab==="liste"&&<BotManagerPage lang={lang} models={models} botConfigs={botConfigs} onRefresh={onRefresh} />}
+          {subTab==="personalities"&&<BotManagerPage lang={lang} models={models} botConfigs={botConfigs} onRefresh={onRefresh} initialView="personalities" />}
         </>);
       case "admin":
         return (<>{renderGerantTabBar("admin")}
