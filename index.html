@@ -8709,14 +8709,37 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
 // CHATTERS TAB (gerant only)
 // =============================================
 const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}) => {
-  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const { convertAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
+  const addToast = useToast();
+
+  // ── state ──
   const [modalChatter, setModalChatter] = useState(null);
   const [modalTab, setModalTab] = useState("performance");
-  const [assignForm, setAssignForm] = useState({});
   const [saving, setSaving] = useState(false);
-  const addToast = useToast();
-  const chatters = profiles.filter(u=>u.role==="chatter");
+  const [hoveredCard, setHoveredCard] = useState(null);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [createModal, setCreateModal] = useState(false);
+  const [createForm, setCreateForm] = useState({name:"",handle:"",commission_pct:"3",assigned_models:[]});
+  const [createSaving, setCreateSaving] = useState(false);
+
+  const chatters = profiles.filter(u => u.role === "chatter");
+
+  // ── card design system (identique Providers) ──
+  const cardStyle = (isHov) => ({
+    background: "#1A1A2E",
+    border: `1px solid ${isHov ? "#8B5CF6" : "#2A2A3E"}`,
+    borderRadius: 16, padding: 20, cursor: "pointer", transition: "all 0.2s",
+    boxShadow: isHov ? "0 4px 20px rgba(139,92,246,0.15)" : "none",
+  });
+  const metricSt  = { padding: "8px 10px", borderRadius: 10, background: "rgba(255,255,255,0.04)" };
+  const metricLbl = { fontSize: 9, fontWeight: 600, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: 0.3, marginBottom: 4 };
+  const metricVal = { fontSize: 16, fontWeight: 800 };
+
+  // ── avatar helpers (identique Providers) ──
+  const _avatarColor = (id) => { let h = 0; for (let i = 0; i < (id||"").length; i++) h = (id||"").charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h) % 360}, 60%, 50%)`; };
+  const _initial    = (name) => (name || "?").trim()[0].toUpperCase();
+
   const avatarColors = ["#8B5CF6","#EC4899","#F59E0B","#10B981","#3B82F6","#EF4444","#6366F1","#14B8A6"];
 
   const chatterStats = useMemo(()=>{
@@ -8757,179 +8780,313 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
     }).sort((a,b)=>b.validCA-a.validCA);
   },[chatters,txs,models,chatterLogs,convertAmount]);
 
-  const totalValidCA = chatterStats.reduce((s,ch)=>s+ch.validCA,0);
-  const avgCA = chatterStats.length>0?totalValidCA/chatterStats.length:0;
+  // ── global aggregates ──
+  const totalValidCA   = chatterStats.reduce((s,ch) => s + ch.validCA, 0);
+  const totalPendingCA = chatterStats.reduce((s,ch) => s + ch.pendingCA, 0);
+  const totalCommDue   = chatterStats.reduce((s,ch) => s + ch.commDue, 0);
+  const totalValidTx   = chatterStats.reduce((s,ch) => s + ch.validTx.length, 0);
+  const avgCA          = chatterStats.length > 0 ? totalValidCA / chatterStats.length : 0;
+  const avgConvRate    = chatterStats.length > 0 ? Math.round(chatterStats.reduce((s,ch) => s + ch.convRate, 0) / chatterStats.length) : 0;
 
-  // Model assign/unassign handler
+  // ── alerts (collapsible) ──
+  const alerts = useMemo(() => {
+    const items = [];
+    chatterStats.filter(ch => ch.chTx.length >= 5 && ch.convRate < 30).forEach(ch =>
+      items.push({ type:"orange", msg:`${ch.name} : taux de conv. faible (${ch.convRate}%)` }));
+    chatterStats.filter(ch => ch.chTx.length === 0).forEach(ch =>
+      items.push({ type:"grey", msg:`${ch.name} : aucune TX cette période` }));
+    chatterStats.filter(ch => ch.commDue > 200).forEach(ch =>
+      items.push({ type:"red", msg:`${ch.name} : commission non versée — ${Math.round(ch.commDue).toLocaleString()}${currencySymbol}` }));
+    return items;
+  }, [chatterStats, currencySymbol]);
+
+  // ── model assign/unassign ──
   const handleModelToggle = async (chatterId, modelId) => {
-    const ch = profiles.find(p=>p.id===chatterId);
-    if(!ch) return;
-    const current = ch.assigned_models||[];
-    const updated = current.includes(modelId)?current.filter(m=>m!==modelId):[...current,modelId];
+    const ch = profiles.find(p => p.id === chatterId);
+    if (!ch) return;
+    const current = ch.assigned_models || [];
+    const updated = current.includes(modelId) ? current.filter(m => m !== modelId) : [...current, modelId];
     setSaving(true);
     try {
-      const {error} = await sb.from("profiles").update({assigned_models:updated}).eq("id",chatterId);
-      if(error){ addToast("Erreur: "+error.message,"error"); } else { addToast(fr?"Mis à jour":"Updated","success"); await onRefresh(); }
-    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+      const {error} = await sb.from("profiles").update({assigned_models: updated}).eq("id", chatterId);
+      if (error) { addToast("Erreur: "+error.message, "error"); }
+      else { addToast(fr ? "Mis à jour" : "Updated", "success"); await onRefresh(); }
+    } catch(e) { addToast("Erreur: "+e.message, "error"); }
     setSaving(false);
   };
 
-  const selCh = modalChatter ? chatterStats.find(c=>c.id===modalChatter) : null;
-  const maxWeekCA = selCh ? Math.max(...selCh.weeklyCA.map(w=>w.ca),1) : 1;
-  const modalTabs = [{id:"performance",label:"Performance",icon:"📊"},{id:"modeles",label:fr?"Modèles assignés":"Assigned Models",icon:"👤"},{id:"logs",label:fr?"Messages bloqués":"Blocked Messages",icon:"⚠️"}];
+  // ── create chatter ──
+  const handleCreate = async () => {
+    if (!createForm.name.trim()) { addToast(fr ? "Nom requis" : "Name required", "error"); return; }
+    setCreateSaving(true);
+    try {
+      const {error} = await sb.from("profiles").insert({
+        name: createForm.name.trim(),
+        telegram_id: createForm.handle.trim() || null,
+        role: "chatter",
+        commission_pct: Number(createForm.commission_pct) || 3,
+        assigned_models: createForm.assigned_models,
+      });
+      if (error) throw error;
+      addToast(fr ? "Chatter créé ✓" : "Chatter created ✓", "success");
+      setCreateModal(false);
+      setCreateForm({name:"",handle:"",commission_pct:"3",assigned_models:[]});
+      await onRefresh();
+    } catch(e) { addToast("Erreur: "+e.message, "error"); }
+    setCreateSaving(false);
+  };
+
+  const selCh      = modalChatter ? chatterStats.find(c => c.id === modalChatter) : null;
+  const maxWeekCA  = selCh ? Math.max(...selCh.weeklyCA.map(w => w.ca), 1) : 1;
+  const modalTabs  = [
+    {id:"performance", label:"Performance",          icon:"📊"},
+    {id:"modeles",     label:fr?"Modèles assignés":"Assigned Models", icon:"👤"},
+    {id:"logs",        label:fr?"Messages bloqués":"Blocked Msgs",    icon:"⛔"},
+  ];
 
   return (
     <div>
-      {/* Global KPIs */}
-      <div className="kpi-grid">
-        <KPICard label={t(lang,"active_chatters")} value={String(chatters.length)} icon="💬"/>
-        <KPICard label={t(lang,"ca_validated")} value={Math.round(totalValidCA).toLocaleString()+currencySymbol} icon="✅"/>
-        <KPICard label={fr?"Moy. CA/chatter":"Avg CA/chatter"} value={Math.round(avgCA).toLocaleString()+currencySymbol} icon="💰"/>
-        <KPICard label={t(lang,"ca_pending")} value={Math.round(chatterStats.reduce((s,ch)=>s+ch.pendingCA,0)).toLocaleString()+currencySymbol} icon="⏳" className="warning" />
+      {/* ── HEADER ── */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:10}}>
+        <div>
+          <h2 style={{fontSize:20,fontWeight:800,margin:0}}>{"💬"} {fr?"Chatters":"Chatters"}</h2>
+          <p style={{fontSize:11,color:"var(--text-tertiary)",margin:"3px 0 0",fontStyle:"italic"}}>{fr?"Gestion et performance de votre équipe de chatters":"Manage and track your chatter team performance"}</p>
+        </div>
+        <button onClick={() => setCreateModal(true)} style={{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6}}>
+          {"+"} {fr?"Nouveau chatter":"New chatter"}
+        </button>
       </div>
 
-      {/* Chatter Cards Grid (PR #17) */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:16}}>
-        {chatterStats.map((ch,i) => {
-          const avatarBg = avatarColors[(ch.name||"").charCodeAt(0)%avatarColors.length];
-          const level = XP_LEVELS.slice().reverse().find(l=>ch.xp>=l.min)||XP_LEVELS[0];
+      {/* ── BARRE NOTIFICATIONS (collapsible) ── */}
+      {alerts.length > 0 && (
+        <div style={{marginBottom:20}}>
+          <button onClick={() => setNotifOpen(o => !o)} style={{
+            width:"100%",padding:"10px 16px",borderRadius:notifOpen?"12px 12px 0 0":12,border:"1px solid rgba(251,191,36,0.35)",
+            background:"rgba(251,191,36,0.07)",color:"var(--warning)",fontSize:12,fontWeight:700,cursor:"pointer",
+            display:"flex",alignItems:"center",gap:8,fontFamily:"'DM Sans',sans-serif",transition:"border-radius 0.2s",
+          }}>
+            <span>{"🔔"}</span>
+            <span>{alerts.length} notification{alerts.length>1?"s":""} chatter</span>
+            <span style={{marginLeft:"auto",fontSize:10}}>{notifOpen?"▲":"▼"}</span>
+          </button>
+          {notifOpen && (
+            <div style={{border:"1px solid rgba(251,191,36,0.35)",borderTop:"none",borderRadius:"0 0 12px 12px",overflow:"hidden"}}>
+              {alerts.map((a,i) => (
+                <div key={i} style={{
+                  padding:"10px 16px",display:"flex",alignItems:"center",gap:10,
+                  background: a.type==="red"?"rgba(248,113,113,0.07)":"rgba(251,191,36,0.05)",
+                  borderTop: i>0?"1px solid rgba(255,255,255,0.04)":"none",
+                }}>
+                  <span>{a.type==="red"?"🔴":a.type==="grey"?"⚪":"🟠"}</span>
+                  <span style={{fontSize:12,fontWeight:600,color:a.type==="red"?"var(--danger)":a.type==="grey"?"var(--text-tertiary)":"var(--warning)"}}>{a.msg}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── GLOBAL KPIs (style Providers) ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:12,marginBottom:24}}>
+        {[
+          {label:fr?"Chatters":"Chatters",          value:chatters.length,                                              icon:"💬"},
+          {label:"CA Généré",                        value:Math.round(totalValidCA).toLocaleString()+currencySymbol,    icon:"💰", color:"var(--success)"},
+          {label:"CA Pending",                       value:Math.round(totalPendingCA).toLocaleString()+currencySymbol,  icon:"⏳", color:"var(--warning)"},
+          {label:"Commission due",                   value:Math.round(totalCommDue).toLocaleString()+currencySymbol,    icon:"💎", color:"var(--accent)"},
+          {label:"TX Validées",                      value:totalValidTx,                                                icon:"✅"},
+          {label:fr?"Conv. Moy.":"Avg Conv.",        value:avgConvRate+"%",                                             icon:"📈", color:avgConvRate>=50?"var(--success)":undefined},
+        ].map(k => (
+          <div key={k.label} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:"14px 16px"}}>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>{k.icon} {k.label}</div>
+            <div style={{fontSize:22,fontWeight:800,color:k.color||"var(--text-primary)"}}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── CARDS CHATTERS (style identique Providers) ── */}
+      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(340px,1fr))",gap:16,marginBottom:28}}>
+        {chatterStats.map(ch => {
+          const level    = getLevel(ch.xp);
+          const isOnShift= ch.on_shift || ch.is_online || false;
           return (
-            <div key={ch.id} className="spender-card card-hover" onClick={()=>{setModalChatter(ch.id);setModalTab("performance");}} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:20,cursor:"pointer",transition:"all 0.2s"}}>
-              {/* Header */}
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-                <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0,flex:1}}>
-                  <div style={{width:42,height:42,borderRadius:"50%",background:avatarBg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff",flexShrink:0}}>{(ch.name||"?")[0]}</div>
-                  <div style={{minWidth:0}}>
-                    <div style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{ch.name}</div>
-                    <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>{ch.assignedModels.length} {fr?"modèle":"model"}{ch.assignedModels.length>1?"s":""} · {ch.chTx.length} TX {fr?"ce mois":"this mo."}</div>
+            <div key={ch.id}
+              onClick={()=>{setModalChatter(ch.id);setModalTab("performance");}}
+              onMouseEnter={()=>setHoveredCard(ch.id)}
+              onMouseLeave={()=>setHoveredCard(null)}
+              style={cardStyle(hoveredCard===ch.id)}
+            >
+              {/* Card Header */}
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <div style={{width:42,height:42,borderRadius:"50%",background:_avatarColor(ch.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontWeight:800,color:"#fff",flexShrink:0}}>
+                    {_initial(ch.name)}
+                  </div>
+                  <div>
+                    <div style={{fontSize:15,fontWeight:800,color:"var(--text-primary)"}}>{ch.name}</div>
+                    <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{ch.assignedModels.length} modèle{ch.assignedModels.length>1?"s":""} · {ch.chTx.length} TX</div>
                   </div>
                 </div>
-                <div style={{flexShrink:0}}>
-                  <span style={{padding:"3px 10px",borderRadius:12,background:level.color+"15",color:level.color,fontSize:10,fontWeight:700}}>{level.icon} {level.name}</span>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4,flexShrink:0}}>
+                  <span style={{padding:"3px 10px",borderRadius:12,background:level.color+"20",color:level.color,fontSize:10,fontWeight:700}}>{level.icon} {level.name}</span>
+                  <span style={{padding:"2px 8px",borderRadius:10,background:isOnShift?"rgba(16,185,129,0.12)":"rgba(255,255,255,0.05)",color:isOnShift?"#10B981":"var(--text-quaternary)",fontSize:9,fontWeight:700,letterSpacing:0.4}}>
+                    {isOnShift?"● EN SHIFT":"○ OFF"}
+                  </span>
                 </div>
               </div>
-              {/* KPI Grid 2×3 */}
+
+              {/* KPIs 2×2 (style Providers) */}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"CA GÉNÉRÉ":"REVENUE"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{Math.round(ch.validCA).toLocaleString()}{currencySymbol}</div>
+                <div style={metricSt}><div style={metricLbl}>CA GÉNÉRÉ</div><div style={{...metricVal,color:"var(--success)"}}>{Math.round(ch.validCA).toLocaleString()}{currencySymbol}</div></div>
+                <div style={metricSt}><div style={metricLbl}>TAUX CONV.</div><div style={{...metricVal,color:ch.convRate>=50?"var(--success)":"var(--text-primary)"}}>{ch.convRate}%</div></div>
+                <div style={metricSt}><div style={metricLbl}>NB TX</div><div style={{...metricVal,color:"var(--text-secondary)"}}>{ch.validTx.length}</div></div>
+                <div style={metricSt}><div style={metricLbl}>COMMISSION</div><div style={{...metricVal,color:"var(--accent)"}}>{Math.round(ch.commDue).toLocaleString()}{currencySymbol}</div></div>
+              </div>
+
+              {/* Modèles assignées — avatars empilés */}
+              <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:10}}>
+                <span style={{fontSize:10,color:"var(--text-tertiary)"}}>Modèles :</span>
+                {ch.assignedModels.length > 0 ? (
+                  <div style={{display:"flex",alignItems:"center"}}>
+                    {ch.assignedModels.slice(0,4).map((m,j) => (
+                      <div key={m.id} title={m.name} style={{width:22,height:22,borderRadius:"50%",background:avatarColors[j%avatarColors.length],display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:800,color:"#fff",border:"2px solid #1A1A2E",marginLeft:j>0?-6:0,position:"relative",zIndex:10-j}}>
+                        {_initial(m.name)}
+                      </div>
+                    ))}
+                    {ch.assignedModels.length > 4 && <span style={{fontSize:9,color:"var(--text-quaternary)",marginLeft:8}}>+{ch.assignedModels.length-4}</span>}
+                  </div>
+                ) : <span style={{fontSize:10,color:"var(--text-quaternary)"}}>—</span>}
+              </div>
+
+              {/* XP progress bar */}
+              <div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                  <span style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase"}}>XP</span>
+                  <span style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)"}}>{ch.score.toLocaleString()}</span>
                 </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"TAUX CONVERSION":"CONV. RATE"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:ch.convRate>=50?"var(--success)":"var(--text-primary)"}}>{ch.convRate}%</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"MSGS ENVOYÉS":"MSGS SENT"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{ch.msgCount}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>SCORE</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{ch.score.toLocaleString()}</div>
+                <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                  <div style={{width:`${level.progress}%`,height:"100%",borderRadius:3,background:level.color,transition:"width 0.3s"}}/>
                 </div>
               </div>
-              {/* Models + Score bar */}
-              <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:8,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                {fr?"Modèles":"Models"}: {ch.assignedModels.length>0?ch.assignedModels.map(m=>m.name).join(", "):"—"}
-              </div>
-              <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
-                <div style={{width:`${Math.min(ch.score/500,100)}%`,height:"100%",borderRadius:3,background:level.color,transition:"width 0.3s"}}/>
+
+              {/* TX status counters */}
+              <div style={{display:"flex",gap:14,marginTop:10}}>
+                <span style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{"✅"} {ch.validTx.length}</span>
+                <span style={{fontSize:11,color:"var(--warning)",fontWeight:600}}>{"⏳"} {ch.pendingTx.length}</span>
+                <span style={{fontSize:11,color:"var(--danger)",fontWeight:600}}>{"❌"} {ch.refusedCount}</span>
               </div>
             </div>
           );
         })}
       </div>
-      {chatters.length===0&&<div style={{padding:60,textAlign:"center",color:"var(--text-tertiary)"}}><div style={{fontSize:32,marginBottom:8}}>{"💬"}</div><div style={{fontSize:14}}>{fr?"Aucun chatter":"No chatters"}</div></div>}
 
-      {/* ═══ CHATTER DETAIL MODAL (PR #17 — 3 tabs) ═══ */}
+      {/* Empty state */}
+      {chatters.length === 0 && (
+        <div style={{padding:60,textAlign:"center",color:"var(--text-tertiary)"}}>
+          <div style={{fontSize:32,marginBottom:8}}>{"💬"}</div>
+          <div style={{fontSize:14}}>{fr?"Aucun chatter — cliquez sur « Nouveau chatter » pour commencer":"No chatters yet — click « New chatter » to get started"}</div>
+        </div>
+      )}
+
+      {/* ════════════════════════════════════════
+          MODALE FICHE CHATTER — 3 ONGLETS
+      ════════════════════════════════════════ */}
       {selCh && (
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:5000}} onClick={()=>setModalChatter(null)}>
-          <div style={{maxWidth:800,width:"95vw",maxHeight:"90vh",overflowY:"auto",background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:_isMobile?"20px 20px 0 0":24,boxShadow:"var(--shadow-lg)"}} onClick={e=>e.stopPropagation()}>
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:_isMobile?"flex-end":"center",justifyContent:"center",zIndex:5000}} onClick={()=>setModalChatter(null)}>
+          <div style={{maxWidth:820,width:"95vw",maxHeight:"90vh",overflowY:"auto",background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:_isMobile?"20px 20px 0 0":20,boxShadow:"0 24px 64px rgba(0,0,0,0.6)"}} onClick={e=>e.stopPropagation()}>
+
             {/* Modal Header */}
-            <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:"var(--bg-raised)",zIndex:2}}>
               <div style={{display:"flex",alignItems:"center",gap:12}}>
-                <div style={{width:48,height:48,borderRadius:"50%",background:avatarColors[(selCh.name||"").charCodeAt(0)%avatarColors.length],display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff"}}>{(selCh.name||"?")[0]}</div>
+                <div style={{width:48,height:48,borderRadius:"50%",background:_avatarColor(selCh.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff"}}>{_initial(selCh.name)}</div>
                 <div>
                   <div style={{fontSize:18,fontWeight:800}}>{selCh.name}</div>
-                  <div style={{display:"flex",gap:6,alignItems:"center",marginTop:2}}>
+                  <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:2}}>
                     <LevelBadge xp={selCh.xp}/>
-                    {selCh.streak>0&&<StreakBadge streak={selCh.streak}/>}
-                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>Commission: {selCh.commission_pct||0}%</span>
+                    {selCh.streak > 0 && <StreakBadge streak={selCh.streak}/>}
+                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>Commission : {selCh.commission_pct||0}%</span>
+                    <span style={{padding:"2px 8px",borderRadius:10,background:(selCh.on_shift||selCh.is_online)?"rgba(16,185,129,0.12)":"rgba(255,255,255,0.05)",color:(selCh.on_shift||selCh.is_online)?"#10B981":"var(--text-quaternary)",fontSize:9,fontWeight:700}}>
+                      {(selCh.on_shift||selCh.is_online)?"● EN SHIFT":"○ OFF"}
+                    </span>
                   </div>
                 </div>
               </div>
-              <button onClick={()=>setModalChatter(null)} style={{background:"none",border:"none",fontSize:20,cursor:"pointer",color:"var(--text-tertiary)",padding:8}}>{"✕"}</button>
+              <button onClick={()=>setModalChatter(null)} style={{background:"rgba(255,255,255,0.06)",border:"none",fontSize:16,cursor:"pointer",color:"var(--text-tertiary)",padding:"5px 11px",borderRadius:8}}>{"✕"}</button>
             </div>
+
             {/* Tab bar */}
-            <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border-subtle)"}}>
-              {modalTabs.map(mt=>(
-                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{flex:1,padding:"12px 16px",border:"none",borderBottom:modalTab===mt.id?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:modalTab===mt.id?"var(--accent)":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>{mt.icon} {mt.label}</button>
+            <div style={{display:"flex",borderBottom:"1px solid var(--border-subtle)"}}>
+              {modalTabs.map(mt => (
+                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{flex:1,padding:"12px 16px",border:"none",borderBottom:modalTab===mt.id?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:modalTab===mt.id?"var(--accent)":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",justifyContent:"center",gap:6,transition:"color 0.15s"}}>
+                  {mt.icon} {mt.label}
+                </button>
               ))}
             </div>
+
             <div style={{padding:24}}>
 
-              {/* ═══ TAB: PERFORMANCE ═══ */}
-              {modalTab==="performance"&&(
+              {/* ── TAB PERFORMANCE ── */}
+              {modalTab==="performance" && (
                 <div>
-                  {/* Achievement badges */}
                   <div style={{marginBottom:16}}><BadgeBar badges={getBadges(txs,selCh.id).badges}/></div>
-                  {/* KPIs */}
+                  {/* KPIs 3×2 */}
                   <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
                     {[
-                      {label:fr?"CA Généré":"Revenue",value:`${Math.round(selCh.validCA).toLocaleString()}${currencySymbol}`,color:"var(--success)"},
-                      {label:"Pending",value:`${Math.round(selCh.pendingCA).toLocaleString()}${currencySymbol}`,color:"var(--warning)"},
-                      {label:"Commission",value:`${Math.round(selCh.commDue).toLocaleString()}${currencySymbol}`,color:selCh.commDue>0?"var(--warning)":"var(--success)"},
-                      {label:fr?"Taux Conv.":"Conv. Rate",value:`${selCh.convRate}%`,color:selCh.convRate>=50?"var(--success)":"var(--text-primary)"},
-                      {label:fr?"Panier moyen":"Avg Ticket",value:`${selCh.avgTicket}${currencySymbol}`,color:"var(--text-primary)"},
-                      {label:"Streak",value:`${selCh.streak}j`,color:selCh.streak>=7?"var(--warning)":"var(--text-primary)"},
-                    ].map((k,i)=>(
+                      {label:fr?"CA Généré":"Revenue",    value:`${Math.round(selCh.validCA).toLocaleString()}${currencySymbol}`, color:"var(--success)"},
+                      {label:"Pending",                   value:`${Math.round(selCh.pendingCA).toLocaleString()}${currencySymbol}`,color:"var(--warning)"},
+                      {label:`Commission (${selCh.commission_pct||3}%)`,value:`${Math.round(selCh.commDue).toLocaleString()}${currencySymbol}`,color:selCh.commDue>0?"var(--warning)":"var(--success)"},
+                      {label:fr?"Taux Conv.":"Conv. Rate", value:`${selCh.convRate}%`,  color:selCh.convRate>=50?"var(--success)":"var(--text-primary)"},
+                      {label:fr?"Panier Moyen":"Avg Ticket",value:`${selCh.avgTicket}${currencySymbol}`,color:"var(--text-primary)"},
+                      {label:"Streak",                    value:`${selCh.streak}j`,     color:selCh.streak>=7?"var(--warning)":"var(--text-primary)"},
+                    ].map((k,i) => (
                       <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
                         <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{k.label}</div>
                         <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.value}</div>
                       </div>
                     ))}
                   </div>
-                  {/* CA/Week bar chart */}
-                  <div style={{marginBottom:20}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-                      <span style={{fontSize:12,fontWeight:700}}>{fr?"CA par semaine":"Revenue per week"}</span>
-                      <span style={{fontSize:10,color:"var(--text-quaternary)"}}>{fr?"Moyenne":"Avg"}: {Math.round(avgCA).toLocaleString()}{currencySymbol}</span>
+                  {/* CA par semaine — mini graphe barres */}
+                  <div style={{marginBottom:20,background:"rgba(255,255,255,0.02)",borderRadius:12,padding:"14px 16px",border:"1px solid var(--border-subtle)"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                      <span style={{fontSize:12,fontWeight:700}}>{fr?"CA par semaine":"Revenue / week"}</span>
+                      <span style={{fontSize:10,color:"var(--text-quaternary)"}}>{fr?"vs moy. équipe":"vs team avg"} : <b style={{color:selCh.validCA>avgCA?"var(--success)":"var(--danger)"}}>{selCh.validCA>avgCA?"+":""}{Math.round(selCh.validCA-avgCA).toLocaleString()}{currencySymbol}</b></span>
                     </div>
-                    <div style={{display:"flex",alignItems:"flex-end",gap:6,height:100}}>
-                      {selCh.weeklyCA.map((w,i)=>(
-                        <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
-                          <span style={{fontSize:9,color:"var(--text-quaternary)"}}>{w.ca>0?w.ca:""}</span>
-                          <div style={{width:"100%",height:Math.max(4,Math.round((w.ca/maxWeekCA)*80)),borderRadius:4,background:i===selCh.weeklyCA.length-1?"var(--accent)":"var(--success)",transition:"height 0.3s"}}/>
+                    <div style={{display:"flex",alignItems:"flex-end",gap:5,height:90}}>
+                      {selCh.weeklyCA.map((w,i) => (
+                        <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+                          {w.ca > 0 && <span style={{fontSize:8,color:"var(--text-quaternary)"}}>{w.ca >= 1000 ? (w.ca/1000).toFixed(0)+"k" : w.ca}</span>}
+                          <div style={{width:"100%",height:Math.max(4,Math.round((w.ca/maxWeekCA)*72)),borderRadius:4,background:i===selCh.weeklyCA.length-1?"var(--accent)":"var(--success)",transition:"height 0.3s",opacity:w.ca===0?0.2:1}}/>
                           <span style={{fontSize:8,color:"var(--text-quaternary)"}}>{w.label}</span>
                         </div>
                       ))}
                     </div>
-                    {/* Avg line indicator */}
-                    <div style={{fontSize:10,color:"var(--text-quaternary)",textAlign:"center",marginTop:6}}>{fr?"vs moyenne équipe":"vs team average"}: <b style={{color:selCh.validCA>avgCA?"var(--success)":"var(--danger)"}}>{selCh.validCA>avgCA?"+":""}{Math.round(selCh.validCA-avgCA).toLocaleString()}{currencySymbol}</b></div>
                   </div>
-                  {/* Managed spenders */}
+                  {/* Spenders gérés */}
                   <div>
                     <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{fr?"Spenders gérés":"Managed spenders"} ({selCh.spenders.length})</div>
-                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{selCh.spenders.slice(0,15).map(sp=><Tag key={sp} type="spender" label={sp} id={sp}/>)}{selCh.spenders.length>15&&<span style={{fontSize:10,color:"var(--text-quaternary)"}}>+{selCh.spenders.length-15}</span>}</div>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                      {selCh.spenders.slice(0,20).map(sp => <Tag key={sp} type="spender" label={sp} id={sp}/>)}
+                      {selCh.spenders.length > 20 && <span style={{fontSize:10,color:"var(--text-quaternary)"}}>+{selCh.spenders.length-20}</span>}
+                    </div>
                   </div>
                 </div>
               )}
 
-              {/* ═══ TAB: MODÈLES ASSIGNÉS ═══ */}
-              {modalTab==="modeles"&&(
+              {/* ── TAB MODÈLES ASSIGNÉES ── */}
+              {modalTab==="modeles" && (
                 <div>
-                  <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{fr?"Modèles assignés":"Assigned Models"} ({selCh.assignedModels.length})</div>
+                  <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{fr?"Modèles assignées":"Assigned Models"} ({selCh.assignedModels.length}/{models.length})</div>
                   <div style={{display:"flex",flexDirection:"column",gap:10}}>
-                    {models.map(m=>{
+                    {models.map(m => {
                       const isAssigned = (selCh.assigned_models||[]).includes(m.id);
                       const mCA = selCh.caByModel[m.id];
                       return (
-                        <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderRadius:12,background:isAssigned?"rgba(139,92,246,0.08)":"rgba(255,255,255,0.03)",border:`1px solid ${isAssigned?"rgba(139,92,246,0.2)":"var(--border-subtle)"}`,transition:"all 0.2s"}}>
-                          <div style={{width:36,height:36,borderRadius:"50%",background:avatarColors[(m.name||"").charCodeAt(0)%avatarColors.length],display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:800,color:"#fff",flexShrink:0}}>{(m.name||"?")[0]}</div>
+                        <div key={m.id} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",borderRadius:12,background:isAssigned?"rgba(139,92,246,0.08)":"rgba(255,255,255,0.03)",border:`1px solid ${isAssigned?"rgba(139,92,246,0.25)":"var(--border-subtle)"}`,transition:"all 0.2s"}}>
+                          <div style={{width:36,height:36,borderRadius:"50%",background:_avatarColor(m.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,fontWeight:800,color:"#fff",flexShrink:0}}>{_initial(m.name)}</div>
                           <div style={{flex:1,minWidth:0}}>
                             <div style={{fontSize:13,fontWeight:700}}>{m.name}</div>
-                            {mCA&&<div style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{Math.round(mCA.ca).toLocaleString()}{currencySymbol} CA</div>}
+                            {mCA && <div style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{Math.round(mCA.ca).toLocaleString()}{currencySymbol} CA</div>}
                           </div>
-                          <button onClick={()=>handleModelToggle(selCh.id,m.id)} disabled={saving} style={{padding:"6px 14px",borderRadius:8,border:"none",background:isAssigned?"var(--danger)":"var(--success)",color:"#fff",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",opacity:saving?0.5:1}}>
+                          <button onClick={()=>handleModelToggle(selCh.id,m.id)} disabled={saving} style={{padding:"6px 14px",borderRadius:8,border:"none",background:isAssigned?"var(--danger)":"rgba(16,185,129,0.15)",color:isAssigned?"#fff":"var(--success)",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",opacity:saving?0.5:1,transition:"all 0.15s"}}>
                             {isAssigned?(fr?"Retirer":"Remove"):(fr?"Assigner":"Assign")}
                           </button>
                         </div>
@@ -8939,46 +9096,103 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
                 </div>
               )}
 
-              {/* ═══ TAB: MESSAGES BLOQUÉS / LOGS ═══ */}
-              {modalTab==="logs"&&(
+              {/* ── TAB MESSAGES BLOQUÉS ── */}
+              {modalTab==="logs" && (
                 <div>
                   {/* KPI row */}
                   <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:20}}>
-                    <div style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"TOTAL LOGS":"TOTAL LOGS"}</div>
-                      <div style={{fontSize:18,fontWeight:800}}>{selCh.myLogs.length}</div>
-                    </div>
-                    <div style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"MESSAGES":"MESSAGES"}</div>
-                      <div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{selCh.msgCount}</div>
-                    </div>
-                    <div style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                      <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"ACTIONS BOT":"BOT ACTIONS"}</div>
-                      <div style={{fontSize:18,fontWeight:800,color:"var(--warning)"}}>{selCh.myLogs.filter(l=>l.action==="hand_back_bot").length}</div>
-                    </div>
+                    {[
+                      {label:"Total logs",     value:selCh.myLogs.length,                                        color:"var(--text-primary)"},
+                      {label:"Msgs envoyés",   value:selCh.msgCount,                                             color:"var(--success)"},
+                      {label:"Actions bot",    value:selCh.myLogs.filter(l=>l.action==="hand_back_bot").length,  color:"var(--warning)"},
+                    ].map((k,i) => (
+                      <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                        <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{k.label}</div>
+                        <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.value}</div>
+                      </div>
+                    ))}
                   </div>
-                  {/* Log list */}
-                  <div style={{fontSize:12,fontWeight:700,marginBottom:10}}>{fr?"Historique chronologique":"Chronological log"}</div>
-                  {selCh.myLogs.length===0&&<div style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr?"Aucun log":"No logs"}</div>}
-                  <div style={{maxHeight:350,overflowY:"auto",display:"flex",flexDirection:"column",gap:6}}>
-                    {selCh.myLogs.slice(0,50).map((log,i)=>{
-                      const actionColors = {message_sent:{icon:"💬",color:"var(--success)"},hand_back_bot:{icon:"🤖",color:"var(--warning)"},assign_chatter:{icon:"👤",color:"var(--accent)"},gerant_message:{icon:"👑",color:"var(--accent)"}};
-                      const ac = actionColors[log.action]||{icon:"📝",color:"var(--text-quaternary)"};
-                      return (
-                        <div key={log.id||i} style={{display:"flex",gap:10,padding:"8px 12px",borderRadius:8,background:"rgba(255,255,255,0.02)",border:"1px solid var(--border-subtle)"}}>
-                          <span style={{fontSize:14,flexShrink:0}}>{ac.icon}</span>
-                          <div style={{flex:1,minWidth:0}}>
-                            <div style={{fontSize:11,fontWeight:600,color:ac.color}}>{log.action}</div>
-                            {log.content&&<div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",marginTop:2}}>{log.content}</div>}
-                          </div>
-                          <span style={{fontSize:9,color:"var(--text-quaternary)",flexShrink:0,whiteSpace:"nowrap"}}>{log.created_at?new Date(log.created_at).toLocaleString(fr?"fr-FR":"en-US",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):""}</span>
+                  {/* Blocked messages first, then all logs */}
+                  {(() => {
+                    const blocked = selCh.myLogs.filter(l => l.blocked || l.action === "blocked_message" || l.action === "needs_human");
+                    const allLogs = selCh.myLogs.slice(0, 50);
+                    const list = blocked.length > 0 ? blocked : allLogs;
+                    const title = blocked.length > 0 ? `⛔ ${fr?"Messages nécessitant intervention":"Messages needing review"} (${blocked.length})` : `${fr?"Historique activité":"Activity log"} (${allLogs.length})`;
+                    const actionIcon = {message_sent:"💬",hand_back_bot:"🤖",assign_chatter:"👤",gerant_message:"👑",blocked_message:"⛔",needs_human:"⛔"};
+                    const actionColor = {message_sent:"var(--success)",hand_back_bot:"var(--warning)",assign_chatter:"var(--accent)",gerant_message:"var(--accent)",blocked_message:"var(--danger)",needs_human:"var(--danger)"};
+                    return (
+                      <div>
+                        <div style={{fontSize:12,fontWeight:700,marginBottom:10,color:blocked.length>0?"var(--danger)":undefined}}>{title}</div>
+                        {list.length===0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:24,fontSize:13}}>{fr?"Aucun message bloqué 👌":"No blocked messages 👌"}</div>}
+                        <div style={{maxHeight:340,overflowY:"auto",display:"flex",flexDirection:"column",gap:6}}>
+                          {list.map((log,i) => (
+                            <div key={log.id||i} style={{display:"flex",gap:10,padding:"9px 12px",borderRadius:9,background:"rgba(255,255,255,0.025)",border:`1px solid ${log.blocked||log.action==="blocked_message"||log.action==="needs_human"?"rgba(239,68,68,0.2)":"var(--border-subtle)"}`}}>
+                              <span style={{fontSize:14,flexShrink:0}}>{actionIcon[log.action]||"📝"}</span>
+                              <div style={{flex:1,minWidth:0}}>
+                                <div style={{fontSize:11,fontWeight:600,color:actionColor[log.action]||"var(--text-quaternary)"}}>{log.action}</div>
+                                {log.content && <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{log.content}</div>}
+                              </div>
+                              <span style={{fontSize:9,color:"var(--text-quaternary)",flexShrink:0,whiteSpace:"nowrap"}}>{log.created_at?new Date(log.created_at).toLocaleString("fr-FR",{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}):""}</span>
+                            </div>
+                          ))}
                         </div>
-                      );
-                    })}
-                  </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ════════════════════════════════════════
+          MODALE CRÉATION CHATTER
+      ════════════════════════════════════════ */}
+      {createModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:_isMobile?"flex-end":"center",justifyContent:"center",zIndex:5100}} onClick={()=>setCreateModal(false)}>
+          <div style={{maxWidth:480,width:"95vw",background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:_isMobile?"20px 20px 0 0":16,boxShadow:"0 24px 64px rgba(0,0,0,0.6)"}} onClick={e=>e.stopPropagation()}>
+            <div style={{padding:"18px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:16,fontWeight:800}}>{"+"} {fr?"Nouveau chatter":"New chatter"}</span>
+              <button onClick={()=>setCreateModal(false)} style={{background:"rgba(255,255,255,0.06)",border:"none",color:"var(--text-tertiary)",fontSize:14,cursor:"pointer",padding:"4px 10px",borderRadius:8}}>{"✕"}</button>
+            </div>
+            <div style={{padding:"20px 24px",display:"flex",flexDirection:"column",gap:14}}>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>{fr?"Nom complet *":"Full name *"}</label>
+                <input className="form-input" value={createForm.name} onChange={e=>setCreateForm({...createForm,name:e.target.value})} placeholder="Ex: Mala" style={{width:"100%",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Handle Telegram</label>
+                <input className="form-input" value={createForm.handle} onChange={e=>setCreateForm({...createForm,handle:e.target.value})} placeholder="@username ou ID" style={{width:"100%",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>{fr?"Commission (%)":"Commission (%)"}</label>
+                <input className="form-input" type="number" min="0" max="100" value={createForm.commission_pct} onChange={e=>setCreateForm({...createForm,commission_pct:e.target.value})} style={{width:"100%",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <label style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:8}}>{fr?"Modèles assignées":"Assigned models"}</label>
+                <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                  {models.map(m => {
+                    const checked = createForm.assigned_models.includes(m.id);
+                    return (
+                      <label key={m.id} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,padding:"8px 10px",borderRadius:8,background:checked?"rgba(139,92,246,0.08)":"rgba(255,255,255,0.02)",border:`1px solid ${checked?"rgba(139,92,246,0.2)":"var(--border-subtle)"}`,transition:"all 0.15s"}}>
+                        <input type="checkbox" checked={checked} onChange={()=>{const cur=createForm.assigned_models;setCreateForm({...createForm,assigned_models:checked?cur.filter(id=>id!==m.id):[...cur,m.id]});}} style={{accentColor:"var(--accent)"}}/>
+                        <div style={{width:24,height:24,borderRadius:"50%",background:_avatarColor(m.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:800,color:"#fff"}}>{_initial(m.name)}</div>
+                        {m.name}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+              <div style={{display:"flex",gap:10,paddingTop:4}}>
+                <button onClick={()=>setCreateModal(false)} style={{flex:1,padding:"10px",borderRadius:10,border:"1px solid var(--border-default)",background:"transparent",color:"var(--text-tertiary)",fontSize:13,fontWeight:600,cursor:"pointer"}}>
+                  {fr?"Annuler":"Cancel"}
+                </button>
+                <button onClick={handleCreate} disabled={createSaving||!createForm.name.trim()} style={{flex:2,padding:"10px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:createSaving||!createForm.name.trim()?0.5:1}}>
+                  {createSaving?"...":(fr?"Créer le chatter":"Create chatter")}
+                </button>
+              </div>
             </div>
           </div>
         </div>
