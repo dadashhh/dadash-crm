@@ -6483,6 +6483,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [showNewSpender, setShowNewSpender] = useState(false);
   const [newSpForm, setNewSpForm] = useState({handle:"",first_name:"",langue:"FR",timezone:"Europe/Zurich"});
   const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [search, setSearch] = useState("");
+  const [filterBadge, setFilterBadge] = useState("");
+  const [filterLangue, setFilterLangue] = useState("");
   const handleSpStatus = async (txId, newStatus) => {
     if (processingTxId) return;
     setProcessingTxId(txId);
@@ -6660,10 +6663,15 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     }
   },[selectedSpenderKey, spenders]);
 
-  let filtered = filterModel ? spenders.filter(s=>s.byModel[filterModel]) : spenders;
+  let filtered = [...spenders];
+  if (filterModel) filtered = filtered.filter(s=>s.byModel[filterModel]);
+  if (filterLangue) filtered = filtered.filter(s=>(s.langue||"").toUpperCase()===filterLangue);
+  if (search.trim()) { const q=search.trim().toLowerCase().replace(/^@/,""); filtered=filtered.filter(s=>(s.name||"").toLowerCase().includes(q)||(s.first_name||"").toLowerCase().includes(q)); }
+  if (filterBadge) filtered = filtered.filter(s=>computeSpenderBadges(s).some(b=>b.label===filterBadge));
   let sorted = [...filtered];
   if(sortBy==="frequency") sorted.sort((a,b)=>b.cnt-a.cnt);
-  else if(sortBy==="recency") sorted.sort((a,b)=>new Date(b.txs[b.txs.length-1]?.date||0)-new Date(a.txs[a.txs.length-1]?.date||0));
+  else if(sortBy==="recency") sorted.sort((a,b)=>new Date(b.lastTxDate||0)-new Date(a.lastTxDate||0));
+  else if(sortBy==="vip") sorted.sort((a,b)=>computeVIPScore(b)-computeVIPScore(a));
   else if(sortBy==="model_ca" && filterModel) sorted.sort((a,b)=>(b.byModel[filterModel]?.ca||0)-(a.byModel[filterModel]?.ca||0));
   else sorted.sort((a,b)=>b.ltv-a.ltv);
 
@@ -6684,16 +6692,38 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         <KPICard label="Pending" value={`${totalPending.toFixed(0)}${currencySymbol}`} icon="⏳"/>
       </div>
 
-      <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:12,alignItems:"center"}}>
-        <button className="btn btn-primary" onClick={()=>setShowNewSpender(true)} style={{fontSize:12,padding:"6px 14px",borderRadius:12}}>{"➕"} {fr?"Nouveau Spender":"New Spender"}</button>
+      {/* ── Barre recherche + filtres ── */}
+      <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16,alignItems:"center"}}>
+        <input
+          className="filter-select"
+          style={{flex:"1 1 180px",minWidth:160}}
+          placeholder={`🔍 ${fr?"Rechercher handle / nom…":"Search handle / name…"}`}
+          value={search}
+          onChange={e=>setSearch(e.target.value)}
+        />
         <select className="filter-select" value={filterModel} onChange={e=>{setFilterModel(e.target.value);setSelected(null);}}>
-          <option value="">{fr?"Tous les modeles":"All models"}</option>
+          <option value="">{fr?"Tous les modèles":"All models"}</option>
           {models.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
         </select>
-        <button className={`filter-chip ${sortBy==="ltv"?"active":""}`} onClick={()=>setSortBy("ltv")}>LTV</button>
-        <button className={`filter-chip ${sortBy==="frequency"?"active":""}`} onClick={()=>setSortBy("frequency")}>{t(lang,"frequency")}</button>
-        <button className={`filter-chip ${sortBy==="recency"?"active":""}`} onClick={()=>setSortBy("recency")}>{t(lang,"recency")}</button>
-        {filterModel && <button className={`filter-chip ${sortBy==="model_ca"?"active":""}`} onClick={()=>setSortBy("model_ca")}>{fr?"CA modele":"Model CA"}</button>}
+        <select className="filter-select" value={filterBadge} onChange={e=>setFilterBadge(e.target.value)}>
+          <option value="">{fr?"Tous les badges":"All badges"}</option>
+          <option value="WHALE">🐋 WHALE</option>
+          <option value="ACTIF">🔥 ACTIF</option>
+          <option value="INACTIF">💤 INACTIF</option>
+          <option value="NOUVEAU">⭐ NOUVEAU</option>
+          <option value="RÉGULIER">🔄 RÉGULIER</option>
+        </select>
+        <select className="filter-select" value={filterLangue} onChange={e=>setFilterLangue(e.target.value)}>
+          <option value="">{fr?"Toutes langues":"All langs"}</option>
+          {SPENDER_LANGUAGES.map(l=><option key={l} value={l}>{LANG_FLAGS[l]} {l}</option>)}
+        </select>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",alignItems:"center"}}>
+          <span style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600,marginRight:2}}>{fr?"Tri :":"Sort:"}</span>
+          {[{v:"ltv",l:"LTV"},{v:"vip",l:"VIP"},{v:"frequency",l:fr?"Fréq.":"Freq."},{v:"recency",l:fr?"Récence":"Recency"}].map(o=>(
+            <button key={o.v} className={`filter-chip ${sortBy===o.v?"active":""}`} onClick={()=>setSortBy(o.v)} style={{fontSize:11,padding:"4px 10px"}}>{o.l}</button>
+          ))}
+        </div>
+        <button className="btn btn-primary" onClick={()=>setShowNewSpender(true)} style={{fontSize:12,padding:"6px 14px",borderRadius:12,marginLeft:"auto"}}>{"➕"} {fr?"Nouveau":"New"}</button>
       </div>
 
       {/* ═══ SPENDER ALERTS IA ═══ */}
@@ -6738,83 +6768,80 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       })()}
 
       {/* ═══ SPENDER CARDS GRID ═══ */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:16,marginBottom:20}}>
+      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(300px,1fr))",gap:16,marginBottom:20}}>
           {spPag.paginatedData.map(s=>{
             const _vipScore = computeVIPScore(s);
             const _vipColor = _vipScore >= 70 ? "var(--success)" : _vipScore >= 40 ? "var(--warning)" : "var(--danger)";
             const _lastTxRel = (() => { if (!s.lastTxDate) return fr?"jamais":"never"; const d=Math.floor((Date.now()-new Date(s.lastTxDate).getTime())/86400000); if(d===0) return fr?"aujourd'hui":"today"; if(d===1) return fr?"hier":"yesterday"; return `${fr?"il y a ":""}${d}${fr?"j":"d ago"}`; })();
-            const _topBadge = computeSpenderBadges(s)[0];
+            const _badges = computeSpenderBadges(s);
+            // Couleur avatar unique générée depuis le handle
+            const _avatarColors = ["#8b5cf6","#10b981","#f59e0b","#3b82f6","#ef4444","#06b6d4","#ec4899","#f97316"];
+            const _avatarHash = (s.name||"").split("").reduce((h,c)=>(h*31+c.charCodeAt(0))&0xffff,0);
+            const _avatarColor = _avatarColors[_avatarHash % _avatarColors.length];
             return (
-            <div key={s.name} className="spender-card card-hover" onClick={()=>openSpenderModal(s)} style={{background:"#1A1A2E",border:"1px solid #2A2A3E",borderRadius:16,padding:20,cursor:"pointer",transition:"all 0.2s"}}>
-              {/* ── HEADER: Avatar + Name + Flag + Badge ── */}
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-                <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0,flex:1}}>
-                  <div style={{width:42,height:42,borderRadius:"50%",background:"var(--accent-muted)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontWeight:800,color:"var(--accent)",flexShrink:0}}>
-                    {s.first_name?s.first_name[0].toUpperCase():s.name?s.name[0].toUpperCase():"?"}
-                  </div>
-                  <div style={{minWidth:0}}>
-                    <div style={{display:"flex",alignItems:"center",gap:6}}>
-                      <span style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}><Tag type="spender" label={s.name} id={s.name}/></span>
-                      {s.langue && LANG_FLAGS[s.langue] && <span title={s.langue} style={{fontSize:13}}>{LANG_FLAGS[s.langue]}</span>}
-                    </div>
-                    <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>
-                      {s.modelCount} {fr?"modèle":"model"}{s.modelCount>1?"s":""} · {s.cnt} TX
-                    </div>
-                  </div>
+            <div key={s.name} className="spender-card" onClick={()=>openSpenderModal(s)}
+              style={{background:"var(--surface,#111520)",border:"1px solid var(--border,rgba(255,255,255,0.07))",borderRadius:16,padding:20,cursor:"pointer",transition:"all 0.18s"}}
+              onMouseEnter={e=>{e.currentTarget.style.border="1px solid rgba(139,92,246,0.5)";e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 8px 24px rgba(139,92,246,0.12)";}}
+              onMouseLeave={e=>{e.currentTarget.style.border="1px solid var(--border,rgba(255,255,255,0.07))";e.currentTarget.style.transform="";e.currentTarget.style.boxShadow="";}}
+            >
+              {/* ── HEADER: Avatar + Name + Flag ── */}
+              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                <div style={{width:44,height:44,borderRadius:"50%",background:_avatarColor+"22",border:`2px solid ${_avatarColor}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:_avatarColor,flexShrink:0}}>
+                  {s.first_name?s.first_name[0].toUpperCase():s.name?s.name[0].toUpperCase():"?"}
                 </div>
-                <div style={{display:"flex",gap:4,alignItems:"center",flexShrink:0}}>
-                  {s.telegramId && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-telegram-muted)",color:"var(--brand-telegram)",fontWeight:700}}>TG</span>}
-                  {s.whatsapp_phone && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-whatsapp-muted)",color:"var(--brand-whatsapp)",fontWeight:700}}>WA</span>}
-                  {_topBadge && <span style={{padding:"3px 10px",borderRadius:12,background:_topBadge.bg,color:_topBadge.color,fontSize:10,fontWeight:700}}>{_topBadge.icon} {_topBadge.label}</span>}
+                <div style={{minWidth:0,flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                    <span style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>@{s.name}</span>
+                    {s.langue && LANG_FLAGS[s.langue] && <span title={s.langue} style={{fontSize:13}}>{LANG_FLAGS[s.langue]}</span>}
+                    {s.telegramId && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(0,136,204,0.15)",color:"#0088cc",fontWeight:700}}>TG</span>}
+                  </div>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2,display:"flex",gap:8}}>
+                    {s.first_name && <span style={{color:"var(--text-secondary)",fontWeight:500}}>{s.first_name}</span>}
+                    {s.timezone && <span>🕐 {s.timezone.replace("Europe/","")}</span>}
+                  </div>
                 </div>
               </div>
-              {/* ── KPI GRID 2×3 (provider style) ── */}
-              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"LTV Total":"Total LTV"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{filterModel?(s.byModel[filterModel]?.ca||0).toFixed(0):s.ltv.toFixed(0)}{currencySymbol}</div>
+              {/* ── BADGES AUTO ── */}
+              {_badges.length>0 && (
+                <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:10}}>
+                  {_badges.map(b=>(
+                    <span key={b.label} style={{padding:"2px 8px",borderRadius:10,background:b.bg,color:b.color,fontSize:9,fontWeight:700,whiteSpace:"nowrap"}}>{b.icon} {b.label}</span>
+                  ))}
                 </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>AOV</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{s.aov.toFixed(0)}{currencySymbol}</div>
+              )}
+              {/* ── KPI ROW ── */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:10}}>
+                <div style={{padding:"7px 9px",borderRadius:9,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:8,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:3}}>{fr?"Total dépensé":"Total spent"}</div>
+                  <div style={{fontSize:15,fontWeight:800,color:"var(--success)"}}>{s.ltv.toFixed(0)}{currencySymbol}</div>
                 </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Validé":"Validated"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{s.validCA.toFixed(0)}{currencySymbol}</div>
+                <div style={{padding:"7px 9px",borderRadius:9,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:8,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:3}}>{fr?"Panier moy.":"Avg basket"}</div>
+                  <div style={{fontSize:15,fontWeight:800,color:"var(--text-primary)"}}>{s.aov.toFixed(0)}{currencySymbol}</div>
                 </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Pending</div>
-                  <div style={{fontSize:16,fontWeight:800,color:s.pendingCA>0?"var(--warning)":"var(--text-primary)"}}>{s.pendingCA.toFixed(0)}{currencySymbol}</div>
+                <div style={{padding:"7px 9px",borderRadius:9,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:8,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:3}}>{fr?"Dernière TX":"Last TX"}</div>
+                  <div style={{fontSize:12,fontWeight:700,color:"var(--text-secondary)"}}>{_lastTxRel}</div>
                 </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Dernière TX":"Last TX"}</div>
-                  <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{_lastTxRel}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Fréquence":"Frequency"}</div>
-                  <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{s.cnt} TX</div>
+                <div style={{padding:"7px 9px",borderRadius:9,background:"rgba(255,255,255,0.04)"}}>
+                  <div style={{fontSize:8,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:3}}>TX</div>
+                  <div style={{fontSize:15,fontWeight:800,color:"var(--text-primary)"}}>{s.cnt}</div>
                 </div>
               </div>
               {/* ── VIP SCORE BAR ── */}
-              <div style={{marginBottom:8}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-                  <span style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase"}}>VIP Score</span>
-                  <span style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)"}}>{_vipScore}/100</span>
+              <div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:3}}>
+                  <span style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3}}>VIP Score</span>
+                  <span style={{fontSize:10,fontWeight:700,color:_vipColor}}>{_vipScore}/100</span>
                 </div>
-                <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
-                  <div style={{width:`${_vipScore}%`,height:"100%",borderRadius:3,background:_vipColor,transition:"width 0.3s"}}/>
+                <div style={{height:4,borderRadius:2,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                  <div style={{width:`${_vipScore}%`,height:"100%",borderRadius:2,background:_vipColor,transition:"width 0.3s"}}/>
                 </div>
-              </div>
-              {/* ── COUNTERS BOTTOM ── */}
-              <div style={{display:"flex",gap:14,marginTop:6}}>
-                <span style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{"✅"} {s.validCount}</span>
-                <span style={{fontSize:11,color:"var(--warning)",fontWeight:600}}>{"⏳"} {s.pendingCount}</span>
-                {s.modelBreakdown.length>0 && <span style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.modelBreakdown.slice(0,2).map(mb=>mb.name).join(", ")}</span>}
               </div>
             </div>
           )})}
       </div>
-      {sorted.length===0 && <div style={{color:"var(--text2)",textAlign:"center",padding:40}}>{fr?"Aucun spender":"No spenders"}</div>}
+      {sorted.length===0 && <div style={{color:"var(--text-tertiary)",textAlign:"center",padding:40,fontSize:14}}>{fr?"Aucun spender trouvé":"No spenders found"}</div>}
       <PaginationControls pag={spPag} lang={lang}/>
 
         {/* Spender Detail Modal */}
@@ -6858,10 +6885,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               </div>
               <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:10,fontWeight:700,color:"var(--text-tertiary)"}}>VIP</span><div style={{flex:1}}><VIPScoreBar score={computeVIPScore(selected)}/></div></div>
             </div>
-            {/* 4 Tabs: Profil / Préférences / Historique / Analytics */}
+            {/* 3 Tabs : Profil / Historique TX / Préférences */}
             <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border-subtle)"}}>
-              {[{key:"profil",label:fr?"Profil":"Profile",icon:"\u{1F464}"},{key:"prefs",label:fr?"Préférences":"Preferences",icon:"⚙️"},{key:"historique",label:fr?"Historique":"History",icon:"\u{1F4CB}"},{key:"analytics",label:"Analytics",icon:"\u{1F4CA}"}].map(tb=>(
-                <button key={tb.key} onClick={()=>setSpModalTab(tb.key)} style={{flex:1,padding:"10px 8px",border:"none",borderBottom:spModalTab===tb.key?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:spModalTab===tb.key?"var(--accent)":"var(--text-tertiary)",fontSize:11,fontWeight:700,cursor:"pointer"}}>{tb.icon} {tb.label}</button>
+              {[{key:"profil",label:"Profil",icon:"👤"},{key:"historique",label:"Historique TX",icon:"💰"},{key:"prefs",label:"Préférences",icon:"❤️"}].map(tb=>(
+                <button key={tb.key} onClick={()=>setSpModalTab(tb.key)} style={{flex:1,padding:"12px 8px",border:"none",borderBottom:spModalTab===tb.key?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:spModalTab===tb.key?"var(--accent)":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer"}}>{tb.icon} {tb.label}</button>
               ))}
             </div>
             <div style={{padding:"16px 24px"}}>
@@ -6916,9 +6943,56 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             {/* ── PRÉFÉRENCES TAB ── */}
             {spModalTab==="prefs" && (
               <div>
+                {/* Auto-calculé : produits favoris, modèle, méthode paiement */}
+                {(()=>{
+                  const txArr = selected.txs || [];
+                  // Top 3 produits
+                  const prodMap = {};
+                  txArr.forEach(tx=>{ const p=tx.product||tx.tag; if(p){ prodMap[p]=(prodMap[p]||{count:0,ca:0}); prodMap[p].count++; prodMap[p].ca+=Number(tx.amount); } });
+                  const topProds = Object.entries(prodMap).sort((a,b)=>b[1].count-a[1].count).slice(0,3);
+                  // Modèle préférée
+                  const modMap = {};
+                  txArr.forEach(tx=>{ if(tx.model_id){ modMap[tx.model_id]=(modMap[tx.model_id]||{count:0,ca:0}); modMap[tx.model_id].count++; modMap[tx.model_id].ca+=Number(tx.amount); } });
+                  const topModel = Object.entries(modMap).sort((a,b)=>b[1].ca-a[1].ca)[0];
+                  const topModelName = topModel ? (models.find(m=>m.id===topModel[0])?.name||topModel[0]) : null;
+                  // Méthode paiement favorite
+                  const pmMap = {};
+                  txArr.forEach(tx=>{ if(tx.payment_method){ pmMap[tx.payment_method]=(pmMap[tx.payment_method]||0)+1; } });
+                  const topPM = Object.entries(pmMap).sort((a,b)=>b[1]-a[1])[0];
+                  const PCOLORS = {"#8b5cf6":"rgba(139,92,246,0.15)","#10b981":"rgba(16,185,129,0.15)","#f59e0b":"rgba(245,158,11,0.15)"};
+                  if (topProds.length===0 && !topModelName && !topPM) return null;
+                  return (
+                    <div style={{marginBottom:16,padding:14,borderRadius:12,background:"rgba(139,92,246,0.05)",border:"1px solid rgba(139,92,246,0.15)"}}>
+                      <div style={{fontSize:11,fontWeight:700,color:"var(--accent)",marginBottom:10}}>✨ {fr?"Préférences auto-calculées":"Auto-detected preferences"}</div>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+                        <div>
+                          <div style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{fr?"🛍️ Produits favoris":"🛍️ Top products"}</div>
+                          {topProds.length>0 ? topProds.map(([p,d],i)=>(
+                            <div key={p} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,padding:"3px 8px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
+                              <span style={{fontSize:11,fontWeight:600,color:i===0?"var(--accent)":"var(--text-secondary)"}}>{i===0?"🥇":i===1?"🥈":"🥉"} {p}</span>
+                              <span style={{fontSize:9,color:"var(--text-tertiary)"}}>{d.count}×</span>
+                            </div>
+                          )) : <span style={{fontSize:11,color:"var(--text-quaternary)",fontStyle:"italic"}}>—</span>}
+                        </div>
+                        <div>
+                          <div style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{fr?"💜 Modèle préférée":"💜 Fav model"}</div>
+                          {topModelName ? (
+                            <div style={{padding:"6px 10px",borderRadius:10,background:"rgba(139,92,246,0.1)",border:"1px solid rgba(139,92,246,0.2)",fontSize:12,fontWeight:700,color:"var(--accent)"}}>{topModelName}</div>
+                          ) : <span style={{fontSize:11,color:"var(--text-quaternary)",fontStyle:"italic"}}>—</span>}
+                        </div>
+                        <div>
+                          <div style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{fr?"💳 Paiement fav.":"💳 Fav payment"}</div>
+                          {topPM ? (
+                            <div style={{padding:"6px 10px",borderRadius:10,background:"rgba(16,185,129,0.1)",border:"1px solid rgba(16,185,129,0.2)",fontSize:12,fontWeight:700,color:"var(--success)"}}>{topPM[0]}</div>
+                          ) : <span style={{fontSize:11,color:"var(--text-quaternary)",fontStyle:"italic"}}>—</span>}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
                 {spEditMode ? (
                   <div>
-                    {[{l:fr?"Préférences / Kinks":"Preferences / Kinks",f:"preferences",ph:fr?"Ex: pieds, lingerie, vidéos POV...":"Ex: feet, lingerie, POV videos..."},{l:fr?"Personnalité":"Personality",f:"personality_notes",ph:fr?"Comment lui parler, ses habitudes...":"How to talk, habits..."},{l:fr?"Contenu favori":"Favorite content",f:"favorite_content",ph:"cam, pack_photo, sexting..."},{l:fr?"Meilleur moment":"Best time",f:"best_time",ph:"ex: soir 21h-23h"},{l:fr?"Notes privées":"Private notes",f:"chatter_notes",ph:fr?"Notes libres...":"Free notes..."}].map(fd=>(
+                    {[{l:fr?"Préférences / Kinks":"Preferences / Kinks",f:"preferences",ph:fr?"Ex: pieds, lingerie, vidéos POV...":"Ex: feet, lingerie, POV videos..."},{l:fr?"Personnalité":"Personality",f:"personality_notes",ph:fr?"Comment lui parler, ses habitudes...":"How to talk, habits..."},{l:fr?"Contenu favori":"Favorite content",f:"favorite_content",ph:"cam, pack_photo, sexting..."},{l:fr?"Meilleur moment":"Best time",f:"best_time",ph:"ex: soir 21h-23h"},{l:fr?"Notes chatter":"Chatter notes",f:"chatter_notes",ph:fr?"Notes libres...":"Free notes..."}].map(fd=>(
                       <div key={fd.f} style={{marginBottom:12}}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fd.l}</div><textarea className="filter-select" style={{width:"100%",minHeight:50,resize:"vertical"}} value={spForm[fd.f]||""} onChange={e=>setSpForm(p=>({...p,[fd.f]:e.target.value}))} placeholder={fd.ph}/></div>
                     ))}
                     <div style={{display:"flex",justifyContent:"flex-end",gap:8,paddingTop:12,borderTop:"1px solid var(--border-subtle)"}}>
@@ -6931,227 +7005,64 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                     {[{l:fr?"Préférences":"Preferences",v:selected.preferences},{l:fr?"Personnalité":"Personality",v:selected.personality_notes},{l:fr?"Contenu favori":"Fav content",v:selected.favorite_content},{l:fr?"Meilleur moment":"Best time",v:selected.best_time},{l:"Notes",v:selected.dbNotes}].map(f=>(
                       <div key={f.l} style={{marginBottom:12}}><div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:4}}>{f.l}</div><div style={{fontSize:13,color:f.v?"var(--text-secondary)":"var(--text-quaternary)",fontStyle:f.v?"normal":"italic",lineHeight:1.5}}>{f.v||"—"}</div></div>
                     ))}
+                    <button onClick={()=>setSpEditMode(true)} className="btn" style={{fontSize:11,marginTop:8}}>✏️ {fr?"Modifier":"Edit"}</button>
                   </div>
                 )}
               </div>
             )}
-            {/* ── HISTORIQUE TAB ── */}
+            {/* ── HISTORIQUE TX TAB ── */}
             {spModalTab==="historique" && (
               <div>
-                {/* Monthly sparkline */}
                 {(()=>{
-                  const months = {};
-                  selected.txs.forEach(tx => { const m = (tx.date||"").slice(0,7); if(m) months[m] = (months[m]||0) + Number(tx.amount); });
-                  const keys = Object.keys(months).sort();
-                  const data = keys.map(k => months[k]);
-                  if(data.length >= 2) return (
-                    <div style={{marginBottom:16,padding:12,borderRadius:12,background:"var(--bg-overlay)"}}>
-                      <div style={{fontSize:10,color:"var(--text-quaternary)",marginBottom:6}}>{fr?"Évolution mensuelle":"Monthly trend"}</div>
-                      <div style={{display:"flex",alignItems:"center",gap:12}}>
-                        <MiniSparkline data={data} width={200} height={32} color="var(--accent)"/>
-                        <span style={{fontSize:10,color:"var(--text-tertiary)"}}>{keys[0]} → {keys[keys.length-1]}</span>
+                  const txSorted = [...selected.txs].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+                  const totalSpent = txSorted.reduce((s,tx)=>s+Number(tx.amount),0);
+                  return (
+                    <>
+                      <div className="table-wrap" style={{marginBottom:14}}>
+                        <table className="table" style={{fontSize:11}}>
+                          <thead>
+                            <tr>
+                              <th>Date</th>
+                              <th>{fr?"Modèle":"Model"}</th>
+                              <th>{fr?"Produit":"Product"}</th>
+                              <th>{fr?"Montant":"Amount"}</th>
+                              <th>Statut</th>
+                              {(user.role==="gerant"||user.role==="provider")&&<th>Actions</th>}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {txSorted.map((tx,idx)=>{
+                              const mName=models.find(m=>m.id===tx.model_id)?.name||"—";
+                              const canEdit=tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id));
+                              return (
+                                <tr key={tx.id||idx}>
+                                  <td style={{fontFamily:"monospace",fontSize:11,whiteSpace:"nowrap",color:"var(--text-secondary)"}}>{fmtDate(tx.date)}</td>
+                                  <td><Tag type="model" label={mName} id={tx.model_id}/></td>
+                                  <td style={{fontSize:11}}>{tx.product||tx.tag||"—"}</td>
+                                  <td style={{fontWeight:800,color:"var(--success)"}}>{fmtAmount(tx.amount,tx.currency)}</td>
+                                  <td><StatusPill status={tx.status} lang={lang}/></td>
+                                  {(user.role==="gerant"||user.role==="provider")&&(
+                                    <td style={{whiteSpace:"nowrap"}}>
+                                      {canEdit&&<button className="btn-edit" style={{marginRight:4}} onClick={()=>setEditingTx(tx)}>✏️</button>}
+                                      {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
+                                        <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>handleSpStatus(tx.id,"validated")} disabled={!!processingTxId}>{processingTxId===tx.id?<Spinner size={12}/>:"✓"}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>setConfirmRefuse(tx)} disabled={!!processingTxId}>{processingTxId===tx.id?<Spinner size={12}/>:"✕"}</button></>
+                                      )}
+                                    </td>
+                                  )}
+                                </tr>
+                              );
+                            })}
+                            {txSorted.length===0&&<tr><td colSpan={6} style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr?"Aucune transaction":"No transactions"}</td></tr>}
+                          </tbody>
+                        </table>
                       </div>
-                    </div>
+                      <div style={{display:"flex",justifyContent:"flex-end",padding:"10px 0",borderTop:"1px solid var(--border-subtle)"}}>
+                        <span style={{fontSize:13,color:"var(--text-tertiary)",marginRight:8}}>{fr?"Total dépensé :":"Total spent:"}</span>
+                        <span style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{totalSpent.toFixed(0)}{currencySymbol}</span>
+                      </div>
+                    </>
                   );
-                  return null;
                 })()}
-                {/* Model / Chatter / Provider breakdown tabs */}
-                <div style={{display:"flex",gap:4,marginBottom:10,flexWrap:"wrap"}}>
-                  <button className={`filter-chip ${detailTab==="models"?"active":""}`} onClick={()=>setDetailTab("models")} style={{fontSize:10,padding:"3px 10px"}}>{"\u{1F469}"} {fr?"Modèles":"Models"}</button>
-                  <button className={`filter-chip ${detailTab==="chatters"?"active":""}`} onClick={()=>setDetailTab("chatters")} style={{fontSize:10,padding:"3px 10px"}}>{"\u{1F4AC}"} Chatters</button>
-                  <button className={`filter-chip ${detailTab==="providers"?"active":""}`} onClick={()=>setDetailTab("providers")} style={{fontSize:10,padding:"3px 10px"}}>{"\u{1F512}"} Providers</button>
-                  <button className={`filter-chip ${detailTab==="txs"?"active":""}`} onClick={()=>setDetailTab("txs")} style={{fontSize:10,padding:"3px 10px"}}>{"\u{1F4CB}"} TX</button>
-                </div>
-
-            {/* MODEL BREAKDOWN */}
-            {detailTab==="models" && (
-              <div className="profile-section">
-                <div className="profile-section-title" style={{marginBottom:8}}>{fr?"Depenses par Modele":"Spending by Model"}</div>
-                {selected.modelBreakdown.length>1 && (
-                  <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:10}}>
-                    <button className={`filter-chip ${detailModel===""?"active":""}`} onClick={()=>setDetailModel("")} style={{fontSize:10,padding:"3px 10px"}}>{fr?"Tous":"All"}</button>
-                    {selected.modelBreakdown.map(mb=>(
-                      <button key={mb.id} className={`filter-chip ${detailModel===mb.id?"active":""}`} onClick={()=>setDetailModel(mb.id)} style={{fontSize:10,padding:"3px 10px"}}>{mb.name}</button>
-                    ))}
-                  </div>
-                )}
-                {(detailModel ? selected.modelBreakdown.filter(mb=>mb.id===detailModel) : selected.modelBreakdown).map(mb=>(
-                  <div key={mb.id} style={{background:"var(--accent-subtle)",borderRadius:10,padding:12,marginBottom:8,border:"1px solid var(--accent-muted)"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
-                      <Tag type="model" label={mb.name} id={mb.id}/>
-                      <span style={{fontWeight:700,fontSize:16}}>{mb.ca}{currencySymbol} <span style={{fontSize:11,color:"var(--text2)",fontWeight:400}}>({mb.pct.toFixed(0)}%)</span></span>
-                    </div>
-                    <div style={{background:"var(--accent-subtle)",borderRadius:4,height:6,marginBottom:8,overflow:"hidden"}}>
-                      <div style={{background:"var(--accent)",height:"100%",width:`${mb.pct}%`,borderRadius:4,transition:"width 0.3s"}}></div>
-                    </div>
-                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:11}}>
-                      <div><span style={{color:"var(--text2)"}}>{fr?"Valide":"Valid"}</span><br/><span style={{color:"var(--success)",fontWeight:600}}>{mb.validated}{currencySymbol}</span></div>
-                      <div><span style={{color:"var(--text2)"}}>Pending</span><br/><span style={{color:"var(--warning)",fontWeight:600}}>{mb.pending}{currencySymbol}</span></div>
-                      <div><span style={{color:"var(--text2)"}}>TX</span><br/><span style={{fontWeight:600}}>{mb.txCount}</span></div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* CHATTER BREAKDOWN */}
-            {detailTab==="chatters" && (
-              <div className="profile-section">
-                <div className="profile-section-title" style={{marginBottom:8}}>💬 {fr?"CA par Chatter":"Revenue by Chatter"}</div>
-                {selected.chatterBreakdown.length===0 ? (
-                  <div style={{color:"var(--text-tertiary)",fontSize:12,textAlign:"center",padding:20}}>{fr?"Aucun chatter":"No chatters"}</div>
-                ) : selected.chatterBreakdown.map(ch=>(
-                  <div key={ch.id} style={{background:"rgba(96,165,250,0.05)",borderRadius:10,padding:12,marginBottom:8,border:"1px solid rgba(96,165,250,0.15)"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-                      <span style={{fontWeight:700,color:"var(--blue-accent)"}}>{ch.name}</span>
-                      <span style={{fontWeight:700,fontSize:16}}>{ch.ca}{currencySymbol}</span>
-                    </div>
-                    <div style={{background:"rgba(96,165,250,0.1)",borderRadius:4,height:5,marginBottom:6,overflow:"hidden"}}>
-                      <div style={{background:"var(--blue-accent)",height:"100%",width:`${selected.ltv>0?((ch.ca/selected.ltv)*100):0}%`,borderRadius:4}}></div>
-                    </div>
-                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:11}}>
-                      <div><span style={{color:"var(--text2)"}}>TX</span><br/><span style={{fontWeight:600}}>{ch.count}</span></div>
-                      <div><span style={{color:"var(--text2)"}}>{fr?"Valide":"Valid"}</span><br/><span style={{color:"var(--success)",fontWeight:600}}>{ch.validated}{currencySymbol}</span></div>
-                      <div><span style={{color:"var(--text2)"}}>Pending</span><br/><span style={{color:"var(--warning)",fontWeight:600}}>{ch.pending}{currencySymbol}</span></div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* PROVIDER BREAKDOWN */}
-            {detailTab==="providers" && (
-              <div className="profile-section">
-                <div className="profile-section-title" style={{marginBottom:8}}>🔒 {fr?"CA par Provider":"Revenue by Provider"}</div>
-                {selected.providerBreakdown.length===0 ? (
-                  <div style={{color:"var(--text-tertiary)",fontSize:12,textAlign:"center",padding:20}}>{fr?"Aucun provider":"No providers"}</div>
-                ) : selected.providerBreakdown.map(pv=>(
-                  <div key={pv.id} style={{background:"var(--warning-muted)",borderRadius:10,padding:12,marginBottom:8,border:"1px solid var(--warning-muted)"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
-                      <span style={{fontWeight:700,color:"var(--warning)"}}>{pv.name}</span>
-                      <span style={{fontWeight:700,fontSize:16}}>{pv.ca}{currencySymbol}</span>
-                    </div>
-                    <div style={{background:"var(--warning-muted)",borderRadius:4,height:5,marginBottom:6,overflow:"hidden"}}>
-                      <div style={{background:"var(--warning)",height:"100%",width:`${selected.ltv>0?((pv.ca/selected.ltv)*100):0}%`,borderRadius:4}}></div>
-                    </div>
-                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,fontSize:11}}>
-                      <div><span style={{color:"var(--text2)"}}>TX</span><br/><span style={{fontWeight:600}}>{pv.count}</span></div>
-                      <div><span style={{color:"var(--text2)"}}>{fr?"Valide":"Valid"}</span><br/><span style={{color:"var(--success)",fontWeight:600}}>{pv.validated}{currencySymbol}</span></div>
-                      <div><span style={{color:"var(--text2)"}}>Pending</span><br/><span style={{color:"var(--warning)",fontWeight:600}}>{pv.pending}{currencySymbol}</span></div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* TX LIST */}
-            {detailTab==="txs" && (
-              <div className="profile-section">
-                <div className="profile-section-title" style={{marginBottom:8}}>📋 {fr?"Transactions":"Transactions"} ({selected.cnt})</div>
-                <div className="table-wrap">
-                  <table className="table" style={{fontSize:10}}>
-                    <thead><tr><th>Date</th><th>{t(lang,"amount")}</th><th>{fr?"Produit":"Product"}</th><th>Tag</th><th>{fr?"Modele":"Model"}</th><th>Chatter</th><th>Provider</th><th>{t(lang,"status")}</th><th>{t(lang,"actions")}</th></tr></thead>
-                    <tbody>
-                      {selected.txs.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0)).slice(0,20).map((tx,idx)=>{
-                        const mName = models.find(m=>m.id===tx.model_id)?.name||"?";
-                        const cName = profiles.find(p=>p.id===tx.chatter_id)?.name||"?";
-                        const pName = profiles.find(p=>p.id===tx.provider_id)?.name||"?";
-                        const canEdit = tx.status==="pending"&&(user.role==="gerant"||user.role==="chatter"||(user.role==="provider"&&tx.provider_id===user.id));
-                        return (
-                          <tr key={tx.id||idx}>
-                            <td>{fmtDate(tx.date)}</td>
-                            <td style={{fontWeight:700}}>{fmtAmount(tx.amount,tx.currency)}</td>
-                            <td>{tx.product||"—"}</td>
-                            <td>{tx.tag||"—"}</td>
-                            <td>{mName}</td>
-                            <td style={{color:"var(--blue-accent)"}}>{cName}</td>
-                            <td style={{color:"var(--warning)"}}>{pName}</td>
-                            <td><StatusPill status={tx.status} lang={lang}/></td>
-                            <td style={{whiteSpace:"nowrap"}}>
-                              {canEdit&&<button className="btn-edit" style={{marginRight:4}} onClick={()=>setEditingTx(tx)}>✏️ Modifier</button>}
-                              {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
-                                <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>handleSpStatus(tx.id,"validated")} disabled={!!processingTxId}>{processingTxId===tx.id?<Spinner size={12}/>:t(lang,"validate")}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>setConfirmRefuse(tx)} disabled={!!processingTxId}>{processingTxId===tx.id?<Spinner size={12}/>:t(lang,"refuse")}</button></>
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                  {selected.cnt>20 && <div style={{fontSize:10,color:"var(--text2)",textAlign:"center",marginTop:4}}>+{selected.cnt-20} {fr?"autres":"more"}</div>}
-                </div>
-              </div>
-            )}
-
-              </div>
-            )}
-            {/* ── ANALYTICS TAB ── */}
-            {spModalTab==="analytics" && (
-              <div>
-                <div style={{fontSize:13,fontWeight:700,marginBottom:14}}>{"\u{1F4CA}"} VIP Score Analysis</div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:20}}>
-                  <div style={{padding:16,borderRadius:14,background:"var(--bg-overlay)"}}>
-                    <div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:8}}>VIP Score</div>
-                    <div style={{fontSize:36,fontWeight:800,color:computeVIPScore(selected)>=70?"var(--success)":computeVIPScore(selected)>=40?"var(--warning)":"var(--danger)",marginBottom:8}}>{computeVIPScore(selected)}<span style={{fontSize:16,fontWeight:400,color:"var(--text-quaternary)"}}>/100</span></div>
-                    <VIPScoreBar score={computeVIPScore(selected)}/>
-                  </div>
-                  <div style={{padding:16,borderRadius:14,background:"var(--bg-overlay)"}}>
-                    <div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:8}}>{fr?"Composantes":"Components"}</div>
-                    {(()=>{
-                      const ltv=selected.ltv||0,cnt=selected.cnt||0,aov=cnt>0?ltv/cnt:0;
-                      const txArr=selected.txs||[];const now30=Date.now()-30*86400000;const txL30=txArr.filter(tx=>new Date(tx.date).getTime()>now30).length;
-                      const sortedTx=[...txArr].sort((a,b)=>new Date(b.date)-new Date(a.date));
-                      const lastD=sortedTx.length>0?new Date(sortedTx[0].date):null;const dSL=lastD?Math.floor((Date.now()-lastD.getTime())/86400000):365;
-                      return [{l:"LTV (40%)",v:Math.round(Math.min(ltv/1000,1)*40),mx:40,c:"var(--success)"},{l:fr?"Fréquence (25%)":"Frequency (25%)",v:Math.round(Math.min(txL30/5,1)*25),mx:25,c:"var(--blue-accent)"},{l:fr?"Récence (20%)":"Recency (20%)",v:Math.round(Math.max(1-dSL/90,0)*20),mx:20,c:"var(--warning)"},{l:"AOV (15%)",v:Math.round(Math.min(aov/200,1)*15),mx:15,c:"var(--accent)"}].map(c=>(
-                        <div key={c.l} style={{marginBottom:6}}>
-                          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:2}}><span style={{color:"var(--text-tertiary)"}}>{c.l}</span><span style={{fontWeight:700,color:c.c}}>{c.v}/{c.mx}</span></div>
-                          <div style={{height:4,borderRadius:2,background:"var(--border-subtle)",overflow:"hidden"}}><div style={{height:"100%",width:`${(c.v/c.mx)*100}%`,borderRadius:2,background:c.c}}/></div>
-                        </div>
-                      ));
-                    })()}
-                  </div>
-                </div>
-                <div style={{marginBottom:16}}>
-                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>Auto-Badges</div>
-                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                    {computeSpenderBadges(selected).length>0?computeSpenderBadges(selected).map(b=>(
-                      <span key={b.label} style={{padding:"4px 12px",borderRadius:10,background:b.bg,color:b.color,fontSize:11,fontWeight:700}}>{b.icon} {b.label}</span>
-                    )):<span style={{color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucun badge":"No badges"}</span>}
-                  </div>
-                </div>
-                {(()=>{const _scChecks=(window.__screenshotChecks||[]).filter(c=>c.spender_id===selected.id);const _scSub=_scChecks.length;const _scVal=_scChecks.filter(c=>c.status==="validated").length;const _scRej=_scChecks.filter(c=>c.status==="rejected").length;const _scamFlag=selected.scam_flag||(selected.scam_count&&selected.scam_count>=2);return _scSub>0||_scamFlag?(
-                <div style={{marginBottom:16}}>
-                  <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{"\u{1F4F8}"} Scan Checker</div>
-                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8}}>
-                    <div style={{padding:10,borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Soumis</div><div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{_scSub}</div></div>
-                    <div style={{padding:10,borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Validés</div><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{_scVal}</div></div>
-                    <div style={{padding:10,borderRadius:10,background:"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Rejetés</div><div style={{fontSize:16,fontWeight:800,color:"var(--danger)"}}>{_scRej}</div></div>
-                    <div style={{padding:10,borderRadius:10,background:_scamFlag?"rgba(239,68,68,0.1)":"var(--bg-overlay)",textAlign:"center"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Scam flag</div><div style={{fontSize:14,fontWeight:800,color:_scamFlag?"var(--danger)":"var(--success)"}}>{_scamFlag?"\u{1F6A8} OUI":"✅ NON"}</div></div>
-                  </div>
-                </div>
-                ):null;})()}
-                <div style={{fontSize:12,fontWeight:700,marginBottom:8}}>{fr?"Prédictions":"Predictions"}</div>
-                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12}}>
-                  {(()=>{
-                    const vip=computeVIPScore(selected);
-                    const churnRisk=vip<30?(fr?"Élevé":"High"):vip<60?(fr?"Moyen":"Medium"):(fr?"Faible":"Low");
-                    const churnColor=vip<30?"var(--danger)":vip<60?"var(--warning)":"var(--success)";
-                    const upsell=selected.cnt>=3&&vip>=40?(fr?"Bon potentiel":"Good potential"):(fr?"À développer":"To develop");
-                    const nextBuy=vip>=60?(fr?"< 7 jours":"< 7 days"):vip>=30?(fr?"< 30 jours":"< 30 days"):(fr?"Incertain":"Uncertain");
-                    return [{l:fr?"Risque churn":"Churn risk",v:churnRisk,c:churnColor,i:"⚠️"},{l:fr?"Prochain achat":"Next purchase",v:nextBuy,c:"var(--text-secondary)",i:"\u{1F4C5}"},{l:"Upsell",v:upsell,c:"var(--accent)",i:"\u{1F4B0}"}].map(p=>(
-                      <div key={p.l} style={{padding:14,borderRadius:12,background:"var(--bg-overlay)",textAlign:"center"}}>
-                        <div style={{fontSize:18,marginBottom:4}}>{p.i}</div>
-                        <div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:4}}>{p.l}</div>
-                        <div style={{fontSize:13,fontWeight:700,color:p.c}}>{p.v}</div>
-                      </div>
-                    ));
-                  })()}
-                </div>
-                {selected.txs.length>0 && (
-                  <div style={{marginTop:16,padding:12,borderRadius:12,background:"var(--bg-overlay)"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"var(--text-tertiary)"}}><span>{t(lang,"first_tx")}: {fmtDate(selected.txs[selected.txs.length-1]?.date)}</span><span>{t(lang,"last_activity")}: {fmtDate(selected.txs[0]?.date)}</span></div>
-                  </div>
-                )}
               </div>
             )}
             </div>
