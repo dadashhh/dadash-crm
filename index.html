@@ -4083,7 +4083,7 @@ const DASHBOARD_MODELS = ["Carla", "Sophie", "TS"];
 const DASHBOARD_METRICS = [
   { id: "ca_brut",         label: "CA BRUT",        color: "#8b5cf6", calc: (d) => d.caBrut,        fmt: "currency", inGraph: true  },
   { id: "ca_net",          label: "CA NET",          color: "#10b981", calc: (d) => d.caNet,         fmt: "currency", inGraph: true  },
-  { id: "transactions",    label: "CA BRUT EN ATTENTE", color: "#f59e0b", calc: (d) => d.caBrutPending, fmt: "currency", inGraph: false },
+  { id: "transactions",    label: "CA BRUT EN ATTENTE", color: "#f97316", calc: (d) => d.caBrutPending, fmt: "currency", inGraph: true  },
   { id: "tx_pending",      label: "TX EN ATTENTE",   color: "#f97316", calc: (d) => d.txPending,     fmt: "number",   inGraph: false },
   { id: "panier_moyen",    label: "PANIER MOYEN",    color: "#06b6d4", calc: (d) => d.panierMoyen,   fmt: "currency", inGraph: true  },
   { id: "taux_validation", label: "TAUX VALIDATION", color: "#e2e8f0", calc: (d) => d.tauxValidation,fmt: "percent",  inGraph: true  },
@@ -4276,7 +4276,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     const dEnd = new Date(dateFin); dEnd.setHours(23, 59, 59, 999);
     for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
       const key = d.toISOString().slice(0, 10);
-      byDay[key] = { date: key, ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0 };
+      byDay[key] = { date: key, ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0 };
     }
     filteredTxs.forEach(tx => {
       const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
@@ -4288,13 +4288,14 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       if (isVal) byDay[key].ca_net += convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency);
       byDay[key].total += 1;
       if (isVal) byDay[key].valid += 1;
-      if (isPend) byDay[key].pending += 1;
+      if (isPend) { byDay[key].pending += 1; byDay[key].ca_brut_pending += amt; }
     });
     return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
       date,
       label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
       ca_brut: Math.round(d.ca_brut),
       ca_net: Math.round(d.ca_net),
+      transactions: Math.round(d.ca_brut_pending),
       panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
       taux_validation: (d.valid + d.pending) > 0 ? Math.round((d.valid / (d.valid + d.pending)) * 100) : 0,
     }));
@@ -4414,13 +4415,24 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
           const val = m.calc(kpiData);
           const deltaKey = { ca_brut: "deltaCaBrut", ca_net: "deltaCaNet", transactions: "deltaCaBrutPending", tx_pending: "deltaTxPending", panier_moyen: "deltaPanier", taux_validation: "deltaTaux" }[m.id];
           const delta = kpiData[deltaKey];
-          const cardStyle = m.inGraph ? kpiCardStyle(m.id) : { background: "var(--surface)", border: "1px solid var(--border)", borderBottom: "2px solid transparent", borderRadius: 12, padding: "14px 16px", cursor: "default", transition: "all 0.2s" };
+          const isPendingListCard = m.id === "tx_pending";
+          const cardStyle = m.inGraph
+            ? kpiCardStyle(m.id)
+            : isPendingListCard
+              ? { background: "var(--surface)", border: "1px solid var(--border)", borderBottom: "2px solid transparent", borderRadius: 12, padding: "14px 16px", cursor: "pointer", transition: "all 0.2s" }
+              : { background: "var(--surface)", border: "1px solid var(--border)", borderBottom: "2px solid transparent", borderRadius: 12, padding: "14px 16px", cursor: "default", transition: "all 0.2s" };
+          const handleClick = m.inGraph
+            ? () => toggleMetric(m.id)
+            : isPendingListCard
+              ? () => setPopup("pending_list")
+              : undefined;
           return (
-            <div key={m.id} onClick={m.inGraph ? () => toggleMetric(m.id) : undefined} style={cardStyle}>
+            <div key={m.id} onClick={handleClick} style={cardStyle}>
               <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>{m.label}</div>
               <div style={{ fontSize: 20, fontWeight: 800, color: m.inGraph && activeMetrics.has(m.id) ? m.color : m.inGraph ? "var(--text)" : m.color, lineHeight: 1.1 }}>{fmtVal(m.id, val)}</div>
               {delta != null && !isNaN(delta) && <div style={{ fontSize: 10, fontWeight: 700, color: delta >= 0 ? "#10b981" : "#ef4444", marginTop: 4 }}>{delta >= 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>}
               {m.inGraph && <div style={{ fontSize: 9, color: "var(--muted2)", marginTop: 5 }}>Cliquer → graphe</div>}
+              {isPendingListCard && <div style={{ fontSize: 9, color: "var(--muted2)", marginTop: 5 }}>Cliquer → liste</div>}
             </div>
           );
         })}
@@ -4747,6 +4759,34 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
             );
           })}
         </div>
+      </DashModal>
+
+      {/* ═══ POPUP PENDING LIST ═══ */}
+      <DashModal open={popup === "pending_list"} onClose={() => setPopup(null)} title="⏳ Transactions en attente" maxWidth={820}>
+        {(() => {
+          const pendingTxs = [...allTxs].filter(tx => tx.status === "pending").sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at));
+          if (pendingTxs.length === 0) return <div style={{ textAlign: "center", padding: "40px 0", color: "var(--muted)", fontSize: 14 }}>Aucune transaction en attente</div>;
+          return pendingTxs.map((tx, i) => {
+            const mod = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
+            const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
+            const prov = allProfiles.find(p => p.id === tx.provider_id);
+            return (
+              <div key={tx.id || i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "#f8fafc" }}>@{tx.spender_handle || "?"}</div>
+                  <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{mod?.name || "?"} · {ppm?.label || prov?.name || "?"}</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {currencySymbol}</div>
+                    <div style={{ fontSize: 10, color: "#64748b" }}>{new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</div>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: "#f59e0b22", color: "#f59e0b", minWidth: 50, textAlign: "center" }}>PEND.</span>
+                </div>
+              </div>
+            );
+          });
+        })()}
       </DashModal>
 
       {/* ═══ POPUP TX ═══ */}
