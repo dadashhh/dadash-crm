@@ -14493,8 +14493,10 @@ const ChatterMessagerieTab = ({user, lang, spenders}) => {
 };
 
 // =============================================
-// TELEGRAM BETA — Messagerie lecture seule (gerant/chatter)
+// TELEGRAM BETA — Messagerie (gerant/chatter) + enforcement messaging_permissions
 // =============================================
+const DEFAULT_MP = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
+
 const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
   const addToast = useToast();
   const fr = lang === "fr";
@@ -14515,6 +14517,13 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
 
   const debouncedSearch = useDebounce(searchQuery, DEBOUNCE_DELAY);
 
+  const getMessagingPerm = useCallback((key) => {
+    if (user?.role === "gerant") return true;
+    const mp = (profiles || []).find(p => p.id === user?.id)?.messaging_permissions || user?.messaging_permissions;
+    if (mp && typeof mp === "object" && mp[key] !== undefined) return !!mp[key];
+    return !!DEFAULT_MP[key];
+  }, [user?.id, user?.role, user?.messaging_permissions, profiles]);
+
   const loadConversations = useCallback(async () => {
     if (!user) return;
     if (user.role === "provider" || user.role === "modele") { setLoading(false); return; }
@@ -14523,8 +14532,9 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
     try {
       let q = sb.from("tg_conversations").select("*").order("last_message_at", { ascending: false });
       if (user.role === "chatter") {
+        const viewAllAssigned = getMessagingPerm("can_view_all_assigned");
         const myModelIds = user.assigned_models || [];
-        if (myModelIds.length > 0) {
+        if (viewAllAssigned && myModelIds.length > 0) {
           q = q.or(`assigned_chatter_id.eq.${user.id},model_id.in.(${myModelIds.join(",")})`);
         } else {
           q = q.eq("assigned_chatter_id", user.id);
@@ -14539,7 +14549,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
       setConversations([]);
     }
     setLoading(false);
-  }, [user?.id, user?.role, user?.assigned_models, fr, addToast]);
+  }, [user?.id, user?.role, user?.assigned_models, getMessagingPerm, fr, addToast]);
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
@@ -14591,6 +14601,10 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
 
   const sendMessage = useCallback(async () => {
     if (!selectedConv || !msgInput.trim() || sending) return;
+    if (user.role === "chatter" && !getMessagingPerm("can_send")) {
+      addToast(fr ? "Envoi non autorisé" : "Sending not allowed", "error");
+      return;
+    }
     const convClosed = selectedConv.status === "closed";
     if (convClosed) {
       addToast(fr ? "Conversation fermée" : "Conversation closed", "error");
@@ -14631,7 +14645,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
     } finally {
       setSending(false);
     }
-  }, [selectedConv, msgInput, sending, user?.id, fr, addToast, loadMessages]);
+  }, [selectedConv, msgInput, sending, user?.id, user?.role, getMessagingPerm, fr, addToast, loadMessages]);
 
   const getSpenderName = (conv) => {
     if (!conv?.spender_id) return conv?.tg_chat_id || "—";
@@ -14667,7 +14681,10 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
   const chatters = (profiles || []).filter(p => p.role === "chatter");
 
   const assignToChatter = useCallback(async (chatterId) => {
-    if (!selectedConv || user.role !== "gerant") return;
+    if (!selectedConv) return;
+    if (user.role === "gerant") { /* full access */ }
+    else if (user.role === "chatter" && !getMessagingPerm("can_assign")) return;
+    else if (user.role !== "chatter") return;
     setAssigning(true);
     setAssignDropdown(false);
     try {
@@ -14690,10 +14707,13 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
     } finally {
       setAssigning(false);
     }
-  }, [selectedConv, user?.id, user?.role, fr, addToast, loadConversations]);
+  }, [selectedConv, user?.id, user?.role, getMessagingPerm, fr, addToast, loadConversations]);
 
   const closeConversation = useCallback(async () => {
-    if (!selectedConv || user.role !== "gerant") return;
+    if (!selectedConv) return;
+    if (user.role === "gerant") { /* full access */ }
+    else if (user.role === "chatter" && !getMessagingPerm("can_close")) return;
+    else if (user.role !== "chatter") return;
     if (selectedConv.status === "closed") return;
     setClosing(true);
     try {
@@ -14716,7 +14736,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
     } finally {
       setClosing(false);
     }
-  }, [selectedConv, user?.id, user?.role, fr, addToast, loadConversations]);
+  }, [selectedConv, user?.id, user?.role, getMessagingPerm, fr, addToast, loadConversations]);
 
   if (user.role === "provider" || user.role === "modele") {
     return (
@@ -14800,13 +14820,14 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
                     {fr?"Assigné à":"Assigned to"}: {getChatterName(selectedConv.assigned_chatter_id) || "—"}
                   </div>
                 </div>
-                {user.role === "gerant" && (
+                {((user.role === "gerant") || (user.role === "chatter" && (getMessagingPerm("can_close") || getMessagingPerm("can_assign")))) && (
                   <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                    {selectedConv.status !== "closed" && (
+                    {selectedConv.status !== "closed" && (user.role === "gerant" || getMessagingPerm("can_close")) && (
                       <button className="btn btn-small" onClick={closeConversation} disabled={closing} style={{fontSize:11,background:"var(--danger)",color:"#fff",border:"none"}}>
                         {closing ? React.createElement(Spinner) : "\u{1F512}"} {fr?"Fermer":"Close"}
                       </button>
                     )}
+                    {(user.role === "gerant" || getMessagingPerm("can_assign")) && (
                     <div style={{position:"relative"}}>
                     <button className="btn btn-small" onClick={()=>setAssignDropdown(!assignDropdown)} disabled={assigning} style={{fontSize:11}}>
                       {assigning ? React.createElement(Spinner) : "\u{1F464}"} {fr?"Assigner":"Assign"}
@@ -14823,6 +14844,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
                       </div>
                     )}
                     </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -14842,10 +14864,14 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
                 {!msgLoading && messages.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr ? "Aucun message" : "No messages"}</div>}
               </div>
               {selectedConv.status !== "closed" && (
+                getMessagingPerm("can_send") ? (
                 <div style={{padding:14,borderTop:"1px solid var(--border-subtle)",display:"flex",gap:8}}>
                   <textarea className="filter-select" style={{flex:1,resize:"none",minHeight:40,maxHeight:100,padding:"10px 12px"}} value={msgInput} onChange={e=>setMsgInput(e.target.value)} placeholder={fr?"Écrire un message..." : "Write a message..."} onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage();}}} disabled={sending} />
                   <button className="btn btn-primary" onClick={sendMessage} disabled={sending||!msgInput.trim()} style={{alignSelf:"flex-end"}}>{sending?React.createElement(Spinner):(fr?"Envoyer":"Send")}</button>
                 </div>
+                ) : (
+                <div style={{padding:14,borderTop:"1px solid var(--border-subtle)",fontSize:12,color:"var(--text-tertiary)"}}>{fr?"Envoi non autorisé — contacte le gérant pour modifier tes permissions":"Sending not allowed — contact manager to update your permissions"}</div>
+                )
               )}
               {selectedConv.status === "closed" && (
                 <div style={{padding:14,borderTop:"1px solid var(--border-subtle)",fontSize:12,color:"var(--text-tertiary)"}}>{fr?"Conversation fermée — envoi désactivé":"Conversation closed — sending disabled"}</div>
