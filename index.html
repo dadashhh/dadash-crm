@@ -14899,7 +14899,9 @@ const DEFAULT_MESSAGING_PERMS = { can_send: true, can_close: false, can_assign: 
 const BOT_STATUS_ENDPOINT = "/bot/status";
 const BOT_STATUS_TIMEOUT_MS = 8000;
 
-const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, onRefresh}) => {
+const ASSIGN_COLUMNS = ["assigned_chatter_id", "assigned_to", "assigned_profile_id"];
+
+const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spenders, onRefresh}) => {
   const fr = lang === "fr";
   const addToast = useToast();
   const [savingChatterId, setSavingChatterId] = useState(null);
@@ -14907,6 +14909,13 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, onR
   const [botStatus, setBotStatus] = useState(null);
   const [botStatusLoading, setBotStatusLoading] = useState(false);
   const [botStatusError, setBotStatusError] = useState(null);
+  const [convs, setConvs] = useState([]);
+  const [convsLoading, setConvsLoading] = useState(false);
+  const [selectedConvId, setSelectedConvId] = useState(null);
+  const [selectedChatterId, setSelectedChatterId] = useState("");
+  const [assignLoading, setAssignLoading] = useState(false);
+  const [assignColumn, setAssignColumn] = useState(null);
+  const [assignError, setAssignError] = useState(null);
 
   const chatters = (profiles || []).filter(p => p.role === "chatter");
 
@@ -14947,6 +14956,59 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, onR
   }, [fr]);
 
   useEffect(() => { fetchBotStatus(); }, [fetchBotStatus]);
+
+  const fetchConvsAndDetectColumn = useCallback(async () => {
+    setConvsLoading(true);
+    setAssignError(null);
+    try {
+      let col = null;
+      for (const c of ASSIGN_COLUMNS) {
+        const { error } = await sb.from("tg_conversations").select("id," + c).limit(1);
+        if (!error) { col = c; break; }
+      }
+      setAssignColumn(col);
+      const { data: list, error: listErr } = await sb.from("tg_conversations").select("*").order("last_message_at", { ascending: false }).limit(100);
+      if (listErr) throw new Error(listErr.message);
+      setConvs(list || []);
+    } catch (e) {
+      setAssignError((e?.message || String(e)));
+      setConvs([]);
+    } finally {
+      setConvsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { fetchConvsAndDetectColumn(); }, [fetchConvsAndDetectColumn]);
+
+  const selectedConv = selectedConvId ? (convs || []).find(c => c.id === selectedConvId) : null;
+  const assignedChatterId = selectedConv && assignColumn ? selectedConv[assignColumn] : null;
+
+  const doAssign = useCallback(async (chatterId) => {
+    if (!selectedConv || !assignColumn) return;
+    setAssignLoading(true);
+    setAssignError(null);
+    try {
+      const payload = {};
+      payload[assignColumn] = chatterId || null;
+      const { error } = await sb.from("tg_conversations").update(payload).eq("id", selectedConv.id);
+      if (error) throw new Error(error.message);
+      addToast(fr ? (chatterId ? "Chatter assigné" : "Assignation supprimée") : (chatterId ? "Chatter assigned" : "Assignment removed"), "success");
+      await fetchConvsAndDetectColumn();
+      if (onRefresh) await onRefresh();
+    } catch (e) {
+      const msg = e?.message || String(e);
+      setAssignError(msg);
+      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
+    } finally {
+      setAssignLoading(false);
+    }
+  }, [selectedConv, assignColumn, fr, addToast, fetchConvsAndDetectColumn, onRefresh]);
+
+  const getSpenderLabel = (conv) => {
+    if (!conv?.spender_id) return conv?.tg_chat_id || conv?.id || "—";
+    const sp = (spenders || []).find(s => s.id === conv.spender_id);
+    return sp ? (sp.first_name || sp.handle || sp.email || conv.tg_chat_id) : (conv.tg_chat_id || "—");
+  };
 
   const getPerm = (chatter, key) => {
     try {
@@ -15101,6 +15163,59 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, onR
             );
           })}
         </div>
+      </div>
+
+      {/* Assignation conversation */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:20}}>
+        <h3 style={{fontSize:15,fontWeight:700,margin:"0 0 16px"}}>{"\u{1F4DD}"} {fr ? "Assignation conversation" : "Conversation assignment"}</h3>
+        {!assignColumn && !convsLoading && (
+          <div style={{fontSize:12,color:"var(--danger)"}}>{fr ? "Colonne d'assignation absente dans tg_conversations" : "Assignment column missing in tg_conversations"}</div>
+        )}
+        {assignColumn && (
+          <>
+            <div style={{marginBottom:12}}>
+              <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:4}}>{fr ? "Conversation" : "Conversation"}</label>
+              <select value={selectedConvId||""} onChange={e=>{setSelectedConvId(e.target.value||null);setSelectedChatterId("");}} disabled={convsLoading} style={{fontSize:12,padding:"8px 12px",borderRadius:8,border:"1px solid var(--border-subtle)",background:"var(--bg-base)",color:"var(--text-primary)",minWidth:200}}>
+                <option value="">{fr ? "— Sélectionner une conversation —" : "— Select a conversation —"}</option>
+                {(convs||[]).map(c=>(
+                  <option key={c.id} value={c.id}>{getSpenderLabel(c)} ({c.tg_chat_id||c.id})</option>
+                ))}
+              </select>
+              {convsLoading && <span style={{marginLeft:8,fontSize:10,color:"var(--text-tertiary)"}}>{React.createElement(Spinner)}</span>}
+            </div>
+            {selectedConv ? (
+              <>
+                <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:8}}>{fr ? "Sélectionnée:" : "Selected:"} {getSpenderLabel(selectedConv)} — {selectedConv.id}</div>
+                <div style={{marginBottom:12}}>
+                  <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:4}}>{fr ? "Chatter" : "Chatter"}</label>
+                  <select value={selectedChatterId} onChange={e=>setSelectedChatterId(e.target.value||"")} disabled={assignLoading} style={{fontSize:12,padding:"8px 12px",borderRadius:8,border:"1px solid var(--border-subtle)",background:"var(--bg-base)",color:"var(--text-primary)",minWidth:200}}>
+                    <option value="">{fr ? "— Non assigné —" : "— Unassigned —"}</option>
+                    {chatters.map(ch=>(
+                      <option key={ch.id} value={ch.id}>{ch.name||ch.email||ch.handle||"?"}</option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                  <button className="btn btn-primary" onClick={()=>doAssign(selectedChatterId||null)} disabled={assignLoading} style={{fontSize:12}}>
+                    {assignLoading ? React.createElement(Spinner) : (fr ? "Assigner" : "Assign")}
+                  </button>
+                  {assignedChatterId && (
+                    <button className="btn btn-small" onClick={()=>doAssign(null)} disabled={assignLoading} style={{fontSize:12}}>
+                      {fr ? "Désassigner" : "Unassign"}
+                    </button>
+                  )}
+                  {assignLoading && <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{fr ? "Chargement…" : "Loading…"}</span>}
+                  {assignError && <span style={{fontSize:11,color:"var(--danger)"}}>{assignError}</span>}
+                </div>
+                {assignedChatterId && (
+                  <div style={{fontSize:11,color:"var(--success)",marginTop:8}}>{fr ? "Assigné à:" : "Assigned to:"} {(chatters.find(c=>c.id===assignedChatterId)?.name||chatters.find(c=>c.id===assignedChatterId)?.email)||"—"}</div>
+                )}
+              </>
+            ) : (
+              <div style={{fontSize:12,color:"var(--text-quaternary)"}}>{fr ? "Sélectionnez une conversation pour assigner un chatter." : "Select a conversation to assign a chatter."}</div>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
@@ -22048,7 +22163,7 @@ const App = () => {
           </div>
           {messagerieSubTab==="whatsapp"&&<GerantMessagerieTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
           {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
-          {messagerieSubTab==="admin_panel"&&user?.role==="gerant"&&<MessagerieGerantAdminPanel user={user} lang={lang} profiles={profiles} models={models} botStats={botStats} onRefresh={onRefresh} />}
+          {messagerieSubTab==="admin_panel"&&user?.role==="gerant"&&<MessagerieGerantAdminPanel user={user} lang={lang} profiles={profiles} models={models} botStats={botStats} spenders={spenders} onRefresh={onRefresh} />}
         </>);
       case "compta":
         return (<>{renderGerantTabBar("compta")}
