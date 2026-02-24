@@ -135,6 +135,21 @@
       --chip-active-bg: var(--accent-muted);
       --chip-active-border: var(--border-accent);
       --chip-active-color: var(--accent);
+      /* — Dashboard redesign — */
+      --surface: #111520;
+      --surface2: #161b27;
+      --border: rgba(255,255,255,0.07);
+      --border2: rgba(255,255,255,0.04);
+      --muted: #4a5568;
+      --muted2: #6b7280;
+      --purple: #7c3aed;
+      --purple-light: #8b5cf6;
+      --purple-glow: rgba(124,58,237,0.15);
+      --green: #10b981;
+      --red: #ef4444;
+      --gold: #f59e0b;
+      --blue: #3b82f6;
+      --cyan: #06b6d4;
     }
     /* ====== LIGHT THEME ====== */
     [data-theme="light"] {
@@ -4060,6 +4075,525 @@ const DashboardAnalytics = ({ user, lang, txs, models, profiles, spenders }) => 
     </div>
   );
 };
+
+// =============================================
+// DASHBOARD REDESIGN — Unified Dashboard
+// =============================================
+const DASHBOARD_MODELS = ["Carla", "Sophie", "TS"];
+const DASHBOARD_METRICS = [
+  { id: "ca_brut", label: "CA Brut", color: "#8b5cf6", calc: (d) => d.caBrut, fmt: "currency" },
+  { id: "ca_net", label: "CA Net", color: "#10b981", calc: (d) => d.caNet, fmt: "currency" },
+  { id: "transactions", label: "Transactions", color: "#f59e0b", calc: (d) => d.txCount, fmt: "number" },
+  { id: "spenders", label: "Spenders", color: "#3b82f6", calc: (d) => d.spenderCount, fmt: "number" },
+  { id: "panier_moyen", label: "Panier Moyen", color: "#06b6d4", calc: (d) => d.panierMoyen, fmt: "currency" },
+  { id: "taux_validation", label: "Taux Validation", color: "#ef4444", calc: (d) => d.tauxValidation, fmt: "percent" },
+];
+
+const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spenders, providerPayouts, providerPaymentMethods, botStats, alerts, navigateTo, navigateToSpender }) => {
+  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+
+  const [period, setPeriod] = useState("30j");
+  const [dateStart, setDateStart] = useState("");
+  const [dateEnd, setDateEnd] = useState("");
+  const [modelFilter, setModelFilter] = useState("all");
+  const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut", "ca_net"]));
+  const [chartView, setChartView] = useState("curve");
+  const [hoveredPoint, setHoveredPoint] = useState(null);
+
+  const allTxs = txs || [];
+  const allModels = models || [];
+  const allProfiles = profiles || [];
+  const modeleProfiles = allProfiles.filter(p => p.role === "modele");
+  const modelOptions = DASHBOARD_MODELS.map(n => {
+    const m = allModels.find(x => (x.name || "").toLowerCase() === n.toLowerCase());
+    const p = modeleProfiles.find(x => (x.name || "").toLowerCase() === n.toLowerCase());
+    const entity = m || p;
+    return entity ? { id: entity.id, name: entity.name || n } : null;
+  }).filter(Boolean);
+
+  const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
+    const now = new Date();
+    let start, end, prevStart, prevEnd;
+    if (period === "custom" && dateStart && dateEnd) {
+      start = new Date(dateStart); end = new Date(dateEnd);
+      const diff = end.getTime() - start.getTime();
+      prevEnd = new Date(start.getTime()); prevStart = new Date(start.getTime() - diff);
+    } else {
+      const days = period === "24h" ? 1 : period === "7j" ? 7 : period === "30j" ? 30 : period === "90j" ? 90 : 99999;
+      end = new Date(now); end.setHours(23, 59, 59, 999);
+      start = new Date(now); start.setDate(start.getDate() - days); start.setHours(0, 0, 0, 0);
+      prevEnd = new Date(start.getTime()); prevEnd.setMilliseconds(-1);
+      prevStart = new Date(prevEnd.getTime()); prevStart.setDate(prevStart.getDate() - days);
+    }
+    return { dateDebut: start, dateFin: end, prevDateDebut: prevStart, prevDateFin: prevEnd };
+  }, [period, dateStart, dateEnd]);
+
+  const filteredTxs = useMemo(() => {
+    return allTxs.filter(tx => {
+      const d = new Date(tx.date || tx.created_at).getTime();
+      if (d < dateDebut.getTime() || d > dateFin.getTime()) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
+    });
+  }, [allTxs, dateDebut, dateFin, modelFilter]);
+
+  const prevFilteredTxs = useMemo(() => {
+    return allTxs.filter(tx => {
+      const d = new Date(tx.date || tx.created_at).getTime();
+      if (d < prevDateDebut.getTime() || d > prevDateFin.getTime()) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
+    });
+  }, [allTxs, prevDateDebut, prevDateFin, modelFilter]);
+
+  const kpiData = useMemo(() => {
+    const valid = filteredTxs.filter(tx => tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee");
+    const pending = filteredTxs.filter(tx => tx.status === "pending");
+    const brutTxs = [...valid, ...pending];
+    const caBrut = brutTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const caNet = valid.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+    const txCount = brutTxs.length;
+    const spenderSet = new Set(brutTxs.map(tx => tx.spender_handle || tx.spender_id).filter(Boolean));
+    const panierMoyen = txCount > 0 ? caBrut / txCount : 0;
+    const tauxValidation = brutTxs.length > 0 ? (valid.length / brutTxs.length) * 100 : 0;
+
+    const pValid = prevFilteredTxs.filter(tx => tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee");
+    const pPending = prevFilteredTxs.filter(tx => tx.status === "pending");
+    const pBrutTxs = [...pValid, ...pPending];
+    const pCaBrut = pBrutTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const pCaNet = pValid.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+    const pTxCount = pBrutTxs.length;
+    const pSpenderSet = new Set(pBrutTxs.map(tx => tx.spender_handle || tx.spender_id).filter(Boolean));
+    const pPanierMoyen = pTxCount > 0 ? pCaBrut / pTxCount : 0;
+    const pTauxVal = pBrutTxs.length > 0 ? (pValid.length / pBrutTxs.length) * 100 : 0;
+
+    const delta = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
+    return {
+      caBrut, caNet, txCount, spenderCount: spenderSet.size, panierMoyen, tauxValidation,
+      deltaCaBrut: delta(caBrut, pCaBrut), deltaCaNet: delta(caNet, pCaNet), deltaTx: delta(txCount, pTxCount),
+      deltaSpenders: delta(spenderSet.size, pSpenderSet.size), deltaPanier: delta(panierMoyen, pPanierMoyen), deltaTaux: tauxValidation - pTauxVal,
+    };
+  }, [filteredTxs, prevFilteredTxs, convertAmount]);
+
+  const toggleMetric = (id) => {
+    setActiveMetrics(prev => {
+      const next = new Set(prev);
+      if (next.has(id) && next.size <= 1) return prev;
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const chartData = useMemo(() => {
+    const byDay = {};
+    const dStart = new Date(dateDebut); dStart.setHours(0, 0, 0, 0);
+    const dEnd = new Date(dateFin); dEnd.setHours(23, 59, 59, 999);
+    for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
+      const key = d.toISOString().slice(0, 10);
+      byDay[key] = { date: key, ca_brut: 0, ca_net: 0, transactions: 0, spenders: new Set(), panier_moyen: 0, taux_validation: 0, total: 0, valid: 0 };
+    }
+    filteredTxs.forEach(tx => {
+      const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
+      if (!byDay[key]) return;
+      const amt = convertAmount(Number(tx.amount || 0), tx.currency);
+      const isVal = tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee";
+      byDay[key].ca_brut += amt;
+      if (isVal) byDay[key].ca_net += convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency);
+      byDay[key].transactions += 1;
+      byDay[key].spenders.add(tx.spender_handle || tx.spender_id || "");
+      byDay[key].total += 1;
+      if (isVal) byDay[key].valid += 1;
+    });
+    return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
+      date,
+      ca_brut: Math.round(d.ca_brut),
+      ca_net: Math.round(d.ca_net),
+      transactions: d.transactions,
+      spenders: d.spenders.size,
+      panier_moyen: d.transactions > 0 ? Math.round(d.ca_brut / d.transactions) : 0,
+      taux_validation: d.total > 0 ? Math.round((d.valid / d.total) * 100) : 0,
+    }));
+  }, [filteredTxs, dateDebut, dateFin, convertAmount]);
+
+  const modelStats = useMemo(() => {
+    const total = filteredTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0) || 1;
+    const byModel = {};
+    DASHBOARD_MODELS.forEach(name => {
+      const m = modeleProfiles.find(p => (p.name || "").toLowerCase() === name.toLowerCase()) || allModels.find(m => (m.name || "").toLowerCase() === name.toLowerCase());
+      if (!m) return;
+      const mTxs = filteredTxs.filter(tx => tx.model_id === m.id);
+      const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const convs = new Set(mTxs.map(tx => tx.spender_handle)).size;
+      const actives = mTxs.filter(tx => tx.status === "pending").length;
+      byModel[name] = { name, ca, convs, actives, pct: total > 0 ? (ca / total) * 100 : 0 };
+    });
+    const topCa = Math.max(...Object.values(byModel).map(x => x.ca), 1);
+    return Object.values(byModel).map(x => ({ ...x, barPct: (x.ca / topCa) * 100 })).sort((a, b) => b.ca - a.ca);
+  }, [filteredTxs, modeleProfiles, allModels, convertAmount]);
+
+  const paymentBreakdown = useMemo(() => {
+    const byMethod = {};
+    filteredTxs.forEach(tx => {
+      const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
+      const type = (ppm?.type || ppm?.label || tx.payment_method || "Autre").toString();
+      const key = type.toLowerCase().includes("twint") ? "Twint" : type.toLowerCase().includes("revolut") ? "Revolut" : "Autre";
+      byMethod[key] = (byMethod[key] || 0) + convertAmount(Number(tx.amount || 0), tx.currency);
+    });
+    const total = Object.values(byMethod).reduce((s, v) => s + v, 0) || 1;
+    return Object.entries(byMethod).map(([name, val]) => ({ name, val: Math.round(val), pct: (val / total) * 100 })).sort((a, b) => b.val - a.val);
+  }, [filteredTxs, providerPaymentMethods, convertAmount]);
+
+  const recentTxs = useMemo(() => [...filteredTxs].sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at)).slice(0, 5), [filteredTxs]);
+
+  const botStatusList = useMemo(() => {
+    const now = Date.now();
+    const bots = [
+      { id: "telegram", name: "Bot Telegram", channel: "telegram" },
+      { id: "chatting", name: "Chatting Bot", channel: "whatsapp" },
+      { id: "scan", name: "Scan Checker", channel: "whatsapp" },
+    ];
+    return bots.map(b => {
+      const stats = (botStats || []).filter(s => s.channel === b.channel);
+      const last24h = stats.filter(s => (now - new Date(s.timestamp).getTime()) < 86400000);
+      const status = last24h.length > 0 ? "ACTIVE" : "OFFLINE";
+      return { ...b, status };
+    });
+  }, [botStats]);
+
+  const dashboardAlerts = useMemo(() => {
+    const items = [];
+    (providerPayouts || []).forEach(pp => {});
+    const provProfiles = allProfiles.filter(p => p.role === "provider");
+    provProfiles.forEach(prov => {
+      const validated = filteredTxs.filter(tx => tx.provider_id === prov.id && (tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee"));
+      const totalCA = validated.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const paid = (providerPayouts || []).filter(p => p.provider_id === prov.id).reduce((s, p) => s + Number(p.amount || 0), 0);
+      const unpaid = totalCA - paid;
+      if (unpaid > 100) items.push({ severity: "red", icon: "\u{1F534}", msg: `${prov.name} : ${unpaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 })} ${currencySymbol} non reversés`, ongoing: true });
+    });
+    const refused = filteredTxs.filter(tx => tx.status === "refused").slice(0, 2);
+    refused.forEach(tx => {
+      const m = allModels.find(m => m.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
+      items.push({ severity: "red", icon: "\u{274C}", msg: `TX refusée ${convertAmount(Number(tx.amount), tx.currency).toFixed(0)}${tx.currency || "CHF"} @${tx.spender_handle || "?"} · ${m?.name || "?"}`, days: 1 });
+    });
+    const pending = filteredTxs.filter(tx => tx.status === "pending");
+    if (pending.length >= 5) items.push({ severity: "gold", icon: "\u{26A0}", msg: `Provider : ${pending.length} TX en attente`, ongoing: true });
+    const offline = botStatusList.filter(b => b.status === "OFFLINE");
+    offline.forEach(b => items.push({ severity: "gold", icon: "\u{26A0}", msg: `Bot ${b.name} offline`, days: 2 }));
+    return items.slice(0, 5);
+  }, [filteredTxs, allProfiles, allModels, modeleProfiles, providerPayouts, convertAmount, currencySymbol, botStatusList]);
+
+  const heatmapData = useMemo(() => {
+    const cells = [];
+    const now = new Date();
+    const monOffset = (now.getDay() + 6) % 7;
+    const base = new Date(now); base.setDate(base.getDate() - monOffset);
+    for (let w = 0; w < 4; w++) {
+      for (let d = 0; d < 7; d++) {
+        const date = new Date(base); date.setDate(date.getDate() - (3 - w) * 7 + d);
+        const key = date.toISOString().slice(0, 10);
+        const count = filteredTxs.filter(tx => (tx.date || tx.created_at || "").toString().slice(0, 10) === key).length;
+        cells.push({ w, d, count });
+      }
+    }
+    const maxCount = Math.max(...cells.map(c => c.count), 1);
+    return cells.map(c => ({ ...c, opacity: c.count === 0 ? 0.03 : 0.03 + (c.count / maxCount) * 0.92 }));
+  }, [filteredTxs]);
+
+  const fmtVal = (metricId, val) => {
+    const m = DASHBOARD_METRICS.find(x => x.id === metricId);
+    if (!m) return String(val);
+    if (m.fmt === "currency") return val.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol;
+    if (m.fmt === "percent") return val.toFixed(1) + "%";
+    return String(Math.round(val));
+  };
+
+  const chartMax = useMemo(() => {
+    let m = 0;
+    activeMetrics.forEach(id => {
+      chartData.forEach(row => { const v = row[id]; if (typeof v === "number" && v > m) m = v; });
+    });
+    return m * 1.12 || 1;
+  }, [chartData, activeMetrics]);
+
+  const cardStyle = (metricId) => {
+    const m = DASHBOARD_METRICS.find(x => x.id === metricId);
+    const active = activeMetrics.has(metricId);
+    return {
+      background: active ? `${m?.color}12` : "var(--surface)",
+      borderBottom: `2px solid ${active ? m?.color : "transparent"}`,
+      border: "1px solid var(--border)",
+      borderRadius: 12,
+      padding: "14px 16px",
+      cursor: "pointer",
+      transition: "all 0.2s",
+    };
+  };
+
+  const modelColors = { Carla: "#8b5cf6", Sophie: "#10b981", TS: "#f59e0b" };
+
+  return (
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: _isMobile ? "0 12px" : 0 }}>
+      {/* 1. FILTRE GLOBAL */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", marginBottom: 14 }}>
+        {["24h", "7j", "30j", "90j", "all"].map(p => (
+          <button key={p} onClick={() => { setPeriod(p); setDateStart(""); setDateEnd(""); }} style={{
+            padding: "8px 14px", borderRadius: 10, border: `1px solid ${period === p ? "var(--purple-light)" : "var(--border)"}`,
+            background: period === p ? "var(--purple-glow)" : "var(--surface)", color: period === p ? "#fff" : "var(--text)",
+            fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans',sans-serif",
+          }}>{p === "all" ? "All time" : p}</button>
+        ))}
+        <span style={{ color: "var(--muted)", fontSize: 12 }}>|</span>
+        <input type="date" value={dateStart} onChange={e => { setDateStart(e.target.value); setPeriod("custom"); }} style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 12 }} />
+        <span style={{ color: "var(--muted)", fontSize: 12 }}>→</span>
+        <input type="date" value={dateEnd} onChange={e => { setDateEnd(e.target.value); setPeriod("custom"); }} style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 12 }} />
+        <span style={{ color: "var(--muted)", fontSize: 12 }}>|</span>
+        <select value={modelFilter} onChange={e => setModelFilter(e.target.value)} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 13, cursor: "pointer" }}>
+          <option value="all">Tous les modèles</option>
+          {modelOptions.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+        </select>
+      </div>
+
+      {/* 2. KPI STRIP — 6 cartes */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr 1fr" : "repeat(6, 1fr)", gap: 12, marginBottom: 20 }}>
+        {DASHBOARD_METRICS.map((m) => {
+          const val = m.calc(kpiData);
+          const deltaMap = { ca_brut: "deltaCaBrut", ca_net: "deltaCaNet", transactions: "deltaTx", spenders: "deltaSpenders", panier_moyen: "deltaPanier", taux_validation: "deltaTaux" };
+          const delta = kpiData[deltaMap[m.id]];
+          return (
+            <div key={m.id} onClick={() => toggleMetric(m.id)} style={cardStyle(m.id)}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", marginBottom: 4 }}>{m.label}</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color: "var(--text)" }}>{fmtVal(m.id, val)}</div>
+              {delta != null && !isNaN(delta) && (
+                <div style={{ fontSize: 11, fontWeight: 700, color: delta >= 0 ? "var(--green)" : "var(--red)", marginTop: 4 }}>{delta >= 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>
+              )}
+              <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 6 }}>Cliquer pour ajouter au graphe</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* 3. GRAPHE MULTI-MÉTRIQUES */}
+      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, marginBottom: 20 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 16 }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)" }}>Évolution des métriques</div>
+            <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 4 }}>Cliquer sur un KPI ou une pill pour ajouter/retirer une courbe</div>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {["curve", "bar", "table"].map(v => (
+              <button key={v} onClick={() => setChartView(v)} style={{
+                padding: "6px 12px", borderRadius: 8, border: "1px solid var(--border)", background: chartView === v ? "var(--purple-glow)" : "var(--surface2)",
+                color: chartView === v ? "#fff" : "var(--text)", fontSize: 12, cursor: "pointer",
+              }}>{v === "curve" ? "📈 Courbe" : v === "bar" ? "📊 Barres" : "🗒️ Tableau"}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+          {DASHBOARD_METRICS.map(m => (
+            <button key={m.id} onClick={() => toggleMetric(m.id)} style={{
+              padding: "6px 12px", borderRadius: 20, border: `2px solid ${activeMetrics.has(m.id) ? m.color : "var(--border)"}`,
+              background: activeMetrics.has(m.id) ? `${m.color}22` : "var(--surface2)", color: activeMetrics.has(m.id) ? m.color : "var(--muted)",
+              fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+            }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: activeMetrics.has(m.id) ? m.color : "transparent", border: activeMetrics.has(m.id) ? "none" : "1px solid var(--muted)" }} />
+              {m.label}
+            </button>
+          ))}
+        </div>
+
+        {chartView === "curve" && (
+          <div style={{ position: "relative", height: 260 }}>
+            <svg viewBox="0 0 100 260" preserveAspectRatio="none" width="100%" height="260" style={{ display: "block" }} onMouseLeave={() => setHoveredPoint(null)}>
+              <defs>
+                {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map((m) => (
+                  <linearGradient key={m.id} id={`grad-${m.id}`} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={m.color} stopOpacity="0.18" /><stop offset="100%" stopColor={m.color} stopOpacity="0" />
+                  </linearGradient>
+                ))}
+              </defs>
+              {[1, 2, 3, 4].map(i => (
+                <line key={i} x1="0" y1={(260 / 4) * i} x2="100" y2={(260 / 4) * i} stroke="rgba(255,255,255,0.04)" strokeWidth="0.5" />
+              ))}
+              {chartData.length > 0 && DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map((m) => {
+                const n = chartData.length;
+                const pts = chartData.map((row, i) => {
+                  const v = row[m.id];
+                  const x = n > 1 ? (i / (n - 1)) * 100 : 50;
+                  const y = 260 - (typeof v === "number" ? (v / chartMax) * 240 : 0);
+                  return `${x},${y}`;
+                }).join(" ");
+                const polyPts = chartData.map((row, i) => {
+                  const v = row[m.id];
+                  const x = n > 1 ? (i / (n - 1)) * 100 : 50;
+                  const y = 260 - (typeof v === "number" ? (v / chartMax) * 240 : 0);
+                  return `${x},${y}`;
+                }).join(" ");
+                return (
+                  <g key={m.id}>
+                    <polygon points={`0,260 ${polyPts} 100,260`} fill={`url(#grad-${m.id})`} />
+                    <polyline points={pts} fill="none" stroke={m.color} strokeWidth="0.8" strokeLinecap="round" strokeLinejoin="round" />
+                    {chartData.map((row, i) => {
+                      const v = row[m.id];
+                      const x = n > 1 ? (i / (n - 1)) * 100 : 50;
+                      const y = 260 - (typeof v === "number" ? (v / chartMax) * 240 : 0);
+                      return <circle key={i} cx={x} cy={y} r="1.2" fill={m.color} stroke="var(--surface)" strokeWidth="0.6" />;
+                    })}
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+        )}
+
+        {chartView === "bar" && (
+          <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: 260, padding: "0 20px" }}>
+            {chartData.map((row, i) => (
+              <div key={i} style={{ flex: 1, display: "flex", gap: 2, alignItems: "flex-end", justifyContent: "center" }}>
+                {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => {
+                  const v = row[m.id] || 0;
+                  const h = chartMax > 0 ? (v / chartMax) * 220 : 0;
+                  return <div key={m.id} style={{ width: "100%", maxWidth: 24, height: h, background: m.color, borderRadius: "4px 4px 0 0", opacity: 0.85 }} title={`${m.label}: ${fmtVal(m.id, v)}`} />;
+                })}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {chartView === "table" && (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid var(--border)" }}>
+                  <th style={{ padding: "10px 12px", textAlign: "left", color: "var(--muted)" }}>Date</th>
+                  {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
+                    <th key={m.id} style={{ padding: "10px 12px", textAlign: "right", color: m.color }}>{m.label}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {chartData.map((row, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid var(--border2)" }}>
+                    <td style={{ padding: "8px 12px", color: "var(--text)" }}>{new Date(row.date).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</td>
+                    {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
+                      <td key={m.id} style={{ padding: "8px 12px", textAlign: "right", color: m.color, fontWeight: 600 }}>{fmtVal(m.id, row[m.id] || 0)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {(chartView === "curve" || chartView === "bar") && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border2)" }}>
+            {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
+              <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ width: 16, height: 2, background: m.color, borderRadius: 1 }} />
+                <span style={{ fontSize: 12, color: "var(--text)" }}>{m.label}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* 4. BOTTOM GRID — 3 colonnes */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr 340px", gap: 14 }}>
+        {/* Colonne 1 */}
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
+          <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 16, color: "var(--text)" }}>Modèles actives</div>
+          {modelStats.map((m, i) => (
+            <div key={m.name} style={{ marginBottom: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                <div style={{ width: 36, height: 36, borderRadius: 10, background: (modelColors[m.name] || "var(--purple)") + "33", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 14, color: modelColors[m.name] || "var(--purple)" }}>{m.name[0]}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{m.name}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted2)" }}>{m.convs} conv · {m.actives} actives</div>
+                </div>
+                <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>{m.ca.toLocaleString("fr-FR")} {currencySymbol}</div>
+              </div>
+              <div style={{ height: 6, borderRadius: 3, background: "var(--surface2)", overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${m.barPct}%`, background: modelColors[m.name] || "var(--purple)", borderRadius: 3, transition: "width 0.3s" }} />
+              </div>
+            </div>
+          ))}
+          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "var(--text)" }}>💳 Répartition paiement</div>
+            {paymentBreakdown.map((p, i) => (
+              <div key={i} style={{ marginBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+                  <span style={{ color: "var(--text)" }}>{p.name}</span>
+                  <span style={{ color: "var(--muted2)" }}>{p.val.toLocaleString("fr-FR")} {currencySymbol} · {p.pct.toFixed(0)}%</span>
+                </div>
+                <div style={{ height: 6, borderRadius: 3, background: "var(--surface2)", overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${p.pct}%`, background: "var(--purple-light)", borderRadius: 3 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Colonne 2 */}
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
+          <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 16, color: "var(--text)" }}>TX récentes</div>
+          {recentTxs.map(tx => {
+            const m = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
+            const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
+            const prov = allProfiles.find(p => p.id === tx.provider_id);
+            const statusColor = tx.status === "validated" || tx.status === "validé" ? "var(--green)" : tx.status === "pending" ? "var(--gold)" : "var(--red)";
+            const statusLabel = tx.status === "validated" || tx.status === "validé" ? "VALID" : tx.status === "pending" ? "PEND." : "REFUSÉE";
+            return (
+              <div key={tx.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid var(--border2)" }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>@{tx.spender_handle || "?"} · {m?.name || "?"} · {ppm?.label || prov?.name || "Provider"}</div>
+                  <div style={{ fontSize: 12, color: "var(--muted2)" }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {tx.currency || currencySymbol}</div>
+                </div>
+                <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 6, background: statusColor + "22", color: statusColor }}>{statusLabel}</span>
+              </div>
+            );
+          })}
+          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
+            <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 12, color: "var(--text)" }}>Bots Status</div>
+            {botStatusList.map(b => (
+              <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ width: 8, height: 8, borderRadius: "50%", background: b.status === "ACTIVE" ? "var(--green)" : "var(--red)", animation: b.status === "ACTIVE" ? "pulse 2s infinite" : "none" }} />
+                <span style={{ fontSize: 13, color: "var(--text)" }}>{b.name}</span>
+                <span style={{ fontSize: 11, color: b.status === "ACTIVE" ? "var(--green)" : "var(--muted2)" }}>{b.status}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Colonne 3 */}
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
+          <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 16, color: "var(--text)" }}>Alertes</div>
+          {dashboardAlerts.map((a, i) => (
+            <div key={i} style={{ padding: "10px 0", borderBottom: "1px solid var(--border2)", fontSize: 12 }}>
+              <span style={{ marginRight: 6 }}>{a.icon}</span>
+              <span style={{ color: a.severity === "red" ? "var(--red)" : "var(--gold)" }}>{a.msg}</span>
+              <span style={{ color: "var(--muted2)", marginLeft: 4 }}>{a.ongoing ? "ongoing" : (a.days || 0) + "j"}</span>
+            </div>
+          ))}
+          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "var(--text)" }}>Heatmap activité hebdo</div>
+            <div style={{ fontSize: 9, color: "var(--muted2)", display: "flex", gap: 4, marginBottom: 6 }}>
+              {["L", "M", "M", "J", "V", "S", "D"].map((d, i) => <span key={i} style={{ width: 20, textAlign: "center" }}>{d}</span>)}
+            </div>
+            {[0, 1, 2, 3].map(w => (
+              <div key={w} style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+                {[0, 1, 2, 3, 4, 5, 6].map(d => {
+                  const cell = heatmapData.find(c => c.w === w && c.d === d);
+                  return <div key={d} style={{ width: 20, height: 20, borderRadius: 4, background: `rgba(139,92,246,${cell?.opacity ?? 0.03})`, flexShrink: 0 }} title={cell ? `${cell.count} TX` : "0 TX"} />;
+                })}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 // =============================================
 // DASHBOARD TAB — V2 ACTION-ORIENTED
@@ -20755,15 +21289,7 @@ const App = () => {
   const renderGerantContent = () => {
     switch(tab) {
       case "dashboard":
-        return (<>
-          <div style={{ display: "flex", gap: 0, marginBottom: 24, borderBottom: "1px solid #2A2A3E" }}>
-            {[{ id: "analytics", label: "📈 Analytics" }, { id: "operations", label: "📋 Opérations" }].map(t => (
-              <button key={t.id} onClick={() => setSubTab(t.id)} style={{ padding: "12px 20px", background: "none", border: "none", borderBottom: (subTab === t.id || (!subTab && t.id === "analytics")) ? "2px solid #8B5CF6" : "2px solid transparent", color: (subTab === t.id || (!subTab && t.id === "analytics")) ? "#fff" : "#6B7280", cursor: "pointer", fontSize: 14, fontWeight: 600, fontFamily: "'Inter', sans-serif", transition: "all 0.2s" }}>{t.label}</button>
-            ))}
-          </div>
-          {(subTab === "analytics" || !subTab) && <DashboardAnalytics user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} />}
-          {subTab === "operations" && <DashboardTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} providerPaymentMethods={providerPaymentMethods} spenders={spenders} navigateTo={navigateTo} navigateToSpender={navigateToSpender} providerPayouts={providerPayouts} chatterLogs={chatterLogs} />}
-        </>);
+        return <DashboardRedesign user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} botStats={botStats} alerts={alerts} navigateTo={navigateTo} navigateToSpender={navigateToSpender} />;
       case "business":
         return (<>{renderGerantTabBar("business")}
           {subTab==="transactions"&&<TransactionsTab user={user} lang={lang} txs={txs} txTotal={txTotal} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
