@@ -15010,6 +15010,9 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
     return sp ? (sp.first_name || sp.handle || sp.email || conv.tg_chat_id) : (conv.tg_chat_id || "—");
   };
 
+  const [lineStatus, setLineStatus] = useState({});
+  const [lineError, setLineError] = useState({});
+
   const getPerm = (chatter, key) => {
     try {
       const over = permOverrides[chatter?.id];
@@ -15020,33 +15023,65 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
     } catch (_) { return !!DEFAULT_MESSAGING_PERMS[key]; }
   };
 
-  const savePerm = async (chatterId, key, val) => {
+  const getCurrentPerms = (chatter) => {
+    try {
+      const over = permOverrides[chatter?.id];
+      if (over && typeof over === "object") return { ...DEFAULT_MESSAGING_PERMS, ...over };
+      const mp = chatter?.messaging_permissions;
+      if (mp != null && typeof mp === "object" && !Array.isArray(mp)) return { ...DEFAULT_MESSAGING_PERMS, ...mp };
+      return { ...DEFAULT_MESSAGING_PERMS };
+    } catch (_) { return { ...DEFAULT_MESSAGING_PERMS }; }
+  };
+
+  const handlePermToggle = (chatterId, key, checked) => {
+    const ch = chatters.find(c => c.id === chatterId);
+    if (!ch) return;
+    const current = getCurrentPerms(ch);
+    setPermOverrides(prev => ({ ...prev, [chatterId]: { ...current, [key]: checked } }));
+    setLineError(prev => { const n={...prev}; delete n[chatterId]; return n; });
+  };
+
+  const saveChatterPerms = async (chatterId) => {
     const ch = chatters.find(c => c.id === chatterId);
     if (!ch || !onRefresh) return;
-    let base;
-    try {
-      const mp = ch.messaging_permissions;
-      base = (mp != null && typeof mp === "object" && !Array.isArray(mp)) ? { ...mp } : { ...DEFAULT_MESSAGING_PERMS };
-    } catch (_) { base = { ...DEFAULT_MESSAGING_PERMS }; }
-    const current = { ...base, [key]: val };
-    setPermOverrides(prev => ({ ...prev, [chatterId]: current }));
+    const current = getCurrentPerms(ch);
     setSavingChatterId(chatterId);
+    setLineStatus(prev => ({ ...prev, [chatterId]: "saving" }));
+    setLineError(prev => { const n={...prev}; delete n[chatterId]; return n; });
     try {
       const { error } = await sb.from("profiles").update({ messaging_permissions: current }).eq("id", chatterId);
       if (error) throw new Error(error.message);
       addToast(fr ? "Permissions sauvegardées" : "Permissions saved", "success");
       await onRefresh();
-      setPermOverrides(prev => { const next={...prev}; delete next[chatterId]; return next; });
+      setPermOverrides(prev => { const n={...prev}; delete n[chatterId]; return n; });
+      setLineStatus(prev => ({ ...prev, [chatterId]: "saved" }));
+      setTimeout(() => setLineStatus(prev => { const n={...prev}; delete n[chatterId]; return n; }), 2000);
     } catch (e) {
-      addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
-      setPermOverrides(prev => { const next={...prev}; delete next[chatterId]; return next; });
+      const msg = e?.message || String(e);
+      setLineStatus(prev => ({ ...prev, [chatterId]: "error" }));
+      setLineError(prev => ({ ...prev, [chatterId]: msg }));
+      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
     } finally {
       setSavingChatterId(null);
     }
   };
 
-  const handlePermToggle = (chatterId, key, checked) => {
-    savePerm(chatterId, key, checked);
+  const resetChatterPerms = async (chatterId) => {
+    if (!onRefresh) return;
+    setSavingChatterId(chatterId);
+    setLineStatus(prev => ({ ...prev, [chatterId]: "saving" }));
+    setLineError(prev => { const n={...prev}; delete n[chatterId]; return n; });
+    try {
+      setPermOverrides(prev => { const n={...prev}; delete n[chatterId]; return n; });
+      await onRefresh();
+      setLineStatus(prev => ({ ...prev, [chatterId]: "saved" }));
+      setTimeout(() => setLineStatus(prev => { const n={...prev}; delete n[chatterId]; return n; }), 2000);
+    } catch (e) {
+      setLineStatus(prev => ({ ...prev, [chatterId]: "error" }));
+      setLineError(prev => ({ ...prev, [chatterId]: e?.message || String(e) }));
+    } finally {
+      setSavingChatterId(null);
+    }
   };
 
   const hasLastWebhook = botStatus && botStatus.last_webhook_at != null;
@@ -15132,12 +15167,25 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
           {chatters.map(ch=>{
             const assigned = (ch.assigned_models||[]).map(mid=>models?.find(m=>m.id===mid)?.name).filter(Boolean).join(", ") || (fr?"—":"—");
             const isSaving = savingChatterId === ch.id;
+            const status = lineStatus[ch.id];
+            const errMsg = lineError[ch.id];
+            const statusLabel = status === "saving" ? (fr ? "sauvegarde…" : "saving…") : status === "saved" ? (fr ? "sauvegardé" : "saved") : "";
             return (
               <div key={ch.id} style={{padding:14,background:"var(--bg-base)",borderRadius:12,border:"1px solid var(--border-subtle)"}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}}>
                   <div>
                     <span style={{fontSize:13,fontWeight:700}}>{ch.name||ch.email||ch.handle||"?"}</span>
-                    {isSaving && <span style={{marginLeft:8,fontSize:10,color:"var(--text-tertiary)"}}>{React.createElement(Spinner)} {fr?"sauvegarde…":"saving…"}</span>}
+                    {status === "saving" && <span style={{marginLeft:8,fontSize:10,color:"var(--text-tertiary)"}}>{React.createElement(Spinner)} {statusLabel}</span>}
+                    {status === "saved" && <span style={{marginLeft:8,fontSize:10,color:"var(--success)"}}>{"\u{2713}"} {statusLabel}</span>}
+                    {status === "error" && errMsg && <span style={{marginLeft:8,fontSize:10,color:"var(--danger)"}}>{errMsg}</span>}
+                  </div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    <button className="btn btn-primary" onClick={()=>saveChatterPerms(ch.id)} disabled={isSaving} style={{fontSize:11}}>
+                      {fr ? "Sauvegarder" : "Save"}
+                    </button>
+                    <button className="btn btn-small" onClick={()=>resetChatterPerms(ch.id)} disabled={isSaving} style={{fontSize:11}}>
+                      {fr ? "Réinitialiser" : "Reset"}
+                    </button>
                   </div>
                 </div>
                 <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:4}}>{fr?"Modèles assignés:" : "Assigned models:"} {assigned}</div>
