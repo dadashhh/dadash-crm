@@ -14897,6 +14897,8 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models}) => {
 const DEFAULT_MESSAGING_PERMS = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
 
 const BOT_STATUS_ENDPOINT = "/bot/status";
+const BOT_PAUSE_ENDPOINT = "/bot/pause";
+const BOT_RESUME_ENDPOINT = "/bot/resume";
 const BOT_STATUS_TIMEOUT_MS = 8000;
 const LS_BOT_URL = "dadash_tg_admin_bot_url";
 const LS_API_KEY = "dadash_tg_admin_api_key";
@@ -14923,6 +14925,8 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
   const [configKeyVisible, setConfigKeyVisible] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [testLoading, setTestLoading] = useState(false);
+  const [modelActionLoading, setModelActionLoading] = useState(null);
+  const [modelActionError, setModelActionError] = useState({});
 
   const chatters = (profiles || []).filter(p => p.role === "chatter");
 
@@ -15009,6 +15013,40 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
       setTestResult({ error: e?.message || String(e) });
     } finally {
       setTestLoading(false);
+    }
+  };
+
+  const doModelPauseResume = async (modelItem, pause) => {
+    const modelId = modelItem?.model_id || modelItem?.id;
+    const baseUrl = (window.TELEGRAM_BOT_URL || configInputUrl || "").toString().trim().replace(/\/$/, "");
+    const apiKey = (window.DADASH_INTERNAL_API_KEY || configInputKey || "").toString().trim();
+    if (!baseUrl || !modelId) return;
+    const path = pause ? BOT_PAUSE_ENDPOINT : BOT_RESUME_ENDPOINT;
+    const url = baseUrl + (path.startsWith("/") ? path : "/" + path);
+    setModelActionLoading(modelId);
+    setModelActionError(prev => { const n = {...prev}; delete n[modelId]; return n; });
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), BOT_STATUS_TIMEOUT_MS);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(apiKey ? { "X-DADASH-KEY": apiKey } : {}) },
+        body: JSON.stringify({ model_id: modelId }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(res.status === 404 ? (fr ? "Action backend non disponible" : "Backend action not available") : (txt || res.statusText || String(res.status)));
+      }
+      addToast(fr ? (pause ? "Modèle mis en pause" : "Modèle repris") : (pause ? "Model paused" : "Model resumed"), "success");
+      await fetchBotStatus();
+    } catch (e) {
+      const msg = e?.message || String(e);
+      setModelActionError(prev => ({ ...prev, [modelId]: msg }));
+      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
+    } finally {
+      setModelActionLoading(null);
     }
   };
 
@@ -15271,17 +15309,31 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
             </div>
             <div style={{marginTop:4}}>
               <div style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",marginBottom:8}}>{fr ? "Modèles" : "Models"}</div>
-              {(botStatus.models && Array.isArray(botStatus.models) && botStatus.models.length > 0) ? (
-                <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
-                  {botStatus.models.map((m,i)=>(
-                    <div key={m.id||m.name||i} style={{display:"flex",alignItems:"center",gap:6,padding:"6px 12px",background:"var(--bg-base)",borderRadius:8,border:"1px solid var(--border-subtle)"}}>
-                      <span style={{fontSize:12}}>{m.name||m.handle||"?"}</span>
-                      <span style={{fontSize:10,color:m.paused?"var(--danger)":"var(--success)"}}>{m.paused ? (fr?"Pause":"Paused") : (fr?"Actif":"Active")}</span>
-                    </div>
-                  ))}
-                </div>
+              {(!botStatus.models || !Array.isArray(botStatus.models) || botStatus.models.length === 0) ? (
+                <span style={{fontSize:11,color:"var(--text-quaternary)"}}>{fr ? "Aucun modèle remonté par le bot" : "No models returned by bot"}</span>
               ) : (
-                <span style={{fontSize:11,color:"var(--text-quaternary)"}}>{fr ? "Aucun modèle" : "No models"}</span>
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  {botStatus.models.map((m,i)=>{
+                    const mid = m.model_id || m.id;
+                    const isActing = modelActionLoading === mid;
+                    const err = modelActionError[mid];
+                    return (
+                      <div key={mid||m.name||i} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:"var(--bg-base)",borderRadius:8,border:"1px solid var(--border-subtle)",flexWrap:"wrap"}}>
+                        <span style={{fontSize:12,fontWeight:600}}>{m.name||m.handle||"?"}</span>
+                        <span style={{fontSize:10,color:m.paused?"var(--danger)":"var(--success)"}}>{m.paused ? (fr?"Pause":"Paused") : (fr?"Actif":"Active")}</span>
+                        <div style={{display:"flex",gap:6,marginLeft:"auto",alignItems:"center"}}>
+                          <button className="btn btn-small" onClick={()=>doModelPauseResume(m,true)} disabled={!mid||isActing||m.paused} style={{fontSize:10}} title={!mid ? (fr ? "Action backend non disponible" : "Backend action not available") : ""}>
+                            {isActing ? React.createElement(Spinner) : (fr ? "Pause" : "Pause")}
+                          </button>
+                          <button className="btn btn-small" onClick={()=>doModelPauseResume(m,false)} disabled={!mid||isActing||!m.paused} style={{fontSize:10}} title={!mid ? (fr ? "Action backend non disponible" : "Backend action not available") : ""}>
+                            {isActing ? React.createElement(Spinner) : (fr ? "Reprendre" : "Resume")}
+                          </button>
+                        </div>
+                        {err && <span style={{fontSize:10,color:"var(--danger)",width:"100%"}}>{err}</span>}
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
