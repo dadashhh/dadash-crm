@@ -4089,8 +4089,61 @@ const DASHBOARD_METRICS = [
   { id: "taux_validation", label: "Taux Validation", color: "#ef4444", calc: (d) => d.tauxValidation, fmt: "percent" },
 ];
 
+// ── LiveClock — horloge temps réel topbar ──
+const LiveClock = ({ timezone }) => {
+  const [time, setTime] = React.useState('');
+  React.useEffect(() => {
+    const tick = () => setTime(new Date().toLocaleTimeString('fr-FR', { timeZone: timezone || 'Europe/Paris', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [timezone]);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+        <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--success)', animation: 'pulse 2s infinite', flexShrink: 0 }} />
+        <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>Live</span>
+      </div>
+      <div style={{ fontSize: 11, fontFamily: 'monospace', color: 'var(--text-tertiary)', letterSpacing: '0.04em' }}>{time}</div>
+    </div>
+  );
+};
+
+// ── DashModal — popup générique style modale chatter ──
+const DashModal = ({ open, onClose, title, children, maxWidth = 900 }) => {
+  React.useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.72)', zIndex: 4500, display: 'flex', alignItems: _isMobile ? 'flex-end' : 'center', justifyContent: 'center' }} onClick={onClose}>
+      <div style={{ background: '#111520', border: '1px solid rgba(255,255,255,0.08)', borderRadius: _isMobile ? '16px 16px 0 0' : 16, maxWidth, width: _isMobile ? '100%' : '90%', maxHeight: _isMobile ? '92vh' : '85vh', overflowY: 'auto', boxShadow: '0 24px 64px rgba(0,0,0,0.6)' }} onClick={e => e.stopPropagation()}>
+        <div style={{ padding: '18px 24px', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, background: '#111520', zIndex: 2 }}>
+          <span style={{ fontSize: 16, fontWeight: 800, color: '#f8fafc' }}>{title}</span>
+          <button onClick={onClose} style={{ background: 'rgba(255,255,255,0.06)', border: 'none', color: '#94a3b8', fontSize: 16, cursor: 'pointer', padding: '4px 10px', borderRadius: 8, lineHeight: 1 }}>✕</button>
+        </div>
+        <div style={{ padding: '20px 24px' }}>{children}</div>
+      </div>
+    </div>
+  );
+};
+
+// ── DashTabs — onglets style modale chatter ──
+const DashTabs = ({ tabs, active, onSelect }) => (
+  <div style={{ display: 'flex', borderBottom: '1px solid rgba(255,255,255,0.06)', marginBottom: 18 }}>
+    {tabs.map(tab => (
+      <button key={tab.id} onClick={() => onSelect(tab.id)} style={{ padding: '10px 14px', border: 'none', background: 'transparent', borderBottom: active === tab.id ? '2px solid #8b5cf6' : '2px solid transparent', color: active === tab.id ? '#fff' : '#64748b', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'DM Sans',sans-serif", transition: 'color 0.15s' }}>{tab.icon} {tab.label}</button>
+    ))}
+  </div>
+);
+
 const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spenders, providerPayouts, providerPaymentMethods, botStats, alerts, navigateTo, navigateToSpender }) => {
-  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const { convertAmount, currencySymbol } = useCurrency();
+  const timezone = useTimezone();
+  const addToast = useToast();
   const fr = lang === "fr";
 
   const [period, setPeriod] = useState("30j");
@@ -4099,7 +4152,38 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const [modelFilter, setModelFilter] = useState("all");
   const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut", "ca_net"]));
   const [chartView, setChartView] = useState("curve");
-  const [hoveredPoint, setHoveredPoint] = useState(null);
+
+  // Popup state
+  const [popup, setPopup] = useState(null);
+  const [popupTxTab, setPopupTxTab] = useState("all");
+  const [popupBotTabs, setPopupBotTabs] = useState({});
+  const [popupModelTabs, setPopupModelTabs] = useState({});
+
+  // To-do state
+  const [todos, setTodos] = useState([]);
+  const [newTodoText, setNewTodoText] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try { const { data } = await sb.from("todos").select("*").order("created_at", { ascending: false }).limit(50); if (data) setTodos(data); } catch (e) { /* table may not exist */ }
+    })();
+  }, []);
+
+  const addTodo = async () => {
+    const text = newTodoText.trim(); if (!text) return; setNewTodoText("");
+    const tempId = "tmp-" + Date.now();
+    setTodos(prev => [{ id: tempId, text, done: false, priority: "normale", created_at: new Date().toISOString() }, ...prev]);
+    try { const { data } = await sb.from("todos").insert({ text, created_by: user?.id, priority: "normale" }).select(); if (data?.[0]) setTodos(prev => prev.map(t => t.id === tempId ? data[0] : t)); } catch (e) { /* local only */ }
+  };
+  const toggleTodo = async (id) => {
+    const t = todos.find(x => x.id === id); if (!t) return;
+    setTodos(prev => prev.map(x => x.id === id ? { ...x, done: !x.done } : x));
+    try { await sb.from("todos").update({ done: !t.done }).eq("id", id); } catch (e) {}
+  };
+  const deleteTodo = async (id) => {
+    setTodos(prev => prev.filter(x => x.id !== id));
+    try { await sb.from("todos").delete().eq("id", id); } catch (e) {}
+  };
 
   const allTxs = txs || [];
   const allModels = models || [];
@@ -4207,6 +4291,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     });
     return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
       date,
+      label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
       ca_brut: Math.round(d.ca_brut),
       ca_net: Math.round(d.ca_net),
       transactions: d.transactions,
@@ -4218,130 +4303,99 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
 
   const modelStats = useMemo(() => {
     const total = filteredTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0) || 1;
-    const byModel = {};
-    DASHBOARD_MODELS.forEach(name => {
-      const m = modeleProfiles.find(p => (p.name || "").toLowerCase() === name.toLowerCase()) || allModels.find(m => (m.name || "").toLowerCase() === name.toLowerCase());
-      if (!m) return;
+    const result = DASHBOARD_MODELS.map(name => {
+      const m = allModels.find(x => (x.name || "").toLowerCase() === name.toLowerCase()) || modeleProfiles.find(p => (p.name || "").toLowerCase() === name.toLowerCase());
+      if (!m) return null;
       const mTxs = filteredTxs.filter(tx => tx.model_id === m.id);
+      const allMTxs = allTxs.filter(tx => tx.model_id === m.id).sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at));
+      const prevMTxs = prevFilteredTxs.filter(tx => tx.model_id === m.id);
       const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const prevCa = prevMTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
       const convs = new Set(mTxs.map(tx => tx.spender_handle)).size;
       const actives = mTxs.filter(tx => tx.status === "pending").length;
-      byModel[name] = { name, ca, convs, actives, pct: total > 0 ? (ca / total) * 100 : 0 };
-    });
-    const topCa = Math.max(...Object.values(byModel).map(x => x.ca), 1);
-    return Object.values(byModel).map(x => ({ ...x, barPct: (x.ca / topCa) * 100 })).sort((a, b) => b.ca - a.ca);
-  }, [filteredTxs, modeleProfiles, allModels, convertAmount]);
+      const weeklyCA = [];
+      for (let w = 7; w >= 0; w--) {
+        const ws = new Date(); ws.setDate(ws.getDate() - (w + 1) * 7); ws.setHours(0, 0, 0, 0);
+        const we = new Date(); we.setDate(we.getDate() - w * 7); we.setHours(23, 59, 59, 999);
+        const wc = allMTxs.filter(tx => { const d = new Date(tx.date || tx.created_at); return d >= ws && d <= we; }).reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+        weeklyCA.push({ label: `S${8 - w}`, ca: Math.round(wc) });
+      }
+      return { name, id: m.id, ca, prevCa, convs, actives, pct: total > 0 ? (ca / total) * 100 : 0, allMTxs, weeklyCA };
+    }).filter(Boolean).sort((a, b) => b.ca - a.ca);
+    const topCa = Math.max(...result.map(x => x.ca), 1);
+    return result.map(x => ({ ...x, barPct: (x.ca / topCa) * 100 }));
+  }, [filteredTxs, prevFilteredTxs, allTxs, modeleProfiles, allModels, convertAmount]);
 
-  const paymentBreakdown = useMemo(() => {
-    const byMethod = {};
-    filteredTxs.forEach(tx => {
-      const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
-      const type = (ppm?.type || ppm?.label || tx.payment_method || "Autre").toString();
-      const key = type.toLowerCase().includes("twint") ? "Twint" : type.toLowerCase().includes("revolut") ? "Revolut" : "Autre";
-      byMethod[key] = (byMethod[key] || 0) + convertAmount(Number(tx.amount || 0), tx.currency);
-    });
-    const total = Object.values(byMethod).reduce((s, v) => s + v, 0) || 1;
-    return Object.entries(byMethod).map(([name, val]) => ({ name, val: Math.round(val), pct: (val / total) * 100 })).sort((a, b) => b.val - a.val);
-  }, [filteredTxs, providerPaymentMethods, convertAmount]);
-
-  const recentTxs = useMemo(() => [...filteredTxs].sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at)).slice(0, 5), [filteredTxs]);
 
   const botStatusList = useMemo(() => {
     const now = Date.now();
-    const bots = [
+    return [
       { id: "telegram", name: "Bot Telegram", channel: "telegram" },
       { id: "chatting", name: "Chatting Bot", channel: "whatsapp" },
       { id: "scan", name: "Scan Checker", channel: "whatsapp" },
-    ];
-    return bots.map(b => {
+    ].map(b => {
       const stats = (botStats || []).filter(s => s.channel === b.channel);
       const last24h = stats.filter(s => (now - new Date(s.timestamp).getTime()) < 86400000);
-      const status = last24h.length > 0 ? "ACTIVE" : "OFFLINE";
-      return { ...b, status };
+      const errors = last24h.reduce((s, x) => s + (x.errors || 0), 0);
+      const status = last24h.length > 0 ? (errors > 5 ? "DEGRADED" : "ACTIVE") : "OFFLINE";
+      const msgs = last24h.reduce((s, x) => s + (x.messages_sent || 0) + (x.messages_received || 0), 0);
+      const convs = new Set(last24h.map(x => x.conversation_id || x.spender_id).filter(Boolean)).size;
+      const escalations = last24h.reduce((s, x) => s + (x.escalations || 0), 0);
+      const uptime = last24h.length > 0 ? Math.round(((last24h.length - last24h.filter(x => (x.errors || 0) > 0).length) / last24h.length) * 100) : 0;
+      const logs = last24h.slice(0, 20).map(s => ({ time: new Date(s.timestamp).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }), type: (s.errors || 0) > 0 ? "error" : (s.escalations || 0) > 0 ? "esc" : "info", text: (s.errors || 0) > 0 ? `${s.errors} erreur(s)` : (s.escalations || 0) > 0 ? `Escalade (${s.escalations})` : `${(s.messages_sent || 0) + (s.messages_received || 0)} messages` }));
+      return { ...b, status, msgs, convs, escalations, errors, uptime, logs };
     });
   }, [botStats]);
 
   const dashboardAlerts = useMemo(() => {
     const items = [];
-    (providerPayouts || []).forEach(pp => {});
-    const provProfiles = allProfiles.filter(p => p.role === "provider");
-    provProfiles.forEach(prov => {
-      const validated = filteredTxs.filter(tx => tx.provider_id === prov.id && (tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee"));
+    allProfiles.filter(p => p.role === "provider").forEach(prov => {
+      const validated = allTxs.filter(tx => tx.provider_id === prov.id && (tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee"));
       const totalCA = validated.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
       const paid = (providerPayouts || []).filter(p => p.provider_id === prov.id).reduce((s, p) => s + Number(p.amount || 0), 0);
       const unpaid = totalCA - paid;
-      if (unpaid > 100) items.push({ severity: "red", icon: "\u{1F534}", msg: `${prov.name} : ${unpaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 })} ${currencySymbol} non reversés`, ongoing: true });
+      if (unpaid > 100) items.push({ severity: "red", icon: "🔴", msg: `${prov.name} : ${unpaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 })} ${currencySymbol} non reversés`, ongoing: true, nav: () => { navigateTo && navigateTo("equipe", "providers"); setPopup(null); } });
     });
-    const refused = filteredTxs.filter(tx => tx.status === "refused").slice(0, 2);
-    refused.forEach(tx => {
-      const m = allModels.find(m => m.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
-      items.push({ severity: "red", icon: "\u{274C}", msg: `TX refusée ${convertAmount(Number(tx.amount), tx.currency).toFixed(0)}${tx.currency || "CHF"} @${tx.spender_handle || "?"} · ${m?.name || "?"}`, days: 1 });
+    allTxs.filter(tx => tx.status === "refused").slice(0, 3).forEach(tx => {
+      const m = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
+      const days = Math.floor((Date.now() - new Date(tx.date || tx.created_at).getTime()) / 86400000);
+      items.push({ severity: "red", icon: "❌", msg: `TX refusée ${convertAmount(Number(tx.amount), tx.currency).toFixed(0)}${tx.currency || "CHF"} @${tx.spender_handle || "?"} · ${m?.name || "?"}`, days, nav: () => { navigateTo && navigateTo("business", "transactions"); setPopup(null); } });
     });
-    const pending = filteredTxs.filter(tx => tx.status === "pending");
-    if (pending.length >= 5) items.push({ severity: "gold", icon: "\u{26A0}", msg: `Provider : ${pending.length} TX en attente`, ongoing: true });
-    const offline = botStatusList.filter(b => b.status === "OFFLINE");
-    offline.forEach(b => items.push({ severity: "gold", icon: "\u{26A0}", msg: `Bot ${b.name} offline`, days: 2 }));
-    return items.slice(0, 5);
-  }, [filteredTxs, allProfiles, allModels, modeleProfiles, providerPayouts, convertAmount, currencySymbol, botStatusList]);
+    const pendingCount = allTxs.filter(tx => tx.status === "pending").length;
+    if (pendingCount >= 5) items.push({ severity: "gold", icon: "⚠️", msg: `${pendingCount} TX en attente de validation`, ongoing: true, nav: () => { navigateTo && navigateTo("business", "transactions"); setPopup(null); } });
+    botStatusList.filter(b => b.status !== "ACTIVE").forEach(b => items.push({ severity: "gold", icon: "⚠️", msg: `Bot ${b.name} ${b.status}`, days: 0, nav: () => { navigateTo && navigateTo("automation", "bots"); setPopup(null); } }));
+    return items;
+  }, [allTxs, allProfiles, allModels, modeleProfiles, providerPayouts, convertAmount, currencySymbol, botStatusList, navigateTo]);
 
-  const heatmapData = useMemo(() => {
-    const cells = [];
-    const now = new Date();
-    const monOffset = (now.getDay() + 6) % 7;
-    const base = new Date(now); base.setDate(base.getDate() - monOffset);
-    for (let w = 0; w < 4; w++) {
-      for (let d = 0; d < 7; d++) {
-        const date = new Date(base); date.setDate(date.getDate() - (3 - w) * 7 + d);
-        const key = date.toISOString().slice(0, 10);
-        const count = filteredTxs.filter(tx => (tx.date || tx.created_at || "").toString().slice(0, 10) === key).length;
-        cells.push({ w, d, count });
-      }
-    }
-    const maxCount = Math.max(...cells.map(c => c.count), 1);
-    return cells.map(c => ({ ...c, opacity: c.count === 0 ? 0.03 : 0.03 + (c.count / maxCount) * 0.92 }));
-  }, [filteredTxs]);
 
-  const fmtVal = (metricId, val) => {
-    const m = DASHBOARD_METRICS.find(x => x.id === metricId);
-    if (!m) return String(val);
-    if (m.fmt === "currency") return val.toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol;
-    if (m.fmt === "percent") return val.toFixed(1) + "%";
-    return String(Math.round(val));
-  };
-
-  const chartMax = useMemo(() => {
-    let m = 0;
-    activeMetrics.forEach(id => {
-      chartData.forEach(row => { const v = row[id]; if (typeof v === "number" && v > m) m = v; });
-    });
-    return m * 1.12 || 1;
-  }, [chartData, activeMetrics]);
-
-  const cardStyle = (metricId) => {
-    const m = DASHBOARD_METRICS.find(x => x.id === metricId);
-    const active = activeMetrics.has(metricId);
-    return {
-      background: active ? `${m?.color}12` : "var(--surface)",
-      borderBottom: `2px solid ${active ? m?.color : "transparent"}`,
-      border: "1px solid var(--border)",
-      borderRadius: 12,
-      padding: "14px 16px",
-      cursor: "pointer",
-      transition: "all 0.2s",
-    };
+  const fmtVal = (id, v) => {
+    const m = DASHBOARD_METRICS.find(x => x.id === id);
+    if (!m) return String(v);
+    if (m.fmt === "currency") return (v || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol;
+    if (m.fmt === "percent") return (v || 0).toFixed(1) + "%";
+    return String(Math.round(v || 0));
   };
 
   const modelColors = { Carla: "#8b5cf6", Sophie: "#10b981", TS: "#f59e0b" };
+  const sColor = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee" ? "#10b981" : s === "pending" ? "#f59e0b" : "#ef4444";
+  const sLabel = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee" ? "VALID" : s === "pending" ? "PEND." : "REFUSÉE";
+  const kpiCardStyle = (id) => {
+    const m = DASHBOARD_METRICS.find(x => x.id === id); const active = activeMetrics.has(id);
+    return { background: active ? `${m?.color}12` : "var(--surface)", border: "1px solid var(--border)", borderBottom: `2px solid ${active ? m?.color : "transparent"}`, borderRadius: 12, padding: "14px 16px", cursor: "pointer", transition: "all 0.2s" };
+  };
+
+  const recentAllTxs = useMemo(() => [...allTxs].sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at)).slice(0, 20), [allTxs]);
+  const chatterProfiles = allProfiles.filter(p => p.role === "chatter");
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto", padding: _isMobile ? "0 12px" : 0 }}>
       {/* 1. FILTRE GLOBAL */}
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", marginBottom: 14 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 16 }}>
         {["24h", "7j", "30j", "90j", "all"].map(p => (
           <button key={p} onClick={() => { setPeriod(p); setDateStart(""); setDateEnd(""); }} style={{
-            padding: "8px 14px", borderRadius: 10, border: `1px solid ${period === p ? "var(--purple-light)" : "var(--border)"}`,
-            background: period === p ? "var(--purple-glow)" : "var(--surface)", color: period === p ? "#fff" : "var(--text)",
-            fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans',sans-serif",
+            padding: "7px 13px", borderRadius: 9, border: `1px solid ${period === p ? "#8b5cf6" : "var(--border)"}`,
+            background: period === p ? "rgba(139,92,246,0.15)" : "var(--surface)", color: period === p ? "#c4b5fd" : "var(--text)",
+            fontSize: 13, fontWeight: 600, cursor: "pointer",
           }}>{p === "all" ? "All time" : p}</button>
         ))}
         <span style={{ color: "var(--muted)", fontSize: 12 }}>|</span>
@@ -4355,242 +4409,468 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
         </select>
       </div>
 
-      {/* 2. KPI STRIP — 6 cartes */}
-      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr 1fr" : "repeat(6, 1fr)", gap: 12, marginBottom: 20 }}>
-        {DASHBOARD_METRICS.map((m) => {
+      {/* 2. KPI STRIP */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr 1fr" : "repeat(6, 1fr)", gap: 10, marginBottom: 18 }}>
+        {DASHBOARD_METRICS.map(m => {
           const val = m.calc(kpiData);
-          const deltaMap = { ca_brut: "deltaCaBrut", ca_net: "deltaCaNet", transactions: "deltaTx", spenders: "deltaSpenders", panier_moyen: "deltaPanier", taux_validation: "deltaTaux" };
-          const delta = kpiData[deltaMap[m.id]];
+          const deltaKey = { ca_brut: "deltaCaBrut", ca_net: "deltaCaNet", transactions: "deltaTx", spenders: "deltaSpenders", panier_moyen: "deltaPanier", taux_validation: "deltaTaux" }[m.id];
+          const delta = kpiData[deltaKey];
           return (
-            <div key={m.id} onClick={() => toggleMetric(m.id)} style={cardStyle(m.id)}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", marginBottom: 4 }}>{m.label}</div>
-              <div style={{ fontSize: 22, fontWeight: 800, color: "var(--text)" }}>{fmtVal(m.id, val)}</div>
-              {delta != null && !isNaN(delta) && (
-                <div style={{ fontSize: 11, fontWeight: 700, color: delta >= 0 ? "var(--green)" : "var(--red)", marginTop: 4 }}>{delta >= 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>
-              )}
-              <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 6 }}>Cliquer pour ajouter au graphe</div>
+            <div key={m.id} onClick={() => toggleMetric(m.id)} style={kpiCardStyle(m.id)}>
+              <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>{m.label}</div>
+              <div style={{ fontSize: 20, fontWeight: 800, color: activeMetrics.has(m.id) ? m.color : "var(--text)", lineHeight: 1.1 }}>{fmtVal(m.id, val)}</div>
+              {delta != null && !isNaN(delta) && <div style={{ fontSize: 10, fontWeight: 700, color: delta >= 0 ? "#10b981" : "#ef4444", marginTop: 4 }}>{delta >= 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>}
+              <div style={{ fontSize: 9, color: "var(--muted2)", marginTop: 5 }}>Cliquer → graphe</div>
             </div>
           );
         })}
       </div>
 
-      {/* 3. GRAPHE MULTI-MÉTRIQUES */}
-      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, marginBottom: 20 }}>
-        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 16 }}>
+      {/* 3. GRAPHE MULTI-SMOOTH */}
+      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 18 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 }}>
           <div>
-            <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)" }}>Évolution des métriques</div>
-            <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 4 }}>Cliquer sur un KPI ou une pill pour ajouter/retirer une courbe</div>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>Évolution des métriques</div>
+            <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 2 }}>Cliquer sur un KPI ou une pill pour ajouter/retirer</div>
           </div>
-          <div style={{ display: "flex", gap: 8 }}>
-            {["curve", "bar", "table"].map(v => (
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["curve", "📈 Courbe"], ["bar", "📊 Barres"], ["table", "🗒️ Tableau"]].map(([v, lbl]) => (
               <button key={v} onClick={() => setChartView(v)} style={{
-                padding: "6px 12px", borderRadius: 8, border: "1px solid var(--border)", background: chartView === v ? "var(--purple-glow)" : "var(--surface2)",
-                color: chartView === v ? "#fff" : "var(--text)", fontSize: 12, cursor: "pointer",
-              }}>{v === "curve" ? "📈 Courbe" : v === "bar" ? "📊 Barres" : "🗒️ Tableau"}</button>
+                padding: "5px 11px", borderRadius: 8, border: `1px solid ${chartView === v ? "#8b5cf6" : "var(--border)"}`,
+                background: chartView === v ? "rgba(139,92,246,0.15)" : "var(--surface2)", color: chartView === v ? "#c4b5fd" : "var(--text)", fontSize: 11, cursor: "pointer",
+              }}>{lbl}</button>
             ))}
           </div>
         </div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+        {/* Pills */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 14 }}>
           {DASHBOARD_METRICS.map(m => (
             <button key={m.id} onClick={() => toggleMetric(m.id)} style={{
-              padding: "6px 12px", borderRadius: 20, border: `2px solid ${activeMetrics.has(m.id) ? m.color : "var(--border)"}`,
+              padding: "5px 11px", borderRadius: 20, border: `2px solid ${activeMetrics.has(m.id) ? m.color : "var(--border)"}`,
               background: activeMetrics.has(m.id) ? `${m.color}22` : "var(--surface2)", color: activeMetrics.has(m.id) ? m.color : "var(--muted)",
-              fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+              fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 5,
             }}>
-              <span style={{ width: 8, height: 8, borderRadius: "50%", background: activeMetrics.has(m.id) ? m.color : "transparent", border: activeMetrics.has(m.id) ? "none" : "1px solid var(--muted)" }} />
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: activeMetrics.has(m.id) ? m.color : "var(--muted)", display: "inline-block" }} />
               {m.label}
             </button>
           ))}
         </div>
 
-        {chartView === "curve" && (
-          <div style={{ position: "relative", height: 260 }}>
-            <svg viewBox="0 0 100 260" preserveAspectRatio="none" width="100%" height="260" style={{ display: "block" }} onMouseLeave={() => setHoveredPoint(null)}>
-              <defs>
-                {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map((m) => (
-                  <linearGradient key={m.id} id={`grad-${m.id}`} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={m.color} stopOpacity="0.18" /><stop offset="100%" stopColor={m.color} stopOpacity="0" />
-                  </linearGradient>
-                ))}
-              </defs>
-              {[1, 2, 3, 4].map(i => (
-                <line key={i} x1="0" y1={(260 / 4) * i} x2="100" y2={(260 / 4) * i} stroke="rgba(255,255,255,0.04)" strokeWidth="0.5" />
-              ))}
-              {chartData.length > 0 && DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map((m) => {
-                const n = chartData.length;
-                const pts = chartData.map((row, i) => {
-                  const v = row[m.id];
-                  const x = n > 1 ? (i / (n - 1)) * 100 : 50;
-                  const y = 260 - (typeof v === "number" ? (v / chartMax) * 240 : 0);
-                  return `${x},${y}`;
-                }).join(" ");
-                const polyPts = chartData.map((row, i) => {
-                  const v = row[m.id];
-                  const x = n > 1 ? (i / (n - 1)) * 100 : 50;
-                  const y = 260 - (typeof v === "number" ? (v / chartMax) * 240 : 0);
-                  return `${x},${y}`;
-                }).join(" ");
+        {chartView === "curve" && rechartsReady && chartData.length > 0 && (
+          <ResponsiveContainer width="100%" height={240}>
+            <LineChart data={chartData} margin={{ top: 5, right: 10, bottom: 0, left: -10 }}>
+              <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
+              <XAxis dataKey="label" tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+              <YAxis tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} width={52} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : String(v)} />
+              <Tooltip content={({ active, payload, label }) => {
+                if (!active || !payload || !payload.length) return null;
                 return (
-                  <g key={m.id}>
-                    <polygon points={`0,260 ${polyPts} 100,260`} fill={`url(#grad-${m.id})`} />
-                    <polyline points={pts} fill="none" stroke={m.color} strokeWidth="0.8" strokeLinecap="round" strokeLinejoin="round" />
-                    {chartData.map((row, i) => {
-                      const v = row[m.id];
-                      const x = n > 1 ? (i / (n - 1)) * 100 : 50;
-                      const y = 260 - (typeof v === "number" ? (v / chartMax) * 240 : 0);
-                      return <circle key={i} cx={x} cy={y} r="1.2" fill={m.color} stroke="var(--surface)" strokeWidth="0.6" />;
-                    })}
-                  </g>
+                  <div style={{ background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>{label}</div>
+                    {payload.map((p, i) => <div key={i} style={{ fontSize: 12, fontWeight: 600, color: p.stroke }}>{p.name}: {fmtVal(p.dataKey, p.value)}</div>)}
+                  </div>
                 );
-              })}
-            </svg>
-          </div>
+              }} />
+              {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
+                <Line key={m.id} type="monotone" dataKey={m.id} name={m.label} stroke={m.color} strokeWidth={2} dot={false} activeDot={{ r: 5, fill: m.color, stroke: "#1a2035", strokeWidth: 2 }} />
+              ))}
+            </LineChart>
+          </ResponsiveContainer>
         )}
-
-        {chartView === "bar" && (
-          <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: 260, padding: "0 20px" }}>
-            {chartData.map((row, i) => (
-              <div key={i} style={{ flex: 1, display: "flex", gap: 2, alignItems: "flex-end", justifyContent: "center" }}>
-                {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => {
-                  const v = row[m.id] || 0;
-                  const h = chartMax > 0 ? (v / chartMax) * 220 : 0;
-                  return <div key={m.id} style={{ width: "100%", maxWidth: 24, height: h, background: m.color, borderRadius: "4px 4px 0 0", opacity: 0.85 }} title={`${m.label}: ${fmtVal(m.id, v)}`} />;
-                })}
-              </div>
-            ))}
-          </div>
+        {chartView === "curve" && (!rechartsReady || !chartData.length) && (
+          <div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" }}>Aucune donnée</div>
         )}
-
+        {chartView === "bar" && rechartsReady && chartData.length > 0 && (
+          <ResponsiveContainer width="100%" height={240}>
+            <BarChart data={chartData} margin={{ top: 5, right: 10, bottom: 0, left: -10 }}>
+              <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
+              <XAxis dataKey="label" tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+              <YAxis tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} width={52} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : String(v)} />
+              <Tooltip content={({ active, payload, label }) => {
+                if (!active || !payload || !payload.length) return null;
+                return (
+                  <div style={{ background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>{label}</div>
+                    {payload.map((p, i) => <div key={i} style={{ fontSize: 12, fontWeight: 600, color: p.fill }}>{p.name}: {fmtVal(p.dataKey, p.value)}</div>)}
+                  </div>
+                );
+              }} />
+              {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
+                <Bar key={m.id} dataKey={m.id} name={m.label} fill={m.color} radius={[3,3,0,0]} opacity={0.85} />
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+        {chartView === "bar" && !chartData.length && <div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" }}>Aucune donnée</div>}
         {chartView === "table" && (
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
-              <thead>
-                <tr style={{ borderBottom: "1px solid var(--border)" }}>
-                  <th style={{ padding: "10px 12px", textAlign: "left", color: "var(--muted)" }}>Date</th>
-                  {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
-                    <th key={m.id} style={{ padding: "10px 12px", textAlign: "right", color: m.color }}>{m.label}</th>
-                  ))}
-                </tr>
-              </thead>
+              <thead><tr style={{ borderBottom: "1px solid var(--border)" }}>
+                <th style={{ padding: "8px 12px", textAlign: "left", color: "var(--muted)", fontWeight: 600 }}>Date</th>
+                {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => <th key={m.id} style={{ padding: "8px 12px", textAlign: "right", color: m.color, fontWeight: 700 }}>{m.label}</th>)}
+              </tr></thead>
               <tbody>
                 {chartData.map((row, i) => (
-                  <tr key={i} style={{ borderBottom: "1px solid var(--border2)" }}>
-                    <td style={{ padding: "8px 12px", color: "var(--text)" }}>{new Date(row.date).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</td>
-                    {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
-                      <td key={m.id} style={{ padding: "8px 12px", textAlign: "right", color: m.color, fontWeight: 600 }}>{fmtVal(m.id, row[m.id] || 0)}</td>
-                    ))}
+                  <tr key={i} style={{ borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                    <td style={{ padding: "7px 12px", color: "var(--text)" }}>{row.label}</td>
+                    {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => <td key={m.id} style={{ padding: "7px 12px", textAlign: "right", color: m.color, fontWeight: 600 }}>{fmtVal(m.id, row[m.id] || 0)}</td>)}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         )}
-
-        {(chartView === "curve" || chartView === "bar") && (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--border2)" }}>
+        {chartView !== "table" && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.04)" }}>
             {DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => (
-              <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <div style={{ width: 16, height: 2, background: m.color, borderRadius: 1 }} />
-                <span style={{ fontSize: 12, color: "var(--text)" }}>{m.label}</span>
+                <span style={{ fontSize: 11, color: "var(--text)" }}>{m.label}</span>
               </div>
             ))}
           </div>
         )}
       </div>
 
-      {/* 4. BOTTOM GRID — 3 colonnes */}
-      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr 340px", gap: 14 }}>
-        {/* Colonne 1 */}
-        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
-          <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 16, color: "var(--text)" }}>Modèles actives</div>
-          {modelStats.map((m, i) => (
-            <div key={m.name} style={{ marginBottom: 16 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
-                <div style={{ width: 36, height: 36, borderRadius: 10, background: (modelColors[m.name] || "var(--purple)") + "33", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 14, color: modelColors[m.name] || "var(--purple)" }}>{m.name[0]}</div>
+      {/* 4. BOTTOM GRID */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr 340px", gap: 14, marginBottom: 20 }}>
+
+        {/* COL 1 — Modèles + Chatters */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div onClick={() => setPopup("models")} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" }} onMouseOver={e => e.currentTarget.style.borderColor = "#8b5cf6"} onMouseOut={e => e.currentTarget.style.borderColor = "var(--border)"}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>🔥 Modèles actives</div>
+              <span style={{ fontSize: 10, color: "#8b5cf6" }}>Détails →</span>
+            </div>
+            {modelStats.map(m => (
+              <div key={m.name} style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 5 }}>
+                  <div style={{ width: 34, height: 34, borderRadius: 10, background: (modelColors[m.name] || "#8b5cf6") + "33", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 14, color: modelColors[m.name] || "#8b5cf6", flexShrink: 0 }}>{m.name[0]}</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)" }}>{m.name}</div>
+                    <div style={{ fontSize: 10, color: "var(--muted2)" }}>{m.convs} conv · {m.actives} actives</div>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: "var(--text)", flexShrink: 0 }}>{m.ca.toLocaleString("fr-FR")} {currencySymbol}</div>
+                </div>
+                <div style={{ height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${m.barPct}%`, background: modelColors[m.name] || "#8b5cf6", borderRadius: 3, transition: "width 0.3s" }} />
+                </div>
+              </div>
+            ))}
+            {modelStats.length === 0 && <div style={{ textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 }}>Aucune donnée modèle</div>}
+          </div>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
+            <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 14, color: "var(--text)" }}>👥 Chatters en shift</div>
+            {chatterProfiles.slice(0, 5).map(ch => (
+              <div key={ch.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                <div style={{ width: 32, height: 32, borderRadius: 10, background: "rgba(99,102,241,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 13, color: "#818cf8", flexShrink: 0 }}>{(ch.name || "?")[0]}</div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{m.name}</div>
-                  <div style={{ fontSize: 11, color: "var(--muted2)" }}>{m.convs} conv · {m.actives} actives</div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{ch.name}</div>
+                  <div style={{ fontSize: 10, color: "var(--muted2)" }}>{ch.assigned_models?.length ? `${ch.assigned_models.length} modèle(s)` : "Non assigné"}</div>
                 </div>
-                <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>{m.ca.toLocaleString("fr-FR")} {currencySymbol}</div>
-              </div>
-              <div style={{ height: 6, borderRadius: 3, background: "var(--surface2)", overflow: "hidden" }}>
-                <div style={{ height: "100%", width: `${m.barPct}%`, background: modelColors[m.name] || "var(--purple)", borderRadius: 3, transition: "width 0.3s" }} />
-              </div>
-            </div>
-          ))}
-          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "var(--text)" }}>💳 Répartition paiement</div>
-            {paymentBreakdown.map((p, i) => (
-              <div key={i} style={{ marginBottom: 10 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-                  <span style={{ color: "var(--text)" }}>{p.name}</span>
-                  <span style={{ color: "var(--muted2)" }}>{p.val.toLocaleString("fr-FR")} {currencySymbol} · {p.pct.toFixed(0)}%</span>
-                </div>
-                <div style={{ height: 6, borderRadius: 3, background: "var(--surface2)", overflow: "hidden" }}>
-                  <div style={{ height: "100%", width: `${p.pct}%`, background: "var(--purple-light)", borderRadius: 3 }} />
-                </div>
+                <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: "rgba(52,211,153,0.15)", color: "#34d399" }}>SHIFT</span>
               </div>
             ))}
+            {chatterProfiles.length === 0 && <div style={{ textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 }}>Aucun chatter</div>}
           </div>
         </div>
 
-        {/* Colonne 2 */}
-        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
-          <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 16, color: "var(--text)" }}>TX récentes</div>
-          {recentTxs.map(tx => {
-            const m = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
-            const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
-            const prov = allProfiles.find(p => p.id === tx.provider_id);
-            const statusColor = tx.status === "validated" || tx.status === "validé" ? "var(--green)" : tx.status === "pending" ? "var(--gold)" : "var(--red)";
-            const statusLabel = tx.status === "validated" || tx.status === "validé" ? "VALID" : tx.status === "pending" ? "PEND." : "REFUSÉE";
-            return (
-              <div key={tx.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 0", borderBottom: "1px solid var(--border2)" }}>
-                <div>
-                  <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>@{tx.spender_handle || "?"} · {m?.name || "?"} · {ppm?.label || prov?.name || "Provider"}</div>
-                  <div style={{ fontSize: 12, color: "var(--muted2)" }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {tx.currency || currencySymbol}</div>
+        {/* COL 2 — TX récentes + Bots */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div onClick={() => setPopup("tx")} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" }} onMouseOver={e => e.currentTarget.style.borderColor = "#f59e0b"} onMouseOut={e => e.currentTarget.style.borderColor = "var(--border)"}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>🕐 TX récentes</div>
+              <span style={{ fontSize: 10, color: "#f59e0b" }}>Voir tout →</span>
+            </div>
+            {recentAllTxs.slice(0, 5).map((tx, i) => {
+              const m = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
+              const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
+              const prov = allProfiles.find(p => p.id === tx.provider_id);
+              const sc = sColor(tx.status);
+              return (
+                <div key={tx.id || i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>@{tx.spender_handle || "?"} · {m?.name || "?"}</div>
+                    <div style={{ fontSize: 10, color: "var(--muted2)" }}>{ppm?.label || prov?.name || "?"} · {new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0, marginLeft: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: sc }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {tx.currency || currencySymbol}</span>
+                    <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 6, background: sc + "22", color: sc }}>{sLabel(tx.status)}</span>
+                  </div>
                 </div>
-                <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 6, background: statusColor + "22", color: statusColor }}>{statusLabel}</span>
-              </div>
-            );
-          })}
-          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
-            <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 12, color: "var(--text)" }}>Bots Status</div>
-            {botStatusList.map(b => (
-              <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                <span style={{ width: 8, height: 8, borderRadius: "50%", background: b.status === "ACTIVE" ? "var(--green)" : "var(--red)", animation: b.status === "ACTIVE" ? "pulse 2s infinite" : "none" }} />
-                <span style={{ fontSize: 13, color: "var(--text)" }}>{b.name}</span>
-                <span style={{ fontSize: 11, color: b.status === "ACTIVE" ? "var(--green)" : "var(--muted2)" }}>{b.status}</span>
-              </div>
-            ))}
+              );
+            })}
+          </div>
+          <div onClick={() => setPopup("bots")} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" }} onMouseOver={e => e.currentTarget.style.borderColor = "#38bdf8"} onMouseOut={e => e.currentTarget.style.borderColor = "var(--border)"}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>📡 Bots Status</div>
+              <span style={{ fontSize: 10, color: "#38bdf8" }}>Détails →</span>
+            </div>
+            {botStatusList.map(b => {
+              const dc = b.status === "ACTIVE" ? "#10b981" : b.status === "DEGRADED" ? "#f59e0b" : "#ef4444";
+              return (
+                <div key={b.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: dc, animation: b.status === "ACTIVE" ? "pulse 2s infinite" : "none", flexShrink: 0 }} />
+                  <span style={{ fontSize: 13, color: "var(--text)", flex: 1 }}>{b.name}</span>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: dc }}>{b.status}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
 
-        {/* Colonne 3 */}
-        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
-          <div style={{ fontSize: 15, fontWeight: 800, marginBottom: 16, color: "var(--text)" }}>Alertes</div>
-          {dashboardAlerts.map((a, i) => (
-            <div key={i} style={{ padding: "10px 0", borderBottom: "1px solid var(--border2)", fontSize: 12 }}>
-              <span style={{ marginRight: 6 }}>{a.icon}</span>
-              <span style={{ color: a.severity === "red" ? "var(--red)" : "var(--gold)" }}>{a.msg}</span>
-              <span style={{ color: "var(--muted2)", marginLeft: 4 }}>{a.ongoing ? "ongoing" : (a.days || 0) + "j"}</span>
+        {/* COL 3 — Alertes + To-Do */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div onClick={() => setPopup("alerts")} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" }} onMouseOver={e => e.currentTarget.style.borderColor = "#ef4444"} onMouseOut={e => e.currentTarget.style.borderColor = "var(--border)"}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>🔔 Alertes {dashboardAlerts.length > 0 && <span style={{ fontSize: 11, fontWeight: 700, padding: "1px 7px", borderRadius: 8, background: "rgba(239,68,68,0.15)", color: "#f87171", marginLeft: 6 }}>{dashboardAlerts.length}</span>}</div>
+              <span style={{ fontSize: 10, color: "#ef4444" }}>Voir tout →</span>
             </div>
-          ))}
-          <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginTop: 16 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12, color: "var(--text)" }}>Heatmap activité hebdo</div>
-            <div style={{ fontSize: 9, color: "var(--muted2)", display: "flex", gap: 4, marginBottom: 6 }}>
-              {["L", "M", "M", "J", "V", "S", "D"].map((d, i) => <span key={i} style={{ width: 20, textAlign: "center" }}>{d}</span>)}
-            </div>
-            {[0, 1, 2, 3].map(w => (
-              <div key={w} style={{ display: "flex", gap: 4, marginBottom: 4 }}>
-                {[0, 1, 2, 3, 4, 5, 6].map(d => {
-                  const cell = heatmapData.find(c => c.w === w && c.d === d);
-                  return <div key={d} style={{ width: 20, height: 20, borderRadius: 4, background: `rgba(139,92,246,${cell?.opacity ?? 0.03})`, flexShrink: 0 }} title={cell ? `${cell.count} TX` : "0 TX"} />;
-                })}
+            {dashboardAlerts.slice(0, 5).map((a, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "7px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                <span style={{ fontSize: 13, flexShrink: 0 }}>{a.icon}</span>
+                <span style={{ flex: 1, fontSize: 11, color: a.severity === "red" ? "#f87171" : "#fbbf24", lineHeight: 1.3 }}>{a.msg}</span>
+                <span style={{ fontSize: 9, color: "var(--muted2)", flexShrink: 0 }}>{a.ongoing ? "ongoing" : `${a.days || 0}j`}</span>
               </div>
             ))}
+            {dashboardAlerts.length === 0 && <div style={{ textAlign: "center", padding: 12, color: "var(--muted)", fontSize: 12 }}>✅ Aucune alerte</div>}
+          </div>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>✅ To-Do</div>
+              <button onClick={e => { e.stopPropagation(); setPopup("todos"); }} style={{ fontSize: 10, color: "#818cf8", background: "none", border: "none", cursor: "pointer" }}>Voir tout →</button>
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              {todos.filter(t => !t.done).slice(0, 4).map(t => (
+                <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+                  <input type="checkbox" checked={false} onChange={() => toggleTodo(t.id)} onClick={e => e.stopPropagation()} style={{ accentColor: "#8b5cf6", cursor: "pointer", flexShrink: 0 }} />
+                  <span style={{ fontSize: 12, color: "var(--text)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.text}</span>
+                  {t.priority === "haute" && <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 5, background: "rgba(239,68,68,0.15)", color: "#f87171", flexShrink: 0 }}>!</span>}
+                </div>
+              ))}
+              {todos.filter(t => !t.done).length === 0 && <div style={{ fontSize: 11, color: "var(--muted)", textAlign: "center", padding: "8px 0" }}>Aucune tâche en attente</div>}
+            </div>
+            <div style={{ display: "flex", gap: 6 }} onClick={e => e.stopPropagation()}>
+              <input value={newTodoText} onChange={e => setNewTodoText(e.target.value)} onKeyDown={e => e.key === "Enter" && addTodo()} placeholder="+ Ajouter une tâche..." style={{ flex: 1, padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text)", fontSize: 11 }} />
+              <button onClick={addTodo} disabled={!newTodoText.trim()} style={{ padding: "6px 10px", borderRadius: 8, border: "none", background: newTodoText.trim() ? "#8b5cf6" : "var(--surface2)", color: newTodoText.trim() ? "#fff" : "var(--muted)", fontSize: 11, cursor: newTodoText.trim() ? "pointer" : "default" }}>+</button>
+            </div>
           </div>
         </div>
       </div>
+
+      {/* ═══ POPUP MODÈLES ═══ */}
+      <DashModal open={popup === "models"} onClose={() => setPopup(null)} title="🔥 Modèles actives" maxWidth={1000}>
+        <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(3, 1fr)", gap: 16 }}>
+          {DASHBOARD_MODELS.map(name => {
+            const mStat = modelStats.find(x => x.name === name);
+            if (!mStat) return <div key={name} style={{ padding: 20, borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)", textAlign: "center", color: "var(--muted)", fontSize: 13 }}>{name} — Aucune donnée</div>;
+            const tabKey = `m-${name}`;
+            const tab = popupModelTabs[tabKey] || "performance";
+            const mColor = modelColors[name] || "#8b5cf6";
+            const mTxs = mStat.allMTxs || [];
+            const validMTxs = mTxs.filter(t => t.status === "validated" || t.status === "validé");
+            const pendingMTxs = mTxs.filter(t => t.status === "pending");
+            return (
+              <div key={name} style={{ border: `1px solid ${mColor}40`, borderRadius: 14, overflow: "hidden", background: `${mColor}08` }}>
+                <div style={{ padding: "16px 20px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", gap: 12 }}>
+                  <div style={{ width: 44, height: 44, borderRadius: 12, background: mColor + "33", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 20, color: mColor }}>{name[0]}</div>
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 800, color: "#f8fafc" }}>{name}</div>
+                    <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: mStat.ca > 0 ? "rgba(52,211,153,0.15)" : "rgba(100,116,139,0.2)", color: mStat.ca > 0 ? "#34d399" : "#64748b" }}>{mStat.ca > 0 ? "ACTIVE" : "INACTIVE"}</span>
+                  </div>
+                </div>
+                <DashTabs tabs={[{ id: "performance", icon: "📊", label: "Performance" }, { id: "conversations", icon: "💬", label: "Conversations" }, { id: "paiements", icon: "💳", label: "Paiements" }]} active={tab} onSelect={t => setPopupModelTabs(prev => ({ ...prev, [tabKey]: t }))} />
+                <div style={{ padding: "0 16px 16px" }}>
+                  {tab === "performance" && (
+                    <div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+                        {[
+                          { l: "CA généré", v: mStat.ca.toLocaleString("fr-FR") + " " + currencySymbol, c: mColor },
+                          { l: "Pending", v: pendingMTxs.reduce((s, t) => s + convertAmount(Number(t.amount || 0), t.currency), 0).toLocaleString("fr-FR") + " " + currencySymbol, c: "#f59e0b" },
+                          { l: "Taux conv.", v: mTxs.length > 0 ? (validMTxs.length / mTxs.length * 100).toFixed(0) + "%" : "—", c: "#10b981" },
+                          { l: "Panier moy.", v: mStat.convs > 0 ? Math.round(mStat.ca / mStat.convs).toLocaleString("fr-FR") + " " + currencySymbol : "—", c: "#818cf8" },
+                          { l: "TX total", v: String(mTxs.length), c: "var(--text)" },
+                          { l: "Conv actives", v: String(mStat.actives), c: "#f59e0b" },
+                        ].map((k, i) => (
+                          <div key={i} style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.04)" }}>
+                            <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 3 }}>{k.l}</div>
+                            <div style={{ fontSize: 16, fontWeight: 800, color: k.c }}>{k.v}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "#a1a1aa", marginBottom: 8 }}>CA par semaine</div>
+                      <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 56 }}>
+                        {(mStat.weeklyCA || []).map((w, i) => {
+                          const maxW = Math.max(...(mStat.weeklyCA || []).map(x => x.ca), 1);
+                          return (
+                            <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+                              <div style={{ width: "100%", height: Math.max(3, (w.ca / maxW) * 44), background: mColor, borderRadius: "3px 3px 0 0", opacity: i === (mStat.weeklyCA || []).length - 1 ? 1 : 0.55, transition: "height 0.3s" }} />
+                              <span style={{ fontSize: 7, color: "#64748b" }}>{w.label}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  {tab === "conversations" && (
+                    <div>
+                      {pendingMTxs.slice(0, 8).map((tx, i) => (
+                        <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)", fontSize: 11 }}>
+                          <span style={{ color: "#818cf8" }}>@{tx.spender_handle || "?"}</span>
+                          <span style={{ color: "#f59e0b", fontWeight: 600 }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {tx.currency || currencySymbol}</span>
+                        </div>
+                      ))}
+                      {pendingMTxs.length === 0 && <div style={{ padding: 20, textAlign: "center", color: "#64748b", fontSize: 12 }}>Aucune conv active</div>}
+                    </div>
+                  )}
+                  {tab === "paiements" && (
+                    <div>
+                      {mTxs.slice(0, 8).map((tx, i) => {
+                        const sc = sColor(tx.status);
+                        return (
+                          <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)", fontSize: 11 }}>
+                            <div>
+                              <div style={{ color: "#f8fafc" }}>@{tx.spender_handle || "?"}</div>
+                              <div style={{ color: "#64748b", marginTop: 1 }}>{new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</div>
+                            </div>
+                            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
+                              <span style={{ fontWeight: 700, color: sc }}>{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {tx.currency || currencySymbol}</span>
+                              <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 5, background: sc + "22", color: sc }}>{sLabel(tx.status)}</span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </DashModal>
+
+      {/* ═══ POPUP TX ═══ */}
+      <DashModal open={popup === "tx"} onClose={() => setPopup(null)} title="🕐 Transactions récentes" maxWidth={820}>
+        <DashTabs tabs={[{ id: "all", icon: "", label: "Toutes" }, { id: "validated", icon: "✅", label: "Validées" }, { id: "pending", icon: "⏳", label: "En attente" }, { id: "refused", icon: "❌", label: "Refusées" }]} active={popupTxTab} onSelect={setPopupTxTab} />
+        {recentAllTxs.filter(tx => popupTxTab === "all" || (popupTxTab === "validated" && (tx.status === "validated" || tx.status === "validé")) || (popupTxTab === "pending" && tx.status === "pending") || (popupTxTab === "refused" && tx.status === "refused")).map((tx, i) => {
+          const m = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
+          const ppm = (providerPaymentMethods || []).find(p => p.id === tx.provider_payment_method_id);
+          const prov = allProfiles.find(p => p.id === tx.provider_id);
+          const sc = sColor(tx.status);
+          return (
+            <div key={tx.id || i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#f8fafc" }}>@{tx.spender_handle || "?"}</div>
+                <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>{m?.name || "?"} · {ppm?.label || prov?.name || "?"} · {tx.product || "—"}</div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: sc }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {tx.currency || currencySymbol}</div>
+                  <div style={{ fontSize: 10, color: "#64748b" }}>{new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</div>
+                </div>
+                <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: sc + "22", color: sc, minWidth: 50, textAlign: "center" }}>{sLabel(tx.status)}</span>
+              </div>
+            </div>
+          );
+        })}
+      </DashModal>
+
+      {/* ═══ POPUP BOTS ═══ */}
+      <DashModal open={popup === "bots"} onClose={() => setPopup(null)} title="📡 Bots Status" maxWidth={900}>
+        <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(3, 1fr)", gap: 16 }}>
+          {botStatusList.map(b => {
+            const tabKey = `b-${b.id}`;
+            const tab = popupBotTabs[tabKey] || "stats";
+            const dc = b.status === "ACTIVE" ? "#10b981" : b.status === "DEGRADED" ? "#f59e0b" : "#ef4444";
+            return (
+              <div key={b.id} style={{ border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, overflow: "hidden", background: "#0f1320" }}>
+                <div style={{ padding: "14px 18px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ width: 9, height: 9, borderRadius: "50%", background: dc, animation: b.status === "ACTIVE" ? "pulse 2s infinite" : "none", display: "inline-block", flexShrink: 0 }} />
+                    <span style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>{b.name}</span>
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: dc }}>{b.status}</span>
+                </div>
+                <DashTabs tabs={[{ id: "stats", icon: "📊", label: "Stats" }, { id: "logs", icon: "📋", label: "Logs" }]} active={tab} onSelect={t => setPopupBotTabs(prev => ({ ...prev, [tabKey]: t }))} />
+                <div style={{ padding: "0 16px 16px" }}>
+                  {tab === "stats" && (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      {[{ l: "Uptime", v: b.uptime + "%", c: b.uptime > 90 ? "#10b981" : "#f59e0b" }, { l: "Msgs/jour", v: String(b.msgs), c: "#818cf8" }, { l: "Conv actives", v: String(b.convs), c: "#38bdf8" }, { l: "Escalades", v: String(b.escalations), c: "#f59e0b" }, { l: "Erreurs", v: String(b.errors), c: b.errors > 0 ? "#ef4444" : "#10b981" }].map((k, i) => (
+                        <div key={i} style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(255,255,255,0.04)" }}>
+                          <div style={{ fontSize: 9, color: "#64748b", textTransform: "uppercase", marginBottom: 3 }}>{k.l}</div>
+                          <div style={{ fontSize: 18, fontWeight: 800, color: k.c }}>{k.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {tab === "logs" && (
+                    <div>
+                      {b.logs.map((log, i) => (
+                        <div key={i} style={{ display: "flex", gap: 8, padding: "6px 0", borderBottom: "1px solid rgba(255,255,255,0.04)", fontSize: 11 }}>
+                          <span style={{ color: "#64748b", flexShrink: 0, fontFamily: "monospace" }}>{log.time}</span>
+                          <span style={{ color: log.type === "error" ? "#f87171" : log.type === "esc" ? "#fbbf24" : "#a1a1aa" }}>{log.text}</span>
+                        </div>
+                      ))}
+                      {b.logs.length === 0 && <div style={{ textAlign: "center", padding: 20, color: "#64748b", fontSize: 12 }}>Aucun log récent</div>}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </DashModal>
+
+      {/* ═══ POPUP ALERTES ═══ */}
+      <DashModal open={popup === "alerts"} onClose={() => setPopup(null)} title="🔔 Alertes" maxWidth={700}>
+        {dashboardAlerts.length === 0 && (
+          <div style={{ textAlign: "center", padding: 40, color: "#64748b" }}>
+            <div style={{ fontSize: 40, marginBottom: 8 }}>✅</div>
+            <div style={{ fontSize: 14 }}>Aucune alerte active</div>
+          </div>
+        )}
+        {dashboardAlerts.map((a, i) => (
+          <div key={i} onClick={a.nav} style={{ display: "flex", alignItems: "flex-start", gap: 14, padding: "14px 0", borderBottom: "1px solid rgba(255,255,255,0.06)", cursor: a.nav ? "pointer" : "default" }} onMouseOver={e => a.nav && (e.currentTarget.style.background = "rgba(255,255,255,0.03)")} onMouseOut={e => (e.currentTarget.style.background = "transparent")}>
+            <span style={{ fontSize: 20, flexShrink: 0 }}>{a.icon}</span>
+            <span style={{ flex: 1, fontSize: 13, color: a.severity === "red" ? "#f87171" : "#fbbf24", lineHeight: 1.4 }}>{a.msg}</span>
+            <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+              <span style={{ fontSize: 10, color: "#64748b" }}>{a.ongoing ? "ongoing" : `${a.days || 0}j`}</span>
+              {a.nav && <span style={{ fontSize: 10, color: "#818cf8" }}>Voir →</span>}
+            </div>
+          </div>
+        ))}
+      </DashModal>
+
+      {/* ═══ POPUP TO-DO ═══ */}
+      <DashModal open={popup === "todos"} onClose={() => setPopup(null)} title="✅ To-Do" maxWidth={600}>
+        <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
+          <input value={newTodoText} onChange={e => setNewTodoText(e.target.value)} onKeyDown={e => e.key === "Enter" && addTodo()} placeholder="Nouvelle tâche..." style={{ flex: 1, padding: "10px 14px", borderRadius: 10, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.05)", color: "#f8fafc", fontSize: 13 }} />
+          <button onClick={addTodo} disabled={!newTodoText.trim()} style={{ padding: "10px 16px", borderRadius: 10, border: "none", background: newTodoText.trim() ? "#8b5cf6" : "rgba(255,255,255,0.08)", color: newTodoText.trim() ? "#fff" : "#64748b", fontSize: 13, fontWeight: 700, cursor: newTodoText.trim() ? "pointer" : "default" }}>Ajouter</button>
+        </div>
+        {todos.filter(t => !t.done).length > 0 && <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>En cours ({todos.filter(t => !t.done).length})</div>}
+        {todos.filter(t => !t.done).map(t => (
+          <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+            <input type="checkbox" checked={false} onChange={() => toggleTodo(t.id)} style={{ accentColor: "#8b5cf6", cursor: "pointer", flexShrink: 0, width: 16, height: 16 }} />
+            <span style={{ flex: 1, fontSize: 13, color: "#f8fafc" }}>{t.text}</span>
+            {t.priority === "haute" && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 6, background: "rgba(239,68,68,0.15)", color: "#f87171" }}>HAUTE</span>}
+            {t.due_date && <span style={{ fontSize: 10, color: "#64748b" }}>{new Date(t.due_date).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" })}</span>}
+            <button onClick={() => deleteTodo(t.id)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 18, padding: "2px 4px", borderRadius: 4, lineHeight: 1 }}>×</button>
+          </div>
+        ))}
+        {todos.filter(t => t.done).length > 0 && (
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5, marginTop: 20, marginBottom: 10 }}>Terminées ({todos.filter(t => t.done).length})</div>
+            {todos.filter(t => t.done).map(t => (
+              <div key={t.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.06)", opacity: 0.5 }}>
+                <input type="checkbox" checked={true} onChange={() => toggleTodo(t.id)} style={{ accentColor: "#8b5cf6", cursor: "pointer", flexShrink: 0, width: 16, height: 16 }} />
+                <span style={{ flex: 1, fontSize: 13, color: "#f8fafc", textDecoration: "line-through" }}>{t.text}</span>
+                <button onClick={() => deleteTodo(t.id)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 18, padding: "2px 4px", lineHeight: 1 }}>×</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </DashModal>
+
     </div>
   );
 });
@@ -21534,10 +21814,7 @@ const App = () => {
             {isGerant&&!_isMobile&&<button onClick={()=>setShowSearch(true)} style={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:12,padding:"5px 14px",cursor:"pointer",color:"var(--text-quaternary)",fontSize:12,fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6}}>
               {"\u{1F50D}"} {t(lang,"search_cmd")}
             </button>}
-            {!_isMobile && <div style={{display:"flex",alignItems:"center",gap:6}}>
-              <span style={{width:8,height:8,borderRadius:"50%",background:"var(--success)",boxShadow:"none",animation:"pulse 2s infinite"}}/>
-              <span style={{color:"var(--text-secondary)",fontSize:12}}>Live</span>
-            </div>}
+            {!_isMobile && <LiveClock timezone={timezone} />}
             {/* Notifications bell + dropdown */}
             <div style={{position:"relative"}}>
               <div style={{cursor:"pointer",padding:"4px 8px",borderRadius:12,background:showNotifs?"var(--accent-muted)":"transparent",transition:"background 0.2s",display:"flex",alignItems:"center",gap:4}} onClick={()=>setShowNotifs(!showNotifs)}>
