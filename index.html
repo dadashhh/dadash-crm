@@ -14954,6 +14954,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
 const DEFAULT_MESSAGING_PERMS = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
 
 const BOT_STATUS_ENDPOINT = "/bot/status";
+const BOT_SEND_ENDPOINT = "/sendMessage";
 const BOT_PAUSE_ENDPOINT = "/bot/pause";
 const BOT_RESUME_ENDPOINT = "/bot/resume";
 const BOT_STATUS_TIMEOUT_MS = 8000;
@@ -14980,8 +14981,12 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
   const [configInputUrl, setConfigInputUrl] = useState("");
   const [configInputKey, setConfigInputKey] = useState("");
   const [configKeyVisible, setConfigKeyVisible] = useState(false);
+  const [keyConfigured, setKeyConfigured] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [testLoading, setTestLoading] = useState(false);
+  const [lastTestLog, setLastTestLog] = useState(null);
+  const [testSendLoading, setTestSendLoading] = useState(false);
+  const [refreshConvsLoading, setRefreshConvsLoading] = useState(false);
   const [modelActionLoading, setModelActionLoading] = useState(null);
   const [modelActionError, setModelActionError] = useState({});
 
@@ -14992,7 +14997,8 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
       const url = window.TELEGRAM_BOT_URL || localStorage.getItem(LS_BOT_URL) || "";
       const key = window.DADASH_INTERNAL_API_KEY || localStorage.getItem(LS_API_KEY) || "";
       setConfigInputUrl(url);
-      setConfigInputKey(key);
+      setConfigInputKey(key ? "" : "");
+      setKeyConfigured(!!key);
       if (url && !window.TELEGRAM_BOT_URL) window.TELEGRAM_BOT_URL = url;
       if (key && !window.DADASH_INTERNAL_API_KEY) window.DADASH_INTERNAL_API_KEY = key;
     } catch (_) {}
@@ -15001,16 +15007,23 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
   const saveBotConfig = () => {
     try {
       const url = (configInputUrl || "").trim().replace(/\/$/, "");
-      const key = (configInputKey || "").trim();
+      const newKey = (configInputKey || "").trim();
+      const key = newKey || (keyConfigured ? (window.DADASH_INTERNAL_API_KEY || (typeof localStorage!=="undefined" ? localStorage.getItem(LS_API_KEY) : "") || "") : "");
       localStorage.setItem(LS_BOT_URL, url);
-      localStorage.setItem(LS_API_KEY, key);
       window.TELEGRAM_BOT_URL = url;
-      window.DADASH_INTERNAL_API_KEY = key;
+      if (key) {
+        localStorage.setItem(LS_API_KEY, key);
+        window.DADASH_INTERNAL_API_KEY = key;
+        setKeyConfigured(true);
+        setConfigInputKey("");
+      }
       addToast(fr ? "Config sauvegardée" : "Config saved", "success");
     } catch (e) {
       addToast((fr ? "Erreur: " : "Error: ") + (e?.message || e), "error");
     }
   };
+
+  const getEffectiveApiKey = () => (configInputKey || "").trim() || (keyConfigured ? (window.DADASH_INTERNAL_API_KEY || "") : "") || "";
 
   const clearBotConfig = () => {
     try {
@@ -15020,7 +15033,9 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
       window.DADASH_INTERNAL_API_KEY = "";
       setConfigInputUrl("");
       setConfigInputKey("");
+      setKeyConfigured(false);
       setTestResult(null);
+      setLastTestLog(null);
       setBotStatusError(fr ? "Bot URL non configurée" : "Bot URL not configured");
       setBotStatus(null);
       addToast(fr ? "Config effacée" : "Config cleared", "success");
@@ -15033,11 +15048,13 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
     const baseUrl = (configInputUrl || "").trim().replace(/\/$/, "");
     if (!baseUrl) {
       setTestResult({ error: fr ? "Bot URL non configurée" : "Bot URL not configured" });
+      setLastTestLog({ type: "status", ok: false, message: fr ? "Bot URL non configurée" : "Bot URL not configured", at: new Date().toISOString() });
       return;
     }
-    const apiKey = (configInputKey || "").trim();
+    const apiKey = getEffectiveApiKey();
     if (!apiKey) {
-      setTestResult({ error: fr ? "Clé X-DADASH-KEY manquante" : "X-DADASH-KEY missing" });
+      setTestResult({ error: fr ? "Clé X-DADASH-KEY manquante — renseigner URL + X-DADASH-KEY" : "X-DADASH-KEY missing — set URL + X-DADASH-KEY" });
+      setLastTestLog({ type: "status", ok: false, message: fr ? "Clé manquante" : "Key missing", at: new Date().toISOString() });
       return;
     }
     const url = baseUrl + (BOT_STATUS_ENDPOINT.startsWith("/") ? BOT_STATUS_ENDPOINT : "/" + BOT_STATUS_ENDPOINT);
@@ -15053,9 +15070,11 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
         const errMsg = res.status === 401
           ? (fr ? "Clé X-DADASH-KEY invalide ou manquante" : "X-DADASH-KEY invalid or missing")
           : (fr ? "Endpoint inaccessible (HTTP " + res.status + ")" : "Endpoint inaccessible (HTTP " + res.status + ")");
+        setLastTestLog({ type: "status", ok: false, httpCode: res.status, message: errMsg, at: new Date().toISOString() });
         throw new Error(txt || errMsg);
       }
       const data = await res.json().catch(() => null);
+      setLastTestLog({ type: "status", ok: true, httpCode: 200, message: data?.bot_online ? (fr ? "Bot en ligne" : "Bot online") : (fr ? "Bot hors ligne" : "Bot offline"), at: new Date().toISOString() });
       const nbModels = (data?.models && Array.isArray(data.models)) ? data.models.length : 0;
       let lastWebhookFmt = "";
       if (data?.last_webhook_at != null) {
@@ -15079,8 +15098,75 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
         ? (fr ? "Endpoint inaccessible (timeout)" : "Endpoint inaccessible (timeout)")
         : msg;
       setTestResult({ error: friendly });
+      setLastTestLog({ type: "status", ok: false, message: friendly, at: new Date().toISOString() });
     } finally {
       setTestLoading(false);
+    }
+  };
+
+  const testSendEndpoint = async () => {
+    const baseUrl = (configInputUrl || "").trim().replace(/\/$/, "");
+    if (!baseUrl) {
+      setLastTestLog({ type: "send", ok: false, message: fr ? "Bot URL non configurée" : "Bot URL not configured", at: new Date().toISOString() });
+      addToast(fr ? "Renseigner Bot URL + X-DADASH-KEY" : "Set Bot URL + X-DADASH-KEY", "error");
+      return;
+    }
+    const apiKey = getEffectiveApiKey();
+    if (!apiKey) {
+      setLastTestLog({ type: "send", ok: false, message: fr ? "Clé X-DADASH-KEY manquante" : "X-DADASH-KEY missing", at: new Date().toISOString() });
+      addToast(fr ? "Renseigner X-DADASH-KEY" : "Set X-DADASH-KEY", "error");
+      return;
+    }
+    const url = baseUrl + (BOT_SEND_ENDPOINT.startsWith("/") ? BOT_SEND_ENDPOINT : "/" + BOT_SEND_ENDPOINT);
+    setTestSendLoading(true);
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), BOT_STATUS_TIMEOUT_MS);
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-DADASH-KEY": apiKey },
+        body: JSON.stringify({ dry_run: true, conversation_id: "test", text: "" }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const msg = data?.dry_run ? (fr ? "Dry-run OK" : "Dry-run OK") : (fr ? "Endpoint OK (HTTP " + res.status + ")" : "Endpoint OK (HTTP " + res.status + ")");
+        setLastTestLog({ type: "send", ok: true, httpCode: res.status, message: msg, at: new Date().toISOString() });
+        addToast(msg, "success");
+      } else if (res.status === 400 || res.status === 404) {
+        setLastTestLog({ type: "send", ok: true, httpCode: res.status, message: fr ? "Endpoint présent, dry-run non supporté" : "Endpoint present, dry-run not supported", at: new Date().toISOString() });
+        addToast(fr ? "Endpoint accessible (dry-run non supporté)" : "Endpoint reachable (dry-run not supported)", "success");
+      } else if (res.status === 401) {
+        setLastTestLog({ type: "send", ok: false, httpCode: 401, message: fr ? "Clé invalide" : "Invalid key", at: new Date().toISOString() });
+        addToast(fr ? "Clé X-DADASH-KEY invalide" : "Invalid X-DADASH-KEY", "error");
+      } else {
+        const txt = await res.text().catch(() => "");
+        setLastTestLog({ type: "send", ok: false, httpCode: res.status, message: txt || res.statusText, at: new Date().toISOString() });
+        addToast((fr ? "Erreur HTTP " : "HTTP error ") + res.status, "error");
+      }
+    } catch (e) {
+      const msg = e?.message || String(e);
+      const friendly = e?.name === "AbortError" || /timeout|aborted/i.test(msg) ? (fr ? "Timeout" : "Timeout") : msg;
+      setLastTestLog({ type: "send", ok: false, message: friendly, at: new Date().toISOString() });
+      addToast(friendly, "error");
+    } finally {
+      setTestSendLoading(false);
+    }
+  };
+
+  const refreshTgConvs = async () => {
+    setRefreshConvsLoading(true);
+    try {
+      await fetchConvsAndDetectColumn();
+      if (onRefresh) await onRefresh();
+      setLastTestLog({ type: "refresh", ok: true, message: fr ? "Conversations rafraîchies" : "Conversations refreshed", at: new Date().toISOString() });
+      addToast(fr ? "Conversations rafraîchies" : "Conversations refreshed", "success");
+    } catch (e) {
+      setLastTestLog({ type: "refresh", ok: false, message: e?.message || String(e), at: new Date().toISOString() });
+      addToast((fr ? "Erreur: " : "Error: ") + (e?.message || e), "error");
+    } finally {
+      setRefreshConvsLoading(false);
     }
   };
 
@@ -15331,10 +15417,9 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
             </div>
             <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
               <div style={{flex:1,minWidth:200,maxWidth:320}}>
-                <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:4,fontFamily:"'Inter', sans-serif"}}>X-DADASH-KEY</label>
-                <input type={configKeyVisible?"text":"password"} value={configInputKey} onChange={e=>setConfigInputKey(e.target.value)} placeholder="••••••••" style={{width:"100%",padding:"10px 14px",fontSize:12,borderRadius:10,border:"1px solid var(--border-subtle)",background:"var(--bg-raised)",color:"var(--text-primary)",fontFamily:"'Inter', sans-serif"}} />
+                <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:4,fontFamily:"'Inter', sans-serif"}}>X-DADASH-KEY {keyConfigured && <span style={{fontSize:10,color:"var(--success)"}}>({fr?"configurée, masquée":"configured, hidden"})</span>}</label>
+                <input type="password" value={configInputKey} onChange={e=>{setConfigInputKey(e.target.value);if(e.target.value)setKeyConfigured(false);}} placeholder={keyConfigured?"••••••••":"Saisir la clé"} style={{width:"100%",padding:"10px 14px",fontSize:12,borderRadius:10,border:"1px solid var(--border-subtle)",background:"var(--bg-raised)",color:"var(--text-primary)",fontFamily:"'Inter', sans-serif"}} />
               </div>
-              <button type="button" onClick={()=>setConfigKeyVisible(!configKeyVisible)} style={{marginTop:18,padding:"6px 10px",fontSize:10,borderRadius:6,border:"1px solid var(--border-subtle)",background:"var(--bg-base)",color:"var(--text-tertiary)",cursor:"pointer"}}>{configKeyVisible ? (fr?"Masquer":"Hide") : (fr?"Afficher":"Show")}</button>
             </div>
             <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
               <button className="btn btn-primary" onClick={testBotConnection} disabled={testLoading} style={{fontSize:11}}>{testLoading ? React.createElement(Spinner) : (fr ? "Tester connexion" : "Test connection")}</button>
@@ -15416,6 +15501,41 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
               )}
             </div>
           </div>
+        )}
+      </div>
+
+      {/* Outils de test */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:24,boxShadow:"var(--shadow-md)"}}>
+        <h3 style={{fontSize:16,fontWeight:700,margin:"0 0 18px",fontFamily:"'Inter', sans-serif"}}>{"\u{1F527}"} {fr ? "Outils de test" : "Test tools"}</h3>
+        {(!(configInputUrl||"").trim() || !getEffectiveApiKey()) ? (
+          <div style={{padding:14,background:"var(--warning-muted)",borderRadius:12,border:"1px solid var(--warning)",fontSize:12,color:"var(--warning)"}}>
+            {fr ? "Renseigner Bot URL et X-DADASH-KEY ci-dessus pour activer les outils de test." : "Set Bot URL and X-DADASH-KEY above to enable test tools."}
+          </div>
+        ) : (
+          <>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:16}}>
+              <button className="btn btn-small" onClick={testBotConnection} disabled={testLoading} style={{fontSize:12}}>
+                {testLoading ? React.createElement(Spinner) : "\u{1F504}"} {fr ? "Tester endpoint bot status" : "Test bot status endpoint"}
+              </button>
+              <button className="btn btn-small" onClick={testSendEndpoint} disabled={testSendLoading} style={{fontSize:12}}>
+                {testSendLoading ? React.createElement(Spinner) : "\u{1F4E8}"} {fr ? "Tester endpoint send (dry-run)" : "Test send endpoint (dry-run)"}
+              </button>
+              <button className="btn btn-small" onClick={refreshTgConvs} disabled={refreshConvsLoading} style={{fontSize:12}}>
+                {refreshConvsLoading ? React.createElement(Spinner) : "\u{1F504}"} {fr ? "Rafraîchir conversations Telegram" : "Refresh Telegram conversations"}
+              </button>
+            </div>
+            {lastTestLog && (
+              <div style={{padding:12,background:"var(--bg-base)",borderRadius:12,border:"1px solid var(--border-subtle)",fontSize:11}}>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                  <span style={{fontWeight:600,color:"var(--text-secondary)"}}>{fr ? "Dernier test:" : "Last test:"}</span>
+                  <span style={{color:lastTestLog.ok?"var(--success)":"var(--danger)",fontWeight:600}}>{lastTestLog.ok ? "OK" : (fr ? "Erreur" : "Error")}</span>
+                  {lastTestLog.httpCode != null && <span style={{color:"var(--text-tertiary)"}}>HTTP {lastTestLog.httpCode}</span>}
+                  <span style={{color:"var(--text-tertiary)"}}>{lastTestLog.at ? new Date(lastTestLog.at).toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : ""}</span>
+                </div>
+                <div style={{marginTop:6,color:"var(--text-secondary)"}}>{lastTestLog.message}</div>
+              </div>
+            )}
+          </>
         )}
       </div>
 
