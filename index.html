@@ -4734,6 +4734,13 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   }, [filteredTxs, prevFilteredTxs, allTxs, modeleProfiles, allModels, convertAmount]);
 
 
+  // ── Platform accounts for widget ──
+  const [dashPlatformAccounts, setDashPlatformAccounts] = useState([]);
+  useEffect(() => {
+    sb.from("platform_accounts").select("id,platform,account_name,status").order("platform")
+      .then(({ data }) => setDashPlatformAccounts(data || []));
+  }, []);
+
   const botStatusList = useMemo(() => {
     const now = Date.now();
     return [
@@ -5065,6 +5072,30 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
           </div>
         </div>
       </div>
+
+      {/* 5. PLATEFORMES WIDGET */}
+      {dashPlatformAccounts.length > 0 && (
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 20, cursor: "pointer" }} onClick={() => navigateTo && navigateTo("admin", "platforms")}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>🔌 Plateformes</div>
+            <span style={{ fontSize: 10, color: "#8b5cf6" }}>Admin →</span>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            {dashPlatformAccounts.map(acct => {
+              const sc = { active:"#10B981", error:"#EF4444", pending:"#F59E0B", inactive:"#6B7280" }[acct.status] || "#6B7280";
+              const icon = { onlyfans:"🔒", mym:"💜", telegram:"✈️" }[acct.platform] || "🔗";
+              return (
+                <div key={acct.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 9, background: sc + "12", border: "1px solid " + sc + "30" }}>
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: sc, display: "inline-block", flexShrink: 0 }} />
+                  <span style={{ fontSize: 12 }}>{icon}</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{acct.account_name}</span>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: sc }}>{acct.status}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* ═══ POPUP PENDING LIST ═══ */}
       <DashModal open={popup === "pending_list"} onClose={() => setPopup(null)} title="⏳ Transactions en attente" maxWidth={820}>
@@ -6544,6 +6575,21 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [filterBadge, setFilterBadge] = useState("");
   const [filterLangue, setFilterLangue] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
+
+  // Platform presence lookup: handle → Set<platform>
+  const [spenderPlatforms, setSpenderPlatforms] = useState({});
+  useEffect(() => {
+    sb.from("platform_fans").select("username,platform").then(({ data }) => {
+      if (!data) return;
+      const map = {};
+      data.forEach(row => {
+        const h = (row.username || "").replace(/^@/, "").toLowerCase();
+        if (h) { if (!map[h]) map[h] = new Set(); map[h].add(row.platform); }
+      });
+      setSpenderPlatforms(map);
+    });
+  }, []);
+
   const handleSpStatus = async (txId, newStatus) => {
     if (processingTxId) return;
     setProcessingTxId(txId);
@@ -6882,6 +6928,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                     <span style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>@{s.name}</span>
                     {s.langue && LANG_FLAGS[s.langue] && <span title={s.langue} style={{fontSize:13}}>{LANG_FLAGS[s.langue]}</span>}
                     {s.telegramId && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(0,136,204,0.15)",color:"#0088cc",fontWeight:700}}>TG</span>}
+                    {(() => { const sp = spenderPlatforms[(s.name||"").toLowerCase()]; return sp ? (<>
+                      {sp.has("onlyfans") && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(0,175,240,0.15)",color:"#00AFF0",fontWeight:700}}>OF</span>}
+                      {sp.has("mym")      && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(124,58,237,0.15)",color:"#7C3AED",fontWeight:700}}>MYM</span>}
+                    </>) : null; })()}
                   </div>
                   <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2,display:"flex",gap:8}}>
                     {s.first_name && <span style={{color:"var(--text-secondary)",fontWeight:500}}>{s.first_name}</span>}
@@ -13464,6 +13514,224 @@ const AdminExportTab = ({lang, txs, spenders, profiles, models, expenses}) => {
   );
 };
 
+// ── Tab 6: Plateformes (OnlyFans / MYM / Telegram) ──
+const PlatformSettingsTab = ({ lang }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [accounts, setAccounts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showForm, setShowForm] = useState(null); // platform id
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(null);
+  const [syncing, setSyncing] = useState(null);
+
+  const PLATFORMS = [
+    { id: "onlyfans", label: "OnlyFans", icon: "🔒", color: "#00AFF0",
+      fields: [
+        { key: "auth_id",   label: "auth_id",    placeholder: "Votre auth_id" },
+        { key: "sess",      label: "sess",        placeholder: "Valeur du cookie sess", type: "password" },
+        { key: "user_agent",label: "User-Agent",  placeholder: "(optionnel)" },
+      ]},
+    { id: "mym", label: "MYM.fans", icon: "💜", color: "#7C3AED",
+      fields: [
+        { key: "api_token", label: "API Token", placeholder: "(intégration à venir)", type: "password", disabled: true },
+      ]},
+    { id: "telegram", label: "Telegram Bot", icon: "✈️", color: "#0088CC",
+      fields: [
+        { key: "bot_token", label: "Bot Token", placeholder: "1234567890:ABC...", type: "password" },
+        { key: "chat_id",   label: "Chat ID / Channel", placeholder: "@channel ou -1001234..." },
+      ]},
+  ];
+
+  useEffect(() => { loadAccounts(); }, []);
+
+  const loadAccounts = async () => {
+    setLoading(true);
+    try {
+      const { data } = await sb.from("platform_accounts").select("id,platform,account_name,status,last_sync_at,created_at").order("created_at");
+      setAccounts(data || []);
+    } catch (_) { setAccounts([]); }
+    setLoading(false);
+  };
+
+  const handleConnect = async (platformId) => {
+    setSaving(true);
+    try {
+      const plat = PLATFORMS.find(p => p.id === platformId);
+      const accountName = form.account_name || (plat?.label + " Account");
+      // Credentials stored in JSONB — encrypted at rest by Supabase
+      const creds = {};
+      (plat?.fields || []).forEach(f => { if (form[f.key]) creds[f.key] = form[f.key]; });
+      const { error } = await sb.from("platform_accounts").insert({
+        platform: platformId,
+        account_name: accountName,
+        credentials: creds,
+        status: "pending",
+      });
+      if (error) throw error;
+      addToast(fr ? "Compte connecté ✓" : "Account connected ✓", "success");
+      setShowForm(null);
+      setForm({});
+      loadAccounts();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const handleDisconnect = async (id) => {
+    if (!window.confirm(fr ? "Supprimer ce compte plateforme ?" : "Delete this platform account?")) return;
+    try {
+      const { error } = await sb.from("platform_accounts").delete().eq("id", id);
+      if (error) throw error;
+      addToast(fr ? "Compte supprimé" : "Account deleted", "success");
+      loadAccounts();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+  };
+
+  const callEdgeFn = async (fnName, body) => {
+    const { data: { session } } = await sb.auth.getSession();
+    if (!session) throw new Error("Non authentifié");
+    const url = window.SUPABASE_URL + "/functions/v1/" + fnName;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + session.access_token, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || res.statusText);
+    return json;
+  };
+
+  const handleTest = async (acct) => {
+    setTesting(acct.id);
+    try {
+      const result = await callEdgeFn("platform-health", { platform_account_id: acct.id });
+      addToast(result.isValid ? `✅ ${acct.account_name} — OK` : `❌ ${acct.account_name} — ${result.error}`, result.isValid ? "success" : "error");
+      loadAccounts();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setTesting(null);
+  };
+
+  const handleSync = async (acct) => {
+    setSyncing(acct.id);
+    try {
+      const result = await callEdgeFn("sync-platform", { platform_account_id: acct.id });
+      if (result.success) {
+        addToast(`✅ Sync terminé — ${result.records_synced} fans`, "success");
+      } else {
+        addToast(`⚠️ Sync: ${result.error}`, "error");
+      }
+      loadAccounts();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setSyncing(null);
+  };
+
+  const statusColor = s => ({ active:"#10B981", error:"#EF4444", pending:"#F59E0B", inactive:"#6B7280" }[s] || "#6B7280");
+  const statusLabel = s => ({ active:"Actif", error:"Erreur", pending:"En attente", inactive:"Inactif" }[s] || s);
+
+  const inS = { width:"100%", padding:"9px 14px", borderRadius:10, border:"1px solid rgba(255,255,255,0.08)", background:"#131926", color:"var(--text)", fontSize:13, outline:"none", boxSizing:"border-box" };
+  const lbS = { display:"block", fontSize:10, fontWeight:600, color:"var(--text-secondary)", textTransform:"uppercase", marginBottom:6, letterSpacing:"0.8px" };
+
+  return (
+    <div>
+      <div style={{marginBottom:24}}>
+        <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>🔌 {fr?"Plateformes connectées":"Connected Platforms"}</div>
+        <div style={{fontSize:11,color:"var(--muted2)",marginTop:2}}>{fr?"Gérez vos connexions OnlyFans, MYM et Telegram":"Manage your OnlyFans, MYM and Telegram connections"}</div>
+      </div>
+
+      {/* Comptes existants */}
+      {loading ? (
+        <div style={{padding:32,textAlign:"center",color:"var(--muted2)"}}>Chargement...</div>
+      ) : (
+        <div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:28}}>
+          {accounts.map(acct => {
+            const plat = PLATFORMS.find(p => p.id === acct.platform);
+            const sc = statusColor(acct.status);
+            return (
+              <div key={acct.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px"}}>
+                <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                  <span style={{fontSize:22}}>{plat?.icon || "🔗"}</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>{acct.account_name}</div>
+                    <div style={{fontSize:11,color:"var(--muted2)",marginTop:2}}>
+                      <span style={{padding:"1px 7px",borderRadius:8,background:sc+"20",color:sc,fontWeight:700,fontSize:10,marginRight:8}}>{statusLabel(acct.status)}</span>
+                      {acct.last_sync_at && <span>Sync: {new Date(acct.last_sync_at).toLocaleDateString("fr-FR",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"})}</span>}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:6,flexShrink:0}}>
+                    <button onClick={() => handleTest(acct)} disabled={!!testing} style={{padding:"6px 12px",borderRadius:9,border:"1px solid rgba(255,255,255,0.1)",background:"rgba(255,255,255,0.04)",color:"var(--text)",fontSize:12,cursor:"pointer",opacity:testing===acct.id?0.5:1}}>
+                      {testing===acct.id?"...":"🔍 Test"}
+                    </button>
+                    {acct.platform !== "mym" && (
+                      <button onClick={() => handleSync(acct)} disabled={!!syncing} style={{padding:"6px 12px",borderRadius:9,border:"1px solid rgba(16,185,129,0.3)",background:"rgba(16,185,129,0.08)",color:"#10B981",fontSize:12,cursor:"pointer",opacity:syncing===acct.id?0.5:1}}>
+                        {syncing===acct.id?"...":"🔄 Sync"}
+                      </button>
+                    )}
+                    <button onClick={() => handleDisconnect(acct.id)} style={{padding:"6px 12px",borderRadius:9,border:"1px solid rgba(239,68,68,0.3)",background:"rgba(239,68,68,0.08)",color:"#EF4444",fontSize:12,cursor:"pointer"}}>
+                      🗑
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          {accounts.length === 0 && (
+            <div style={{padding:"24px 0",textAlign:"center",color:"var(--muted2)",fontSize:13}}>
+              {fr?"Aucune plateforme connectée":"No platform connected yet"}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Connexion d'un nouveau compte */}
+      <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.8,marginBottom:14}}>➕ {fr?"Connecter une plateforme":"Connect a platform"}</div>
+      <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:showForm?24:0}}>
+        {PLATFORMS.map(plat => (
+          <button key={plat.id} onClick={() => { setShowForm(showForm===plat.id?null:plat.id); setForm({}); }}
+            style={{padding:"10px 18px",borderRadius:11,border:`1px solid ${showForm===plat.id?plat.color:"var(--border)"}`,background:showForm===plat.id?plat.color+"18":"var(--surface)",color:showForm===plat.id?plat.color:"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",transition:"all 0.15s"}}>
+            {plat.icon} {plat.label}
+          </button>
+        ))}
+      </div>
+
+      {showForm && (() => {
+        const plat = PLATFORMS.find(p => p.id === showForm);
+        if (!plat) return null;
+        return (
+          <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:20,maxWidth:520,marginTop:16}}>
+            <div style={{fontSize:14,fontWeight:800,marginBottom:16,color:"var(--text)"}}>{plat.icon} {fr?"Connexion":"Connect"} {plat.label}</div>
+            {/* Security notice */}
+            <div style={{padding:"8px 12px",borderRadius:8,background:"rgba(16,185,129,0.08)",border:"1px solid rgba(16,185,129,0.2)",marginBottom:16,fontSize:11,color:"#34d399"}}>
+              🔒 {fr?"Identifiants chiffrés côté serveur — jamais accessibles au client":"Credentials encrypted server-side — never exposed to client"}
+            </div>
+            <div style={{marginBottom:14}}>
+              <label style={lbS}>{fr?"Nom du compte":"Account name"}</label>
+              <input style={inS} value={form.account_name||""} onChange={e=>setForm({...form,account_name:e.target.value})} placeholder={plat.label + " Account"} />
+            </div>
+            {plat.fields.map(f => (
+              <div key={f.key} style={{marginBottom:14}}>
+                <label style={lbS}>{f.label}</label>
+                <input style={{...inS,opacity:f.disabled?0.5:1}} type={f.type||"text"} disabled={!!f.disabled}
+                  value={form[f.key]||""} onChange={e=>setForm({...form,[f.key]:e.target.value})} placeholder={f.placeholder||""} />
+              </div>
+            ))}
+            <div style={{display:"flex",gap:8,marginTop:4}}>
+              <button onClick={() => handleConnect(showForm)} disabled={saving}
+                style={{padding:"10px 22px",borderRadius:10,border:"none",background:saving?"var(--surface2)":plat.color,color:"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}}>
+                {saving?"...":(fr?"Connecter":"Connect")}
+              </button>
+              <button onClick={() => { setShowForm(null); setForm({}); }}
+                style={{padding:"10px 16px",borderRadius:10,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:13,cursor:"pointer"}}>
+                {fr?"Annuler":"Cancel"}
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+};
+
 // ── Tab 5: Paramètres Agence ──
 const AdminSettingsTab = ({lang}) => {
   const addToast = useToast();
@@ -13522,11 +13790,12 @@ const AdminSettingsTab = ({lang}) => {
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
   const fr = lang === "fr";
   const ADMIN_TABS = [
-    {id:"users",   icon:"👥", label:fr?"Utilisateurs":"Users"},
-    {id:"roles",   icon:"🔐", label:fr?"Rôles & Permissions":"Roles & Permissions"},
-    {id:"logs",    icon:"📋", label:"Logs"},
-    {id:"export",  icon:"📤", label:"Export"},
-    {id:"settings",icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
+    {id:"users",     icon:"👥", label:fr?"Utilisateurs":"Users"},
+    {id:"roles",     icon:"🔐", label:fr?"Rôles & Permissions":"Roles & Permissions"},
+    {id:"logs",      icon:"📋", label:"Logs"},
+    {id:"export",    icon:"📤", label:"Export"},
+    {id:"platforms", icon:"🔌", label:fr?"Plateformes":"Platforms"},
+    {id:"settings",  icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
   ];
   const activeSub = subTab || "users";
   const tabStyle = (id) => ({padding:"8px 14px",borderRadius:9,border:"1px solid "+(activeSub===id?"#8b5cf6":"var(--border)"),background:activeSub===id?"rgba(139,92,246,0.15)":"var(--surface)",color:activeSub===id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0,whiteSpace:"nowrap",transition:"all 0.15s"});
@@ -13549,6 +13818,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
         {activeSub==="roles"&&<AdminRolesTab lang={lang} />}
         {activeSub==="logs"&&<AdminLogsTab lang={lang} profiles={profiles} />}
         {activeSub==="export"&&<AdminExportTab lang={lang} txs={txs} spenders={spenders} profiles={profiles} models={models} expenses={expenses} />}
+        {activeSub==="platforms"&&<PlatformSettingsTab lang={lang} />}
         {activeSub==="settings"&&<AdminSettingsTab lang={lang} />}
       </div>
     </div>
@@ -23414,6 +23684,9 @@ const PushPageV1 = ({ user, lang, models, spenders, botStats, onRefresh }) => {
   const [filterTo, setFilterTo] = useState("");
   const [retrying, setRetrying] = useState(null);
 
+  // ── Platform accounts (dynamic channel availability) ──
+  const [platformAccounts, setPlatformAccounts] = useState([]);
+
   // ── Hooks (avant tout return) ──
   const BOT_DEFS = [
     { id: "telegram", name: "Bot Telegram",   platform: "telegram",  icon: "✈️" },
@@ -23436,7 +23709,10 @@ const PushPageV1 = ({ user, lang, models, spenders, botStats, onRefresh }) => {
     });
   }, [botStats]);
 
-  useEffect(() => { fetchCampaigns(); }, []);
+  useEffect(() => {
+    fetchCampaigns();
+    sb.from("platform_accounts").select("platform,status").then(({ data }) => setPlatformAccounts(data || []));
+  }, []);
 
   const fetchCampaigns = async () => {
     setLogsLoading(true);
@@ -23520,8 +23796,8 @@ const PushPageV1 = ({ user, lang, models, spenders, botStats, onRefresh }) => {
 
   const CHANNELS = [
     { id:"telegram",  label:"Telegram",  icon:"✈️",  active:true  },
-    { id:"onlyfans",  label:"OnlyFans",  icon:"🔒",  active:false },
-    { id:"mym",       label:"MYM",       icon:"💜",  active:false },
+    { id:"onlyfans",  label:"OnlyFans",  icon:"🔒",  active:platformAccounts.some(a=>a.platform==="onlyfans"&&a.status==="active") },
+    { id:"mym",       label:"MYM",       icon:"💜",  active:platformAccounts.some(a=>a.platform==="mym"&&a.status==="active") },
     { id:"whatsapp",  label:"WhatsApp",  icon:"💬",  active:false },
   ];
 
