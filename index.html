@@ -2183,6 +2183,17 @@ const toLocalDate = (utcString) => {
   try { return new Date(utcString).toLocaleDateString('fr-CA', { timeZone: getUserTimezone() }); } catch(_) { return null; }
 };
 const formatDateSafe = (v) => { try { if (!v) return "—"; const d = new Date(v); return isNaN(d.getTime()) ? "—" : d.toLocaleDateString("fr-CH", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: getUserTimezone() }); } catch (_) { return "—"; } };
+// TZ2 — Retourne {start, end} en ISO UTC pour un jour donné (Europe/Zurich)
+const getLocalDayRange = (offsetDays = 0) => {
+  const tz = 'Europe/Zurich';
+  const now = new Date();
+  const target = new Date(now);
+  target.setDate(target.getDate() + offsetDays);
+  const dateStr = target.toLocaleDateString('sv-SE', { timeZone: tz });
+  const start = new Date(dateStr + 'T00:00:00+01:00');
+  const end = new Date(dateStr + 'T23:59:59+01:00');
+  return { start: start.toISOString(), end: end.toISOString() };
+};
 // AD1 — displayUserName: jamais profiles.email (colonne absente en prod). Ordre: full_name > username > display_name > name > telegram_handle > id
 const displayUserName = (profile) => { if (!profile) return "—"; var v = profile.full_name || profile.username || profile.display_name || profile.name || profile.telegram_handle; if (v && String(v).trim()) return String(v).trim(); return profile.id ? String(profile.id).slice(0, 8) + "…" : "—"; };
 
@@ -3199,12 +3210,12 @@ const _tz = { current: getUserTimezone() };
 const fmtDate = (d) => {
   if(!d) return "";
   const dt = new Date(d);
-  return dt.toLocaleDateString("fr-CH", { timeZone: _tz.current });
+  return dt.toLocaleDateString("fr-CH", { timeZone: 'Europe/Zurich', day:"2-digit", month:"2-digit", year:"numeric" });
 };
 const fmtTime = (d) => {
   if(!d) return "";
   const dt = new Date(d);
-  return dt.toLocaleTimeString("fr-CH",{hour:"2-digit",minute:"2-digit", timeZone: _tz.current});
+  return dt.toLocaleTimeString("fr-CH",{hour:"2-digit",minute:"2-digit", timeZone: 'Europe/Zurich'});
 };
 const fmtDayTime = (d) => {
   if(!d) return "";
@@ -3747,21 +3758,24 @@ const useDateRange = (defaultPreset="30d") => {
     setStartDate(sStr);
     setEndDate(todayStr);
   },[]);
-  // TZ1 — Compare les dates en fuseau local (fr-CA = YYYY-MM-DD)
+  // TZ2 — ISO UTC bounds for Supabase queries (Europe/Zurich)
+  const startISO = startDate ? new Date(startDate + 'T00:00:00+01:00').toISOString() : null;
+  const endISO = endDate ? new Date(endDate + 'T23:59:59+01:00').toISOString() : null;
+  // TZ2 — Compare les dates en fuseau Europe/Zurich — préfère created_at sur le champ date
   const filterByDate = (data, dateField="date") => {
     if(activePreset==="all"&&!startDate&&!endDate) return data;
-    const tz = getUserTimezone();
     return data.filter(item=>{
-      if(!item[dateField]) return false;
+      const fieldVal = item['created_at'] || item[dateField];
+      if(!fieldVal) return false;
       try {
-        const localDate = new Date(item[dateField]).toLocaleDateString('fr-CA', { timeZone: tz });
+        const localDate = new Date(fieldVal).toLocaleDateString('fr-CA', { timeZone: 'Europe/Zurich' });
         if(startDate && localDate < startDate) return false;
         if(endDate && localDate > endDate) return false;
       } catch(_) { return false; }
       return true;
     });
   };
-  return {startDate, endDate, setStartDate, setEndDate, activePreset, setActivePreset, filterByDate};
+  return {startDate, endDate, startISO, endISO, setStartDate, setEndDate, activePreset, setActivePreset, filterByDate};
 };
 
 // Centralized filter helpers
@@ -6325,8 +6339,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     if (chatter) f.chatter_id = chatter;
     if (txProvider) f.provider_id = txProvider;
     const qm = (q) => {
-      if (dr.startDate) q = q.gte("date", dr.startDate instanceof Date ? dr.startDate.toISOString() : dr.startDate);
-      if (dr.endDate) q = q.lte("date", dr.endDate instanceof Date ? dr.endDate.toISOString() : dr.endDate + "T23:59:59");
+      if (dr.startISO) q = q.gte("created_at", dr.startISO);
+      if (dr.endISO) q = q.lte("created_at", dr.endISO);
       return q;
     };
     const result = await loadPage("transactions", p, TX_PAGE_SIZE, f, "date", qm);
@@ -6389,12 +6403,11 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
       } catch(e) { /* Spender upsert best-effort */ }
 
       // Step 2: INSERT transaction — only include FK fields if they look like valid UUIDs
-      // Store date in UTC+1 (Europe/Paris) reference timezone
+      // TZ2 — Stocker date en UTC ISO (created_at est posé par Supabase, date = référence UTC propre)
       const now = new Date();
-      const dateUTC1 = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Paris" }));
       const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
       const txRow = {
-        date: dateUTC1.toISOString(),
+        date: now.toISOString(),
         spender_handle: handle,
         amount: parseFloat(form.amount),
         status: "pending",
@@ -15418,8 +15431,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
         addToast(fr ? "TX modifiée" : "TX updated", "success");
       } else {
         const now = new Date();
-        const dateUTC1 = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Paris"}));
-        const txRow = {date: dateUTC1.toISOString(), spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "CHF", amount_original: parseFloat(form.amount), currency_original: form.currency || "CHF", status: "pending", model_id: form.model_id, chatter_id: user.id, notes: form.notes || null, payment_method: form.payment_method || null};
+        const txRow = {date: now.toISOString(), spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "CHF", amount_original: parseFloat(form.amount), currency_original: form.currency || "CHF", status: "pending", model_id: form.model_id, chatter_id: user.id, notes: form.notes || null, payment_method: form.payment_method || null};
         if (isUUID(form.provider_id)) txRow.provider_id = form.provider_id;
         if (form.product) txRow.product = form.product;
         if (form.tag) txRow.tag = form.tag;
