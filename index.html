@@ -16191,74 +16191,148 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
 };
 
 // =============================================
-// CHATTER ROLE — COMPTA (Fiches de paie + commission)
+// CHATTER ROLE — COMPTA (EC7) Fiche de paie + historique payouts
 // =============================================
-const ChatterComptaTab = ({user, lang, payslips: allPayslips, txs}) => {
+const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayouts, txs, models}) => {
   const fr = lang === "fr";
   const { fmtAmount, convertAmount } = useCurrency();
-  const payslips = (allPayslips||[]).filter(p=>p.user_id===user.id);
+  const ctx = getChatterContext(user, models);
+  const myModelIds = ctx.assignedModelIds;
 
-  const myTxs = (txs||[]).filter(tx=>tx.chatter_id===user.id&&(tx.status==="validated"||tx.status==="confirmee"));
-  const totalEarned = myTxs.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency||"EUR"),0);
-  const totalPaid = payslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
-  const balanceDue = totalEarned - totalPaid;
+  const payslips = (allPayslips||[]).filter(p=>p.user_id===user.id);
+  const myPayouts = (allPayouts||[]).filter(p=>p.user_id===user.id);
+
+  const myTxs = useMemo(() => {
+    return (txs||[]).filter(tx=>(tx.status==="validated"||tx.status==="confirmee")&&(myModelIds.includes(tx.model_id)||tx.chatter_id===user.id));
+  }, [txs, myModelIds, user.id]);
+
+  const commPct = getChatterCommissionPct(user);
+  const commissionsThisMonth = useMemo(() => {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    return myTxs.filter(tx=>new Date(tx.date||tx.created_at||0)>=monthStart).reduce((s,tx)=>{
+      const amt = Number(tx.amount||0);
+      const cur = tx.currency||"EUR";
+      const stored = Number(tx.chatter_commission||0);
+      if(stored>0) return s+convertAmount(stored,cur);
+      return s+convertAmount(amt*commPct,cur);
+    },0);
+  }, [myTxs, commPct, convertAmount]);
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const totalThisMonth = payslips.filter(p => p.status === "paid" && new Date(p.period) >= monthStart).reduce((s, p) => s + Number(p.total || 0), 0);
-  const totalAllTime = payslips.filter(p => p.status === "paid").reduce((s, p) => s + Number(p.total || 0), 0);
-  const nextPayslip = payslips.find(p => p.status === "pending");
+  const monthLabel = now.toLocaleDateString(fr?"fr-FR":"en-US",{month:"long",year:"numeric"});
 
-  const kpiCards = [
-    {label: fr ? "Total gagné" : "Total earned", value: fmtAmount(totalEarned), icon: "\u{1F4B0}", color: "var(--accent)"},
-    {label: fr ? "Déjà payé" : "Already paid", value: fmtAmount(totalPaid), icon: "\u{1F4C5}", color: "var(--success)"},
-    {label: fr ? "Solde dû" : "Balance due", value: fmtAmount(Math.max(0, balanceDue)), icon: "\u{1F4E8}", color: balanceDue > 0 ? "var(--warning)" : "var(--text-tertiary)"},
-    {label: fr ? "Prochain paiement" : "Next payment", value: nextPayslip ? fmtAmount(nextPayslip.total) : "—", icon: "\u{1F4E8}", color: "var(--pink)"},
-  ];
+  const currentPayslip = payslips.find(p=>{
+    const pDate = p.period ? new Date(p.period) : null;
+    return pDate && pDate.getMonth()===monthStart.getMonth() && pDate.getFullYear()===monthStart.getFullYear();
+  }) || payslips.find(p=>p.status==="pending");
+
+  const base = currentPayslip ? Number(currentPayslip.base||0) : 0;
+  const bonus = currentPayslip ? Number(currentPayslip.bonus||0) : 0;
+  const totalEstime = base + bonus + commissionsThisMonth;
+  const totalPayePayouts = myPayouts.filter(p=>p.status==="paid"||p.status==="done"||p.status==="validated").reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"EUR"),0);
+  const totalPayePayslips = payslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
+  const totalPaye = totalPayePayouts + totalPayePayslips;
+
+  const sortedPayouts = useMemo(()=>[...myPayouts].sort((a,b)=>new Date(b.date||b.created_at||0)-new Date(a.date||a.created_at||0)),[myPayouts]);
 
   return (
-    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
-      <div style={{marginBottom:18}}>
-        <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{"\u{1F4C4}"} {fr ? "Ma Compta" : "My Accounting"}</div>
-        <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>{fr ? "Commissions & fiches de paie" : "Commissions & payslips"}</div>
-      </div>
-      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4,1fr)",gap:10,marginBottom:18}}>
-        {kpiCards.map(k => (
-          <div key={k.label} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"14px 16px"}}>
-            <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{k.icon} {k.label}</div>
-            <div style={{fontSize:20,fontWeight:800,color:k.color}}>{k.value}</div>
-          </div>
-        ))}
+    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":"0 24px"}}>
+      <div className="ui-section-header">
+        <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4C4}"} {fr ? "Ma Compta" : "My Accounting"}</h2>
+        <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr ? "Fiche de paie & historique des paies" : "Payslip & payout history"}</p>
       </div>
 
-      {payslips.length === 0 && (
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:48,textAlign:"center"}}>
-          <div style={{fontSize:32,marginBottom:12}}>{"\u{1F4C4}"}</div>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Fiches de paie bientôt disponibles" : "Payslips coming soon"}</div>
+      {!ctx.hasAssignments && (
+        <div className="ui-panel" style={{padding:12,background:"var(--warning-muted)",border:"1px solid var(--warning)",marginBottom:16,fontSize:12,color:"var(--text-secondary)"}}>
+          {fr ? "Aucun modèle assigné — les commissions sont calculées à partir de tes modèles assignés." : "No model assigned — commissions are calculated from your assigned models."}
         </div>
       )}
-      {payslips.length > 0 && (
-        <div>
-          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr ? "Fiches de paie" : "Payslips"}</div>
-          {payslips.map(p => {
-            const isPaid = p.status === "paid";
-            const sc = isPaid ? "var(--success)" : "var(--warning)";
-            return (
-              <div key={p.id} style={{display:"flex",alignItems:"center",gap:14,padding:"12px 16px",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,marginBottom:8,flexWrap:"wrap"}}>
-                <div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"✅":"⏳"}</div>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:14,fontWeight:700}}>{p.period}</div>
-                  <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"·"} Bonus: {fmtAmount(p.bonus||0)}</div>
-                </div>
-                <div style={{textAlign:"right"}}>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div>
-                  <span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{isPaid?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span>
-                </div>
+
+      <>
+          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr ? "Ma fiche de paie" : "My payslip"} — {monthLabel}</div>
+          <div className="ui-panel" style={{marginBottom:20}}>
+            <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(2,1fr) repeat(2,1fr)",gap:14}}>
+              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Base" : "Base"}</div>
+                <div style={{fontSize:18,fontWeight:800,color:"var(--text-primary)"}}>{base>0 ? fmtAmount(base) : "—"}</div>
               </div>
-            );
-          })}
-        </div>
-      )}
+              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Commissions" : "Commissions"}</div>
+                <div style={{fontSize:18,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(commissionsThisMonth)}</div>
+              </div>
+              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Bonus" : "Bonus"}</div>
+                <div style={{fontSize:18,fontWeight:800,color:"var(--text-primary)"}}>{bonus>0 ? fmtAmount(bonus) : "—"}</div>
+              </div>
+              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Total estimé" : "Est. total"}</div>
+                <div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalEstime)}</div>
+              </div>
+            </div>
+            <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Total payé (toutes périodes)" : "Total paid (all time)"}</span>
+              <span style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalPaye)}</span>
+            </div>
+          </div>
+
+          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr ? "Historique des paies" : "Payout history"}</div>
+          <div className="ui-panel">
+            <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+              <table className="table" style={{fontSize:12,minWidth:_isMobile?400:undefined}}>
+                <thead><tr>
+                  <th>{fr ? "Date" : "Date"}</th>
+                  <th>{fr ? "Montant" : "Amount"}</th>
+                  <th>{fr ? "Statut" : "Status"}</th>
+                  <th>{fr ? "Méthode" : "Method"}</th>
+                  <th>{fr ? "Notes" : "Notes"}</th>
+                </tr></thead>
+                <tbody>
+                  {sortedPayouts.map(p=>(
+                    <tr key={p.id}>
+                      <td style={{whiteSpace:"nowrap"}}>{fmtDate(p.date||p.created_at)}</td>
+                      <td style={{fontWeight:700}}>{fmtAmount(Number(p.amount||0),p.currency)}</td>
+                      <td><span style={{padding:"2px 8px",borderRadius:10,background:(p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)")+"15",color:p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)",fontSize:10,fontWeight:700}}>{p.status||"—"}</span></td>
+                      <td>{p.method||"—"}</td>
+                      <td style={{maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.notes||"—"}</td>
+                    </tr>
+                  ))}
+                  {sortedPayouts.length===0 && (
+                    <tr><td colSpan={5} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr ? "Aucune paie reçue" : "No payouts received"}</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {payslips.length>0 && (
+            <>
+              <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12,marginTop:20}}>{"\u{1F4CB}"} {fr ? "Fiches de paie" : "Payslips"}</div>
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                {payslips.map(p=>{
+                  const isPaid = p.status==="paid";
+                  const sc = isPaid ? "var(--success)" : "var(--warning)";
+                  return (
+                    <div key={p.id} className="ui-panel" style={{padding:16}}>
+                      <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+                        <div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"✅":"⏳"}</div>
+                        <div style={{flex:1}}>
+                          <div style={{fontSize:14,fontWeight:700}}>{p.period||"—"}</div>
+                          <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"·"} Bonus: {fmtAmount(p.bonus||0)}</div>
+                        </div>
+                        <div style={{textAlign:"right"}}>
+                          <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div>
+                          <span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{isPaid?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </>
     </div>
   );
 };
@@ -23459,7 +23533,7 @@ const App = () => {
             {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
             {messagerieSubTab==="escalades"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} escaladesOnly />}
           </>)}
-          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} txs={txSummary} />}
+          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} payouts={payouts} txs={txSummary} models={models} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
