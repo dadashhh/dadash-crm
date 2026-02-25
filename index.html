@@ -1944,6 +1944,9 @@ var adminAssignmentsConfig = { tableName:"", colId:"id", colChatterId:"chatter_i
 var appendAdminActionLog = function(actionType, targetType, targetId, meta){ try { if (!window.sb) return; var m = {}; try { m = meta && typeof meta === "object" ? JSON.parse(JSON.stringify(meta)) : {}; } catch(_){ m = {}; } var payload = { action_type: actionType || "unknown", target_type: targetType || null, target_id: targetId != null ? String(targetId) : null, meta: m }; window.sb.from("admin_action_logs").insert(payload).then(function(r){ if (r && r.error) { console.warn("[AdminUI] appendAdminActionLog error", r.error); } else { logAdminUiEvent("admin_action_log_ok", { actionType: actionType }); } }).catch(function(e){ console.warn("[AdminUI] appendAdminActionLog fail", e); }); } catch(e){ console.warn("[AdminUI] appendAdminActionLog", e); } };
 // AD6 — safeLower pour filtres recherche
 var safeLower = function(v){ try { return (v != null ? String(v) : "").toLowerCase(); } catch(_){ return ""; } };
+// AD7 — JSON safe helpers pour app_settings
+var safeJsonStringify = function(value, fallback){ try { return JSON.stringify(value, null, 2) || (fallback || "{}"); } catch(_){ return fallback || "{}"; } };
+var tryParseJson = function(text){ try { if (text == null || String(text).trim() === "") return null; return JSON.parse(String(text)); } catch(_){ return undefined; } };
 
 // ═══ EC2 — CHATTER CONTEXT HELPERS (réutilisables par toutes les sous-pages chatter) ═══
 const isChatterUser = (u) => !!(u && u.role === "chatter");
@@ -14036,6 +14039,175 @@ const AdminLogsCenterTab = ({lang, refreshTick}) => {
 };
 
 // =============================================
+// AD7 — ADMIN PARAMÈTRES (app_settings, JSON safe)
+// =============================================
+const AdminSettingsTab = ({lang, refreshTick}) => {
+  var fr = lang === "fr";
+  var addToast = useToast();
+  var [adminSettingsRows, setAdminSettingsRows] = useState([]);
+  var [adminSettingsLoading, setAdminSettingsLoading] = useState(true);
+  var [adminSettingsError, setAdminSettingsError] = useState(null);
+  var [selectedAdminSetting, setSelectedAdminSetting] = useState(null);
+  var [editDescription, setEditDescription] = useState("");
+  var [editValueText, setEditValueText] = useState("");
+  var [saveError, setSaveError] = useState(null);
+  var [saving, setSaving] = useState(false);
+  var [createForm, setCreateForm] = useState({ setting_key: "", description: "", setting_value: "{}" });
+  var [creating, setCreating] = useState(false);
+  var [createError, setCreateError] = useState(null);
+
+  var loadAdminSettings = useCallback(function(){
+    setAdminSettingsLoading(true);
+    setAdminSettingsError(null);
+    if (!window.sb) { setAdminSettingsRows([]); setAdminSettingsError("Supabase non initialisé"); setAdminSettingsLoading(false); return; }
+    window.sb.from("app_settings").select("*").order("setting_key", { ascending: true }).then(function(res){
+      if (res && res.error) { setAdminSettingsError(res.error.message || "Erreur"); setAdminSettingsRows([]); }
+      else { setAdminSettingsRows(safeArray(res && res.data)); }
+      setAdminSettingsLoading(false);
+    }).catch(function(e){ setAdminSettingsError(e && e.message ? e.message : "Erreur"); setAdminSettingsRows([]); setAdminSettingsLoading(false); });
+  }, []);
+
+  useEffect(function(){ loadAdminSettings(); }, [loadAdminSettings, refreshTick]);
+
+  useEffect(function(){
+    if (selectedAdminSetting) {
+      setEditDescription(selectedAdminSetting.description || "");
+      setEditValueText(safeJsonStringify(selectedAdminSetting.setting_value, "{}"));
+      setSaveError(null);
+    }
+  }, [selectedAdminSetting]);
+
+  var handleReset = useCallback(function(){
+    if (!selectedAdminSetting) return;
+    setEditDescription(selectedAdminSetting.description || "");
+    setEditValueText(safeJsonStringify(selectedAdminSetting.setting_value, "{}"));
+    setSaveError(null);
+  }, [selectedAdminSetting]);
+
+  var handleSave = useCallback(async function(){
+    if (!selectedAdminSetting || !selectedAdminSetting.id) return;
+    var parsed = tryParseJson(editValueText);
+    if (parsed === undefined) {
+      setSaveError(fr ? "JSON invalide. Vérifiez la syntaxe (guillemets, virgules, accolades)." : "Invalid JSON. Check syntax (quotes, commas, braces).");
+      return;
+    }
+    setSaving(true);
+    setSaveError(null);
+    try {
+      var res = await sb.from("app_settings").update({ description: editDescription, setting_value: parsed }).eq("id", selectedAdminSetting.id).select().single();
+      if (res && res.error) throw new Error(res.error.message);
+      loadAdminSettings();
+      setSelectedAdminSetting(res && res.data ? res.data : Object.assign({}, selectedAdminSetting, { description: editDescription, setting_value: parsed }));
+      addToast(fr ? "Enregistré ✓" : "Saved ✓", "success");
+      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_update", "app_settings", selectedAdminSetting.setting_key, { key: selectedAdminSetting.setting_key });
+      else logAdminUiEvent("settings_update_ok", { key: selectedAdminSetting.setting_key });
+    } catch (e) {
+      var msg = e && e.message ? e.message : String(e);
+      setSaveError(msg);
+      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
+      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_update_fail", "app_settings", selectedAdminSetting.setting_key, { err: msg });
+      else logAdminUiEvent("settings_update_fail", { key: selectedAdminSetting.setting_key, err: msg });
+    }
+    setSaving(false);
+  }, [selectedAdminSetting, editDescription, editValueText, fr, addToast, loadAdminSettings]);
+
+  var handleCreate = useCallback(async function(){
+    var key = (createForm.setting_key || "").trim();
+    if (!key) { setCreateError(fr ? "Clé requise" : "Key required"); return; }
+    var parsed = tryParseJson(createForm.setting_value || "{}");
+    if (parsed === undefined) { setCreateError(fr ? "JSON invalide" : "Invalid JSON"); return; }
+    setCreating(true);
+    setCreateError(null);
+    try {
+      var res = await sb.from("app_settings").insert({ setting_key: key, description: (createForm.description || "").trim(), setting_value: parsed }).select().single();
+      if (res && res.error) throw new Error(res.error.message);
+      loadAdminSettings();
+      setCreateForm({ setting_key: "", description: "", setting_value: "{}" });
+      addToast(fr ? "Setting créé ✓" : "Setting created ✓", "success");
+      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_create", "app_settings", key, { key: key });
+      else logAdminUiEvent("settings_create_ok", { key: key });
+    } catch (e) {
+      var msg = e && e.message ? e.message : String(e);
+      setCreateError(msg);
+      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
+      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_create_fail", "app_settings", key, { err: msg });
+      else logAdminUiEvent("settings_create_fail", { key: key, err: msg });
+    }
+    setCreating(false);
+  }, [createForm, fr, addToast, loadAdminSettings]);
+
+  if (adminSettingsLoading) {
+    return React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: 32, textAlign: "center", color: "var(--text-tertiary)" } }, "\u{1F504} " + (fr ? "Chargement..." : "Loading..."));
+  }
+  if (adminSettingsError) {
+    return React.createElement("div", { style: { background: "var(--danger-muted)", border: "1px solid var(--danger)", borderRadius: 14, padding: 24, textAlign: "center" } },
+      React.createElement("div", { style: { fontSize: 15, fontWeight: 700, color: "var(--danger)", marginBottom: 12 } }, "\u26A0\uFE0F " + adminSettingsError),
+      React.createElement("button", { onClick: loadAdminSettings, style: { padding: "8px 16px", borderRadius: 10, border: "none", background: "var(--danger)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" } }, "\u{1F504} " + (fr ? "Réessayer" : "Retry"))
+    );
+  }
+
+  var rows = safeArray(adminSettingsRows);
+
+  return React.createElement("div", { style: { display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr", gap: 16 } },
+    React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: "16px 20px", overflow: "hidden" } },
+      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 14 } }, "\u2699\uFE0F " + (fr ? "Paramètres" : "Settings")),
+      rows.length === 0 ? React.createElement("div", { style: { padding: 32, textAlign: "center", color: "var(--text-tertiary)" } }, fr ? "Aucun paramètre" : "No settings") :
+      React.createElement("div", { className: "table-wrap", style: { overflowX: "auto" } },
+        React.createElement("table", { className: "table", style: { fontSize: 12 } },
+          React.createElement("thead", null, React.createElement("tr", null, React.createElement("th", null, "setting_key"), React.createElement("th", null, "description"), React.createElement("th", null, "updated_at"))),
+          React.createElement("tbody", null,
+            rows.map(function(r) {
+              var isSel = selectedAdminSetting && selectedAdminSetting.id === r.id;
+              return React.createElement("tr", { key: r.id || r.setting_key, onClick: function() { setSelectedAdminSetting(r); }, style: { cursor: "pointer", background: isSel ? "var(--accent-muted)" : "transparent" } },
+                React.createElement("td", { style: { fontFamily: "monospace", fontSize: 12 } }, safeText(r.setting_key)),
+                React.createElement("td", { style: { maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" } }, safeText(r.description)),
+                React.createElement("td", { style: { fontSize: 11, color: "var(--text-tertiary)" } }, formatDateSafe(r.updated_at))
+              );
+            })
+          )
+        )
+      )
+    ),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 16 } },
+      selectedAdminSetting && React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: "16px 20px" } },
+        React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: "var(--text)", marginBottom: 12 } }, fr ? "Détail" : "Detail"),
+        React.createElement("div", { style: { marginBottom: 10 } },
+          React.createElement("label", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", display: "block", marginBottom: 4 } }, "setting_key"),
+          React.createElement("input", { type: "text", value: selectedAdminSetting.setting_key || "", readOnly: true, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text-tertiary)", fontSize: 13 } })
+        ),
+        React.createElement("div", { style: { marginBottom: 10 } },
+          React.createElement("label", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", display: "block", marginBottom: 4 } }, "description"),
+          React.createElement("input", { type: "text", value: editDescription, onChange: function(e) { setEditDescription(e.target.value); }, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 13, outline: "none" } })
+        ),
+        React.createElement("div", { style: { marginBottom: 12 } },
+          React.createElement("label", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", display: "block", marginBottom: 4 } }, "setting_value (JSON)"),
+          React.createElement("textarea", { value: editValueText, onChange: function(e) { setEditValueText(e.target.value); }, rows: 10, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 12, fontFamily: "monospace", outline: "none", resize: "vertical" } })
+        ),
+        saveError && React.createElement("div", { style: { marginBottom: 10, padding: 8, background: "var(--danger-muted)", borderRadius: 8, fontSize: 12, color: "var(--danger)" } }, saveError),
+        React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
+          React.createElement("button", { onClick: handleSave, disabled: saving, style: { padding: "8px 16px", borderRadius: 10, border: "none", background: saving ? "var(--surface2)" : "var(--success)", color: saving ? "var(--muted2)" : "#fff", fontSize: 13, fontWeight: 700, cursor: saving ? "not-allowed" : "pointer" } }, saving ? (fr ? "..." : "...") : (fr ? "Enregistrer" : "Save")),
+          React.createElement("button", { onClick: handleReset, style: { padding: "8px 16px", borderRadius: 10, border: "1px solid var(--border)", background: "transparent", color: "var(--text-secondary)", fontSize: 13, cursor: "pointer" } }, fr ? "Reset" : "Reset")
+        )
+      ),
+      React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: "16px 20px" } },
+        React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: "var(--text)", marginBottom: 12 } }, fr ? "Créer un setting" : "Create setting"),
+        React.createElement("div", { style: { marginBottom: 10 } },
+          React.createElement("input", { type: "text", placeholder: "setting_key", value: createForm.setting_key, onChange: function(e) { setCreateForm(function(p) { return Object.assign({}, p, { setting_key: e.target.value }); }); }, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 13, outline: "none" } })
+        ),
+        React.createElement("div", { style: { marginBottom: 10 } },
+          React.createElement("input", { type: "text", placeholder: "description", value: createForm.description, onChange: function(e) { setCreateForm(function(p) { return Object.assign({}, p, { description: e.target.value }); }); }, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 13, outline: "none" } })
+        ),
+        React.createElement("div", { style: { marginBottom: 10 } },
+          React.createElement("textarea", { placeholder: "{}", value: createForm.setting_value, onChange: function(e) { setCreateForm(function(p) { return Object.assign({}, p, { setting_value: e.target.value }); }); }, rows: 6, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 12, fontFamily: "monospace", outline: "none", resize: "vertical" } })
+        ),
+        createError && React.createElement("div", { style: { marginBottom: 10, padding: 8, background: "var(--danger-muted)", borderRadius: 8, fontSize: 12, color: "var(--danger)" } }, createError),
+        React.createElement("button", { onClick: handleCreate, disabled: creating, style: { padding: "8px 16px", borderRadius: 10, border: "none", background: creating ? "var(--surface2)" : "var(--accent)", color: creating ? "var(--muted2)" : "#fff", fontSize: 13, fontWeight: 700, cursor: creating ? "not-allowed" : "pointer" } }, creating ? (fr ? "..." : "...") : (fr ? "Créer" : "Create"))
+      )
+    )
+  );
+};
+
+// =============================================
 // AD1 — ADMIN SHELL (tabs, state, placeholders pour AD2→AD8)
 // =============================================
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
@@ -14072,7 +14244,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
       {activeSub==="roles"&&<AdminRolesPermissionsTab lang={lang} refreshTick={adminRefreshTick} />}
       {activeSub==="assignments"&&<AdminAssignmentsTab lang={lang} profiles={profiles} models={models} refreshTick={adminRefreshTick} />}
       {activeSub==="logs"&&<AdminLogsCenterTab lang={lang} refreshTick={adminRefreshTick} />}
-      {activeSub==="settings"&&<PlaceholderTab title={t(lang,"settings")} />}
+      {activeSub==="settings"&&<AdminSettingsTab lang={lang} refreshTick={adminRefreshTick} />}
       {activeSub==="qa"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F6E0}"} QA / Maintenance — AD8 à venir</div>}
       {activeSub==="export"&&<ExportRapportsTab lang={lang} txs={txs} spenders={spenders} expenses={expenses} models={models} profiles={profiles} payslips={payslips} payouts={payouts} invoices={invoices} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} />}
     </div>
