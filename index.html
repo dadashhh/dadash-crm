@@ -13896,174 +13896,448 @@ const StreakBadge = ({ streak }) => {
 };
 
 // =============================================
-// CHATTER ROLE — DASHBOARD (EC3)
+// CHATTER DASHBOARD REDESIGN — Clone UI gérant (PR1A)
+// Même look que DashboardRedesign, données chatter uniquement
 // =============================================
-const ChatterDashboardTab = ({user, lang, txs, spenders, models}) => {
-  const addToast = useToast();
-  const { fmtAmount, convertAmount } = useCurrency();
+const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models, profiles }) => {
+  const { convertAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
   const ctx = getChatterContext(user, models);
   const { assignedModelIds, assignedModels } = ctx;
   const myModelIds = assignedModelIds;
   const myModels = assignedModels;
 
-  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 3600000);
+  const [period, setPeriod] = useState("30j");
+  const [dateStart, setDateStart] = useState("");
+  const [dateEnd, setDateEnd] = useState("");
+  const [modelFilter, setModelFilter] = useState("all");
+  const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut", "ca_net"]));
+  const [chartView, setChartView] = useState("curve");
+  const [popup, setPopup] = useState(null);
 
-  const validated = useMemo(() => myTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee"), [myTxs]);
-  const txThisMonth = useMemo(() => myTxs.filter(tx => new Date(tx.date || tx.created_at || 0) >= monthStart), [myTxs, monthStart]);
-  const validatedThisMonth = useMemo(() => txThisMonth.filter(tx => tx.status === "validated" || tx.status === "confirmee"), [txThisMonth]);
-  const caBrut = validated.reduce((s, tx) => s + Number(tx.amount || 0), 0);
-  const commPct = getChatterCommissionPct(user);
-  const commissionThisMonth = useMemo(() => {
-    return validatedThisMonth.reduce((s, tx) => {
-      const amt = Number(tx.amount || 0);
-      const cur = tx.currency || "EUR";
-      const stored = Number(tx.chatter_commission || 0);
-      if (stored > 0) return s + convertAmount(stored, cur);
-      return s + convertAmount(amt * commPct, cur);
-    }, 0);
-  }, [validatedThisMonth, commPct, convertAmount]);
-  const activeSpenderIds = useMemo(() => {
-    const recent = myTxs.filter(tx => new Date(tx.date || tx.created_at || 0) >= thirtyDaysAgo);
-    return new Set(recent.map(tx => tx.spender_id || tx.spender_handle).filter(Boolean));
-  }, [myTxs, thirtyDaysAgo]);
+  const allTxs = useMemo(() => (txs || []).filter(tx => myModelIds.length === 0 || myModelIds.includes(tx.model_id)), [txs, myModelIds]);
+  const allModels = models || [];
+  const modelOptions = useMemo(() => {
+    const opts = myModels.map(m => ({ id: m.id, name: m.name || "—" }));
+    return opts;
+  }, [myModels]);
 
-  const [convCounts, setConvCounts] = useState({});
-  useEffect(() => {
-    if (myModelIds.length === 0) return;
-    sb.from("conversations").select("model_id").in("model_id", myModelIds).then(({ data }) => {
-      const counts = {};
-      (data || []).forEach(c => { counts[c.model_id] = (counts[c.model_id] || 0) + 1; });
-      setConvCounts(counts);
-    }).catch(() => {});
-  }, [myModelIds.join(",")]);
+  const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
+    const now = new Date();
+    let start, end, prevStart, prevEnd;
+    if (period === "custom" && dateStart && dateEnd) {
+      start = new Date(dateStart); end = new Date(dateEnd);
+      const diff = end.getTime() - start.getTime();
+      prevEnd = new Date(start.getTime()); prevStart = new Date(start.getTime() - diff);
+    } else {
+      const days = period === "24h" ? 1 : period === "7j" ? 7 : period === "30j" ? 30 : period === "90j" ? 90 : 99999;
+      end = new Date(now); end.setHours(23, 59, 59, 999);
+      start = new Date(now); start.setDate(start.getDate() - days); start.setHours(0, 0, 0, 0);
+      prevEnd = new Date(start.getTime()); prevEnd.setMilliseconds(-1);
+      prevStart = new Date(prevEnd.getTime()); prevStart.setDate(prevStart.getDate() - days);
+    }
+    return { dateDebut: start, dateFin: end, prevDateDebut: prevStart, prevDateFin: prevEnd };
+  }, [period, dateStart, dateEnd]);
 
-  const recentActivity = useMemo(() => {
-    return [...myTxs].sort((a, b) => new Date(b.date || b.created_at || 0) - new Date(a.date || a.created_at || 0)).slice(0, 15);
-  }, [myTxs]);
+  const filteredTxs = useMemo(() => {
+    return allTxs.filter(tx => {
+      const d = new Date(tx.date || tx.created_at).getTime();
+      if (d < dateDebut.getTime() || d > dateFin.getTime()) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
+    });
+  }, [allTxs, dateDebut, dateFin, modelFilter]);
+
+  const prevFilteredTxs = useMemo(() => {
+    return allTxs.filter(tx => {
+      const d = new Date(tx.date || tx.created_at).getTime();
+      if (d < prevDateDebut.getTime() || d > prevDateFin.getTime()) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
+    });
+  }, [allTxs, prevDateDebut, prevDateFin, modelFilter]);
+
+  const kpiData = useMemo(() => {
+    const valid = filteredTxs.filter(tx => tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee");
+    const pending = filteredTxs.filter(tx => tx.status === "pending");
+    const caBrut = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const caNet = valid.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+    const txCount = valid.length;
+    const txPending = pending.length;
+    const caBrutPending = pending.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const panierMoyen = txCount > 0 ? caBrut / txCount : 0;
+    const tauxValidation = (txCount + txPending) > 0 ? (txCount / (txCount + txPending)) * 100 : 0;
+    const pValid = prevFilteredTxs.filter(tx => tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee");
+    const pPending = prevFilteredTxs.filter(tx => tx.status === "pending");
+    const pCaBrut = pValid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const pCaNet = pValid.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+    const pTxCount = pValid.length;
+    const pTxPending = pPending.length;
+    const pCaBrutPending = pPending.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const pPanierMoyen = pTxCount > 0 ? pCaBrut / pTxCount : 0;
+    const pTauxVal = (pTxCount + pTxPending) > 0 ? (pTxCount / (pTxCount + pTxPending)) * 100 : 0;
+    const delta = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
+    return {
+      caBrut, caNet, txCount, txPending, caBrutPending, panierMoyen, tauxValidation,
+      deltaCaBrut: delta(caBrut, pCaBrut), deltaCaNet: delta(caNet, pCaNet), deltaTx: delta(txCount, pTxCount),
+      deltaTxPending: delta(txPending, pTxPending), deltaCaBrutPending: delta(caBrutPending, pCaBrutPending),
+      deltaPanier: delta(panierMoyen, pPanierMoyen), deltaTaux: tauxValidation - pTauxVal,
+    };
+  }, [filteredTxs, prevFilteredTxs, convertAmount]);
+
+  const toggleMetric = (id) => {
+    setActiveMetrics(prev => {
+      const next = new Set(prev);
+      if (next.has(id) && next.size <= 1) return prev;
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
 
   const chartData = useMemo(() => {
-    const days = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
+    const byDay = {};
+    const dStart = new Date(dateDebut); dStart.setHours(0, 0, 0, 0);
+    const dEnd = new Date(dateFin); dEnd.setHours(23, 59, 59, 999);
+    for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
       const key = d.toISOString().slice(0, 10);
-      const label = d.toLocaleDateString(fr ? "fr-FR" : "en-US", { weekday: "short" });
-      const dayTxs = validated.filter(tx => ((tx.date || tx.created_at) || "").toString().slice(0, 10) === key);
-      days.push({ name: label, ca: dayTxs.reduce((s, tx) => s + Number(tx.amount || 0), 0) });
+      byDay[key] = { date: key, ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0 };
     }
-    return days;
-  }, [validated, now, fr]);
+    filteredTxs.forEach(tx => {
+      const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
+      if (!byDay[key]) return;
+      const amt = convertAmount(Number(tx.amount || 0), tx.currency);
+      const isVal = tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee";
+      const isPend = tx.status === "pending";
+      if (isVal) byDay[key].ca_brut += amt;
+      if (isVal) byDay[key].ca_net += convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency);
+      byDay[key].total += 1;
+      if (isVal) byDay[key].valid += 1;
+      if (isPend) { byDay[key].pending += 1; byDay[key].ca_brut_pending += amt; }
+    });
+    return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
+      date,
+      label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
+      ca_brut: Math.round(d.ca_brut),
+      ca_net: Math.round(d.ca_net),
+      transactions: Math.round(d.ca_brut_pending),
+      panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
+      taux_validation: (d.valid + d.pending) > 0 ? Math.round((d.valid / (d.valid + d.pending)) * 100) : 0,
+    }));
+  }, [filteredTxs, dateDebut, dateFin, convertAmount]);
 
-  const chartTitle = fr ? "CA 7 derniers jours" : "Revenue last 7 days";
-  const chartEmptyMsg = fr ? "Aucune donnée" : "No data";
-  const hasChartData = chartData.length > 0;
+  const modelStats = useMemo(() => {
+    const total = filteredTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0) || 1;
+    const result = myModels.map(m => {
+      const mTxs = filteredTxs.filter(tx => tx.model_id === m.id);
+      const allMTxs = allTxs.filter(tx => tx.model_id === m.id).sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at));
+      const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const convs = new Set(mTxs.map(tx => tx.spender_handle)).size;
+      const actives = mTxs.filter(tx => tx.status === "pending").length;
+      return { name: m.name || "—", id: m.id, ca, convs, actives, pct: total > 0 ? (ca / total) * 100 : 0, allMTxs };
+    });
+    const topCa = Math.max(...result.map(x => x.ca), 1);
+    return result.map(x => ({ ...x, barPct: (x.ca / topCa) * 100 }));
+  }, [filteredTxs, allTxs, myModels, convertAmount]);
 
-  return (
-    <div style={{ maxWidth: 1200, margin: "0 auto", padding: _isMobile ? "0 12px" : 0 }}>
-      <div style={{ marginBottom: _isMobile ? 16 : 24 }}>
-        <div style={{ fontSize: _isMobile ? 18 : 20, fontWeight: 800, color: "var(--text)", letterSpacing: "-0.02em" }}>{"\u{1F4CA}"} {fr ? "Mon Dashboard" : "My Dashboard"}</div>
-        <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 4 }}>{fr ? "Vue d'ensemble de mes modèles et de mon activité" : "Overview of my models and activity"}</div>
-      </div>
-      {myModelIds.length === 0 && (
-        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 48, textAlign: "center" }}>
-          <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 4 }}>{fr ? "Aucune assignation trouvée" : "No assignments found"}</div>
-          <div style={{ fontSize: 13, color: "var(--muted2)" }}>{fr ? "Contacte ton gérant." : "Contact your manager."}</div>
-        </div>
-      )}
-      {myModelIds.length > 0 && (
-        <>
-          <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr 1fr" : "repeat(4, 1fr)", gap: _isMobile ? 8 : 14, marginBottom: _isMobile ? 14 : 20 }}>
-            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: _isMobile ? "14px 12px" : "18px 16px", transition: "all 0.2s" }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{fr ? "CA généré" : "Revenue"}</div>
-              <div style={{ fontSize: _isMobile ? 18 : 20, fontWeight: 800, color: "var(--accent)", lineHeight: 1.1 }}>{fmtAmount(caBrut)}</div>
-              <span style={{ fontSize: 18, marginTop: 4, display: "block" }}>{"\u{1F4B0}"}</span>
-            </div>
-            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: _isMobile ? "14px 12px" : "18px 16px", transition: "all 0.2s" }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{fr ? "Nb TX" : "Nb TX"}</div>
-              <div style={{ fontSize: _isMobile ? 18 : 20, fontWeight: 800, color: "var(--success)", lineHeight: 1.1 }}>{validated.length}</div>
-              <span style={{ fontSize: 18, marginTop: 4, display: "block" }}>{"\u{1F4CB}"}</span>
-            </div>
-            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: _isMobile ? "14px 12px" : "18px 16px", transition: "all 0.2s" }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{fr ? "Spenders actifs" : "Active spenders"}</div>
-              <div style={{ fontSize: _isMobile ? 18 : 20, fontWeight: 800, color: "var(--blue-accent)", lineHeight: 1.1 }}>{activeSpenderIds.size}</div>
-              <span style={{ fontSize: 18, marginTop: 4, display: "block" }}>{"\u{1F465}"}</span>
-            </div>
-            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: _isMobile ? "14px 12px" : "18px 16px", transition: "all 0.2s" }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{fr ? "Commission ce mois" : "Commission this month"}</div>
-              <div style={{ fontSize: _isMobile ? 18 : 20, fontWeight: 800, color: "var(--warning)", lineHeight: 1.1 }}>{fmtAmount(commissionThisMonth)}</div>
-              <span style={{ fontSize: 18, marginTop: 4, display: "block" }}>{"\u{1F4B5}"}</span>
-            </div>
-          </div>
-          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: _isMobile ? "14px 16px" : "16px 20px", marginBottom: 18, overflowX: _isMobile ? "auto" : "visible", minWidth: _isMobile ? 280 : "auto" }}>
-            <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 14 }}>{chartTitle}</div>
-            {rechartsReady && hasChartData ? (
-              <div style={{ width: "100%", height: _isMobile ? 200 : 220, minWidth: _isMobile ? 260 : "auto" }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" vertical={false} />
-                    <XAxis dataKey="name" tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} interval="preserveStartEnd" />
-                    <YAxis tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} tickFormatter={function(v){ return v >= 1000 ? (v / 1000).toFixed(0) + "k" : String(v); }} />
-                    <RechartsTooltip contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 10, fontSize: 12 }} formatter={function(v){ return fmtAmount(v); }} />
-                    <Line type="monotone" dataKey="ca" name="CA" stroke="#8B5CF6" strokeWidth={2} dot={false} activeDot={{ r: 5, fill: "#8B5CF6" }} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            ) : (
-              <div style={{ height: _isMobile ? 200 : 220, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", fontSize: 13 }}>{chartEmptyMsg}</div>
-            )}
-          </div>
+  const recentAllTxs = useMemo(() => [...allTxs].sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at)).slice(0, 20), [allTxs]);
+  const chatterProfilesForCard = useMemo(() => {
+    if (user) return [{ id: user.id, name: user.name || (fr ? "Moi" : "Me"), assigned_models: user.assigned_models || [] }];
+    return [];
+  }, [user, fr]);
 
-          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", marginBottom: 12 }}>{fr ? "Mes Modèles" : "My Models"}</div>
-          <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(auto-fill,minmax(200px,1fr))", gap: 14, marginBottom: 18 }}>
-            {myModels.map(m => {
-              const mTxs = myTxs.filter(tx => tx.model_id === m.id);
-              const mValidated = mTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
-              const mCA = mValidated.reduce((s, tx) => s + Number(tx.amount || 0), 0);
-              const convActive = convCounts[m.id] != null ? String(convCounts[m.id]) : "—";
-              return (
-                <div key={m.id} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 18px" }}>
-                  <div style={{ width: 48, height: 48, borderRadius: "50%", background: "var(--accent-subtle)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, marginBottom: 12 }}>{"\u{1F469}"}</div>
-                  <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>{m.name || "—"}</div>
-                  <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{fr ? "CA" : "Revenue"}: <span style={{ fontWeight: 700, color: "var(--accent)" }}>{fmtAmount(mCA)}</span></div>
-                  <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{mValidated.length} TX</div>
-                  <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{fr ? "Conversations actives" : "Active convs"}: {convActive}</div>
-                </div>
-              );
-            })}
-          </div>
+  const fmtVal = (id, v) => {
+    const m = DASHBOARD_METRICS.find(x => x.id === id);
+    if (!m) return String(v);
+    if (m.fmt === "currency") return (v || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol;
+    if (m.fmt === "percent") return (v || 0).toFixed(1) + "%";
+    return String(Math.round(v || 0));
+  };
 
-          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", marginBottom: 12 }}>{fr ? "Activité récente" : "Recent activity"}</div>
-          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 18px" }}>
-            {recentActivity.length === 0 ? (
-              <div style={{ textAlign: "center", color: "var(--text-tertiary)", padding: 24, fontSize: 13 }}>{fr ? "Aucune activité récente" : "No recent activity"}</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {recentActivity.map(tx => {
-                  const m = models?.find(mm => mm.id === tx.model_id);
-                  const dt = tx.date || tx.created_at;
-                  const dStr = dt ? new Date(dt).toLocaleString(fr ? "fr-FR" : "en-US", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—";
-                  return (
-                    <div key={tx.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--border-subtle)" }}>
-                      <div>
-                        <span style={{ fontWeight: 600, color: "var(--text)" }}>{fmtAmount(Number(tx.amount || 0))}</span>
-                        <span style={{ color: "var(--text-tertiary)", fontSize: 12, marginLeft: 8 }}>@{(tx.spender_handle || tx.spender_id || "—")}</span>
-                        <span style={{ color: "var(--text-tertiary)", fontSize: 11, marginLeft: 6 }}>{m?.name || "—"}</span>
-                      </div>
-                      <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{dStr}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </>
-      )}
-    </div>
+  const CHATTER_MODEL_COLORS = ["#8b5cf6", "#10b981", "#f59e0b", "#06b6d4"];
+  const modelColors = {};
+  myModels.forEach((m, i) => { modelColors[m.name || m.id] = CHATTER_MODEL_COLORS[i % CHATTER_MODEL_COLORS.length]; });
+  const sColor = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee" ? "#10b981" : s === "pending" ? "#f59e0b" : "#ef4444";
+  const sLabel = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee" ? "VALID" : s === "pending" ? "PEND." : "REFUSÉE";
+  const kpiCardStyle = (id) => {
+    const m = DASHBOARD_METRICS.find(x => x.id === id);
+    const active = activeMetrics.has(id);
+    const bg = active ? (m ? m.color + "12" : "var(--surface)") : "var(--surface)";
+    const borderBottom = active && m ? "2px solid " + m.color : "2px solid transparent";
+    return { background: bg, border: "1px solid var(--border)", borderBottom, borderRadius: 12, padding: "14px 16px", cursor: "pointer", transition: "all 0.2s" };
+  };
+
+  const dashboardAlerts = [];
+  const botStatusList = [];
+
+  const filterEl = React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 16 } },
+    ["24h", "7j", "30j", "90j", "all"].map(p => React.createElement("button", {
+      key: p,
+      onClick: () => { setPeriod(p); setDateStart(""); setDateEnd(""); },
+      style: {
+        padding: "7px 13px", borderRadius: 9, border: "1px solid " + (period === p ? "#8b5cf6" : "var(--border)"),
+        background: period === p ? "rgba(139,92,246,0.15)" : "var(--surface)", color: period === p ? "#c4b5fd" : "var(--text)",
+        fontSize: 13, fontWeight: 600, cursor: "pointer",
+      }
+    }, p === "all" ? "All time" : p)),
+    React.createElement("span", { key: "sep1", style: { color: "var(--muted)", fontSize: 12 } }, "|"),
+    React.createElement("input", { key: "d1", type: "date", value: dateStart, onChange: e => { setDateStart(e.target.value); setPeriod("custom"); }, style: { padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 12 } }),
+    React.createElement("span", { key: "sep2", style: { color: "var(--muted)", fontSize: 12 } }, "→"),
+    React.createElement("input", { key: "d2", type: "date", value: dateEnd, onChange: e => { setDateEnd(e.target.value); setPeriod("custom"); }, style: { padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 12 } }),
+    React.createElement("span", { key: "sep3", style: { color: "var(--muted)", fontSize: 12 } }, "|"),
+    React.createElement("select", {
+      key: "model",
+      value: modelFilter,
+      onChange: e => setModelFilter(e.target.value),
+      style: { padding: "8px 12px", borderRadius: 10, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 13, cursor: "pointer" }
+    }, React.createElement("option", { value: "all" }, fr ? "Tous mes modèles" : "All my models"), modelOptions.map(m => React.createElement("option", { key: m.id, value: m.id }, m.name)))
   );
+
+  const kpiCardsEl = React.createElement("div", { style: { display: "grid", gridTemplateColumns: _isMobile ? "1fr 1fr" : "repeat(6, 1fr)", gap: 10, marginBottom: 18 } },
+    DASHBOARD_METRICS.map(m => {
+      const val = m.calc(kpiData);
+      const deltaKey = { ca_brut: "deltaCaBrut", ca_net: "deltaCaNet", transactions: "deltaCaBrutPending", tx_pending: "deltaTxPending", panier_moyen: "deltaPanier", taux_validation: "deltaTaux" }[m.id];
+      const delta = kpiData[deltaKey];
+      const isPendingListCard = m.id === "tx_pending";
+      const cardStyle = m.inGraph ? kpiCardStyle(m.id) : isPendingListCard
+        ? { background: "var(--surface)", border: "1px solid var(--border)", borderBottom: "2px solid transparent", borderRadius: 12, padding: "14px 16px", cursor: "pointer", transition: "all 0.2s" }
+        : { background: "var(--surface)", border: "1px solid var(--border)", borderBottom: "2px solid transparent", borderRadius: 12, padding: "14px 16px", cursor: "default", transition: "all 0.2s" };
+      const handleClick = m.inGraph ? () => toggleMetric(m.id) : isPendingListCard ? () => setPopup("pending_list") : undefined;
+      return React.createElement("div", { key: m.id, onClick: handleClick, style: cardStyle },
+        React.createElement("div", { style: { fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 } }, m.label),
+        React.createElement("div", { style: { fontSize: 20, fontWeight: 800, color: m.inGraph && activeMetrics.has(m.id) ? m.color : m.inGraph ? "var(--text)" : m.color, lineHeight: 1.1 } }, fmtVal(m.id, val)),
+        delta != null && !isNaN(delta) ? React.createElement("div", { style: { fontSize: 10, fontWeight: 700, color: delta >= 0 ? "#10b981" : "#ef4444", marginTop: 4 } }, (delta >= 0 ? "↑" : "↓") + " " + Math.abs(delta).toFixed(1) + "% vs préc.") : null,
+        m.inGraph ? React.createElement("div", { style: { fontSize: 9, color: "var(--muted2)", marginTop: 5 } }, "Cliquer → graphe") : null,
+        isPendingListCard ? React.createElement("div", { style: { fontSize: 9, color: "var(--muted2)", marginTop: 5 } }, "Cliquer → liste") : null
+      );
+    })
+  );
+
+  const chartPillsEl = React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 14 } },
+    DASHBOARD_METRICS.filter(m => m.inGraph).map(m => React.createElement("button", {
+      key: m.id,
+      onClick: () => toggleMetric(m.id),
+      style: {
+        padding: "5px 11px", borderRadius: 20, border: "2px solid " + (activeMetrics.has(m.id) ? m.color : "var(--border)"),
+        background: activeMetrics.has(m.id) ? m.color + "22" : "var(--surface2)", color: activeMetrics.has(m.id) ? m.color : "var(--muted)",
+        fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 5,
+      }
+    }, React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", background: activeMetrics.has(m.id) ? m.color : "var(--muted)", display: "inline-block" } }), m.label))
+  );
+
+  const chartViewBtnsEl = React.createElement("div", { style: { display: "flex", gap: 6 } },
+    [["curve", "📈 Courbe"], ["bar", "📊 Barres"], ["table", "🗒️ Tableau"]].map(([v, lbl]) => React.createElement("button", {
+      key: v,
+      onClick: () => setChartView(v),
+      style: {
+        padding: "5px 11px", borderRadius: 8, border: "1px solid " + (chartView === v ? "#8b5cf6" : "var(--border)"),
+        background: chartView === v ? "rgba(139,92,246,0.15)" : "var(--surface2)", color: chartView === v ? "#c4b5fd" : "var(--text)", fontSize: 11, cursor: "pointer",
+      }
+    }, lbl))
+  );
+
+  const showChartCurve = chartView === "curve" && rechartsReady && chartData.length > 0;
+  const showChartCurveEmpty = chartView === "curve" && (!rechartsReady || !chartData.length);
+  const showChartBar = chartView === "bar" && rechartsReady && chartData.length > 0;
+  const showChartBarEmpty = chartView === "bar" && !chartData.length;
+  const showChartTable = chartView === "table";
+
+  const chartCurveEl = showChartCurve ? React.createElement(ResponsiveContainer, { width: "100%", height: 240 },
+    React.createElement(LineChart, { data: chartData, margin: { top: 5, right: 10, bottom: 0, left: -10 } },
+      React.createElement(CartesianGrid, { stroke: "rgba(255,255,255,0.04)", vertical: false }),
+      React.createElement(XAxis, { dataKey: "label", tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false, interval: "preserveStartEnd" }),
+      React.createElement(YAxis, { tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false, width: 52, tickFormatter: v => v >= 1000 ? (v/1000).toFixed(0) + "k" : String(v) }),
+      React.createElement(RechartsTooltip, {
+        content: ({ active, payload, label }) => {
+          if (!active || !payload || !payload.length) return null;
+          return React.createElement("div", { style: { background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" } },
+            React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 6 } }, label),
+            payload.map((p, i) => React.createElement("div", { key: i, style: { fontSize: 12, fontWeight: 600, color: p.stroke } }, p.name + ": " + fmtVal(p.dataKey, p.value)))
+          );
+        }
+      }),
+      DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement(Line, { key: m.id, type: "monotone", dataKey: m.id, name: m.label, stroke: m.color, strokeWidth: 2, dot: false, activeDot: { r: 5, fill: m.color, stroke: "#1a2035", strokeWidth: 2 } }))
+    )
+  ) : null;
+
+  const chartCurveEmptyEl = showChartCurveEmpty ? React.createElement("div", { style: { height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" } }, "Aucune donnée") : null;
+
+  const chartBarEl = showChartBar ? React.createElement(ResponsiveContainer, { width: "100%", height: 240 },
+    React.createElement(BarChart, { data: chartData, margin: { top: 5, right: 10, bottom: 0, left: -10 } },
+      React.createElement(CartesianGrid, { stroke: "rgba(255,255,255,0.04)", vertical: false }),
+      React.createElement(XAxis, { dataKey: "label", tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false, interval: "preserveStartEnd" }),
+      React.createElement(YAxis, { tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false, width: 52, tickFormatter: v => v >= 1000 ? (v/1000).toFixed(0) + "k" : String(v) }),
+      React.createElement(RechartsTooltip, {
+        content: ({ active, payload, label }) => {
+          if (!active || !payload || !payload.length) return null;
+          return React.createElement("div", { style: { background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" } },
+            React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 6 } }, label),
+            payload.map((p, i) => React.createElement("div", { key: i, style: { fontSize: 12, fontWeight: 600, color: p.fill } }, p.name + ": " + fmtVal(p.dataKey, p.value)))
+          );
+        }
+      }),
+      DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement(Bar, { key: m.id, dataKey: m.id, name: m.label, fill: m.color, radius: [3,3,0,0], opacity: 0.85 }))
+    )
+  ) : null;
+
+  const chartBarEmptyEl = showChartBarEmpty ? React.createElement("div", { style: { height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" } }, "Aucune donnée") : null;
+
+  const chartTableEl = showChartTable ? React.createElement("div", { style: { overflowX: "auto" } },
+    React.createElement("table", { style: { width: "100%", fontSize: 12, borderCollapse: "collapse" } },
+      React.createElement("thead", null, React.createElement("tr", { style: { borderBottom: "1px solid var(--border)" } },
+        React.createElement("th", { style: { padding: "8px 12px", textAlign: "left", color: "var(--muted)", fontWeight: 600 } }, "Date"),
+        DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement("th", { key: m.id, style: { padding: "8px 12px", textAlign: "right", color: m.color, fontWeight: 700 } }, m.label))
+      )),
+      React.createElement("tbody", null,
+        chartData.map((row, i) => React.createElement("tr", { key: i, style: { borderBottom: "1px solid rgba(255,255,255,0.04)" } },
+          React.createElement("td", { style: { padding: "7px 12px", color: "var(--text)" } }, row.label),
+          DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement("td", { key: m.id, style: { padding: "7px 12px", textAlign: "right", color: m.color, fontWeight: 600 } }, fmtVal(m.id, row[m.id] || 0)))
+        ))
+      )
+    )
+  ) : null;
+
+  const chartLegendEl = chartView !== "table" ? React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.04)" } },
+    DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement("div", { key: m.id, style: { display: "flex", alignItems: "center", gap: 6 } },
+      React.createElement("div", { style: { width: 16, height: 2, background: m.color, borderRadius: 1 } }),
+      React.createElement("span", { style: { fontSize: 11, color: "var(--text)" } }, m.label)
+    ))
+  ) : null;
+
+  const chartPanelEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 18 } },
+    React.createElement("div", { style: { display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 } },
+      React.createElement("div", null,
+        React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "Évolution des métriques"),
+        React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)", marginTop: 2 } }, "Cliquer sur un KPI ou une pill pour ajouter/retirer")
+      ),
+      chartViewBtnsEl
+    ),
+    chartPillsEl,
+    chartCurveEl,
+    chartCurveEmptyEl,
+    chartBarEl,
+    chartBarEmptyEl,
+    chartTableEl,
+    chartLegendEl
+  );
+
+  const modelsCardEl = React.createElement("div", {
+    style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" },
+    onClick: () => setPopup("models"),
+    onMouseOver: e => { e.currentTarget.style.borderColor = "#8b5cf6"; },
+    onMouseOut: e => { e.currentTarget.style.borderColor = "var(--border)"; }
+  },
+    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
+      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "🔥 Modèles actives"),
+      React.createElement("span", { style: { fontSize: 10, color: "#8b5cf6" } }, "Détails →")
+    ),
+    modelStats.length > 0 ? modelStats.map(m => React.createElement("div", { key: m.name, style: { marginBottom: 14 } },
+      React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 5 } },
+        React.createElement("div", { style: { width: 34, height: 34, borderRadius: 10, background: (modelColors[m.name] || "#8b5cf6") + "33", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 14, color: modelColors[m.name] || "#8b5cf6", flexShrink: 0 } }, (m.name || "?")[0]),
+        React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+          React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: "var(--text)" } }, m.name),
+          React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, m.convs + " conv · " + m.actives + " actives")
+        ),
+        React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: "var(--text)", flexShrink: 0 } }, m.ca.toLocaleString("fr-FR") + " " + currencySymbol)
+      ),
+      React.createElement("div", { style: { height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" } },
+        React.createElement("div", { style: { height: "100%", width: m.barPct + "%", background: modelColors[m.name] || "#8b5cf6", borderRadius: 3, transition: "width 0.3s" } })
+      )
+    )) : React.createElement("div", { style: { textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 } }, "Aucune donnée modèle")
+  );
+
+  const chattersCardEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 } },
+    React.createElement("div", { style: { fontSize: 15, fontWeight: 800, marginBottom: 14, color: "var(--text)" } }, "👥 Chatters en shift"),
+    chatterProfilesForCard.length > 0 ? chatterProfilesForCard.map(ch => React.createElement("div", { key: ch.id, style: { display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" } },
+      React.createElement("div", { style: { width: 32, height: 32, borderRadius: 10, background: "rgba(99,102,241,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 13, color: "#818cf8", flexShrink: 0 } }, (ch.name || "?")[0]),
+      React.createElement("div", { style: { flex: 1 } },
+        React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--text)" } }, ch.name),
+        React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, ch.assigned_models && ch.assigned_models.length ? ch.assigned_models.length + " modèle(s)" : (fr ? "Non assigné" : "Not assigned"))
+      ),
+      React.createElement("span", { style: { fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: "rgba(52,211,153,0.15)", color: "#34d399" } }, "SHIFT")
+    )) : React.createElement("div", { style: { textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 } }, "—")
+  );
+
+  const txRecentEl = React.createElement("div", {
+    style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" },
+    onClick: () => setPopup("tx"),
+    onMouseOver: e => { e.currentTarget.style.borderColor = "#f59e0b"; },
+    onMouseOut: e => { e.currentTarget.style.borderColor = "var(--border)"; }
+  },
+    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
+      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "🕐 TX récentes"),
+      React.createElement("span", { style: { fontSize: 10, color: "#f59e0b" } }, "Voir tout →")
+    ),
+    recentAllTxs.length > 0 ? recentAllTxs.slice(0, 5).map((tx, i) => {
+      const m = allModels.find(x => x.id === tx.model_id);
+      const sc = sColor(tx.status);
+      return React.createElement("div", { key: tx.id || i, style: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" } },
+        React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+          React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "@" + (tx.spender_handle || "?") + " · " + (m ? m.name : "?")),
+          React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }))
+        ),
+        React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0, marginLeft: 8 } },
+          React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color: sc } }, "+" + convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0) + " " + (tx.currency || currencySymbol)),
+          React.createElement("span", { style: { fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 6, background: sc + "22", color: sc } }, sLabel(tx.status))
+        )
+      );
+    }) : React.createElement("div", { style: { textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 } }, "Aucune TX")
+  );
+
+  const botsCardEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 } },
+    React.createElement("div", { style: { fontSize: 15, fontWeight: 800, marginBottom: 14, color: "var(--text)" } }, "📡 Bots Status"),
+    React.createElement("div", { style: { textAlign: "center", padding: 12, color: "var(--muted)", fontSize: 12 } }, "—")
+  );
+
+  const alertsCardEl = React.createElement("div", {
+    style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" },
+    onClick: () => setPopup("alerts"),
+    onMouseOver: e => { e.currentTarget.style.borderColor = "#ef4444"; },
+    onMouseOut: e => { e.currentTarget.style.borderColor = "var(--border)"; }
+  },
+    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } },
+      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "🔔 Alertes"),
+      React.createElement("span", { style: { fontSize: 10, color: "#ef4444" } }, "Voir tout →")
+    ),
+    React.createElement("div", { style: { textAlign: "center", padding: 12, color: "var(--muted)", fontSize: 12 } }, "✅ Aucune alerte")
+  );
+
+  const todoCardEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 } },
+    React.createElement("div", { style: { fontSize: 15, fontWeight: 800, marginBottom: 12, color: "var(--text)" } }, "✅ To-Do"),
+    React.createElement("div", { style: { fontSize: 11, color: "var(--muted)", textAlign: "center", padding: "8px 0" } }, "—")
+  );
+
+  const col1El = React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, modelsCardEl, chattersCardEl);
+  const col2El = React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, txRecentEl, botsCardEl);
+  const col3El = React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, alertsCardEl, todoCardEl);
+
+  const bottomGridEl = React.createElement("div", { style: { display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr 340px", gap: 14, marginBottom: 20 } }, col1El, col2El, col3El);
+
+  const noAssignBanner = myModelIds.length === 0 ? React.createElement("div", {
+    style: { background: "var(--warning-muted)", border: "1px solid var(--warning)", borderRadius: 14, padding: 48, textAlign: "center", marginBottom: 18 }
+  }, React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 4 } }, fr ? "Aucune assignation trouvée" : "No assignments found"), React.createElement("div", { style: { fontSize: 13, color: "var(--muted2)" } }, fr ? "Contacte ton gérant." : "Contact your manager.")) : null;
+
+  const pendingListModal = popup === "pending_list" ? React.createElement(DashModal, { key: "pm", open: true, onClose: () => setPopup(null), title: "TX en attente", maxWidth: 600 }, React.createElement("div", { style: { maxHeight: 400, overflowY: "auto" } }, recentAllTxs.filter(tx => tx.status === "pending").map((tx, i) => React.createElement("div", { key: tx.id || i, style: { padding: "8px 0", borderBottom: "1px solid var(--border-subtle)", display: "flex", justifyContent: "space-between" } }, React.createElement("span", null, "@" + (tx.spender_handle || "?")), React.createElement("span", { style: { fontWeight: 600 } }, convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0) + " " + currencySymbol))))) : null;
+  const modelsModal = popup === "models" ? React.createElement(DashModal, { key: "mod", open: true, onClose: () => setPopup(null), title: "🔥 Modèles actives", maxWidth: 600 }, React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } }, modelStats.map(m => React.createElement("div", { key: m.id, style: { padding: 16, borderRadius: 12, border: "1px solid var(--border)", background: "var(--surface2)" } }, React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: "var(--text)", marginBottom: 8 } }, m.name), React.createElement("div", { style: { fontSize: 12, color: "var(--muted2)" } }, "CA: " + m.ca.toLocaleString("fr-FR") + " " + currencySymbol + " · " + m.convs + " conv · " + m.actives + " actives"))))) : null;
+  const txModal = popup === "tx" ? React.createElement(DashModal, { key: "txm", open: true, onClose: () => setPopup(null), title: "🕐 TX récentes", maxWidth: 600 }, React.createElement("div", { style: { maxHeight: 400, overflowY: "auto" } }, recentAllTxs.slice(0, 20).map((tx, i) => { const m = allModels.find(x => x.id === tx.model_id); const sc = sColor(tx.status); return React.createElement("div", { key: tx.id || i, style: { padding: "10px 0", borderBottom: "1px solid var(--border-subtle)", display: "flex", justifyContent: "space-between", alignItems: "center" } }, React.createElement("div", null, React.createElement("div", { style: { fontWeight: 600 } }, "@" + (tx.spender_handle || "?") + " · " + (m ? m.name : "?")), React.createElement("div", { style: { fontSize: 11, color: "var(--muted2)" } }, new Date(tx.date || tx.created_at).toLocaleString("fr-FR"))), React.createElement("span", { style: { fontWeight: 700, color: sc } }, "+" + convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0) + " " + currencySymbol)); }))) : null;
+  const alertsModal = popup === "alerts" ? React.createElement(DashModal, { key: "al", open: true, onClose: () => setPopup(null), title: "🔔 Alertes", maxWidth: 500 }, React.createElement("div", { style: { textAlign: "center", padding: 40, color: "var(--muted)" } }, "✅ Aucune alerte")) : null;
+
+  const popupsEl = React.createElement(React.Fragment, null, pendingListModal, modelsModal, txModal, alertsModal);
+
+  return React.createElement("div", { style: { maxWidth: 1200, margin: "0 auto", padding: _isMobile ? "0 12px" : 0 } },
+    noAssignBanner,
+    filterEl,
+    kpiCardsEl,
+    chartPanelEl,
+    bottomGridEl,
+    popupsEl
+  );
+});
+
+// =============================================
+// CHATTER ROLE — DASHBOARD (EC3) — Wrapper PR1A
+// =============================================
+const ChatterDashboardTab = ({user, lang, txs, spenders, models, profiles}) => {
+  return React.createElement(ChatterDashboardRedesign, { user, lang, txs, spenders, models, profiles: profiles || (user ? [user] : []) });
 };
 
 // =============================================
@@ -23543,7 +23817,7 @@ const App = () => {
             </div>
           )}
           {/* ── Chatter-only pages — UNCHANGED ── */}
-          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} />}
+          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
           {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} onRefresh={onRefresh} />}
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} onRefresh={onRefresh} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
