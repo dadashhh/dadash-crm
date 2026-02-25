@@ -2120,14 +2120,12 @@ const PAGE_TABS = {
     { id: "scans",  label: "📷 Scans",  icon: "" },
   ],
   admin: [
-    { id: "overview", label: "Vue d'ensemble", icon: "\u{1F4CA}" },
-    { id: "users", label: "Utilisateurs", icon: "\u{1F465}" },
-    { id: "roles", label: "Rôles & Permissions", icon: "\u{1F510}" },
-    { id: "assignments", label: "Assignations", icon: "\u{1F504}" },
-    { id: "logs", label: "Logs", icon: "\u{1F4CB}" },
-    { id: "settings", label: "Paramètres", icon: "⚙️" },
-    { id: "qa", label: "QA / Maintenance", icon: "\u{1F6E0}" },
-    { id: "export", label: "Export", icon: "\u{1F4E4}" },
+    { id: "users",     label: "Utilisateurs",       icon: "\u{1F465}" },
+    { id: "roles",     label: "Rôles & Permissions", icon: "\u{1F510}" },
+    { id: "logs",      label: "Logs",               icon: "\u{1F4CB}" },
+    { id: "export",    label: "Export",              icon: "\u{1F4E4}" },
+    { id: "platforms", label: "Plateformes",         icon: "\u{1F50C}" },
+    { id: "settings",  label: "Paramètres",          icon: "\u2699\uFE0F" },
   ],
 };
 // AD1 — Nav pour rôles admin/ceo (accès Admin uniquement)
@@ -8563,7 +8561,7 @@ const insertPayoutWithSchemaFallback = async (row, addToast, fr) => {
 // =============================================
 // PAIES TAB
 // =============================================
-const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefresh, invoices}) => {
+const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefresh, invoices, expenses}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const dr = useDateRange("all");
@@ -8579,6 +8577,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
   const payFilteredTxs = dr.filterByDate(txs, "date");
   const chatterPayouts = (payouts || []).filter(p => p.user_id && getPayoutBeneficiaryType(p) === "chatter");
   const modelPayouts = (payouts || []).filter(p => p.model_id && isModelePayout(p));
+  const salaireExpenses = (expenses||[]).filter(e => e.type === "salaire");
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -8587,8 +8586,8 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     const chTx = payFilteredTxs.filter(tx=>tx.chatter_id===chatterId && tx.status==="validated");
     const totalComm = chTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
     const earnedThisMonth = chTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
-    const paidAmount = chatterPayouts.filter(p=>p.user_id===chatterId && (p.status==="done"||p.status==="paid")).reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
-    const pendingAmount = chatterPayouts.filter(p=>p.user_id===chatterId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const paidAmount = salaireExpenses.filter(e=>e.assigned_to_id===chatterId && e.paid===true).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
+    const pendingAmount = salaireExpenses.filter(e=>e.assigned_to_id===chatterId && e.paid===false).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     const chPayslips = (payslips||[]).filter(p=>p.user_id===chatterId);
     const paidPayslips = chPayslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
     return {totalEarned:totalComm, earnedThisMonth, paidAmount, pendingAmount, balance:totalComm-paidAmount, chPayslips, paidPayslips};
@@ -8598,8 +8597,8 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     const mTx = payFilteredTxs.filter(tx=>tx.model_id===modelId && tx.status==="validated");
     const totalNet = mTx.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
     const earnedThisMonth = mTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
-    const paidAmount = modelPayouts.filter(p=>p.model_id===modelId && (p.status==="done"||p.status==="paid")).reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
-    const pendingAmount = modelPayouts.filter(p=>p.model_id===modelId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const paidAmount = salaireExpenses.filter(e=>e.assigned_to_id===modelId && e.paid===true).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
+    const pendingAmount = salaireExpenses.filter(e=>e.assigned_to_id===modelId && e.paid===false).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     return {totalEarned:totalNet, earnedThisMonth, paidAmount, pendingAmount, balance:totalNet-paidAmount};
   };
 
@@ -8650,23 +8649,40 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     if (data.balance <= 0) { addToast(fr?"Rien à marquer payé":"Nothing to mark as paid","info"); return; }
     setSaving(true);
     try {
-      const bt = beneficiary.type || "chatter";
-      const row = {amount:data.balance, date:new Date().toISOString().slice(0,10), status:"done", type:bt, beneficiary_type:bt, notes:"Marqué payé depuis Compta", currency:"CHF", method:"Virement"};
-      if (bt === "chatter") { row.user_id = beneficiary.id; }
-      else { row.model_id = beneficiary.id; }
-      const {error} = await insertPayoutWithSchemaFallback(row, addToast, fr);
-      if (error) {
-        const msg = error.message || "";
-        if (/permission|denied|policy/i.test(msg)) addToast(fr?"Droits insuffisants.":"Insufficient permissions.","error");
-        else if (/column|does not exist/i.test(msg)) addToast(fr?"Schéma payouts incompatible. Migration SQL requise.":"Payouts schema incompatible. SQL migration required.","error");
-        else addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + msg, "error");
-        if (user.role==="gerant") console.warn("[DADASH Compta] handleMarkPaid failed:", msg, row);
-        setSaving(false); return;
+      const assignType = beneficiary.type === "chatter" ? "chatter" : "model";
+      const unpaidIds = salaireExpenses
+        .filter(exp => exp.assigned_to_id === beneficiary.id && exp.paid === false)
+        .map(exp => exp.id);
+      if (unpaidIds.length > 0) {
+        const { error } = await sb.from("expenses")
+          .update({ paid: true, paid_at: new Date().toISOString() })
+          .in("id", unpaidIds);
+        if (error) {
+          addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + (error.message||""), "error");
+          setSaving(false); return;
+        }
+      } else {
+        const row = {
+          name: fr ? `Salaire — ${beneficiary.name||beneficiary.handle||"?"}` : `Salary — ${beneficiary.name||beneficiary.handle||"?"}`,
+          amount: data.balance,
+          currency: "EUR",
+          type: "salaire",
+          category: "salaire",
+          paid: true,
+          paid_at: new Date().toISOString(),
+          date: new Date().toISOString().slice(0,10),
+          assigned_to_id: beneficiary.id,
+          assigned_to_type: assignType,
+        };
+        const { error } = await sb.from("expenses").insert(row);
+        if (error) {
+          addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + (error.message||""), "error");
+          setSaving(false); return;
+        }
       }
-      if (user.role==="gerant") console.log("[DADASH Compta] Marqué payé:", bt, beneficiary.name || beneficiary.id);
       await onRefresh();
       addToast(fr?"Marqué payé ✓":"Marked paid ✓","success");
-    } catch (err) { addToast(fr?"Erreur inattendue: ":"Unexpected error: " + (err.message||err), "error"); if (user.role==="gerant") console.error("[DADASH Compta] handleMarkPaid:", err); }
+    } catch (err) { addToast(fr?"Erreur inattendue: ":"Unexpected error: " + (err.message||err), "error"); }
     setSaving(false);
   };
 
@@ -9439,6 +9455,13 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
   const totalComms = validTxs.reduce((s,tx)=>s+convertAmount(txComm(tx),tx.currency),0);
   const totalCharges = filteredPayouts.reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"CHF"),0);
   const totalExpenses = (expenses||[]).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0);
+  const expByType = {
+    salaire:     (expenses||[]).filter(e=>e.type==="salaire").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    marketing:   (expenses||[]).filter(e=>e.type==="marketing").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    outil:       (expenses||[]).filter(e=>e.type==="outil").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    reversement: (expenses||[]).filter(e=>e.type==="reversement").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    autre:       (expenses||[]).filter(e=>!e.type||e.type==="autre").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+  };
   const grossMargin = totalNet - totalComms;
   const netProfit = grossMargin - totalExpenses;
   const margeNette = totalNet - totalCharges;
@@ -9751,6 +9774,19 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
       {/* ── EXPENSES ── */}
       <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
         <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{t(lang, "expenses") || "Dépenses"}</div>
+        {/* ── Breakdown par type ── */}
+        {totalExpenses > 0 && (
+          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:14}}>
+            {[["salaire","\u{1F4BC}","var(--accent)"],["marketing","\u{1F4E3}","#F59E0B"],["outil","\u{1F527}","#06B6D4"],["reversement","\u{1F504}","#8B5CF6"],["autre","\u{1F4E6}","var(--muted2)"]].map(([type,emoji,color])=>(
+              expByType[type]>0 && (
+                <div key={type} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:"var(--surface2)",border:"1px solid var(--border)",fontSize:12}}>
+                  <span>{emoji} {type.charAt(0).toUpperCase()+type.slice(1)}</span>
+                  <span style={{fontWeight:700,color}}>{fmtAmount(expByType[type])}</span>
+                </div>
+              )
+            ))}
+          </div>
+        )}
         <button onClick={() => setShowForm(!showForm)} style={{padding:"7px 13px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer",marginBottom:14}}>+ {fr ? "Ajouter dépense" : "Add Expense"}</button>
         {showForm && (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 14, marginBottom: 14 }}>
@@ -9767,10 +9803,10 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
         )}
         <div className="table-wrap">
           <table className="table" style={{ fontSize: 12 }}>
-            <thead><tr><th>{fr ? "Nom" : "Name"}</th><th>{fr ? "Catégorie" : "Category"}</th><th>{fr ? "Montant" : "Amount"}</th></tr></thead>
+            <thead><tr><th>{fr ? "Nom" : "Name"}</th><th>Type</th><th>{fr ? "Catégorie" : "Category"}</th><th>{fr ? "Montant" : "Amount"}</th></tr></thead>
             <tbody>
               {(expenses||[]).map(e => (
-                <tr key={e.id}><td>{e.name}</td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.category}</span></td><td style={{ fontWeight: 700 }}>{fmtAmount(e.amount)}</td></tr>
+                <tr key={e.id}><td>{e.name}</td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.type||"autre"}</span></td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.category}</span></td><td style={{ fontWeight: 700 }}>{fmtAmount(e.amount)}</td></tr>
               ))}
             </tbody>
           </table>
@@ -13339,10 +13375,11 @@ const hasPermission = (userId, featureId, loadedPerms, userRole) => {
 // ── Tab 2: Permissions par employé ──
 const AdminRolesTab = ({lang, user, profiles}) => {
   const fr = lang === "fr";
+  const addToast = useToast();
   const [userPerms, setUserPerms] = useState({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState({});
-  const isGerantUser = !!(user && user.role === "gerant");
+  const isGerantUser = isAdminUser(user);
 
   const employees = React.useMemo(() =>
     safeArray(profiles).filter(p => p.is_active !== false && p.id !== (user && user.id)),
@@ -13403,9 +13440,17 @@ const AdminRolesTab = ({lang, user, profiles}) => {
         can_edit: nextPerm === "edit",
       }, { onConflict: "user_id,feature" });
       if (error) throw error;
+      addToast(fr ? "Permission mise à jour ✓" : "Permission updated ✓", "success");
     } catch(e) {
       console.error("[permissions] save:", e.message);
       setUserPerms(prev => ({ ...prev, [empId]: { ...(prev[empId] || {}), [featureId]: currentPerm } }));
+      const isTableMissing = e.code === "42P01" || e.code === "PGRST116";
+      addToast(
+        isTableMissing
+          ? (fr ? "Table permissions manquante — appliquer la migration SQL" : "Permissions table missing — apply SQL migration")
+          : (fr ? "Erreur sauvegarde permission : " + e.message : "Permission save error: " + e.message),
+        "error"
+      );
     }
     setSaving(prev => { const n = {...prev}; delete n[key]; return n; });
   };
@@ -13901,7 +13946,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
     {id:"platforms", icon:"🔌", label:fr?"Plateformes":"Platforms"},
     {id:"settings",  icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
   ];
-  const activeSub = subTab || "users";
+  const activeSub = (subTab && ADMIN_TABS.some(t => t.id === subTab)) ? subTab : "users";
   const tabStyle = (id) => ({padding:"8px 14px",borderRadius:9,border:"1px solid "+(activeSub===id?"#8b5cf6":"var(--border)"),background:activeSub===id?"rgba(139,92,246,0.15)":"var(--surface)",color:activeSub===id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0,whiteSpace:"nowrap",transition:"all 0.15s"});
   return (
     <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
@@ -20184,23 +20229,36 @@ const BroadcastsTab = ({ user, lang, spenders, txs, models, broadcasts, onRefres
 const BOT_ORDER = [
   { id: "tg", key: "tg_bot", name: "Bot TG", icon: "\u{2708}\uFE0F", desc: "Telegram conversations, screenshots, escalades" },
   { id: "chatting", key: "chatting_bot", name: "Chatting Bot", icon: "\u{1F4AC}", desc: "Messages, notifications, relances" },
-  { id: "scan", key: "scan_checker", name: "Scan Checker", icon: "\u{1F50D}", desc: "Vérification captures, détection fake" }
+  { id: "scan", key: "scan_checker", name: "Scan Checker", icon: "\u{1F50D}", desc: "Vérification captures, détection fake" },
+  { id: "cam", key: "cam_bot", name: "Bot Cam", icon: "\u{1F3A5}", desc: "Appels vidéo automatiques, delivery vidéo" }
 ];
 const BotsManagementPage = ({ lang }) => {
   const fr = lang === "fr";
   const [statusRows, setStatusRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [botTabs, setBotTabs] = useState({ tg: "stats", chatting: "stats", scan: "stats" });
+  const [botTabs, setBotTabs] = useState({ tg: "stats", chatting: "stats", scan: "stats", cam: "stats" });
   const setBotTab = (id, tab) => setBotTabs(prev => ({ ...prev, [id]: tab }));
-  const [botLogs, setBotLogs] = useState({ tg: [], chatting: [], scan: [] });
-  const [botLogsLoading, setBotLogsLoading] = useState({ tg: false, chatting: false, scan: false });
-  const [botLogsError, setBotLogsError] = useState({ tg: null, chatting: null, scan: null });
+  const [botLogs, setBotLogs] = useState({ tg: [], chatting: [], scan: [], cam: [] });
+  const [botLogsLoading, setBotLogsLoading] = useState({ tg: false, chatting: false, scan: false, cam: false });
+  const [botLogsError, setBotLogsError] = useState({ tg: null, chatting: null, scan: null, cam: null });
   const [scanResults, setScanResults] = useState([]);
   const [scanLoading, setScanLoading] = useState(false);
   const [scanError, setScanError] = useState(null);
   const [selectedScan, setSelectedScan] = useState(null);
   const [selectedBot, setSelectedBot] = useState(null);
+  const [sessions, setSessions] = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState(null);
+  const [camModels, setCamModels] = useState([]);
+  const [showAddSession, setShowAddSession] = useState(false);
+  const [addStep, setAddStep] = useState(1);
+  const [addPhone, setAddPhone] = useState("");
+  const [addModelId, setAddModelId] = useState("");
+  const [addOtp, setAddOtp] = useState("");
+  const [addSaving, setAddSaving] = useState(false);
+  const [addErr, setAddErr] = useState(null);
+  const [deletingSessionId, setDeletingSessionId] = useState(null);
 
   const fetchScanResults = useCallback(async () => {
     if (!window.sb) { setScanError("Supabase non connecté"); setScanLoading(false); return; }
@@ -20247,6 +20305,77 @@ const BotsManagementPage = ({ lang }) => {
     window.addEventListener("keydown", handleEsc);
     return () => window.removeEventListener("keydown", handleEsc);
   }, [selectedBot]);
+
+  const fetchSessions = useCallback(async () => {
+    if (!window.sb) { setSessionsError("Supabase non connecté"); setSessionsLoading(false); return; }
+    setSessionsError(null);
+    try {
+      const { data, error: err } = await window.sb.from("bot_sessions").select("*").order("created_at", { ascending: false });
+      if (err && (err.code === "42P01" || err.code === "PGRST116")) { setSessions([]); }
+      else if (err) { setSessionsError(err.message || "Erreur"); setSessions([]); }
+      else setSessions(Array.isArray(data) ? data : []);
+    } catch (e) { setSessionsError(String(e && e.message) || "Erreur"); setSessions([]); }
+    setSessionsLoading(false);
+  }, []);
+
+  const fetchCamModels = useCallback(async () => {
+    if (!window.sb) return;
+    try {
+      const { data } = await window.sb.from("models").select("id,name").order("name");
+      if (data) setCamModels(Array.isArray(data) ? data : []);
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => { fetchSessions(); fetchCamModels(); }, [fetchSessions, fetchCamModels]);
+
+  const handleSessionPause = async (sid) => {
+    try { await window.sb.from("bot_sessions").update({ status: "paused" }).eq("id", sid); fetchSessions(); } catch (_) {}
+  };
+  const handleSessionResume = async (sid) => {
+    try { await window.sb.from("bot_sessions").update({ status: "active", last_active_at: new Date().toISOString() }).eq("id", sid); fetchSessions(); } catch (_) {}
+  };
+  const handleSessionDelete = async (sid) => {
+    setDeletingSessionId(sid);
+  };
+  const confirmSessionDelete = async (sid) => {
+    try { await window.sb.from("bot_sessions").delete().eq("id", sid); fetchSessions(); } catch (_) {}
+    setDeletingSessionId(null);
+  };
+
+  const handleAddStep1 = async () => {
+    if (!addPhone.trim()) { setAddErr(fr ? "Numéro requis" : "Phone required"); return; }
+    setAddSaving(true); setAddErr(null);
+    try {
+      const botUrl = (window.BOT_CAM_URL || "").replace(/\/$/, "");
+      if (!botUrl) throw new Error(fr ? "BOT_CAM_URL non configuré" : "BOT_CAM_URL not set");
+      const res = await fetch(botUrl + "/sessions/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: addPhone.trim(), model_id: addModelId || null })
+      });
+      if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + (t ? ": " + t : "")); }
+      setAddStep(2);
+    } catch (e) { setAddErr(e.message || "Erreur"); }
+    setAddSaving(false);
+  };
+
+  const handleAddStep2 = async () => {
+    if (!addOtp.trim()) { setAddErr(fr ? "Code requis" : "Code required"); return; }
+    setAddSaving(true); setAddErr(null);
+    try {
+      const botUrl = (window.BOT_CAM_URL || "").replace(/\/$/, "");
+      if (!botUrl) throw new Error(fr ? "BOT_CAM_URL non configuré" : "BOT_CAM_URL not set");
+      const res = await fetch(botUrl + "/sessions/confirm-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: addPhone.trim(), code: addOtp.trim(), model_id: addModelId || null })
+      });
+      if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + (t ? ": " + t : "")); }
+      setShowAddSession(false); setAddStep(1); setAddPhone(""); setAddModelId(""); setAddOtp("");
+      fetchSessions();
+    } catch (e) { setAddErr(e.message || "Erreur"); }
+    setAddSaving(false);
+  };
 
   const byKey = {};
   statusRows.forEach(r => { const k = r && r.bot_key; if (k) byKey[k] = r; });
@@ -20451,6 +20580,67 @@ const BotsManagementPage = ({ lang }) => {
         })}
       </div>
 
+      {/* ── SESSIONS TELEGRAM ── */}
+      <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.5px" }}>{fr ? "Sessions Telegram" : "Telegram Sessions"}</div>
+        <button onClick={() => { setShowAddSession(true); setAddStep(1); setAddPhone(""); setAddModelId(""); setAddOtp(""); setAddErr(null); }} style={{ padding: "6px 14px", fontSize: 12, fontWeight: 700, borderRadius: 9, border: "1px solid var(--accent)", background: "var(--accent-muted)", color: "var(--accent)", cursor: "pointer" }}>+ {fr ? "Ajouter une session" : "Add session"}</button>
+      </div>
+      {sessionsError && <div style={{ background: "var(--danger-muted)", border: "1px solid var(--danger)", borderRadius: 10, padding: 10, marginBottom: 14, color: "var(--danger)", fontSize: 12 }}>{"\u26A0"} {sessionsError}</div>}
+      {sessionsLoading && sessions.length === 0 ? (
+        <div style={{ ...cardStyle, textAlign: "center", padding: 28, color: "var(--text-tertiary)", fontSize: 12, marginBottom: 28 }}>{"\u23F3"} {fr ? "Chargement sessions…" : "Loading sessions…"}</div>
+      ) : sessions.length === 0 ? (
+        <div style={{ ...cardStyle, textAlign: "center", padding: 28, color: "var(--text-tertiary)", fontSize: 12, marginBottom: 28 }}>{"\u{1F4F5}"} {fr ? "Aucune session active — cliquez sur + Ajouter" : "No active sessions — click + Add"}</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr", gap: 14, marginBottom: 28 }}>
+          {sessions.map(sess => {
+            const isActive = sess.status === "active";
+            const isPaused = sess.status === "paused";
+            const stColor = isActive ? "var(--success)" : isPaused ? "var(--warning)" : "var(--text-tertiary)";
+            const stBg = isActive ? "var(--success-muted)" : isPaused ? "var(--warning-muted)" : "var(--surface2)";
+            const stLabel = isActive ? "ACTIVE" : isPaused ? "PAUSED" : (sess.status || "INACTIVE").toUpperCase();
+            const maskedPhone = sess.phone_number ? sess.phone_number.slice(0, 5) + "•••" + sess.phone_number.slice(-3) : "—";
+            const isConfirmingDelete = deletingSessionId === sess.id;
+            return (
+              <div key={sess.id} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 16 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: "var(--text)" }}>{sess.model_name || "—"}</div>
+                    <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 2 }}>{maskedPhone}</div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "3px 9px", borderRadius: 20, background: stBg, fontSize: 10, fontWeight: 800, color: stColor, letterSpacing: 0.5 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: "50%", background: stColor, animation: isActive ? "pulse 2s infinite" : "none" }} />
+                    {stLabel}
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                  <div style={{ background: "var(--surface2)", borderRadius: 9, padding: "7px 10px", textAlign: "center" }}>
+                    <div style={{ fontSize: 9, color: "var(--muted)", textTransform: "uppercase", fontWeight: 600, marginBottom: 2 }}>{fr ? "Msgs/jour" : "Msgs/day"}</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: "var(--accent)" }}>{sess.messages_today != null ? sess.messages_today : "—"}</div>
+                  </div>
+                  <div style={{ background: "var(--surface2)", borderRadius: 9, padding: "7px 10px", textAlign: "center" }}>
+                    <div style={{ fontSize: 9, color: "var(--muted)", textTransform: "uppercase", fontWeight: 600, marginBottom: 2 }}>{fr ? "Dernière activité" : "Last active"}</div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-secondary)" }}>{sess.last_active_at ? fmtDate(sess.last_active_at) : "—"}</div>
+                  </div>
+                </div>
+                {isConfirmingDelete ? (
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: "var(--danger)", flex: 1 }}>{fr ? "Confirmer la suppression ?" : "Confirm delete?"}</span>
+                    <button onClick={() => confirmSessionDelete(sess.id)} style={{ ...btnStyle, color: "var(--danger)", borderColor: "var(--danger)" }}>{fr ? "Oui" : "Yes"}</button>
+                    <button onClick={() => setDeletingSessionId(null)} style={btnStyle}>{fr ? "Non" : "No"}</button>
+                  </div>
+                ) : (
+                  <div style={btnRow}>
+                    <button onClick={() => handleSessionPause(sess.id)} disabled={isPaused} style={{ ...btnStyle, opacity: isPaused ? 0.4 : 1 }}>{"\u23F8"} Pause</button>
+                    <button onClick={() => handleSessionResume(sess.id)} disabled={isActive} style={{ ...btnStyle, opacity: isActive ? 0.4 : 1 }}>{"\u25B6\uFE0F"} Resume</button>
+                    <button onClick={() => handleSessionDelete(sess.id)} style={{ ...btnStyle, color: "var(--danger)", borderColor: "var(--danger)" }}>{"\u{1F5D1}"} {fr ? "Supprimer" : "Delete"}</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Section KPIs globaux */}
       <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.5px" }}>{fr ? "Bots Control" : "Bots Control"}</div>
       <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(4, 1fr)", gap: 14, marginBottom: 28 }}>
@@ -20548,6 +20738,54 @@ const BotsManagementPage = ({ lang }) => {
         </>
       )}
       {botDetailModal}
+      {showAddSession && (
+        <div onClick={() => { setShowAddSession(false); setAddStep(1); }} style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.65)", zIndex: 9999 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "var(--card-bg)", borderRadius: 16, padding: 24, width: "min(460px, 95vw)", boxShadow: "0 20px 60px rgba(0,0,0,0.4)", border: "1px solid var(--card-border)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)" }}>{"📱"} {fr ? "Ajouter une session" : "Add session"}</div>
+                <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 3 }}>{fr ? ("Étape " + addStep + " / 2") : ("Step " + addStep + " / 2")}</div>
+              </div>
+              <button onClick={() => { setShowAddSession(false); setAddStep(1); }} style={{ background: "none", border: "none", color: "var(--text-tertiary)", fontSize: 20, cursor: "pointer" }}>{"\u00D7"}</button>
+            </div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
+              {[1, 2].map(s => (
+                <div key={s} style={{ flex: 1, height: 3, borderRadius: 3, background: addStep >= s ? "var(--accent)" : "var(--border)" }} />
+              ))}
+            </div>
+            {addStep === 1 ? (
+              <div>
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 6 }}>{fr ? "Numéro Telegram" : "Telegram number"} <span style={{ color: "var(--danger)" }}>*</span></label>
+                  <input value={addPhone} onChange={e => setAddPhone(e.target.value)} placeholder="+41..." style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 14, fontFamily: "inherit", boxSizing: "border-box" }} />
+                </div>
+                <div style={{ marginBottom: 18 }}>
+                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 6 }}>{fr ? "Modèle associé" : "Associated model"}</label>
+                  <select value={addModelId} onChange={e => setAddModelId(e.target.value)} style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 14, fontFamily: "inherit", boxSizing: "border-box" }}>
+                    <option value="">{fr ? "— Aucun modèle —" : "— No model —"}</option>
+                    {camModels.map(m => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+                  </select>
+                </div>
+                {addErr && <div style={{ color: "var(--danger)", fontSize: 12, marginBottom: 12 }}>{"\u26A0"} {addErr}</div>}
+                <button onClick={handleAddStep1} disabled={addSaving} style={{ width: "100%", padding: "11px", borderRadius: 9, border: "none", background: "var(--accent)", color: "#fff", fontWeight: 700, fontSize: 14, cursor: addSaving ? "default" : "pointer", opacity: addSaving ? 0.7 : 1 }}>{addSaving ? (fr ? "Envoi…" : "Sending…") : (fr ? "Envoyer OTP" : "Send OTP")}</button>
+              </div>
+            ) : (
+              <div>
+                <div style={{ marginBottom: 8, padding: 10, background: "var(--success-muted)", borderRadius: 9, fontSize: 12, color: "var(--success)", fontWeight: 600 }}>{"\u2713"} {fr ? ("OTP envoyé au " + addPhone) : ("OTP sent to " + addPhone)}</div>
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 6 }}>{fr ? "Code reçu par SMS" : "Code received by SMS"} <span style={{ color: "var(--danger)" }}>*</span></label>
+                  <input value={addOtp} onChange={e => setAddOtp(e.target.value)} placeholder="12345" maxLength={10} style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 18, fontFamily: "inherit", letterSpacing: 4, textAlign: "center", boxSizing: "border-box" }} />
+                </div>
+                {addErr && <div style={{ color: "var(--danger)", fontSize: 12, marginBottom: 12 }}>{"\u26A0"} {addErr}</div>}
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button onClick={() => { setAddStep(1); setAddErr(null); }} style={{ ...btnStyle, flex: 1, padding: "10px", fontSize: 13 }}>{fr ? "Retour" : "Back"}</button>
+                  <button onClick={handleAddStep2} disabled={addSaving} style={{ flex: 2, padding: "10px", borderRadius: 9, border: "none", background: "var(--accent)", color: "#fff", fontWeight: 700, fontSize: 14, cursor: addSaving ? "default" : "pointer", opacity: addSaving ? 0.7 : 1 }}>{addSaving ? (fr ? "Confirmation…" : "Confirming…") : (fr ? "Confirmer" : "Confirm")}</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -24183,7 +24421,7 @@ const App = () => {
   const [fabDepenseModal, setFabDepenseModal] = useState(false);
   const [fabSpForm, setFabSpForm] = useState({ handle: "", first_name: "", age: "", city: "", country: "", job: "", source: "", status: "active", langue: "FR", timezone: "Europe/Zurich", budget_range: "", telegram_username: "", whatsapp_phone: "", classification: "new", chatter_notes: "" });
   const [fabTodoForm, setFabTodoForm] = useState({ title: "" });
-  const [fabDepenseForm, setFabDepenseForm] = useState({ amount: "", category: "", description: "", date: "", currency: "EUR", assigned_to_id: "", assigned_to_type: "" });
+  const [fabDepenseForm, setFabDepenseForm] = useState({ amount: "", type: "autre", category: "", description: "", date: "", currency: "EUR", assigned_to_id: "", assigned_to_type: "" });
   const [showSearch, setShowSearch] = useState(false);
   const [fabSaving, setFabSaving] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -24973,7 +25211,7 @@ const App = () => {
             </div>
           </div>
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
-          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} />}
+          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} expenses={expenses} />}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
           {subTab==="resultats_dadash"&&<ResultatsDadashTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
@@ -25009,7 +25247,7 @@ const App = () => {
     }
     else if (actionId === "create_push") { navigateTo("automation","push"); }
     else if (actionId === "create_todo") { setFabTodoForm({ title: "" }); setFabTodoModal(true); }
-    else if (actionId === "create_depense") { setFabDepenseForm({ amount: "", category: "", description: "", date: new Date().toISOString().split("T")[0], currency: "EUR", assigned_to_id: "", assigned_to_type: "" }); setFabDepenseModal(true); }
+    else if (actionId === "create_depense") { setFabDepenseForm({ amount: "", type: "autre", category: "", description: "", date: new Date().toISOString().split("T")[0], currency: "EUR", assigned_to_id: "", assigned_to_type: "" }); setFabDepenseModal(true); }
   };
   const handleFabCreateSpender = async () => {
     if (!fabSpForm.handle.trim()) return addToast("Handle requis","error");
@@ -25038,6 +25276,7 @@ const App = () => {
     const row = {
       name: fabDepenseForm.description.trim() || "Dépense",
       amount: parseFloat(fabDepenseForm.amount),
+      type: fabDepenseForm.type || "autre",
       category: fabDepenseForm.category || "autre",
       date: fabDepenseForm.date || new Date().toISOString().split("T")[0],
       currency: fabDepenseForm.currency || "EUR",
@@ -25534,6 +25773,17 @@ const App = () => {
                     </select>
                   </div>
                 </div>
+                {/* ── Type ── */}
+                <div>
+                  <div style={lbSt}>Type *</div>
+                  <select value={fabDepenseForm.type} onChange={e=>{const t=e.target.value;setFabDepenseForm(p=>({...p,type:t,assigned_to_id:t!=="salaire"?"":p.assigned_to_id,assigned_to_type:t!=="salaire"?"":p.assigned_to_type}))}} style={{...inSt,width:"100%",cursor:"pointer"}}>
+                    <option value="salaire">{"\u{1F4BC}"} Salaire</option>
+                    <option value="marketing">{"\u{1F4E3}"} Marketing</option>
+                    <option value="outil">{"\u{1F527}"} Outil</option>
+                    <option value="reversement">{"\u{1F504}"} Reversement</option>
+                    <option value="autre">{"\u{1F4E6}"} Autre</option>
+                  </select>
+                </div>
                 {/* ── Catégorie ── */}
                 <div>
                   <div style={lbSt}>Catégorie</div>
@@ -25542,7 +25792,8 @@ const App = () => {
                     {["marketing","salaire","logement","transport","équipement","abonnement","alimentaire","autre"].map(c=><option key={c} value={c}>{c.charAt(0).toUpperCase()+c.slice(1)}</option>)}
                   </select>
                 </div>
-                {/* ── Assigner à ── */}
+                {/* ── Assigner à (salaire uniquement) ── */}
+                {fabDepenseForm.type === "salaire" && (
                 <div>
                   <div style={lbSt}>Assigner à <span style={{fontWeight:400,color:"#6B7280",textTransform:"none",fontSize:9}}>(optionnel)</span></div>
                   <select
@@ -25562,6 +25813,7 @@ const App = () => {
                     {fabModels.map(m=><option key={m.id} value={"model:"+m.id}>{m.name}</option>)}
                   </select>
                 </div>
+                )}
                 {/* ── Description ── */}
                 <div>
                   <div style={lbSt}>Description</div>
