@@ -8561,7 +8561,7 @@ const insertPayoutWithSchemaFallback = async (row, addToast, fr) => {
 // =============================================
 // PAIES TAB
 // =============================================
-const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefresh, invoices}) => {
+const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefresh, invoices, expenses}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const dr = useDateRange("all");
@@ -8577,6 +8577,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
   const payFilteredTxs = dr.filterByDate(txs, "date");
   const chatterPayouts = (payouts || []).filter(p => p.user_id && getPayoutBeneficiaryType(p) === "chatter");
   const modelPayouts = (payouts || []).filter(p => p.model_id && isModelePayout(p));
+  const salaireExpenses = (expenses||[]).filter(e => e.type === "salaire");
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -8585,8 +8586,8 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     const chTx = payFilteredTxs.filter(tx=>tx.chatter_id===chatterId && tx.status==="validated");
     const totalComm = chTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
     const earnedThisMonth = chTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
-    const paidAmount = chatterPayouts.filter(p=>p.user_id===chatterId && (p.status==="done"||p.status==="paid")).reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
-    const pendingAmount = chatterPayouts.filter(p=>p.user_id===chatterId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const paidAmount = salaireExpenses.filter(e=>e.assigned_to_id===chatterId && e.paid===true).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
+    const pendingAmount = salaireExpenses.filter(e=>e.assigned_to_id===chatterId && e.paid===false).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     const chPayslips = (payslips||[]).filter(p=>p.user_id===chatterId);
     const paidPayslips = chPayslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
     return {totalEarned:totalComm, earnedThisMonth, paidAmount, pendingAmount, balance:totalComm-paidAmount, chPayslips, paidPayslips};
@@ -8596,8 +8597,8 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     const mTx = payFilteredTxs.filter(tx=>tx.model_id===modelId && tx.status==="validated");
     const totalNet = mTx.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
     const earnedThisMonth = mTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
-    const paidAmount = modelPayouts.filter(p=>p.model_id===modelId && (p.status==="done"||p.status==="paid")).reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
-    const pendingAmount = modelPayouts.filter(p=>p.model_id===modelId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const paidAmount = salaireExpenses.filter(e=>e.assigned_to_id===modelId && e.paid===true).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
+    const pendingAmount = salaireExpenses.filter(e=>e.assigned_to_id===modelId && e.paid===false).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     return {totalEarned:totalNet, earnedThisMonth, paidAmount, pendingAmount, balance:totalNet-paidAmount};
   };
 
@@ -8648,23 +8649,40 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     if (data.balance <= 0) { addToast(fr?"Rien à marquer payé":"Nothing to mark as paid","info"); return; }
     setSaving(true);
     try {
-      const bt = beneficiary.type || "chatter";
-      const row = {amount:data.balance, date:new Date().toISOString().slice(0,10), status:"done", type:bt, beneficiary_type:bt, notes:"Marqué payé depuis Compta", currency:"CHF", method:"Virement"};
-      if (bt === "chatter") { row.user_id = beneficiary.id; }
-      else { row.model_id = beneficiary.id; }
-      const {error} = await insertPayoutWithSchemaFallback(row, addToast, fr);
-      if (error) {
-        const msg = error.message || "";
-        if (/permission|denied|policy/i.test(msg)) addToast(fr?"Droits insuffisants.":"Insufficient permissions.","error");
-        else if (/column|does not exist/i.test(msg)) addToast(fr?"Schéma payouts incompatible. Migration SQL requise.":"Payouts schema incompatible. SQL migration required.","error");
-        else addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + msg, "error");
-        if (user.role==="gerant") console.warn("[DADASH Compta] handleMarkPaid failed:", msg, row);
-        setSaving(false); return;
+      const assignType = beneficiary.type === "chatter" ? "chatter" : "model";
+      const unpaidIds = salaireExpenses
+        .filter(exp => exp.assigned_to_id === beneficiary.id && exp.paid === false)
+        .map(exp => exp.id);
+      if (unpaidIds.length > 0) {
+        const { error } = await sb.from("expenses")
+          .update({ paid: true, paid_at: new Date().toISOString() })
+          .in("id", unpaidIds);
+        if (error) {
+          addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + (error.message||""), "error");
+          setSaving(false); return;
+        }
+      } else {
+        const row = {
+          name: fr ? `Salaire — ${beneficiary.name||beneficiary.handle||"?"}` : `Salary — ${beneficiary.name||beneficiary.handle||"?"}`,
+          amount: data.balance,
+          currency: "EUR",
+          type: "salaire",
+          category: "salaire",
+          paid: true,
+          paid_at: new Date().toISOString(),
+          date: new Date().toISOString().slice(0,10),
+          assigned_to_id: beneficiary.id,
+          assigned_to_type: assignType,
+        };
+        const { error } = await sb.from("expenses").insert(row);
+        if (error) {
+          addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + (error.message||""), "error");
+          setSaving(false); return;
+        }
       }
-      if (user.role==="gerant") console.log("[DADASH Compta] Marqué payé:", bt, beneficiary.name || beneficiary.id);
       await onRefresh();
       addToast(fr?"Marqué payé ✓":"Marked paid ✓","success");
-    } catch (err) { addToast(fr?"Erreur inattendue: ":"Unexpected error: " + (err.message||err), "error"); if (user.role==="gerant") console.error("[DADASH Compta] handleMarkPaid:", err); }
+    } catch (err) { addToast(fr?"Erreur inattendue: ":"Unexpected error: " + (err.message||err), "error"); }
     setSaving(false);
   };
 
@@ -9437,6 +9455,13 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
   const totalComms = validTxs.reduce((s,tx)=>s+convertAmount(txComm(tx),tx.currency),0);
   const totalCharges = filteredPayouts.reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"CHF"),0);
   const totalExpenses = (expenses||[]).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0);
+  const expByType = {
+    salaire:     (expenses||[]).filter(e=>e.type==="salaire").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    marketing:   (expenses||[]).filter(e=>e.type==="marketing").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    outil:       (expenses||[]).filter(e=>e.type==="outil").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    reversement: (expenses||[]).filter(e=>e.type==="reversement").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+    autre:       (expenses||[]).filter(e=>!e.type||e.type==="autre").reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0),
+  };
   const grossMargin = totalNet - totalComms;
   const netProfit = grossMargin - totalExpenses;
   const margeNette = totalNet - totalCharges;
@@ -9749,6 +9774,19 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
       {/* ── EXPENSES ── */}
       <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
         <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{t(lang, "expenses") || "Dépenses"}</div>
+        {/* ── Breakdown par type ── */}
+        {totalExpenses > 0 && (
+          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:14}}>
+            {[["salaire","\u{1F4BC}","var(--accent)"],["marketing","\u{1F4E3}","#F59E0B"],["outil","\u{1F527}","#06B6D4"],["reversement","\u{1F504}","#8B5CF6"],["autre","\u{1F4E6}","var(--muted2)"]].map(([type,emoji,color])=>(
+              expByType[type]>0 && (
+                <div key={type} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 12px",borderRadius:20,background:"var(--surface2)",border:"1px solid var(--border)",fontSize:12}}>
+                  <span>{emoji} {type.charAt(0).toUpperCase()+type.slice(1)}</span>
+                  <span style={{fontWeight:700,color}}>{fmtAmount(expByType[type])}</span>
+                </div>
+              )
+            ))}
+          </div>
+        )}
         <button onClick={() => setShowForm(!showForm)} style={{padding:"7px 13px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer",marginBottom:14}}>+ {fr ? "Ajouter dépense" : "Add Expense"}</button>
         {showForm && (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 14, marginBottom: 14 }}>
@@ -9765,10 +9803,10 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
         )}
         <div className="table-wrap">
           <table className="table" style={{ fontSize: 12 }}>
-            <thead><tr><th>{fr ? "Nom" : "Name"}</th><th>{fr ? "Catégorie" : "Category"}</th><th>{fr ? "Montant" : "Amount"}</th></tr></thead>
+            <thead><tr><th>{fr ? "Nom" : "Name"}</th><th>Type</th><th>{fr ? "Catégorie" : "Category"}</th><th>{fr ? "Montant" : "Amount"}</th></tr></thead>
             <tbody>
               {(expenses||[]).map(e => (
-                <tr key={e.id}><td>{e.name}</td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.category}</span></td><td style={{ fontWeight: 700 }}>{fmtAmount(e.amount)}</td></tr>
+                <tr key={e.id}><td>{e.name}</td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.type||"autre"}</span></td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.category}</span></td><td style={{ fontWeight: 700 }}>{fmtAmount(e.amount)}</td></tr>
               ))}
             </tbody>
           </table>
@@ -24383,7 +24421,7 @@ const App = () => {
   const [fabDepenseModal, setFabDepenseModal] = useState(false);
   const [fabSpForm, setFabSpForm] = useState({ handle: "", first_name: "", age: "", city: "", country: "", job: "", source: "", status: "active", langue: "FR", timezone: "Europe/Zurich", budget_range: "", telegram_username: "", whatsapp_phone: "", classification: "new", chatter_notes: "" });
   const [fabTodoForm, setFabTodoForm] = useState({ title: "" });
-  const [fabDepenseForm, setFabDepenseForm] = useState({ amount: "", category: "", description: "", date: "", currency: "EUR", assigned_to_id: "", assigned_to_type: "" });
+  const [fabDepenseForm, setFabDepenseForm] = useState({ amount: "", type: "autre", category: "", description: "", date: "", currency: "EUR", assigned_to_id: "", assigned_to_type: "" });
   const [showSearch, setShowSearch] = useState(false);
   const [fabSaving, setFabSaving] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -25173,7 +25211,7 @@ const App = () => {
             </div>
           </div>
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
-          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} />}
+          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} expenses={expenses} />}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
           {subTab==="resultats_dadash"&&<ResultatsDadashTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
@@ -25209,7 +25247,7 @@ const App = () => {
     }
     else if (actionId === "create_push") { navigateTo("automation","push"); }
     else if (actionId === "create_todo") { setFabTodoForm({ title: "" }); setFabTodoModal(true); }
-    else if (actionId === "create_depense") { setFabDepenseForm({ amount: "", category: "", description: "", date: new Date().toISOString().split("T")[0], currency: "EUR", assigned_to_id: "", assigned_to_type: "" }); setFabDepenseModal(true); }
+    else if (actionId === "create_depense") { setFabDepenseForm({ amount: "", type: "autre", category: "", description: "", date: new Date().toISOString().split("T")[0], currency: "EUR", assigned_to_id: "", assigned_to_type: "" }); setFabDepenseModal(true); }
   };
   const handleFabCreateSpender = async () => {
     if (!fabSpForm.handle.trim()) return addToast("Handle requis","error");
@@ -25238,6 +25276,7 @@ const App = () => {
     const row = {
       name: fabDepenseForm.description.trim() || "Dépense",
       amount: parseFloat(fabDepenseForm.amount),
+      type: fabDepenseForm.type || "autre",
       category: fabDepenseForm.category || "autre",
       date: fabDepenseForm.date || new Date().toISOString().split("T")[0],
       currency: fabDepenseForm.currency || "EUR",
@@ -25734,6 +25773,17 @@ const App = () => {
                     </select>
                   </div>
                 </div>
+                {/* ── Type ── */}
+                <div>
+                  <div style={lbSt}>Type *</div>
+                  <select value={fabDepenseForm.type} onChange={e=>{const t=e.target.value;setFabDepenseForm(p=>({...p,type:t,assigned_to_id:t!=="salaire"?"":p.assigned_to_id,assigned_to_type:t!=="salaire"?"":p.assigned_to_type}))}} style={{...inSt,width:"100%",cursor:"pointer"}}>
+                    <option value="salaire">{"\u{1F4BC}"} Salaire</option>
+                    <option value="marketing">{"\u{1F4E3}"} Marketing</option>
+                    <option value="outil">{"\u{1F527}"} Outil</option>
+                    <option value="reversement">{"\u{1F504}"} Reversement</option>
+                    <option value="autre">{"\u{1F4E6}"} Autre</option>
+                  </select>
+                </div>
                 {/* ── Catégorie ── */}
                 <div>
                   <div style={lbSt}>Catégorie</div>
@@ -25742,7 +25792,8 @@ const App = () => {
                     {["marketing","salaire","logement","transport","équipement","abonnement","alimentaire","autre"].map(c=><option key={c} value={c}>{c.charAt(0).toUpperCase()+c.slice(1)}</option>)}
                   </select>
                 </div>
-                {/* ── Assigner à ── */}
+                {/* ── Assigner à (salaire uniquement) ── */}
+                {fabDepenseForm.type === "salaire" && (
                 <div>
                   <div style={lbSt}>Assigner à <span style={{fontWeight:400,color:"#6B7280",textTransform:"none",fontSize:9}}>(optionnel)</span></div>
                   <select
@@ -25762,6 +25813,7 @@ const App = () => {
                     {fabModels.map(m=><option key={m.id} value={"model:"+m.id}>{m.name}</option>)}
                   </select>
                 </div>
+                )}
                 {/* ── Description ── */}
                 <div>
                   <div style={lbSt}>Description</div>
