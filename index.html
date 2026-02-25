@@ -14875,9 +14875,12 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
 const BLOCKED_KEYWORDS = ["paypal","bitcoin","virement","iban","revolut","twint","crypto","bank","compte","transfer","wire"];
 const BLOCKED_PATTERNS = [/https?:\/\//i, /www\./i, /\.com|\.fr|\.net|\.org/i, /@/i, /\b\d{8,}\b/];
 
-const ChatterMessagerieTab = ({user, lang, spenders}) => {
+const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
   const addToast = useToast();
   const fr = lang === "fr";
+  const ctx = getChatterContext(user, models);
+  const myModelIds = ctx.assignedModelIds;
+
   const [conversations, setConversations] = useState([]);
   const [messages, setMessages] = useState([]);
   const [selectedConv, setSelectedConv] = useState(null);
@@ -14886,17 +14889,22 @@ const ChatterMessagerieTab = ({user, lang, spenders}) => {
   const [loadError, setLoadError] = useState(null);
   const [sending, setSending] = useState(false);
 
-  const myModelIds = user?.assigned_models || [];
-
   const loadConversations = useCallback(async () => {
     setLoadError(null);
     setLoading(true);
     try {
-      const {data} = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).order("updated_at", {ascending: false});
-      setConversations(data || []);
+      let res = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).order("updated_at", {ascending: false});
+      if (res.error) throw new Error(res.error.message);
+      setConversations(res.data || []);
     } catch (e) {
-      setConversations([]);
-      setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error"));
+      try {
+        const fallback = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]);
+        if (!fallback.error) setConversations((fallback.data || []).sort((a,b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0)));
+        else { setConversations([]); setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error")); }
+      } catch (_) {
+        setConversations([]);
+        setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error"));
+      }
     }
     setLoading(false);
   }, [user?.id, myModelIds?.length, fr]);
@@ -14985,8 +14993,8 @@ const ChatterMessagerieTab = ({user, lang, spenders}) => {
         <p style={{fontSize:13,color:"var(--text-secondary)",margin:"6px 0 0",fontFamily:"'Inter', sans-serif"}}>{fr ? "Conversations avec les spenders" : "Conversations with spenders"}</p>
       </div>
 
-      {myModelIds.length === 0 && !loading && (
-        <EmptyState icon="\u{1F464}" message={fr ? "Aucun modèle attribué — contacte le gérant" : "No models assigned — contact manager"} />
+      {!ctx.hasAssignments && !loading && (
+        <EmptyState icon="\u{1F464}" message={fr ? "Aucune assignation trouvée — contacte le gérant" : "No assignments found — contact manager"} />
       )}
 
       {loading && (
@@ -14996,15 +15004,15 @@ const ChatterMessagerieTab = ({user, lang, spenders}) => {
         </div>
       )}
 
-      {!loading && loadError && myModelIds.length > 0 && (
+      {!loading && loadError && ctx.hasAssignments && (
         <EmptyState icon="\u{1F6A8}" message={loadError} onRetry={reload} />
       )}
 
-      {!loading && !loadError && myModelIds.length > 0 && conversations.length === 0 && (
-        <EmptyState icon="\u{1F4AC}" message={fr ? "Aucune conversation WhatsApp" : "No WhatsApp conversations"} />
+      {!loading && !loadError && ctx.hasAssignments && conversations.length === 0 && (
+        <EmptyState icon="\u{1F4AC}" message={fr ? "Aucune conversation" : "No conversations"} />
       )}
 
-      {!loading && conversations.length > 0 && (
+      {!loading && ctx.hasAssignments && conversations.length > 0 && (
         <div className="messagerie-grid" style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"300px 1fr",gap:0,minHeight:500,border:"1px solid var(--border-subtle)",borderRadius:16,overflow:"hidden",boxShadow:"var(--shadow-md)"}}>
           {/* Conversation list */}
           <div style={{background:"var(--card-bg)",borderRight:_isMobile?"none":"1px solid var(--border-subtle)",overflow:"hidden"}}>
@@ -15057,7 +15065,7 @@ const ChatterMessagerieTab = ({user, lang, spenders}) => {
 const DEFAULT_MP = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
 const _devLog = (action, meta) => { try { if (typeof window!=="undefined" && localStorage.getItem("dadash_tg_simu_enabled")==="1") console.log("[MSG]", action, meta||""); } catch(_){} };
 
-const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverride}) => {
+const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverride, escaladesOnly}) => {
   const addToast = useToast();
   const fr = lang === "fr";
   const simuActive = !!simuOverride?.profile;
@@ -15096,16 +15104,21 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
     setLoading(true);
     setLoadError(null);
     try {
-      let q = sb.from("tg_conversations").select("*").order("last_message_at", { ascending: false });
+      let q = sb.from("tg_conversations").select("*");
       if (u.role === "chatter") {
-        const viewAllAssigned = getMessagingPerm("can_view_all_assigned");
-        const myModelIds = u.assigned_models || [];
-        if (viewAllAssigned && myModelIds.length > 0) {
-          q = q.or(`assigned_chatter_id.eq.${u.id},model_id.in.(${myModelIds.join(",")})`);
-        } else {
+        const myModelIds = getChatterContext(u, models).assignedModelIds;
+        if (escaladesOnly) {
           q = q.eq("assigned_chatter_id", u.id);
+        } else {
+          const viewAllAssigned = getMessagingPerm("can_view_all_assigned");
+          if (viewAllAssigned && myModelIds.length > 0) {
+            q = q.or(`assigned_chatter_id.eq.${u.id},model_id.in.(${myModelIds.join(",")})`);
+          } else {
+            q = q.eq("assigned_chatter_id", u.id);
+          }
         }
       }
+      q = q.order("last_message_at", { ascending: false });
       const { data, error } = await q;
       if (error) throw new Error(error.message);
       setConversations(data || []);
@@ -15115,7 +15128,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
       setConversations([]);
     }
     setLoading(false);
-  }, [effectiveUser?.id, effectiveUser?.role, effectiveUser?.assigned_models, getMessagingPerm, fr, addToast]);
+  }, [effectiveUser?.id, effectiveUser?.role, effectiveUser?.assigned_models, getMessagingPerm, fr, addToast, escaladesOnly, models]);
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
@@ -15340,8 +15353,8 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
       <div style={{marginBottom:24}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:14}}>
           <div>
-            <h2 style={{fontSize:24,fontWeight:800,margin:0,fontFamily:"'Inter', sans-serif",color:"var(--text-primary)"}}>{"\u{1F4E1}"} {fr ? "Messagerie Telegram (BETA)" : "Telegram Messaging (BETA)"}</h2>
-            <p style={{fontSize:13,color:"var(--text-secondary)",margin:"6px 0 0",fontFamily:"'Inter', sans-serif"}}>{fr ? "Conversations Telegram — " : "Telegram conversations — "}{permHint}</p>
+            <h2 style={{fontSize:24,fontWeight:800,margin:0,fontFamily:"'Inter', sans-serif",color:"var(--text-primary)"}}>{escaladesOnly ? "\u{1F4A5}" : "\u{1F4E1}"} {escaladesOnly ? (fr ? "Escalades" : "Escalations") : (fr ? "Messagerie Telegram (BETA)" : "Telegram Messaging (BETA)")}</h2>
+            <p style={{fontSize:13,color:"var(--text-secondary)",margin:"6px 0 0",fontFamily:"'Inter', sans-serif"}}>{escaladesOnly ? (fr ? "Conversations assignées à toi — priorité" : "Conversations assigned to you — priority") : (fr ? "Conversations Telegram — " : "Telegram conversations — ")}{escaladesOnly ? "" : permHint}</p>
           </div>
           <button className="btn btn-small" onClick={loadConversations} disabled={loading} style={{padding:"8px 14px",borderRadius:10,fontSize:12}}>
             {loading ? React.createElement(Spinner) : "\u{1F504}"} {fr ? "Rafraîchir" : "Refresh"}
@@ -15360,8 +15373,8 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
         <EmptyState icon="\u{1F6A8}" message={loadError} onRetry={loadConversations} />
       )}
 
-      {!loading && !loadError && effectiveUser?.role === "chatter" && (!effectiveUser?.assigned_models || effectiveUser.assigned_models.length === 0) && (
-        <EmptyState icon="\u{1F464}" message={fr ? "Aucun modèle attribué — contacte le gérant" : "No models assigned — contact manager"} />
+      {!loading && !loadError && effectiveUser?.role === "chatter" && !getChatterContext(effectiveUser, models).hasAssignments && (
+        <EmptyState icon="\u{1F464}" message={fr ? "Aucune assignation trouvée — contacte le gérant" : "No assignments found — contact manager"} />
       )}
 
       {!loading && !loadError && conversations.length === 0 && (effectiveUser?.role !== "chatter" || (effectiveUser?.assigned_models && effectiveUser.assigned_models.length > 0)) && (
@@ -23442,15 +23455,9 @@ const App = () => {
               <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="telegram_beta"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="telegram_beta"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="telegram_beta"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>Telegram</button>
               <button onClick={()=>setMessagerieSubTab("escalades")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="escalades"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="escalades"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="escalades"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>{"\u{1F4A5}"} {lang==="fr"?"Escalades":"Escalations"}</button>
             </div>
-            {messagerieSubTab==="whatsapp"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
+            {messagerieSubTab==="whatsapp"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} models={models} />}
             {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
-            {messagerieSubTab==="escalades"&&(
-              <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:48,textAlign:"center"}}>
-                <div style={{fontSize:32,marginBottom:12}}>{"\u{1F4A5}"}</div>
-                <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{lang==="fr"?"Escalades":"Escalations"}</div>
-                <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Conversations à traiter en priorité — bientôt disponible":"Priority conversations — coming soon"}</div>
-              </div>
-            )}
+            {messagerieSubTab==="escalades"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} escaladesOnly />}
           </>)}
           {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} txs={txSummary} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
