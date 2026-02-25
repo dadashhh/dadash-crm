@@ -1934,6 +1934,12 @@ const formatDateSafe = (v) => { try { if (!v) return "—"; const d = new Date(v
 const displayUserName = (profile) => { if (!profile) return "—"; var v = profile.full_name || profile.username || profile.display_name || profile.name || profile.telegram_handle; if (v && String(v).trim()) return String(v).trim(); return profile.id ? String(profile.id).slice(0, 8) + "…" : "—"; };
 // AD2 — Détection colonnes runtime (basé sur union des clés des rows)
 const buildHasColumn = (rows) => { var keys = {}; (safeArray(rows)).forEach(function(r){ if(r&&typeof r==="object"){ Object.keys(r).forEach(function(k){ keys[k]=1; }); } }); return function(col){ return !!keys[col]; }; };
+// AD3 — Logging admin UI (best-effort, prépare AD6)
+const logAdminUiEvent = function(type, meta){ try { if (type==="save_ok") console.log("[AdminUI]", type, meta); else if (type==="save_fail") console.warn("[AdminUI]", type, meta); else console.log("[AdminUI]", type, meta); } catch(_){} };
+// AD4 — Helper hasPermission(role, permissionKey, rows)
+const hasPermission = function(role, permissionKey, rows){ var list=safeArray(rows); var r=role!= null?String(role).trim():""; var k=permissionKey!=null?String(permissionKey).trim():""; if(!r||!k)return false; var found=list.find(function(x){return x&&(x.role||"")===r&&(x.permission_key||"")===k;}); return found&&(found.allowed===true||found.allowed==="true"||found.allowed===1); };
+// AD5 — Config assignations (schéma tolérant). Mettre tableName pour activer. Ex: { tableName:"chatter_model_assignments", colId:"id", colChatterId:"chatter_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" }
+var adminAssignmentsConfig = { tableName:"", colId:"id", colChatterId:"chatter_id", colProviderId:"provider_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" };
 
 // ═══ EC2 — CHATTER CONTEXT HELPERS (réutilisables par toutes les sous-pages chatter) ═══
 const isChatterUser = (u) => !!(u && u.role === "chatter");
@@ -13113,6 +13119,102 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
 };
 
 // =============================================
+// AD3 — ADMIN USER DETAIL PANEL (affichage + édition conditionnelle)
+// =============================================
+const AdminUserDetailPanel = ({user, lang, fr, addToast, canEditRole, canEditStatus, canEditIsActive, hasAnyEditable, roleOpts, statusOpts, detailFields, hasDetailField, hasCreatedAt, hasUpdatedAt, onClose, onSaveSuccess, onSaveFail, adminUsers, loadAdminUsers}) => {
+  var su = user;
+  if (!su) return null;
+  var initForm = function(u){
+    var f = {};
+    if (canEditRole) f.role = (u&&u.role) != null ? String(u.role) : "";
+    if (canEditStatus) f.status = (u&&u.status) != null ? String(u.status) : "";
+    if (canEditIsActive) f.is_active = u && u.is_active !== false && u.is_active !== "false" && u.is_active !== "0";
+    return f;
+  };
+  var [editForm, setEditForm] = useState(function(){ return initForm(su); });
+  var [saving, setSaving] = useState(false);
+  var [saveError, setSaveError] = useState(null);
+  useEffect(function(){ setEditForm(initForm(su)); setSaveError(null); }, [su]);
+
+  var hasChanged = useMemo(function(){
+    if (canEditRole && (editForm.role||"") !== (su.role||"")) return true;
+    if (canEditStatus && (editForm.status||"") !== (su.status||"")) return true;
+    if (canEditIsActive) { var cur = su.is_active !== false && su.is_active !== "false"; if (editForm.is_active !== cur) return true; }
+    return false;
+  }, [editForm, su, canEditRole, canEditStatus, canEditIsActive]);
+
+  var handleSave = useCallback(async function(){
+    if (!hasChanged) { if (addToast) addToast(fr?"Aucune modification à enregistrer":"No changes to save","info"); return; }
+    setSaving(true);
+    setSaveError(null);
+    try {
+      var payload = {};
+      if (canEditRole && (editForm.role||"") !== (su.role||"")) payload.role = editForm.role || null;
+      if (canEditStatus && (editForm.status||"") !== (su.status||"")) payload.status = editForm.status || null;
+      if (canEditIsActive) { var cur = su.is_active !== false && su.is_active !== "false"; if (editForm.is_active !== cur) payload.is_active = editForm.is_active; }
+      if (Object.keys(payload).length === 0) { setSaving(false); if (addToast) addToast(fr?"Aucune modification à enregistrer":"No changes to save","info"); return; }
+      var res = await sb.from("profiles").update(payload).eq("id", su.id).select().single();
+      if (res.error) throw new Error(res.error.message);
+      setSaving(false);
+      var updated = res.data || su;
+      if (loadAdminUsers) loadAdminUsers();
+      if (onSaveSuccess) onSaveSuccess(updated);
+    } catch (e) {
+      setSaving(false);
+      var msg = e && e.message ? e.message : String(e);
+      setSaveError(msg);
+      if (onSaveFail) onSaveFail(msg);
+    }
+  }, [hasChanged, editForm, su, canEditRole, canEditStatus, canEditIsActive, fr, addToast, loadAdminUsers, onSaveSuccess, onSaveFail]);
+
+  return React.createElement("div",{style:{marginTop:14,padding:16,background:"var(--surface)",borderRadius:12,border:"1px solid var(--border-accent)",overflow:"hidden"}},
+    React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
+      React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)"}},fr?"Détail utilisateur":"User detail"),
+      React.createElement("button",{onClick:onClose,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}},fr?"Fermer":"Close")
+    ),
+    React.createElement("div",{style:{display:"grid",gap:8,marginBottom:16,fontSize:12}},
+      React.createElement("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
+        React.createElement("span",{style:{fontWeight:700,color:"var(--text)"}},displayUserName(su)),
+        React.createElement("span",{style:{color:"var(--text-tertiary)",fontFamily:"monospace",fontSize:11}},su.id || "—")
+      ),
+      canEditRole && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Rôle:":"Role:"),React.createElement("span",{style:{color:"var(--text)"}},safeText(su.role))),
+      canEditStatus && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Statut:":"Status:"),React.createElement("span",{style:{color:"var(--text)"}},safeText(su.status))),
+      canEditIsActive && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Actif:":"Active:"),React.createElement("span",{style:{color:"var(--text)"}},su.is_active !== false && su.is_active !== "false" ? (fr?"Oui":"Yes") : (fr?"Non":"No"))),
+      detailFields.filter(function(f){ return hasDetailField(f); }).map(function(f){
+        return React.createElement("div",{key:f},React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},f+":"),React.createElement("span",{style:{color:"var(--text)"}},safeText(su[f])));
+      }),
+      hasCreatedAt && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Créé:":"Created:"),React.createElement("span",{style:{color:"var(--text)"}},formatDateSafe(su.created_at))),
+      hasUpdatedAt && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"MAJ:":"Updated:"),React.createElement("span",{style:{color:"var(--text)"}},formatDateSafe(su.updated_at)))
+    ),
+    hasAnyEditable ? React.createElement("div",{style:{marginTop:16,paddingTop:14,borderTop:"1px solid var(--border-subtle)"}},
+      saveError && React.createElement("div",{style:{marginBottom:12,padding:10,background:"var(--danger-muted)",borderRadius:8,fontSize:12,color:"var(--danger)"}},saveError),
+      canEditRole && React.createElement("div",{style:{marginBottom:12}},
+        React.createElement("label",{style:{display:"block",fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase",fontWeight:600}},fr?"Rôle":"Role"),
+        React.createElement("select",{value:editForm.role||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{role:e.target.value});});},style:{width:"100%",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}},
+          React.createElement("option",{key:"",value:""},"—"),
+          roleOpts.map(function(r){ return React.createElement("option",{key:r,value:r},r); })
+        )
+      ),
+      canEditStatus && React.createElement("div",{style:{marginBottom:12}},
+        React.createElement("label",{style:{display:"block",fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase",fontWeight:600}},fr?"Statut":"Status"),
+        React.createElement("select",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},style:{width:"100%",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}},
+          React.createElement("option",{key:"",value:""},"—"),
+          statusOpts.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
+        )
+      ),
+      canEditIsActive && React.createElement("div",{style:{marginBottom:12}},
+        React.createElement("label",{style:{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:"var(--text)"}},
+          React.createElement("input",{type:"checkbox",checked:!!editForm.is_active,onChange:function(e){setEditForm(function(p){return Object.assign({},p,{is_active:e.target.checked});});},style:{accentColor:"var(--accent)"}}),
+          fr?"Actif":"Active"
+        )
+      ),
+      React.createElement("button",{onClick:handleSave,disabled:saving,style:{padding:"8px 16px",borderRadius:10,border:"none",background:saving?"var(--surface2)":"var(--success)",color:saving?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}},saving?(fr?"Enregistrement...":"Saving..."):(fr?"Enregistrer":"Save"))
+    ) : React.createElement("div",{style:{marginTop:16,padding:12,background:"var(--accent-muted)",borderRadius:8,fontSize:12,color:"var(--text-secondary)"}},fr?"Aucun champ admin éditable détecté dans public.profiles (role/status/is_active absents).":"No admin-editable fields detected in public.profiles (role/status/is_active missing).")
+    )
+  );
+};
+
+// =============================================
 // AD2 — ADMIN USERS SECTION (liste + recherche + filtres, lecture seule)
 // =============================================
 const AdminUsersSection = ({lang, onRefresh, models, refreshTick}) => {
@@ -13253,14 +13355,25 @@ const AdminUsersSection = ({lang, onRefresh, models, refreshTick}) => {
                 !hasStatus && hasIsActive && React.createElement("td",{style:{color:"var(--text-secondary)"}},u.is_active !== false && u.is_active !== "false" ? "✓" : "—"),
                 hasCreatedAt && React.createElement("td",{style:{color:"var(--text-tertiary)",fontSize:11}},formatDateSafe(u.created_at)),
                 hasUpdatedAt && React.createElement("td",{style:{color:"var(--text-tertiary)",fontSize:11}},formatDateSafe(u.updated_at)),
-                React.createElement("td",null,React.createElement("button",{onClick:function(){setSelectedUser(u.id);},style:{padding:"5px 12px",borderRadius:9,border:"none",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer"}},fr?"Voir détail":"View detail"))
+                React.createElement("td",null,React.createElement("button",{onClick:function(){setSelectedUser(u);logAdminUiEvent("user_detail_open",{userId:u.id});},style:{padding:"5px 12px",borderRadius:9,border:"none",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer"}},fr?"Voir détail":"View detail"))
               );
             })
             }
           </tbody>
         </table>
       </div>
-      {selectedUser && <div style={{marginTop:14,padding:12,background:"var(--accent-muted)",borderRadius:10,border:"1px solid var(--border-accent)",fontSize:12,color:"var(--text-secondary)"}}>{"\u{1F464}"} {fr?"Détail utilisateur — AD3 à venir":"User detail — AD3 coming"}</div>}
+      {selectedUser && (function(){
+        var su = selectedUser;
+        var canEditRole = hasRole;
+        var canEditStatus = hasStatus;
+        var canEditIsActive = hasIsActive;
+        var hasAnyEditable = canEditRole || canEditStatus || canEditIsActive;
+        var roleOpts = roleValues.length > 0 ? roleValues : ["admin","ceo","gerant","chatter","provider","modele"];
+        var statusOpts = statusValues.length > 0 ? statusValues : ["active","inactive","pending","paused"];
+        var detailFields = ["full_name","username","display_name","telegram_handle","whatsapp","whatsapp_phone","phone"];
+        var hasDetailField = function(f){ return hasColumn(f); };
+        return React.createElement(AdminUserDetailPanel,{key:su.id,user:su,lang:lang,fr:fr,addToast:addToast,canEditRole:canEditRole,canEditStatus:canEditStatus,canEditIsActive:canEditIsActive,hasAnyEditable:hasAnyEditable,roleOpts:roleOpts,statusOpts:statusOpts,detailFields:detailFields,hasDetailField:hasDetailField,hasCreatedAt:hasCreatedAt,hasUpdatedAt:hasUpdatedAt,onClose:function(){setSelectedUser(null);},onSaveSuccess:function(updated){loadAdminUsers();setSelectedUser(updated||null);addToast(fr?"Sauvegardé ✓":"Saved ✓","success");logAdminUiEvent("save_ok",{userId:su.id});},onSaveFail:function(err){addToast((fr?"Erreur: ":"Error: ")+(err||""),"error");logAdminUiEvent("save_fail",{userId:su.id,err:err});},adminUsers:adminUsers,loadAdminUsers:loadAdminUsers});
+      })()}
     </div>
   );
 };
@@ -13369,6 +13482,353 @@ const AgencyConfigSection = ({ lang }) => {
 };
 
 // =============================================
+// AD4 — ADMIN ROLES & PERMISSIONS TAB (role_permissions)
+// =============================================
+const AdminRolesPermissionsTab = ({lang, refreshTick}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [filterRole, setFilterRole] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [addForm, setAddForm] = useState({role:"",permission_key:"",allowed:true});
+  const [adding, setAdding] = useState(false);
+  const [togglingId, setTogglingId] = useState(null);
+
+  const loadAdminRolePermissions = useCallback(async function(){
+    setLoading(true);
+    setError(null);
+    try {
+      var res = await sb.from("role_permissions").select("*").order("role",{ascending:true}).order("permission_key",{ascending:true});
+      if (res.error) throw new Error(res.error.message);
+      setRows(safeArray(res.data));
+    } catch (e) {
+      setError(e&&e.message?e.message:(fr?"Erreur chargement":"Load error"));
+      setRows([]);
+    }
+    setLoading(false);
+  }, [fr]);
+
+  useEffect(function(){ loadAdminRolePermissions(); }, [loadAdminRolePermissions, refreshTick]);
+
+  var roleList = useMemo(function(){
+    var seen = {};
+    safeArray(rows).forEach(function(r){ var v = r.role; if (v != null && String(v).trim()) seen[String(v).trim()] = 1; });
+    return Object.keys(seen).sort();
+  }, [rows]);
+
+  var filtered = useMemo(function(){
+    var list = safeArray(rows);
+    var q = (searchQuery||"").trim().toLowerCase();
+    if (q) list = list.filter(function(r){ var s = ((r.role||"")+" "+(r.permission_key||"")).toLowerCase(); return s.indexOf(q) >= 0; });
+    if (filterRole) list = list.filter(function(r){ return (r.role||"") === filterRole; });
+    return list;
+  }, [rows, searchQuery, filterRole]);
+
+  var byRole = useMemo(function(){
+    var out = {};
+    filtered.forEach(function(r){
+      var role = r.role || "";
+      if (!out[role]) out[role] = [];
+      out[role].push(r);
+    });
+    return out;
+  }, [filtered]);
+
+  var handleToggle = useCallback(async function(row){
+    if (!row || !row.id) return;
+    setTogglingId(row.id);
+    try {
+      var newAllowed = !(row.allowed === true || row.allowed === "true" || row.allowed === 1);
+      var res = await sb.from("role_permissions").update({allowed:newAllowed}).eq("id",row.id).select().single();
+      if (res.error) throw new Error(res.error.message);
+      setRows(function(prev){
+        return prev.map(function(x){ return x.id===row.id ? (res.data||Object.assign({},x,{allowed:newAllowed})) : x; });
+      });
+      addToast(fr?"Permission mise à jour":"Permission updated","success");
+      logAdminUiEvent("permission_toggle_ok",{id:row.id,allowed:newAllowed});
+    } catch (e) {
+      var msg = e&&e.message?e.message:String(e);
+      addToast((fr?"Erreur: ":"Error: ")+msg,"error");
+      logAdminUiEvent("permission_toggle_fail",{id:row.id,err:msg});
+    }
+    setTogglingId(null);
+  }, [fr, addToast]);
+
+  var handleAdd = useCallback(async function(){
+    var role = (addForm.role||"").trim();
+    var key = (addForm.permission_key||"").trim();
+    if (!role || !key) { addToast(fr?"Rôle et permission requis":"Role and permission required","error"); return; }
+    setAdding(true);
+    try {
+      var res = await sb.from("role_permissions").upsert({role:role,permission_key:key,allowed:!!addForm.allowed},{onConflict:"role,permission_key"}).select().single();
+      if (res.error) throw new Error(res.error.message);
+      setAddForm({role:"",permission_key:"",allowed:true});
+      loadAdminRolePermissions();
+      addToast(fr?"Permission ajoutée":"Permission added","success");
+      logAdminUiEvent("permission_add_ok",{role:role,permission_key:key});
+    } catch (e) {
+      var msg = e&&e.message?e.message:String(e);
+      addToast((fr?"Erreur: ":"Error: ")+msg,"error");
+      logAdminUiEvent("permission_add_fail",{role:role,permission_key:key,err:msg});
+    }
+    setAdding(false);
+  }, [addForm, fr, addToast, loadAdminRolePermissions]);
+
+  if (loading) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Chargement...":"Loading..."));
+  if (error) return React.createElement("div",{style:{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}},"\u26A0\uFE0F "+error),
+    React.createElement("button",{onClick:loadAdminRolePermissions,style:{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}},"\u{1F504} "+(fr?"Réessayer":"Retry"))
+  );
+
+  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F510} "+(fr?"Rôles & Permissions":"Roles & Permissions")),
+    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}},
+      React.createElement("input",{type:"text",placeholder:fr?"Rechercher (rôle, permission)":"Search (role, permission)",value:searchQuery,onChange:function(e){setSearchQuery(e.target.value);},style:{flex:"1",minWidth:180,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+      React.createElement("select",{value:filterRole,onChange:function(e){setFilterRole(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Tous les rôles":"All roles"),
+        roleList.map(function(r){ return React.createElement("option",{key:r,value:r},r); })
+      )
+    ),
+    React.createElement("div",{style:{marginBottom:16,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+      React.createElement("div",{style:{fontSize:12,fontWeight:700,color:"var(--text-tertiary)",marginBottom:10,textTransform:"uppercase"}},fr?"Ajouter une permission":"Add permission")),
+      React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,alignItems:"flex-end"}},
+        React.createElement("input",{type:"text",placeholder:fr?"Rôle":"Role",value:addForm.role,onChange:function(e){setAddForm(function(p){return Object.assign({},p,{role:e.target.value});});},style:{width:120,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+        React.createElement("input",{type:"text",placeholder:fr?"Clé permission":"Permission key",value:addForm.permission_key,onChange:function(e){setAddForm(function(p){return Object.assign({},p,{permission_key:e.target.value});});},style={{flex:1,minWidth:140,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+        React.createElement("label",{style:{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:13,color:"var(--text)"}},
+          React.createElement("input",{type:"checkbox",checked:!!addForm.allowed,onChange:function(e){setAddForm(function(p){return Object.assign({},p,{allowed:e.target.checked});});},style:{accentColor:"var(--accent)"}}),
+          fr?"Autorisé":"Allowed"
+        ),
+        React.createElement("button",{onClick:handleAdd,disabled:adding,style:{padding:"8px 16px",borderRadius:10,border:"none",background:adding?"var(--surface2)":"var(--success)",color:adding?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:adding?"not-allowed":"pointer"}},adding?(fr?"Ajout...":"Adding..."):(fr?"Ajouter":"Add"))
+      )
+    ),
+    Object.keys(byRole).sort().map(function(role){
+      var items = byRole[role] || [];
+      var total = items.length;
+      var allowedCount = items.filter(function(r){ return r.allowed===true||r.allowed==="true"||r.allowed===1; }).length;
+      return React.createElement("div",{key:role,style:{marginBottom:20,border:"1px solid var(--border)",borderRadius:12,overflow:"hidden"}},
+        React.createElement("div",{style:{padding:"10px 14px",background:"var(--bg-overlay)",fontSize:14,fontWeight:700,color:"var(--text)",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}},
+          role,
+          React.createElement("span",{style:{fontSize:11,color:"var(--text-tertiary)",fontWeight:500}},allowedCount+"/"+total)
+        ),
+        React.createElement("div",{style:{padding:"8px 12px"}},
+          items.map(function(r){
+            var isAllowed = r.allowed===true||r.allowed==="true"||r.allowed===1;
+            var busy = togglingId===r.id;
+            return React.createElement("div",{key:r.id,style:{display:"flex",alignItems:"center",gap:12,padding:"8px 10px",borderRadius:8,background:"var(--surface)",marginBottom:4,flexWrap:"wrap"}},
+              React.createElement("span",{style:{flex:1,fontSize:13,color:"var(--text)",fontFamily:"monospace"}},r.permission_key||"—"),
+              React.createElement("span",{style:{padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:600,background:isAllowed?"var(--success-muted)":"var(--danger-muted)",color:isAllowed?"var(--success)":"var(--danger)"}},isAllowed?(fr?"Oui":"Yes"):(fr?"Non":"No")),
+              r.updated_at && React.createElement("span",{style:{fontSize:10,color:"var(--text-tertiary)"}},formatDateSafe(r.updated_at)),
+              React.createElement("button",{onClick:function(){handleToggle(r);},disabled:busy,style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:busy?"not-allowed":"pointer"}},busy?(fr?"...":"..."):(fr?"Toggle":"Toggle"))
+            );
+          })
+        )
+      );
+    }),
+    filtered.length === 0 && React.createElement("div",{style:{padding:32,textAlign:"center",color:"var(--text-tertiary)",fontSize:13}},fr?"Aucune permission":"No permissions")
+  );
+};
+
+// =============================================
+// AD5 — ADMIN ASSIGNATIONS (lecture + édition minimale, schéma tolérant)
+// =============================================
+const AdminAssignmentsTab = ({lang, profiles, models, refreshTick}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  var cfg = adminAssignmentsConfig || {};
+  var tableName = (cfg.tableName||"").trim();
+  var colId = cfg.colId || "id";
+  var colChatterId = cfg.colChatterId || "chatter_id";
+  var colProviderId = cfg.colProviderId || "provider_id";
+  var colModelId = cfg.colModelId || "model_id";
+  var colStatus = cfg.colStatus || "status";
+  var colCreatedAt = cfg.colCreatedAt || "created_at";
+  var colUpdatedAt = cfg.colUpdatedAt || "updated_at";
+
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterChatter, setFilterChatter] = useState("");
+  const [filterProvider, setFilterProvider] = useState("");
+  const [filterModel, setFilterModel] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  var buildHasColumn = function(r){ var k={}; safeArray(r).forEach(function(x){ if(x&&typeof x==="object") Object.keys(x).forEach(function(c){ k[c]=1; }); }); return function(c){ return !!k[c]; }; };
+  var hasCol = rows.length > 0 ? buildHasColumn(rows) : function(){ return false; };
+
+  var loadAdminAssignments = useCallback(async function(){
+    if (!tableName) return;
+    setLoading(true);
+    setError(null);
+    try {
+      var res = await sb.from(tableName).select("*");
+      if (res.error) throw new Error(res.error.message);
+      var data = safeArray(res.data);
+      var first = data[0];
+      if (data.length > 0 && first) {
+        var hasUpd = first[colUpdatedAt] != null;
+        var hasCre = first[colCreatedAt] != null;
+        if (hasUpd) data.sort(function(a,b){ var da=new Date(a[colUpdatedAt]||0).getTime(); var db=new Date(b[colUpdatedAt]||0).getTime(); return db-da; });
+        else if (hasCre) data.sort(function(a,b){ var da=new Date(a[colCreatedAt]||0).getTime(); var db=new Date(b[colCreatedAt]||0).getTime(); return db-da; });
+        else data.sort(function(a,b){ return String(a[colId]||"").localeCompare(String(b[colId]||"")); });
+      }
+      setRows(data);
+      logAdminUiEvent("assignments_load_ok",{count:data.length});
+    } catch (e) {
+      var msg = e&&e.message?e.message:String(e);
+      setError(msg);
+      setRows([]);
+      logAdminUiEvent("assignments_load_fail",{err:msg});
+    }
+    setLoading(false);
+  }, [tableName, colUpdatedAt, colCreatedAt, colId]);
+
+  useEffect(function(){ if (tableName) loadAdminAssignments(); }, [loadAdminAssignments, refreshTick, tableName]);
+
+  var statusVals = useMemo(function(){
+    if (!hasCol(colStatus)) return [];
+    var s={};
+    safeArray(rows).forEach(function(r){ var v=r[colStatus]; if(v!=null&&String(v).trim()) s[String(v).trim()]=1; });
+    return Object.keys(s).sort();
+  }, [rows, colStatus, hasCol]);
+
+  var filtered = useMemo(function(){
+    var list = safeArray(rows);
+    var q = (searchQuery||"").trim().toLowerCase();
+    if (q) list = list.filter(function(r){
+      var parts = [];
+      if (hasCol(colStatus)) parts.push(String(r[colStatus]||""));
+      if (hasCol(colChatterId)) parts.push(String(r[colChatterId]||""));
+      if (hasCol(colProviderId)) parts.push(String(r[colProviderId]||""));
+      if (hasCol(colModelId)) parts.push(String(r[colModelId]||""));
+      if (hasCol(colId)) parts.push(String(r[colId]||""));
+      return parts.join(" ").toLowerCase().indexOf(q) >= 0;
+    });
+    if (filterStatus && hasCol(colStatus)) list = list.filter(function(r){ return (r[colStatus]||"") === filterStatus; });
+    if (filterChatter && hasCol(colChatterId)) list = list.filter(function(r){ return (r[colChatterId]||"") === filterChatter; });
+    if (filterProvider && hasCol(colProviderId)) list = list.filter(function(r){ return (r[colProviderId]||"") === filterProvider; });
+    if (filterModel && hasCol(colModelId)) list = list.filter(function(r){ return (r[colModelId]||"") === filterModel; });
+    return list;
+  }, [rows, searchQuery, filterStatus, filterChatter, filterProvider, filterModel, colId, colStatus, colChatterId, colProviderId, colModelId, hasCol]);
+
+  var startEdit = function(r){
+    if (!r) return;
+    var id = r[colId];
+    setEditingId(id);
+    var f = {};
+    if (hasCol(colStatus)) f.status = r[colStatus] != null ? String(r[colStatus]) : "";
+    if (hasCol(colChatterId)) f.chatterId = r[colChatterId] != null ? String(r[colChatterId]) : "";
+    if (hasCol(colProviderId)) f.providerId = r[colProviderId] != null ? String(r[colProviderId]) : "";
+    if (hasCol(colModelId)) f.modelId = r[colModelId] != null ? String(r[colModelId]) : "";
+    setEditForm(f);
+  };
+
+  var handleSave = useCallback(async function(){
+    if (!editingId) return;
+    var payload = {};
+    var r = rows.find(function(x){ return x[colId] === editingId; });
+    if (!r) return;
+    if (hasCol(colStatus) && (editForm.status||"") !== (r[colStatus]||"")) payload[colStatus] = editForm.status || null;
+    if (hasCol(colChatterId) && (editForm.chatterId||"") !== (r[colChatterId]||"")) payload[colChatterId] = editForm.chatterId || null;
+    if (hasCol(colProviderId) && (editForm.providerId||"") !== (r[colProviderId]||"")) payload[colProviderId] = editForm.providerId || null;
+    if (hasCol(colModelId) && (editForm.modelId||"") !== (r[colModelId]||"")) payload[colModelId] = editForm.modelId || null;
+    if (Object.keys(payload).length === 0) { addToast(fr?"Aucune modification":"No changes","info"); return; }
+    setSaving(true);
+    try {
+      var res = await sb.from(tableName).update(payload).eq(colId, editingId).select().single();
+      if (res.error) throw new Error(res.error.message);
+      setRows(function(prev){ return prev.map(function(x){ return x[colId]===editingId ? (res.data||x) : x; }); });
+      setEditingId(null);
+      addToast(fr?"Enregistré ✓":"Saved ✓","success");
+      logAdminUiEvent("assignments_update_ok",{id:editingId});
+    } catch (e) {
+      var msg = e&&e.message?e.message:String(e);
+      addToast((fr?"Erreur: ":"Error: ")+msg,"error");
+      logAdminUiEvent("assignments_update_fail",{id:editingId,err:msg});
+    }
+    setSaving(false);
+  }, [editingId, editForm, rows, colId, colStatus, colChatterId, colProviderId, colModelId, tableName, fr, addToast, hasCol]);
+
+  var colsOk = [];
+  var colsMiss = [];
+  [colId,colChatterId,colProviderId,colModelId,colStatus,colCreatedAt,colUpdatedAt].forEach(function(c){ if(c&&(hasCol(c))) colsOk.push(c); else if(c) colsMiss.push(c); });
+
+  if (!tableName) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:700,marginBottom:8}},"\u{1F504} "+(fr?"Config assignations manquante":"Assignments config missing")),
+    React.createElement("div",{style:{fontSize:12,marginBottom:12}},(fr?"Définir adminAssignmentsConfig.tableName (ex: chatter_model_assignments) dans index.html":"Set adminAssignmentsConfig.tableName (e.g. chatter_model_assignments) in index.html"))
+  );
+
+  if (loading) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Chargement...":"Loading..."));
+  if (error) return React.createElement("div",{style:{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}},"\u26A0\uFE0F "+error),
+    React.createElement("button",{onClick:loadAdminAssignments,style:{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}},"\u{1F504} "+(fr?"Réessayer":"Retry"))
+  );
+
+  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F504} "+(fr?"Assignations":"Assignments")),
+    colsMiss.length > 0 && React.createElement("div",{style:{marginBottom:12,padding:8,background:"var(--warning-muted)",borderRadius:8,fontSize:11,color:"var(--warning)"}},(fr?"Colonnes absentes: ":"Missing columns: ")+colsMiss.join(", ")),
+    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}},
+      React.createElement("input",{type:"text",placeholder:fr?"Rechercher":"Search",value:searchQuery,onChange:function(e){setSearchQuery(e.target.value);},style:{flex:"1",minWidth:140,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+      hasCol(colStatus) && React.createElement("select",{value:filterStatus,onChange:function(e){setFilterStatus(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:100}},
+        React.createElement("option",{value:""},fr?"Statut":"Status"),
+        statusVals.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
+      ),
+      hasCol(colChatterId) && React.createElement("select",{value:filterChatter,onChange:function(e){setFilterChatter(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:140}},
+        React.createElement("option",{value:""},fr?"Chatter":"Chatter"),
+        safeArray(profiles).filter(function(p){ return p&&p.role==="chatter"; }).map(function(p){ return React.createElement("option",{key:p.id,value:p.id},displayUserName(p)); })
+      ),
+      hasCol(colProviderId) && React.createElement("select",{value:filterProvider,onChange:function(e){setFilterProvider(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Provider":"Provider"),
+        safeArray(profiles).filter(function(p){ return p&&p.role==="provider"; }).map(function(p){ return React.createElement("option",{key:p.id,value:p.id},displayUserName(p)); })
+      ),
+      hasCol(colModelId) && React.createElement("select",{value:filterModel,onChange:function(e){setFilterModel(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Modèle":"Model"),
+        safeArray(models).map(function(m){ return React.createElement("option",{key:m.id,value:m.id},m.name||m.id); })
+      )
+    ),
+    React.createElement("div",{className:"table-wrap",style:{overflowX:"auto"}},
+      React.createElement("table",{className:"table",style:{fontSize:12}},
+        React.createElement("thead",null,React.createElement("tr",null,
+          hasCol(colId) && React.createElement("th",null,"ID"),
+          hasCol(colChatterId) && React.createElement("th",null,fr?"Chatter":"Chatter"),
+          hasCol(colProviderId) && React.createElement("th",null,fr?"Provider":"Provider"),
+          hasCol(colModelId) && React.createElement("th",null,fr?"Modèle":"Model"),
+          hasCol(colStatus) && React.createElement("th",null,fr?"Statut":"Status"),
+          hasCol(colCreatedAt) && React.createElement("th",null,fr?"Créé":"Created"),
+          hasCol(colUpdatedAt) && React.createElement("th",null,fr?"MAJ":"Updated"),
+          React.createElement("th",null,fr?"Actions":"Actions")
+        )),
+        React.createElement("tbody",null,
+          filtered.length === 0 ? React.createElement("tr",null,React.createElement("td",{colSpan:99,style:{padding:32,textAlign:"center",color:"var(--text-tertiary)"}},fr?"Aucune assignation":"No assignments")) :
+          filtered.map(function(r){
+            var id = r[colId];
+            var isEdit = editingId === id;
+            return React.createElement("tr",{key:String(id)},
+              hasCol(colId) && React.createElement("td",{style:{fontSize:11,fontFamily:"monospace",color:"var(--text-tertiary)"}},String(id).slice(0,8)+"…"),
+              hasCol(colChatterId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.chatterId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{chatterId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : (function(){ var p=safeArray(profiles).find(function(x){return x&&x.id===r[colChatterId];}); return safeText(p?displayUserName(p):r[colChatterId]); })()),
+              hasCol(colProviderId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.providerId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{providerId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : (function(){ var p=safeArray(profiles).find(function(x){return x&&x.id===r[colProviderId];}); return safeText(p?displayUserName(p):r[colProviderId]); })()),
+              hasCol(colModelId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.modelId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{modelId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : (function(){ var m=safeArray(models).find(function(x){return x&&x.id===r[colModelId];}); return safeText(m?m.name:r[colModelId]); })()),
+              hasCol(colStatus) && React.createElement("td",null,isEdit ? (statusVals.length > 0 ? React.createElement("select",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},style:{padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}},
+                React.createElement("option",{value:""},"—"),
+                statusVals.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
+              ) : React.createElement("input",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},placeholder:fr?"Statut":"Status",style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}})) : safeText(r[colStatus])),
+              hasCol(colCreatedAt) && React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},formatDateSafe(r[colCreatedAt])),
+              hasCol(colUpdatedAt) && React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},formatDateSafe(r[colUpdatedAt])),
+              React.createElement("td",null,isEdit ? React.createElement("span",null,React.createElement("button",{onClick:handleSave,disabled:saving,style:{padding:"4px 10px",borderRadius:6,border:"none",background:"var(--success)",color:"#fff",fontSize:11,fontWeight:600,cursor:saving?"not-allowed":"pointer",marginRight:6}},saving?"...":(fr?"Enregistrer":"Save")),React.createElement("button",{onClick:function(){setEditingId(null);},style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:11,cursor:"pointer"}},fr?"Annuler":"Cancel"))) : React.createElement("button",{onClick:function(){startEdit(r);},style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer"}},fr?"Modifier":"Edit")))
+            );
+          })
+        )
+      )
+    )
+  );
+};
+
+// =============================================
 // AD1 — ADMIN SHELL (tabs, state, placeholders pour AD2→AD8)
 // =============================================
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
@@ -13402,20 +13862,8 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
       </div>
       {activeSub==="overview"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F4CA}"} Vue d'ensemble — AD2 à venir</div>}
       {activeSub==="users"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} adminRefreshTick={adminRefreshTick} />}
-      {activeSub==="roles"&&(
-        <div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflowX:"auto"}}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{"\u{1F510}"} {t(lang,"roles_access")}</div>
-          <div className="table-wrap">
-            <table className="table" style={{fontSize:12}}>
-              <thead><tr><th>{t(lang,"role")}</th><th>{t(lang,"accessible_pages")}</th></tr></thead>
-              <tbody>
-                {Object.entries(ROLE_ACCESS).map(function(e){ var role=e[0]; var pages=e[1]; return React.createElement("tr",{key:role},React.createElement("td",{style:{fontWeight:700,textTransform:"capitalize",color:"var(--text)"}},role),React.createElement("td",{style:{color:"var(--text-secondary)"}},Array.isArray(pages)?pages.join(", "):"")); })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-      {activeSub==="assignments"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F504}"} Assignations — AD4 à venir</div>}
+      {activeSub==="roles"&&<AdminRolesPermissionsTab lang={lang} refreshTick={adminRefreshTick} />}
+      {activeSub==="assignments"&&<AdminAssignmentsTab lang={lang} profiles={profiles} models={models} refreshTick={adminRefreshTick} />}
       {activeSub==="logs"&&<LogsAuditTab lang={lang} txs={txs} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} profiles={profiles} spenders={spenders} />}
       {activeSub==="settings"&&<PlaceholderTab title={t(lang,"settings")} />}
       {activeSub==="qa"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F6E0}"} QA / Maintenance — AD8 à venir</div>}
