@@ -1937,6 +1937,13 @@ const getChatterContext = (user, models) => {
     hasAssignments: assignedModelIds.length > 0,
   };
 };
+// EC3 — Commission chatter: user.comm_pct si dispo, sinon 10% par défaut
+const DEFAULT_CHATTER_COMM_PCT = 10;
+const getChatterCommissionPct = (user) => {
+  const pct = user?.comm_pct;
+  if (pct != null && !isNaN(Number(pct))) return Number(pct) / 100;
+  return DEFAULT_CHATTER_COMM_PCT / 100;
+};
 
 // ═══ GÉRANT NAV REFACTO ═══
 const GERANT_NAV = [
@@ -13818,92 +13825,148 @@ const StreakBadge = ({ streak }) => {
 };
 
 // =============================================
-// CHATTER ROLE — DASHBOARD
+// CHATTER ROLE — DASHBOARD (EC3)
 // =============================================
 const ChatterDashboardTab = ({user, lang, txs, spenders, models}) => {
   const addToast = useToast();
-  const { fmtAmount } = useCurrency();
+  const { fmtAmount, convertAmount } = useCurrency();
   const fr = lang === "fr";
+  const ctx = getChatterContext(user, models);
+  const { assignedModelIds, assignedModels } = ctx;
+  const myModelIds = assignedModelIds;
+  const myModels = assignedModels;
 
-  const myModelIds = user.assigned_models || [];
-  const myTxs = txs.filter(tx => myModelIds.includes(tx.model_id));
+  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 3600000);
 
-  const validated = myTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+  const validated = useMemo(() => myTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee"), [myTxs]);
+  const txThisMonth = useMemo(() => myTxs.filter(tx => new Date(tx.date || tx.created_at || 0) >= monthStart), [myTxs, monthStart]);
+  const validatedThisMonth = useMemo(() => txThisMonth.filter(tx => tx.status === "validated" || tx.status === "confirmee"), [txThisMonth]);
   const caBrut = validated.reduce((s, tx) => s + Number(tx.amount || 0), 0);
-  const txThisMonth = myTxs.filter(tx => new Date(tx.date) >= monthStart).length;
-  const activeHandles = new Set(myTxs.filter(tx => new Date(tx.date) >= thirtyDaysAgo).map(tx => tx.spender_handle));
-  const pendingCount = myTxs.filter(tx => tx.status === "pending").length;
+  const commPct = getChatterCommissionPct(user);
+  const commissionThisMonth = useMemo(() => {
+    return validatedThisMonth.reduce((s, tx) => {
+      const amt = Number(tx.amount || 0);
+      const cur = tx.currency || "EUR";
+      const stored = Number(tx.chatter_commission || 0);
+      if (stored > 0) return s + convertAmount(stored, cur);
+      return s + convertAmount(amt * commPct, cur);
+    }, 0);
+  }, [validatedThisMonth, commPct, convertAmount]);
+  const activeSpenderIds = useMemo(() => {
+    const recent = myTxs.filter(tx => new Date(tx.date || tx.created_at || 0) >= thirtyDaysAgo);
+    return new Set(recent.map(tx => tx.spender_id || tx.spender_handle).filter(Boolean));
+  }, [myTxs, thirtyDaysAgo]);
 
-  // Bar chart: CA per day last 7 days
+  const [convCounts, setConvCounts] = useState({});
+  useEffect(() => {
+    if (myModelIds.length === 0) return;
+    sb.from("conversations").select("model_id").in("model_id", myModelIds).then(({ data }) => {
+      const counts = {};
+      (data || []).forEach(c => { counts[c.model_id] = (counts[c.model_id] || 0) + 1; });
+      setConvCounts(counts);
+    }).catch(() => {});
+  }, [myModelIds.join(",")]);
+
+  const recentActivity = useMemo(() => {
+    return [...myTxs].sort((a, b) => new Date(b.date || b.created_at || 0) - new Date(a.date || a.created_at || 0)).slice(0, 15);
+  }, [myTxs]);
+
   const chartData = useMemo(() => {
     const days = [];
     for (let i = 6; i >= 0; i--) {
       const d = new Date(now);
       d.setDate(d.getDate() - i);
       const key = d.toISOString().slice(0, 10);
-      const label = d.toLocaleDateString(fr ? "fr-FR" : "en-US", {weekday: "short"});
-      const dayTxs = validated.filter(tx => (tx.date || "").slice(0, 10) === key);
-      days.push({name: label, ca: dayTxs.reduce((s, tx) => s + Number(tx.amount || 0), 0)});
+      const label = d.toLocaleDateString(fr ? "fr-FR" : "en-US", { weekday: "short" });
+      const dayTxs = validated.filter(tx => ((tx.date || tx.created_at) || "").toString().slice(0, 10) === key);
+      days.push({ name: label, ca: dayTxs.reduce((s, tx) => s + Number(tx.amount || 0), 0) });
     }
     return days;
-  }, [myTxs, now]);
-
-  const myModels = models.filter(m => myModelIds.includes(m.id));
+  }, [validated, now, fr]);
 
   return (
-    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
-      <div style={{marginBottom:18}}>
-        <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{"\u{1F4CA}"} {fr ? "Mon Dashboard" : "My Dashboard"}</div>
-        <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>{fr ? "Vue d'ensemble de mes modèles" : "My models overview"}</div>
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: _isMobile ? "0 12px" : 0 }}>
+      <div style={{ marginBottom: 18 }}>
+        <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>{"\u{1F4CA}"} {fr ? "Mon Dashboard" : "My Dashboard"}</div>
+        <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 2 }}>{fr ? "Vue d'ensemble de mes modèles" : "My models overview"}</div>
       </div>
       {myModelIds.length === 0 && (
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:48,textAlign:"center"}}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucun modèle attribué" : "No models assigned"}</div>
-          <div style={{fontSize:13,color:"var(--muted2)"}}>{fr ? "Contacte ton gérant." : "Contact your manager."}</div>
+        <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 48, textAlign: "center" }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 4 }}>{fr ? "Aucune assignation trouvée" : "No assignments found"}</div>
+          <div style={{ fontSize: 13, color: "var(--muted2)" }}>{fr ? "Contacte ton gérant." : "Contact your manager."}</div>
         </div>
       )}
-      {myModelIds.length > 0 && (<>
-        <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4, 1fr)",gap:10,marginBottom:18}}>
-          <KPICard label={fr?"CA Brut":"Gross Revenue"} value={fmtAmount(caBrut)} icon="💰"/>
-          <KPICard label={fr?"TX ce mois":"TX this month"} value={`${txThisMonth}`} icon="📋"/>
-          <KPICard label={fr?"Spenders actifs":"Active spenders"} value={`${activeHandles.size}`} icon="👥"/>
-          <KPICard label={fr?"TX en attente":"Pending TX"} value={`${pendingCount}`} icon="⏳" className={pendingCount>0?"warning":""}/>
-        </div>
-        {rechartsReady && chartData.length > 0 && (
-          <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
-            <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr ? "CA 7 derniers jours" : "Revenue last 7 days"}</div>
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
-                <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill:"var(--text-tertiary)",fontSize:11}} />
-                <YAxis axisLine={false} tickLine={false} tick={{fill:"var(--text-tertiary)",fontSize:11}} tickFormatter={v => v >= 1000 ? (v/1000).toFixed(1)+"K" : v} />
-                <RechartsTooltip contentStyle={{background:"var(--bg-overlay)",border:"1px solid var(--border-default)",borderRadius:8,fontSize:12}} />
-                <Bar dataKey="ca" fill="var(--accent)" radius={[6,6,0,0]} name="CA" />
-              </BarChart>
-            </ResponsiveContainer>
+      {myModelIds.length > 0 && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr 1fr" : "repeat(4, 1fr)", gap: 10, marginBottom: 18 }}>
+            <KPICard label={fr ? "CA généré" : "Revenue"} value={fmtAmount(caBrut)} icon="💰" />
+            <KPICard label={fr ? "Nb TX" : "Nb TX"} value={`${validated.length}`} icon="📋" />
+            <KPICard label={fr ? "Spenders actifs" : "Active spenders"} value={`${activeSpenderIds.size}`} icon="👥" />
+            <KPICard label={fr ? "Commission ce mois" : "Commission this month"} value={fmtAmount(commissionThisMonth)} icon="💵" />
           </div>
-        )}
+          {rechartsReady && chartData.length > 0 && (
+            <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 18 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", marginBottom: 12 }}>{fr ? "CA 7 derniers jours" : "Revenue last 7 days"}</div>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={chartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
+                  <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fill: "var(--text-tertiary)", fontSize: 11 }} />
+                  <YAxis axisLine={false} tickLine={false} tick={{ fill: "var(--text-tertiary)", fontSize: 11 }} tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(1) + "K" : v} />
+                  <RechartsTooltip contentStyle={{ background: "var(--bg-overlay)", border: "1px solid var(--border-default)", borderRadius: 8, fontSize: 12 }} />
+                  <Bar dataKey="ca" fill="var(--accent)" radius={[6, 6, 0, 0]} name="CA" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
 
-        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr ? "Mes Modèles" : "My Models"}</div>
-        <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(200px,1fr))",gap:14}}>
-          {myModels.map(m => {
-            const mTxs = myTxs.filter(tx => tx.model_id === m.id);
-            const mMonthTxs = mTxs.filter(tx => new Date(tx.date) >= monthStart);
-            const mCA = mMonthTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + Number(tx.amount || 0), 0);
-            return (
-              <div key={m.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 18px"}}>
-                <div style={{width:48,height:48,borderRadius:"50%",background:"var(--accent-subtle)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,marginBottom:12}}>{"\u{1F469}"}</div>
-                <div style={{fontSize:14,fontWeight:700,marginBottom:4}}>{m.name}</div>
-                <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "CA mois" : "Monthly rev"}: <span style={{fontWeight:700,color:"var(--accent)"}}>{fmtAmount(mCA)}</span></div>
-                <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{mMonthTxs.length} TX</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", marginBottom: 12 }}>{fr ? "Mes Modèles" : "My Models"}</div>
+          <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(auto-fill,minmax(200px,1fr))", gap: 14, marginBottom: 18 }}>
+            {myModels.map(m => {
+              const mTxs = myTxs.filter(tx => tx.model_id === m.id);
+              const mValidated = mTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
+              const mCA = mValidated.reduce((s, tx) => s + Number(tx.amount || 0), 0);
+              const convActive = convCounts[m.id] != null ? String(convCounts[m.id]) : "—";
+              return (
+                <div key={m.id} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 18px" }}>
+                  <div style={{ width: 48, height: 48, borderRadius: "50%", background: "var(--accent-subtle)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, marginBottom: 12 }}>{"\u{1F469}"}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>{m.name || "—"}</div>
+                  <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{fr ? "CA" : "Revenue"}: <span style={{ fontWeight: 700, color: "var(--accent)" }}>{fmtAmount(mCA)}</span></div>
+                  <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{mValidated.length} TX</div>
+                  <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{fr ? "Conversations actives" : "Active convs"}: {convActive}</div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", marginBottom: 12 }}>{fr ? "Activité récente" : "Recent activity"}</div>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 18px" }}>
+            {recentActivity.length === 0 ? (
+              <div style={{ textAlign: "center", color: "var(--text-tertiary)", padding: 24, fontSize: 13 }}>{fr ? "Aucune activité récente" : "No recent activity"}</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {recentActivity.map(tx => {
+                  const m = models?.find(mm => mm.id === tx.model_id);
+                  const dt = tx.date || tx.created_at;
+                  const dStr = dt ? new Date(dt).toLocaleString(fr ? "fr-FR" : "en-US", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—";
+                  return (
+                    <div key={tx.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--border-subtle)" }}>
+                      <div>
+                        <span style={{ fontWeight: 600, color: "var(--text)" }}>{fmtAmount(Number(tx.amount || 0))}</span>
+                        <span style={{ color: "var(--text-tertiary)", fontSize: 12, marginLeft: 8 }}>@{(tx.spender_handle || tx.spender_id || "—")}</span>
+                        <span style={{ color: "var(--text-tertiary)", fontSize: 11, marginLeft: 6 }}>{m?.name || "—"}</span>
+                      </div>
+                      <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{dStr}</span>
+                    </div>
+                  );
+                })}
               </div>
-            );
-          })}
-        </div>
-      </>)}
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 };
