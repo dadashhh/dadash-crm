@@ -8414,23 +8414,39 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
   const payFilteredTxs = dr.filterByDate(txs, "date");
   const getBeneficiaryType = (p) => (p && (p.beneficiary_type || p.type)) || "chatter";
   const chatterPayouts = (payouts || []).filter(p => p.user_id && getBeneficiaryType(p) === "chatter");
+  const modelPayouts = (payouts || []).filter(p => p.model_id && getBeneficiaryType(p) === "modele");
+
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
   const getChatterData = (chatterId) => {
     const chTx = payFilteredTxs.filter(tx=>tx.chatter_id===chatterId && tx.status==="validated");
     const totalComm = chTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
-    const paidAmount = chatterPayouts.filter(p=>p.user_id===chatterId && p.status==="done").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const earnedThisMonth = chTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
+    const paidAmount = chatterPayouts.filter(p=>p.user_id===chatterId && (p.status==="done"||p.status==="paid")).reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
     const pendingAmount = chatterPayouts.filter(p=>p.user_id===chatterId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
     const chPayslips = (payslips||[]).filter(p=>p.user_id===chatterId);
     const paidPayslips = chPayslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
-    return {totalEarned:totalComm, paidAmount, pendingAmount, balance:totalComm-paidAmount, chPayslips, paidPayslips};
+    return {totalEarned:totalComm, earnedThisMonth, paidAmount, pendingAmount, balance:totalComm-paidAmount, chPayslips, paidPayslips};
   };
 
-  // Global KPIs
-  const allChatterData = chatters.map(ch=>({...ch, data:getChatterData(ch.id)}));
-  const globalTotalComm = allChatterData.reduce((s,c)=>s+c.data.totalEarned,0);
-  const globalPaid = allChatterData.reduce((s,c)=>s+c.data.paidAmount,0);
-  const globalPending = allChatterData.reduce((s,c)=>s+c.data.pendingAmount,0);
-  const globalBalance = allChatterData.reduce((s,c)=>s+c.data.balance,0);
+  const getModelData = (modelId) => {
+    const mTx = payFilteredTxs.filter(tx=>tx.model_id===modelId && tx.status==="validated");
+    const totalNet = mTx.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+    const earnedThisMonth = mTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+    const paidAmount = modelPayouts.filter(p=>p.model_id===modelId && (p.status==="done"||p.status==="paid")).reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const pendingAmount = modelPayouts.filter(p=>p.model_id===modelId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    return {totalEarned:totalNet, earnedThisMonth, paidAmount, pendingAmount, balance:totalNet-paidAmount};
+  };
+
+  const allChatterData = chatters.map(ch=>({...ch, type:"chatter", data:getChatterData(ch.id)}));
+  const allModelData = modelList.map(m=>({...m, type:"modele", data:getModelData(m.id)}));
+  const allBeneficiaryData = [...allChatterData, ...allModelData];
+
+  const globalTotalComm = allChatterData.reduce((s,c)=>s+c.data.totalEarned,0) + allModelData.reduce((s,c)=>s+c.data.totalEarned,0);
+  const globalPaid = allBeneficiaryData.reduce((s,c)=>s+c.data.paidAmount,0);
+  const globalPending = allBeneficiaryData.reduce((s,c)=>s+c.data.pendingAmount,0);
+  const globalBalance = allBeneficiaryData.reduce((s,c)=>s+c.data.balance,0);
 
   const handleAddPayout = async () => {
     if(!form.beneficiary_id) { addToast(fr?"Sélectionnez un bénéficiaire":"Select a beneficiary","error"); return; }
@@ -8453,6 +8469,24 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
       await onRefresh();
       addToast(t(lang,"payout_added")||"Payout ajouté","success");
     } catch(e) { addToast("Erreur payout: " + e.message, "error"); }
+    setSaving(false);
+  };
+
+  const handleMarkPaid = async (beneficiary, e) => {
+    if (e) e.stopPropagation();
+    const data = beneficiary.type==="chatter" ? getChatterData(beneficiary.id) : getModelData(beneficiary.id);
+    if (data.balance <= 0) { addToast(fr?"Rien à marquer payé":"Nothing to mark as paid","info"); return; }
+    setSaving(true);
+    try {
+      const bt = beneficiary.type || "chatter";
+      const row = {amount:data.balance, date:new Date().toISOString().slice(0,10), status:"done", type:bt, beneficiary_type:bt, notes:"Marqué payé depuis Compta", currency:"CHF", method:"Virement"};
+      if (bt === "chatter") { row.user_id = beneficiary.id; }
+      else { row.model_id = beneficiary.id; }
+      const {error} = await sb.from("payouts").insert(row);
+      if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+      await onRefresh();
+      addToast(fr?"Marqué payé ✓":"Marked paid ✓","success");
+    } catch (err) { addToast("Erreur: " + (err.message||err), "error"); }
     setSaving(false);
   };
 
@@ -8525,7 +8559,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
           {label:fr?"Commissions totales":"Total commissions",value:fmtAmount(globalTotalComm),color:"var(--text)"},
           {label:fr?"Déjà payé":"Already paid",value:fmtAmount(globalPaid),color:"var(--success)"},
           {label:fr?"Reste à payer":"Remaining",value:fmtAmount(globalPending),color:globalPending>0?"var(--warning)":"var(--text)"},
-          {label:fr?"Nb bénéficiaires":"Beneficiaries",value:chatters.length,color:"var(--text)"},
+          {label:fr?"Nb bénéficiaires":"Beneficiaries",value:chatters.length+modelList.length,color:"var(--text)"},
         ].map((k,i)=>(
           <div key={i} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
             <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{k.label}</div>
@@ -8534,34 +8568,41 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
         ))}
       </div>
 
-      {/* ── CHATTER CARDS ── */}
-      {allChatterData.map(ch=>{
-        const {data} = ch;
-        const chPayouts = chatterPayouts.filter(p=>p.user_id===ch.id).sort((a,b)=>new Date(b.date)-new Date(a.date));
-        const lastPayout = chPayouts[0];
+      {/* ── BENEFICIARY CARDS (chatters + modèles) ── */}
+      {allBeneficiaryData.map(b=>{
+        const {data} = b;
+        const isChatter = b.type==="chatter";
+        const payoutsList = isChatter ? chatterPayouts.filter(p=>p.user_id===b.id) : modelPayouts.filter(p=>p.model_id===b.id);
+        const lastPayout = payoutsList.sort((a,b)=>new Date(b.date)-new Date(a.date))[0];
+        const label = b.name || (isChatter ? b.handle : "");
         return (
-          <div key={ch.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,marginBottom:16,cursor:"pointer",transition:"all 0.2s"}} onClick={()=>setBreakdownChatter(ch.id)}>
-            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14}}>
-              <Tag type="chatter" label={ch.name} id={ch.id}/>
-              <span style={{fontSize:11,color:"var(--muted2)"}}>{fr?"Cliquer pour détails":"Click for details"} &rarr;</span>
+          <div key={isChatter?"chatter|"+b.id:"modele|"+b.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,marginBottom:16,cursor:"pointer",transition:"all 0.2s"}} onClick={()=>isChatter&&setBreakdownChatter(b.id)}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:8}}>
+              {isChatter ? <Tag type="chatter" label={label} id={b.id}/> : <Tag type="model" label={label} id={b.id}/>}
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                {user.role==="gerant"&&data.balance>0&&(
+                  <button onClick={e=>handleMarkPaid(b,e)} disabled={saving} style={{padding:"6px 12px",fontSize:11,fontWeight:700,borderRadius:8,border:"none",background:"var(--success)",color:"#fff",cursor:saving?"default":"pointer"}}>{saving?"...":(fr?"Marquer payé":"Mark paid")}</button>
+                )}
+                {isChatter&&<span style={{fontSize:11,color:"var(--muted2)"}}>{fr?"Cliquer pour détails":"Click for details"} &rarr;</span>}
+              </div>
             </div>
             <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10}}>
               <div style={{background:"var(--surface2)",borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
-                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{fr?"Gagné":"Earned"}</div>
-                <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(data.totalEarned)}</div>
+                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{fr?"Gagné ce mois":"Earned this month"}</div>
+                <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(data.earnedThisMonth||0)}</div>
               </div>
               <div style={{background:"var(--surface2)",borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
-                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{fr?"Payé":"Paid"}</div>
+                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{fr?"Déjà payé":"Already paid"}</div>
                 <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(data.paidAmount)}</div>
               </div>
               <div style={{background:"var(--surface2)",borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
-                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{fr?"Solde":"Balance"}</div>
+                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{fr?"Reste à payer":"Remaining"}</div>
                 <div style={{fontSize:16,fontWeight:800,color:data.balance>0?"var(--danger)":"var(--success)"}}>{fmtAmount(data.balance)}</div>
               </div>
             </div>
             {lastPayout && (
               <div style={{marginTop:10,fontSize:11,color:"var(--text-tertiary)"}}>
-                {fr?"Dernier paiement":"Last payment"}: {fmtDate(lastPayout.date)} — {fmtAmount(lastPayout.amount)} ({lastPayout.method}) <span style={{fontSize:9,color:"var(--text-quaternary)",marginLeft:4}}>{getBeneficiaryType(lastPayout)==="modele"?(fr?"Modèle":"Model"):""}</span> <span className={`badge ${lastPayout.status==="done"?"badge-done":"badge-pending"}`} style={{fontSize:9}}>{lastPayout.status}</span>
+                {fr?"Dernier paiement":"Last payment"}: {fmtDate(lastPayout.date)} — {fmtAmount(lastPayout.amount)} {(lastPayout.method||"")} <span className={`badge ${(lastPayout.status==="done"||lastPayout.status==="paid")?"badge-done":"badge-pending"}`} style={{fontSize:9}}>{lastPayout.status}</span>
               </div>
             )}
           </div>
