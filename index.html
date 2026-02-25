@@ -1709,7 +1709,7 @@ const {useState, useEffect, useMemo, useCallback, useContext, createContext, use
 const _isMobile = window.innerWidth < 768;
 
 /* CHRISTINE FIX — App version for cache-busting and display */
-const APP_VERSION = "v2.1.1";
+const APP_VERSION = "v2.1";
 const _isLowPower = _isMobile || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4);
 
 /* UI FOUNDATION — helpers inline réutilisables (Dashboard-style) */
@@ -1932,21 +1932,6 @@ const safeText = (v, fallback) => (v != null && String(v).trim() !== "" ? String
 const formatDateSafe = (v) => { try { if (!v) return "—"; const d = new Date(v); return isNaN(d.getTime()) ? "—" : d.toLocaleDateString("fr-CH", { day: "2-digit", month: "2-digit", year: "numeric" }); } catch (_) { return "—"; } };
 // AD1 — displayUserName: jamais profiles.email (colonne absente en prod). Ordre: full_name > username > display_name > name > telegram_handle > id
 const displayUserName = (profile) => { if (!profile) return "—"; var v = profile.full_name || profile.username || profile.display_name || profile.name || profile.telegram_handle; if (v && String(v).trim()) return String(v).trim(); return profile.id ? String(profile.id).slice(0, 8) + "…" : "—"; };
-// AD2 — Détection colonnes runtime (basé sur union des clés des rows)
-const buildHasColumn = (rows) => { var keys = {}; (safeArray(rows)).forEach(function(r){ if(r&&typeof r==="object"){ Object.keys(r).forEach(function(k){ keys[k]=1; }); } }); return function(col){ return !!keys[col]; }; };
-// AD3 — Logging admin UI (best-effort, prépare AD6)
-const logAdminUiEvent = function(type, meta){ try { if (type==="save_ok") console.log("[AdminUI]", type, meta); else if (type==="save_fail") console.warn("[AdminUI]", type, meta); else console.log("[AdminUI]", type, meta); } catch(_){} };
-// AD4 — Helper hasPermission(role, permissionKey, rows)
-const hasPermission = function(role, permissionKey, rows){ var list=safeArray(rows); var r=role!= null?String(role).trim():""; var k=permissionKey!=null?String(permissionKey).trim():""; if(!r||!k)return false; var found=list.find(function(x){return x&&(x.role||"")===r&&(x.permission_key||"")===k;}); return found&&(found.allowed===true||found.allowed==="true"||found.allowed===1); };
-// AD5 — Config assignations (schéma tolérant). Mettre tableName pour activer. Ex: { tableName:"chatter_model_assignments", colId:"id", colChatterId:"chatter_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" }
-var adminAssignmentsConfig = { tableName:"", colId:"id", colChatterId:"chatter_id", colProviderId:"provider_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" };
-// AD6 — appendAdminActionLog: insert best-effort dans admin_action_logs (ne jamais crasher)
-var appendAdminActionLog = function(actionType, targetType, targetId, meta){ try { if (!window.sb) return; var m = {}; try { m = meta && typeof meta === "object" ? JSON.parse(JSON.stringify(meta)) : {}; } catch(_){ m = {}; } var payload = { action_type: actionType || "unknown", target_type: targetType || null, target_id: targetId != null ? String(targetId) : null, meta: m }; window.sb.from("admin_action_logs").insert(payload).then(function(r){ if (r && r.error) { console.warn("[AdminUI] appendAdminActionLog error", r.error); } else { logAdminUiEvent("admin_action_log_ok", { actionType: actionType }); } }).catch(function(e){ console.warn("[AdminUI] appendAdminActionLog fail", e); }); } catch(e){ console.warn("[AdminUI] appendAdminActionLog", e); } };
-// AD6 — safeLower pour filtres recherche
-var safeLower = function(v){ try { return (v != null ? String(v) : "").toLowerCase(); } catch(_){ return ""; } };
-// AD7 — JSON safe helpers pour app_settings
-var safeJsonStringify = function(value, fallback){ try { return JSON.stringify(value, null, 2) || (fallback || "{}"); } catch(_){ return fallback || "{}"; } };
-var tryParseJson = function(text){ try { if (text == null || String(text).trim() === "") return null; return JSON.parse(String(text)); } catch(_){ return undefined; } };
 
 // ═══ EC2 — CHATTER CONTEXT HELPERS (réutilisables par toutes les sous-pages chatter) ═══
 const isChatterUser = (u) => !!(u && u.role === "chatter");
@@ -2021,6 +2006,7 @@ const PAGE_TABS = {
   admin: [
     { id: "overview", label: "Vue d'ensemble", icon: "\u{1F4CA}" },
     { id: "users", label: "Utilisateurs", icon: "\u{1F465}" },
+    { id: "roles", label: "Rôles & Permissions", icon: "\u{1F510}" },
     { id: "assignments", label: "Assignations", icon: "\u{1F504}" },
     { id: "logs", label: "Logs", icon: "\u{1F4CB}" },
     { id: "settings", label: "Paramètres", icon: "⚙️" },
@@ -11925,12 +11911,13 @@ const PrestatairesTab = React.memo(({user, lang, txs, models, profiles, onRefres
                               </tr>
                             );
                           })}
-                           </tbody>
-    </table>
-         </div>
-  )}
-</>);
-})()}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>);
+              })()}
+
               {/* ── TAB: PERFORMANCE ── */}
               {modalTab === "performance" && (()=>{
                 // Chart data: TX par mois (6 derniers mois)
@@ -13124,281 +13111,118 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
 };
 
 // =============================================
-// AD3 — ADMIN USER DETAIL PANEL (affichage + édition conditionnelle)
-// =============================================
-const AdminUserDetailPanel = ({user, lang, fr, addToast, canEditRole, canEditStatus, canEditIsActive, hasAnyEditable, roleOpts, statusOpts, detailFields, hasDetailField, hasCreatedAt, hasUpdatedAt, onClose, onSaveSuccess, onSaveFail, adminUsers, loadAdminUsers}) => {
-  var su = user;
-  if (!su) return null;
-  var initForm = function(u){
-    var f = {};
-    if (canEditRole) f.role = (u&&u.role) != null ? String(u.role) : "";
-    if (canEditStatus) f.status = (u&&u.status) != null ? String(u.status) : "";
-    if (canEditIsActive) f.is_active = u && u.is_active !== false && u.is_active !== "false" && u.is_active !== "0";
-    return f;
-  };
-  var [editForm, setEditForm] = useState(function(){ return initForm(su); });
-  var [saving, setSaving] = useState(false);
-  var [saveError, setSaveError] = useState(null);
-  useEffect(function(){ setEditForm(initForm(su)); setSaveError(null); }, [su]);
-
-  var hasChanged = useMemo(function(){
-    if (canEditRole && (editForm.role||"") !== (su.role||"")) return true;
-    if (canEditStatus && (editForm.status||"") !== (su.status||"")) return true;
-    if (canEditIsActive) { var cur = su.is_active !== false && su.is_active !== "false"; if (editForm.is_active !== cur) return true; }
-    return false;
-  }, [editForm, su, canEditRole, canEditStatus, canEditIsActive]);
-
-  var handleSave = useCallback(async function(){
-    if (!hasChanged) { if (addToast) addToast(fr?"Aucune modification à enregistrer":"No changes to save","info"); return; }
-    setSaving(true);
-    setSaveError(null);
-    try {
-      var payload = {};
-      if (canEditRole && (editForm.role||"") !== (su.role||"")) payload.role = editForm.role || null;
-      if (canEditStatus && (editForm.status||"") !== (su.status||"")) payload.status = editForm.status || null;
-      if (canEditIsActive) { var cur = su.is_active !== false && su.is_active !== "false"; if (editForm.is_active !== cur) payload.is_active = editForm.is_active; }
-      if (Object.keys(payload).length === 0) { setSaving(false); if (addToast) addToast(fr?"Aucune modification à enregistrer":"No changes to save","info"); return; }
-      var res = await sb.from("profiles").update(payload).eq("id", su.id).select().single();
-      if (res.error) throw new Error(res.error.message);
-      setSaving(false);
-      var updated = res.data || su;
-      if (loadAdminUsers) loadAdminUsers();
-      if (onSaveSuccess) onSaveSuccess(updated);
-    } catch (e) {
-      setSaving(false);
-      var msg = e && e.message ? e.message : String(e);
-      setSaveError(msg);
-      if (onSaveFail) onSaveFail(msg);
-    }
-  }, [hasChanged, editForm, su, canEditRole, canEditStatus, canEditIsActive, fr, addToast, loadAdminUsers, onSaveSuccess, onSaveFail]);
-
-  return React.createElement("div",{style:{marginTop:14,padding:16,background:"var(--surface)",borderRadius:12,border:"1px solid var(--border-accent)",overflow:"hidden"}},
-    React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}},
-      React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)"}},fr?"Détail utilisateur":"User detail"),
-      React.createElement("button",{onClick:onClose,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}},fr?"Fermer":"Close")
-    ),
-    React.createElement("div",{style:{display:"grid",gap:8,marginBottom:16,fontSize:12}},
-      React.createElement("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
-        React.createElement("span",{style:{fontWeight:700,color:"var(--text)"}},displayUserName(su)),
-        React.createElement("span",{style:{color:"var(--text-tertiary)",fontFamily:"monospace",fontSize:11}},su.id || "—")
-      ),
-      canEditRole && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Rôle:":"Role:"),React.createElement("span",{style:{color:"var(--text)"}},safeText(su.role))),
-      canEditStatus && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Statut:":"Status:"),React.createElement("span",{style:{color:"var(--text)"}},safeText(su.status))),
-      canEditIsActive && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Actif:":"Active:"),React.createElement("span",{style:{color:"var(--text)"}},su.is_active !== false && su.is_active !== "false" ? (fr?"Oui":"Yes") : (fr?"Non":"No"))),
-      detailFields.filter(function(f){ return hasDetailField(f); }).map(function(f){
-        return React.createElement("div",{key:f},React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},f+":"),React.createElement("span",{style:{color:"var(--text)"}},safeText(su[f])));
-      }),
-      hasCreatedAt && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"Créé:":"Created:"),React.createElement("span",{style:{color:"var(--text)"}},formatDateSafe(su.created_at))),
-      hasUpdatedAt && React.createElement("div",null,React.createElement("span",{style:{color:"var(--text-tertiary)",marginRight:8}},fr?"MAJ:":"Updated:"),React.createElement("span",{style:{color:"var(--text)"}},formatDateSafe(su.updated_at)))
-    ),
-    (hasAnyEditable ? React.createElement("div",{style:{marginTop:16,paddingTop:14,borderTop:"1px solid var(--border-subtle)"}},
-      saveError && React.createElement("div",{style:{marginBottom:12,padding:10,background:"var(--danger-muted)",borderRadius:8,fontSize:12,color:"var(--danger)"}},saveError),
-      canEditRole && React.createElement("div",{style:{marginBottom:12}},
-        React.createElement("label",{style:{display:"block",fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase",fontWeight:600}},fr?"Rôle":"Role"),
-        React.createElement("select",{value:editForm.role||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{role:e.target.value});});},style:{width:"100%",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}},
-          React.createElement("option",{key:"",value:""},"—"),
-          roleOpts.map(function(r){ return React.createElement("option",{key:r,value:r},r); })
-        )
-      ),
-      canEditStatus && React.createElement("div",{style:{marginBottom:12}},
-        React.createElement("label",{style:{display:"block",fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase",fontWeight:600}},fr?"Statut":"Status"),
-        React.createElement("select",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},style:{width:"100%",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}},
-          React.createElement("option",{key:"",value:""},"—"),
-          statusOpts.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
-        )
-      ),
-      canEditIsActive && React.createElement("div",{style:{marginBottom:12}},
-        React.createElement("label",{style:{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:"var(--text)"}},
-          React.createElement("input",{type:"checkbox",checked:!!editForm.is_active,onChange:function(e){setEditForm(function(p){return Object.assign({},p,{is_active:e.target.checked});});},style:{accentColor:"var(--accent)"}}),
-          fr?"Actif":"Active"
-        )
-      ),
-      React.createElement("button",{onClick:handleSave,disabled:saving,style:{padding:"8px 16px",borderRadius:10,border:"none",background:saving?"var(--surface2)":"var(--success)",color:saving?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}},saving?(fr?"Enregistrement...":"Saving..."):(fr?"Enregistrer":"Save"))
-    ) : React.createElement("div",{style:{marginTop:16,padding:12,background:"var(--accent-muted)",borderRadius:8,fontSize:12,color:"var(--text-secondary)"}},fr?"Aucun champ admin éditable détecté dans public.profiles (role/status/is_active absents).":"No admin-editable fields detected in public.profiles (role/status/is_active missing)."))
-  );
-};
-
-// =============================================
-// AD2 — ADMIN USERS SECTION (liste + recherche + filtres, lecture seule)
-// =============================================
-const AdminUsersSection = ({lang, onRefresh, models, refreshTick}) => {
-  const addToast = useToast();
-  const fr = lang === "fr";
-  const [adminUsers, setAdminUsers] = useState([]);
-  const [adminUsersLoading, setAdminUsersLoading] = useState(true);
-  const [adminUsersError, setAdminUsersError] = useState(null);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [filterRole, setFilterRole] = useState("");
-  const [filterStatus, setFilterStatus] = useState("");
-  const [selectedUser, setSelectedUser] = useState(null);
-
-  const loadAdminUsers = useCallback(async function() {
-    setAdminUsersLoading(true);
-    setAdminUsersError(null);
-    try {
-      var q = sb.from("profiles").select("*");
-      var res = await q;
-      if (res.error) throw new Error(res.error.message);
-      var rows = safeArray(res.data);
-      if (rows.length > 0) {
-        var first = rows[0];
-        var hasUpdated = first && first.updated_at != null;
-        var hasCreated = first && first.created_at != null;
-        if (hasUpdated) rows.sort(function(a,b){ var da=new Date(a.updated_at||0).getTime(); var db=new Date(b.updated_at||0).getTime(); return db-da; });
-        else if (hasCreated) rows.sort(function(a,b){ var da=new Date(a.created_at||0).getTime(); var db=new Date(b.created_at||0).getTime(); return db-da; });
-        else rows.sort(function(a,b){ return String(a.id||"").localeCompare(String(b.id||"")); });
-      }
-      setAdminUsers(rows);
-    } catch (e) {
-      setAdminUsersError(e && e.message ? e.message : (fr ? "Erreur chargement" : "Load error"));
-      setAdminUsers([]);
-    }
-    setAdminUsersLoading(false);
-  }, []);
-
-  useEffect(function(){ loadAdminUsers(); }, [loadAdminUsers, refreshTick]);
-
-  var hasColumn = buildHasColumn(adminUsers);
-  var hasRole = hasColumn("role");
-  var hasStatus = hasColumn("status");
-  var hasIsActive = hasColumn("is_active");
-  var hasCreatedAt = hasColumn("created_at");
-  var hasUpdatedAt = hasColumn("updated_at");
-
-  var searchFields = ["full_name","username","display_name","telegram_handle","whatsapp","whatsapp_phone","phone","id"];
-  var filteredUsers = useMemo(function(){
-    var list = safeArray(adminUsers);
-    var q = (searchQuery||"").trim().toLowerCase();
-    if (q) {
-      list = list.filter(function(p){
-        if (!p) return false;
-        for (var i=0;i<searchFields.length;i++) {
-          var v = p[searchFields[i]];
-          if (v != null && String(v).toLowerCase().indexOf(q) >= 0) return true;
-        }
-        return false;
-      });
-    }
-    if (hasRole && filterRole) list = list.filter(function(p){ return (p.role||"") === filterRole; });
-    if (hasStatus && filterStatus) list = list.filter(function(p){ return (p.status||"") === filterStatus; });
-    if (!hasStatus && hasIsActive && filterStatus) {
-      if (filterStatus === "active") list = list.filter(function(p){ return p.is_active !== false && p.is_active !== "false"; });
-      if (filterStatus === "inactive") list = list.filter(function(p){ return p.is_active === false || p.is_active === "false"; });
-    }
-    return list;
-  }, [adminUsers, searchQuery, filterRole, filterStatus, hasRole, hasStatus, hasIsActive]);
-
-  var roleValues = useMemo(function(){
-    var seen = {};
-    safeArray(adminUsers).forEach(function(p){ var r = p.role; if (r != null && r !== "") seen[r] = 1; });
-    return Object.keys(seen).sort();
-  }, [adminUsers]);
-
-  var statusValues = useMemo(function(){
-    if (hasStatus) {
-      var seen = {};
-      safeArray(adminUsers).forEach(function(p){ var s = p.status; if (s != null && s !== "") seen[s] = 1; });
-      return Object.keys(seen).sort();
-    }
-    if (hasIsActive) return ["active","inactive"];
-    return [];
-  }, [adminUsers, hasStatus, hasIsActive]);
-
-  if (adminUsersLoading) {
-    return <div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F504}"} {fr?"Chargement...":"Loading..."}</div>;
-  }
-  if (adminUsersError) {
-    return (
-      <div style={{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}}>
-        <div style={{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}}>{"\u26A0\uFE0F"} {adminUsersError}</div>
-        <button onClick={loadAdminUsers} style={{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>{"\u{1F504}"} {fr?"Réessayer":"Retry"}</button>
-      </div>
-    );
-  }
-
-  var detailPanel = null;
-  if (selectedUser) {
-    var su = selectedUser;
-    var canEditRole = hasRole;
-    var canEditStatus = hasStatus;
-    var canEditIsActive = hasIsActive;
-    var hasAnyEditable = canEditRole || canEditStatus || canEditIsActive;
-    var roleOpts = roleValues.length > 0 ? roleValues : ["admin","ceo","gerant","chatter","provider","modele"];
-    var statusOpts = statusValues.length > 0 ? statusValues : ["active","inactive","pending","paused"];
-    var detailFields = ["full_name","username","display_name","telegram_handle","whatsapp","whatsapp_phone","phone"];
-    var hasDetailField = function(f){ return hasColumn(f); };
-    detailPanel = React.createElement(AdminUserDetailPanel,{key:su.id,user:su,lang:lang,fr:fr,addToast:addToast,canEditRole:canEditRole,canEditStatus:canEditStatus,canEditIsActive:canEditIsActive,hasAnyEditable:hasAnyEditable,roleOpts:roleOpts,statusOpts:statusOpts,detailFields:detailFields,hasDetailField:hasDetailField,hasCreatedAt:hasCreatedAt,hasUpdatedAt:hasUpdatedAt,onClose:function(){setSelectedUser(null);},onSaveSuccess:function(updated){loadAdminUsers();setSelectedUser(updated||null);addToast(fr?"Sauvegardé ✓":"Saved ✓","success");logAdminUiEvent("save_ok",{userId:su.id});appendAdminActionLog("user_save","profile",su.id,{role:updated&&updated.role,status:updated&&updated.status,is_active:updated&&updated.is_active});},onSaveFail:function(err){addToast((fr?"Erreur: ":"Error: ")+(err||""),"error");logAdminUiEvent("save_fail",{userId:su.id,err:err});},adminUsers:adminUsers,loadAdminUsers:loadAdminUsers});
-  }
-
-  return (
-    <div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden",marginBottom:18}}>
-      <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{t(lang,"users")}</div>
-      <div style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}}>
-        <input type="text" placeholder={fr?"Rechercher (nom, id, telegram...)":"Search (name, id, telegram...)"} value={searchQuery} onChange={function(e){setSearchQuery(e.target.value);}} style={{flex:"1",minWidth:160,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}} />
-        {hasRole && (
-          <select value={filterRole} onChange={function(e){setFilterRole(e.target.value);}} style={{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}}>
-            <option value="">{fr?"Tous les rôles":"All roles"}</option>
-            {roleValues.map(function(r){ return React.createElement("option",{key:r,value:r},r); })}
-          </select>
-        )}
-        {(hasStatus || hasIsActive) && (
-          <select value={filterStatus} onChange={function(e){setFilterStatus(e.target.value);}} style={{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}}>
-            <option value="">{hasStatus ? (fr?"Tous les statuts":"All statuses") : (fr?"Actif/Inactif":"Active/Inactive")}</option>
-            {statusValues.map(function(s){ return React.createElement("option",{key:s,value:s},s); })}
-          </select>
-        )}
-      </div>
-      <div className="table-wrap" style={{overflowX:"auto"}}>
-        <table className="table" style={{fontSize:12}}>
-          <thead><tr>
-            <th>{fr?"Identité":"Identity"}</th>
-            {hasRole && React.createElement("th",null,t(lang,"role"))}
-            {hasStatus && React.createElement("th",null,fr?"Statut":"Status")}
-            {!hasStatus && hasIsActive && React.createElement("th",null,fr?"Actif":"Active")}
-            {hasCreatedAt && React.createElement("th",null,fr?"Créé":"Created")}
-            {hasUpdatedAt && React.createElement("th",null,fr?"MAJ":"Updated")}
-            <th>{fr?"Actions":"Actions"}</th>
-          </tr></thead>
-          <tbody>
-            {filteredUsers.length === 0 ? (
-              React.createElement("tr",null,React.createElement("td",{colSpan:99,style:{padding:32,textAlign:"center",color:"var(--text-tertiary)"}},fr?"Aucun utilisateur":"No users"))
-            ) : filteredUsers.map(function(u){
-              return React.createElement("tr",{key:u.id},
-                React.createElement("td",{style:{color:"var(--text)"}},
-                  React.createElement("div",{style:{fontWeight:600}},displayUserName(u)),
-                  React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)"}},u.id ? String(u.id).slice(0,8)+"…" : "—")
-                ),
-                hasRole && React.createElement("td",{style:{color:"var(--text-secondary)"}},React.createElement("span",{style:{padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:600,background:"var(--accent-muted)",color:"var(--accent)"}},u.role||"—")),
-                hasStatus && React.createElement("td",{style:{color:"var(--text-secondary)"}},React.createElement("span",{style:{padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:600,background:"var(--success-muted)",color:"var(--success)"}},u.status||"—")),
-                !hasStatus && hasIsActive && React.createElement("td",{style:{color:"var(--text-secondary)"}},u.is_active !== false && u.is_active !== "false" ? "✓" : "—"),
-                hasCreatedAt && React.createElement("td",{style:{color:"var(--text-tertiary)",fontSize:11}},formatDateSafe(u.created_at)),
-                hasUpdatedAt && React.createElement("td",{style:{color:"var(--text-tertiary)",fontSize:11}},formatDateSafe(u.updated_at)),
-                React.createElement("td",null,React.createElement("button",{onClick:function(){setSelectedUser(u);logAdminUiEvent("user_detail_open",{userId:u.id});},style:{padding:"5px 12px",borderRadius:9,border:"none",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer"}},fr?"Voir détail":"View detail"))
-              );
-            })
-            }
-          </tbody>
-        </table>
-      </div>
-      {detailPanel}
-    </div>
-  );
-};
-
-// =============================================
 // ADMIN TAB (gerant only)
 // =============================================
-const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeRate, adminRefreshTick}) => {
+const AdminTab = ({lang, profiles, models, onRefresh, exchangeRate, setExchangeRate}) => {
   const addToast = useToast();
   const { currencySymbol } = useCurrency();
+  const [selectedUser, setSelectedUser] = useState(null);
+  const [form, setForm] = useState({});
+  const [saving, setSaving] = useState(false);
+  const startEdit = (u) => {
+    setSelectedUser(u.id);
+    setForm({
+      commission_pct:u.commission_pct||0,
+      daily_goal:u.daily_goal||0,
+      weekly_goal:u.weekly_goal||0,
+      role: u.role||"chatter",
+      assigned_models: u.assigned_models||[]
+    });
+  };
+  const saveEdit = async () => {
+    setSaving(true);
+    try {
+      const {error} = await sb.from("profiles").update({
+        commission_pct: parseFloat(form.commission_pct),
+        daily_goal: parseFloat(form.daily_goal),
+        weekly_goal: parseFloat(form.weekly_goal),
+        role: form.role,
+        assigned_models: form.assigned_models
+      }).eq("id", selectedUser);
+      if(error) { addToast("Erreur profil: " + error.message, "error"); setSaving(false); return; }
+      setSelectedUser(null);
+      await onRefresh();
+      addToast(t(lang,"settings_saved")||"Sauvegardé ✓","success");
+    } catch(e) { /* Profile update failed */ addToast("Erreur profil: " + e.message, "error"); }
+    setSaving(false);
+  };
+  const handleModelToggle = (modelId) => {
+    const current = form.assigned_models || [];
+    if(current.includes(modelId)) {
+      setForm({...form, assigned_models: current.filter(m=>m!==modelId)});
+    } else {
+      setForm({...form, assigned_models: [...current, modelId]});
+    }
+  };
   return (
     <div>
       <div style={{background:"var(--accent-muted)",border:"1px solid var(--border)",borderRadius:10,padding:"10px 14px",fontSize:12,color:"var(--text-secondary)",marginBottom:16}}>
         Pour ajouter un membre, va dans le dashboard Supabase &gt; Authentication &gt; Users &gt; Add User.
         Remplis l'email et un mot de passe. Le profil sera cree automatiquement.
+        Tu peux ensuite modifier le role et la commission ici.
       </div>
-      <AdminUsersSection lang={lang} onRefresh={onRefresh} models={models} refreshTick={adminRefreshTick} />
       <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:16,marginBottom:18}}>
+        <div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{t(lang,"users")}</div>
+          <div className="table-wrap" style={{overflowX:"auto"}}>
+              <table className="table" style={{fontSize:12}}>
+              <thead><tr><th>Name</th><th>{t(lang,"role")}</th><th>Models</th><th>Comm %</th><th>Action</th></tr></thead>
+              <tbody>
+                {safeArray(profiles).map(u=>(
+                  <tr key={u.id}>
+                    <td style={{color:"var(--text)"}}>{displayUserName(u)}</td>
+                    <td style={{color:"var(--text-secondary)"}}>{u.role}</td>
+                    <td style={{color:"var(--text-secondary)"}}>{u.role==="chatter"?(u.assigned_models||[]).map(mid=>safeArray(models).find(m=>m.id===mid)?.name).filter(Boolean).join(", ")||"none":"—"}</td>
+                    <td style={{color:"var(--text-secondary)"}}>{u.commission_pct}%</td>
+                    <td><button onClick={()=>startEdit(u)} style={{padding:"5px 12px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:11,fontWeight:600,cursor:"pointer"}}>{t(lang,"edit")}</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {selectedUser&&(
+            <div style={{marginTop:16,padding:14,background:"var(--accent-muted)",borderRadius:12,border:"1px solid rgba(139,92,246,0.2)"}}>
+              <div style={{marginBottom:14}}>
+                <label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{t(lang,"role")}</label>
+                <select value={form.role} onChange={e=>setForm({...form,role:e.target.value})} style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none"}}>
+                  <option value="gerant">gerant</option>
+                  <option value="modele">modele</option>
+                  <option value="chatter">chatter</option>
+                  <option value="provider">provider</option>
+                </select>
+              </div>
+              {form.role==="chatter"&&(
+                <div style={{marginBottom:14}}>
+                  <label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>Assigned Models</label>
+                  <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                    {safeArray(models).map(m=>(
+                      <label key={m.id} style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",fontSize:13,color:"var(--text)"}}>
+                        <input type="checkbox" checked={(form.assigned_models||[]).includes(m.id)} onChange={()=>handleModelToggle(m.id)} style={{accentColor:"var(--accent)"}} />
+                        {m.name}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div style={{marginBottom:14}}>
+                <label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>Commission %</label>
+                <input type="number" value={form.commission_pct} onChange={e=>setForm({...form,commission_pct:e.target.value})} style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none"}} />
+              </div>
+              <div style={{marginBottom:14}}>
+                <label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{t(lang,"daily_goal")}</label>
+                <input type="number" value={form.daily_goal} onChange={e=>setForm({...form,daily_goal:e.target.value})} style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none"}} />
+              </div>
+              <div style={{marginBottom:14}}>
+                <label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{t(lang,"weekly_goal")}</label>
+                <input type="number" value={form.weekly_goal} onChange={e=>setForm({...form,weekly_goal:e.target.value})} style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none"}} />
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={saveEdit} disabled={saving} style={{padding:"8px 16px",borderRadius:10,border:"none",background:saving?"var(--surface2)":"var(--success)",color:saving?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}}>{saving?"...":t(lang,"save")}</button>
+                <button onClick={()=>setSelectedUser(null)} style={{padding:"8px 16px",borderRadius:10,border:"1px solid var(--danger)",background:"var(--danger-muted)",color:"var(--danger)",fontSize:13,fontWeight:700,cursor:"pointer"}}>{t(lang,"cancel")}</button>
+              </div>
+            </div>
+          )}
+        </div>
         <div>
           <div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",marginBottom:16,overflow:"hidden"}}>
             <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{t(lang,"models")}</div>
@@ -13489,737 +13313,58 @@ const AgencyConfigSection = ({ lang }) => {
 };
 
 // =============================================
-// AD4 — ADMIN ROLES & PERMISSIONS TAB (RECOVERY: removed — Babel crash, reprise en PR séparée)
+// AD1 — ADMIN SHELL (tabs, state, placeholders pour AD2→AD8)
 // =============================================
-const AdminRolesPermissionsTab = function(){ return null; };
-
-// =============================================
-// AD5 — ADMIN ASSIGNATIONS (lecture + édition minimale, schéma tolérant)
-// =============================================
-const AdminAssignmentsTab = ({lang, profiles, models, refreshTick}) => {
-  const addToast = useToast();
-  const fr = lang === "fr";
-  var cfg = adminAssignmentsConfig || {};
-  var tableName = (cfg.tableName||"").trim();
-  var colId = cfg.colId || "id";
-  var colChatterId = cfg.colChatterId || "chatter_id";
-  var colProviderId = cfg.colProviderId || "provider_id";
-  var colModelId = cfg.colModelId || "model_id";
-  var colStatus = cfg.colStatus || "status";
-  var colCreatedAt = cfg.colCreatedAt || "created_at";
-  var colUpdatedAt = cfg.colUpdatedAt || "updated_at";
-
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [filterStatus, setFilterStatus] = useState("");
-  const [filterChatter, setFilterChatter] = useState("");
-  const [filterProvider, setFilterProvider] = useState("");
-  const [filterModel, setFilterModel] = useState("");
-  const [editingId, setEditingId] = useState(null);
-  const [editForm, setEditForm] = useState({});
-  const [saving, setSaving] = useState(false);
-
-  var buildHasColumn = function(r){ var k={}; safeArray(r).forEach(function(x){ if(x&&typeof x==="object") Object.keys(x).forEach(function(c){ k[c]=1; }); }); return function(c){ return !!k[c]; }; };
-  var hasCol = rows.length > 0 ? buildHasColumn(rows) : function(){ return false; };
-
-  var loadAdminAssignments = useCallback(async function(){
-    if (!tableName) return;
-    setLoading(true);
-    setError(null);
-    try {
-      var res = await sb.from(tableName).select("*");
-      if (res.error) throw new Error(res.error.message);
-      var data = safeArray(res.data);
-      var first = data[0];
-      if (data.length > 0 && first) {
-        var hasUpd = first[colUpdatedAt] != null;
-        var hasCre = first[colCreatedAt] != null;
-        if (hasUpd) data.sort(function(a,b){ var da=new Date(a[colUpdatedAt]||0).getTime(); var db=new Date(b[colUpdatedAt]||0).getTime(); return db-da; });
-        else if (hasCre) data.sort(function(a,b){ var da=new Date(a[colCreatedAt]||0).getTime(); var db=new Date(b[colCreatedAt]||0).getTime(); return db-da; });
-        else data.sort(function(a,b){ return String(a[colId]||"").localeCompare(String(b[colId]||"")); });
-      }
-      setRows(data);
-      logAdminUiEvent("assignments_load_ok",{count:data.length});
-    } catch (e) {
-      var msg = e&&e.message?e.message:String(e);
-      setError(msg);
-      setRows([]);
-      logAdminUiEvent("assignments_load_fail",{err:msg});
-    }
-    setLoading(false);
-  }, [tableName, colUpdatedAt, colCreatedAt, colId]);
-
-  useEffect(function(){ if (tableName) loadAdminAssignments(); }, [loadAdminAssignments, refreshTick, tableName]);
-
-  var statusVals = useMemo(function(){
-    if (!hasCol(colStatus)) return [];
-    var s={};
-    safeArray(rows).forEach(function(r){ var v=r[colStatus]; if(v!=null&&String(v).trim()) s[String(v).trim()]=1; });
-    return Object.keys(s).sort();
-  }, [rows, colStatus, hasCol]);
-
-  var filtered = useMemo(function(){
-    var list = safeArray(rows);
-    var q = (searchQuery||"").trim().toLowerCase();
-    if (q) list = list.filter(function(r){
-      var parts = [];
-      if (hasCol(colStatus)) parts.push(String(r[colStatus]||""));
-      if (hasCol(colChatterId)) parts.push(String(r[colChatterId]||""));
-      if (hasCol(colProviderId)) parts.push(String(r[colProviderId]||""));
-      if (hasCol(colModelId)) parts.push(String(r[colModelId]||""));
-      if (hasCol(colId)) parts.push(String(r[colId]||""));
-      return parts.join(" ").toLowerCase().indexOf(q) >= 0;
-    });
-    if (filterStatus && hasCol(colStatus)) list = list.filter(function(r){ return (r[colStatus]||"") === filterStatus; });
-    if (filterChatter && hasCol(colChatterId)) list = list.filter(function(r){ return (r[colChatterId]||"") === filterChatter; });
-    if (filterProvider && hasCol(colProviderId)) list = list.filter(function(r){ return (r[colProviderId]||"") === filterProvider; });
-    if (filterModel && hasCol(colModelId)) list = list.filter(function(r){ return (r[colModelId]||"") === filterModel; });
-    return list;
-  }, [rows, searchQuery, filterStatus, filterChatter, filterProvider, filterModel, colId, colStatus, colChatterId, colProviderId, colModelId, hasCol]);
-
-  var startEdit = function(r){
-    if (!r) return;
-    var id = r[colId];
-    setEditingId(id);
-    var f = {};
-    if (hasCol(colStatus)) f.status = r[colStatus] != null ? String(r[colStatus]) : "";
-    if (hasCol(colChatterId)) f.chatterId = r[colChatterId] != null ? String(r[colChatterId]) : "";
-    if (hasCol(colProviderId)) f.providerId = r[colProviderId] != null ? String(r[colProviderId]) : "";
-    if (hasCol(colModelId)) f.modelId = r[colModelId] != null ? String(r[colModelId]) : "";
-    setEditForm(f);
-  };
-
-  var handleSave = useCallback(async function(){
-    if (!editingId) return;
-    var payload = {};
-    var r = rows.find(function(x){ return x[colId] === editingId; });
-    if (!r) return;
-    if (hasCol(colStatus) && (editForm.status||"") !== (r[colStatus]||"")) payload[colStatus] = editForm.status || null;
-    if (hasCol(colChatterId) && (editForm.chatterId||"") !== (r[colChatterId]||"")) payload[colChatterId] = editForm.chatterId || null;
-    if (hasCol(colProviderId) && (editForm.providerId||"") !== (r[colProviderId]||"")) payload[colProviderId] = editForm.providerId || null;
-    if (hasCol(colModelId) && (editForm.modelId||"") !== (r[colModelId]||"")) payload[colModelId] = editForm.modelId || null;
-    if (Object.keys(payload).length === 0) { addToast(fr?"Aucune modification":"No changes","info"); return; }
-    setSaving(true);
-    try {
-      var res = await sb.from(tableName).update(payload).eq(colId, editingId).select().single();
-      if (res.error) throw new Error(res.error.message);
-      setRows(function(prev){ return prev.map(function(x){ return x[colId]===editingId ? (res.data||x) : x; }); });
-      setEditingId(null);
-      addToast(fr?"Enregistré ✓":"Saved ✓","success");
-      logAdminUiEvent("assignments_update_ok",{id:editingId});
-    } catch (e) {
-      var msg = e&&e.message?e.message:String(e);
-      addToast((fr?"Erreur: ":"Error: ")+msg,"error");
-      logAdminUiEvent("assignments_update_fail",{id:editingId,err:msg});
-    }
-    setSaving(false);
-  }, [editingId, editForm, rows, colId, colStatus, colChatterId, colProviderId, colModelId, tableName, fr, addToast, hasCol]);
-
-  var colsOk = [];
-  var colsMiss = [];
-  [colId,colChatterId,colProviderId,colModelId,colStatus,colCreatedAt,colUpdatedAt].forEach(function(c){ if(c&&(hasCol(c))) colsOk.push(c); else if(c) colsMiss.push(c); });
-
-  if (!tableName) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}},
-    React.createElement("div",{style:{fontSize:15,fontWeight:700,marginBottom:8}},"\u{1F504} "+(fr?"Config assignations manquante":"Assignments config missing")),
-    React.createElement("div",{style:{fontSize:12,marginBottom:12}},(fr?"Définir adminAssignmentsConfig.tableName (ex: chatter_model_assignments) dans index.html":"Set adminAssignmentsConfig.tableName (e.g. chatter_model_assignments) in index.html"))
-  );
-
-  if (loading) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Chargement...":"Loading..."));
-  if (error) return React.createElement("div",{style:{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}},
-    React.createElement("div",{style:{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}},"\u26A0\uFE0F "+error),
-    React.createElement("button",{onClick:loadAdminAssignments,style:{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}},"\u{1F504} "+(fr?"Réessayer":"Retry"))
-  );
-
-  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
-    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F504} "+(fr?"Assignations":"Assignments")),
-    colsMiss.length > 0 && React.createElement("div",{style:{marginBottom:12,padding:8,background:"var(--warning-muted)",borderRadius:8,fontSize:11,color:"var(--warning)"}},(fr?"Colonnes absentes: ":"Missing columns: ")+colsMiss.join(", ")),
-    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}},
-      React.createElement("input",{type:"text",placeholder:fr?"Rechercher":"Search",value:searchQuery,onChange:function(e){setSearchQuery(e.target.value);},style:{flex:"1",minWidth:140,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
-      hasCol(colStatus) && React.createElement("select",{value:filterStatus,onChange:function(e){setFilterStatus(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:100}},
-        React.createElement("option",{value:""},fr?"Statut":"Status"),
-        statusVals.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
-      ),
-      hasCol(colChatterId) && React.createElement("select",{value:filterChatter,onChange:function(e){setFilterChatter(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:140}},
-        React.createElement("option",{value:""},fr?"Chatter":"Chatter"),
-        safeArray(profiles).filter(function(p){ return p&&p.role==="chatter"; }).map(function(p){ return React.createElement("option",{key:p.id,value:p.id},displayUserName(p)); })
-      ),
-      hasCol(colProviderId) && React.createElement("select",{value:filterProvider,onChange:function(e){setFilterProvider(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
-        React.createElement("option",{value:""},fr?"Provider":"Provider"),
-        safeArray(profiles).filter(function(p){ return p&&p.role==="provider"; }).map(function(p){ return React.createElement("option",{key:p.id,value:p.id},displayUserName(p)); })
-      ),
-      hasCol(colModelId) && React.createElement("select",{value:filterModel,onChange:function(e){setFilterModel(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
-        React.createElement("option",{value:""},fr?"Modèle":"Model"),
-        safeArray(models).map(function(m){ return React.createElement("option",{key:m.id,value:m.id},m.name||m.id); })
-      )
-    ),
-    React.createElement("div",{className:"table-wrap",style:{overflowX:"auto"}},
-      React.createElement("table",{className:"table",style:{fontSize:12}},
-        React.createElement("thead",null,React.createElement("tr",null,
-          hasCol(colId) && React.createElement("th",null,"ID"),
-          hasCol(colChatterId) && React.createElement("th",null,fr?"Chatter":"Chatter"),
-          hasCol(colProviderId) && React.createElement("th",null,fr?"Provider":"Provider"),
-          hasCol(colModelId) && React.createElement("th",null,fr?"Modèle":"Model"),
-          hasCol(colStatus) && React.createElement("th",null,fr?"Statut":"Status"),
-          hasCol(colCreatedAt) && React.createElement("th",null,fr?"Créé":"Created"),
-          hasCol(colUpdatedAt) && React.createElement("th",null,fr?"MAJ":"Updated"),
-          React.createElement("th",null,fr?"Actions":"Actions")
-        )),
-        React.createElement("tbody",null,
-          filtered.length === 0 ? React.createElement("tr",null,React.createElement("td",{colSpan:99,style:{padding:32,textAlign:"center",color:"var(--text-tertiary)"}},fr?"Aucune assignation":"No assignments")) :
-          filtered.map(function(r){
-            var id = r[colId];
-            var isEdit = editingId === id;
-            var _p = safeArray(profiles).find(function(x){return x&&x.id===r[colChatterId];});
-            var chatterLabel = safeText(_p ? displayUserName(_p) : r[colChatterId]);
-            var _p2 = safeArray(profiles).find(function(x){return x&&x.id===r[colProviderId];});
-            var providerLabel = safeText(_p2 ? displayUserName(_p2) : r[colProviderId]);
-            var _m = safeArray(models).find(function(x){return x&&x.id===r[colModelId];});
-            var modelLabel = safeText(_m ? _m.name : r[colModelId]);
-            var statusCell = isEdit ? (statusVals.length > 0 ? React.createElement("select",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},style:{padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}},
-              React.createElement("option",{value:""},"—"),
-              statusVals.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
-            ) : React.createElement("input",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},placeholder:fr?"Statut":"Status",style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}})) : safeText(r[colStatus]);
-            var actionsCell = isEdit ? React.createElement("span",null,React.createElement("button",{onClick:handleSave,disabled:saving,style:{padding:"4px 10px",borderRadius:6,border:"none",background:"var(--success)",color:"#fff",fontSize:11,fontWeight:600,cursor:saving?"not-allowed":"pointer",marginRight:6}},saving?"...":(fr?"Enregistrer":"Save")),React.createElement("button",{onClick:function(){setEditingId(null);},style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:11,cursor:"pointer"}},fr?"Annuler":"Cancel")) : React.createElement("button",{onClick:function(){startEdit(r);},style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer"}},fr?"Modifier":"Edit");
-            return React.createElement("tr",{key:String(id)},
-              hasCol(colId) && React.createElement("td",{style:{fontSize:11,fontFamily:"monospace",color:"var(--text-tertiary)"}},String(id).slice(0,8)+"…"),
-              hasCol(colChatterId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.chatterId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{chatterId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : chatterLabel),
-              hasCol(colProviderId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.providerId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{providerId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : providerLabel),
-              hasCol(colModelId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.modelId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{modelId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : modelLabel),
-              hasCol(colStatus) && React.createElement("td",null,statusCell),
-              hasCol(colCreatedAt) && React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},formatDateSafe(r[colCreatedAt])),
-              hasCol(colUpdatedAt) && React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},formatDateSafe(r[colUpdatedAt])),
-              React.createElement("td",null,actionsCell))
-            );
-          })
-        )
-      )
-    )
-  );
-};
-
-// =============================================
-// AD6 — ADMIN LOGS CENTER (admin_action_logs + employee_logs)
-// =============================================
-const AdminLogsCenterTab = ({lang, refreshTick}) => {
-  var fr = lang === "fr";
-  var [adminLogs, setAdminLogs] = useState([]);
-  var [adminLogsLoading, setAdminLogsLoading] = useState(true);
-  var [adminLogsError, setAdminLogsError] = useState(null);
-  var [employeeLogs, setEmployeeLogs] = useState([]);
-  var [employeeLogsLoading, setEmployeeLogsLoading] = useState(true);
-  var [employeeLogsError, setEmployeeLogsError] = useState(null);
-  var [filterSource, setFilterSource] = useState("all");
-  var [filterType, setFilterType] = useState("");
-  var [filterRole, setFilterRole] = useState("");
-  var [filterDateFrom, setFilterDateFrom] = useState("");
-  var [filterDateTo, setFilterDateTo] = useState("");
-  var [filterSearch, setFilterSearch] = useState("");
-  var [expandedMeta, setExpandedMeta] = useState({});
-
-  var loadAdminActionLogs = useCallback(function(){
-    setAdminLogsLoading(true);
-    setAdminLogsError(null);
-    if (!window.sb) { setAdminLogs([]); setAdminLogsError("Supabase non initialisé"); setAdminLogsLoading(false); return; }
-    window.sb.from("admin_action_logs").select("*").then(function(res){
-      if (res && res.error) { setAdminLogsError(res.error.message || "Erreur"); setAdminLogs([]); logAdminUiEvent("admin_action_logs_load_fail", {err: res.error.message}); }
-      else {
-        var data = safeArray(res && res.data);
-        data.sort(function(a,b){ var da=new Date(a.updated_at||a.created_at||0).getTime(); var db=new Date(b.updated_at||b.created_at||0).getTime(); return db-da; });
-        setAdminLogs(data);
-        logAdminUiEvent("admin_action_logs_load_ok", {count: data.length});
-      }
-      setAdminLogsLoading(false);
-    }).catch(function(e){ setAdminLogsError(e&&e.message?e.message:"Erreur"); setAdminLogs([]); setAdminLogsLoading(false); logAdminUiEvent("admin_action_logs_load_fail", {err: String(e)}); });
-  }, []);
-
-  var loadEmployeeLogs = useCallback(function(){
-    setEmployeeLogsLoading(true);
-    setEmployeeLogsError(null);
-    if (!window.sb) { setEmployeeLogs([]); setEmployeeLogsError("Supabase non initialisé"); setEmployeeLogsLoading(false); return; }
-    window.sb.from("employee_logs").select("*").then(function(res){
-      if (res && res.error) { setEmployeeLogsError(res.error.message || "Erreur"); setEmployeeLogs([]); logAdminUiEvent("employee_logs_load_fail", {err: res.error.message}); }
-      else {
-        var data = safeArray(res && res.data);
-        data.sort(function(a,b){ var da=new Date(a.created_at||0).getTime(); var db=new Date(b.created_at||0).getTime(); return db-da; });
-        setEmployeeLogs(data);
-        logAdminUiEvent("employee_logs_load_ok", {count: data.length});
-      }
-      setEmployeeLogsLoading(false);
-    }).catch(function(e){ setEmployeeLogsError(e&&e.message?e.message:"Erreur"); setEmployeeLogs([]); setEmployeeLogsLoading(false); logAdminUiEvent("employee_logs_load_fail", {err: String(e)}); });
-  }, []);
-
-  useEffect(function(){ loadAdminActionLogs(); }, [loadAdminActionLogs, refreshTick]);
-  useEffect(function(){ loadEmployeeLogs(); }, [loadEmployeeLogs, refreshTick]);
-
-  var unifiedRows = useMemo(function(){
-    var out = [];
-    safeArray(adminLogs).forEach(function(r){
-      if (!r) return;
-      var created = r.created_at || r.updated_at || null;
-      var label = (r.target_type || "") + (r.target_id != null ? " #" + String(r.target_id).slice(0,12) : "");
-      if (!label.trim()) label = "—";
-      out.push({ created_at: created, source: "admin", type: r.action_type || "—", role: r.actor_role || "—", actorUserId: r.actor_user_id || "—", label: label, target_type: r.target_type, target_id: r.target_id, meta: r.meta, raw: r });
-    });
-    safeArray(employeeLogs).forEach(function(r){
-      if (!r) return;
-      var created = r.created_at || null;
-      out.push({ created_at: created, source: "employee", type: r.event_type || r.action_type || "—", role: r.role || "—", actorUserId: r.user_id || "—", label: r.event_label || "—", target_type: null, target_id: null, meta: r.meta, raw: r });
-    });
-    out.sort(function(a,b){ var da=new Date(a.created_at||0).getTime(); var db=new Date(b.created_at||0).getTime(); return db-da; });
-    return out;
-  }, [adminLogs, employeeLogs]);
-
-  var typeOpts = useMemo(function(){ var s={}; unifiedRows.forEach(function(r){ var t=r.type; if(t&&t!=="—") s[t]=1; }); return Object.keys(s).sort(); }, [unifiedRows]);
-  var roleOpts = useMemo(function(){ var s={}; unifiedRows.forEach(function(r){ var t=r.role; if(t&&t!=="—") s[t]=1; }); return Object.keys(s).sort(); }, [unifiedRows]);
-
-  var filteredRows = useMemo(function(){
-    var list = unifiedRows;
-    if (filterSource === "admin") list = list.filter(function(r){ return r.source === "admin"; });
-    else if (filterSource === "employee") list = list.filter(function(r){ return r.source === "employee"; });
-    if (filterType) list = list.filter(function(r){ return r.type === filterType; });
-    if (filterRole) list = list.filter(function(r){ return r.role === filterRole; });
-    var q = (filterSearch||"").trim();
-    if (q) {
-      var ql = safeLower(q);
-      list = list.filter(function(r){
-        return safeLower(r.type).indexOf(ql) >= 0 || safeLower(r.role).indexOf(ql) >= 0 || safeLower(r.actorUserId).indexOf(ql) >= 0 || safeLower(r.label).indexOf(ql) >= 0 || (r.target_id != null && safeLower(String(r.target_id)).indexOf(ql) >= 0) || (r.target_type != null && safeLower(String(r.target_type)).indexOf(ql) >= 0);
-      });
-    }
-    if (filterDateFrom) { var df = new Date(filterDateFrom); list = list.filter(function(r){ var d = new Date(r.created_at); return !isNaN(d.getTime()) && d >= df; }); }
-    if (filterDateTo) { var dt = new Date(filterDateTo); dt.setHours(23,59,59,999); list = list.filter(function(r){ var d = new Date(r.created_at); return !isNaN(d.getTime()) && d <= dt; }); }
-    return list;
-  }, [unifiedRows, filterSource, filterType, filterRole, filterSearch, filterDateFrom, filterDateTo]);
-
-  var adminCount = filteredRows.filter(function(r){ return r.source === "admin"; }).length;
-  var employeeCount = filteredRows.filter(function(r){ return r.source === "employee"; }).length;
-
-  var metaPreview = function(meta, len){
-    if (meta == null) return "—";
-    try { var s = JSON.stringify(meta); return (s.length > (len||60) ? s.slice(0,len||60) + "…" : s) || "—"; } catch(_){ return "—"; }
-  };
-  var toggleMetaExpand = function(key){ setExpandedMeta(function(p){ var n = Object.assign({}, p); n[key] = !p[key]; return n; }); };
-
-  var handleRefresh = function(){ loadAdminActionLogs(); loadEmployeeLogs(); };
-
-  if (adminLogsLoading && employeeLogsLoading && unifiedRows.length === 0) {
-    return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Chargement...":"Loading..."));
-  }
-  if (adminLogsError && employeeLogsError && unifiedRows.length === 0) {
-    return React.createElement("div",{style:{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}},
-      React.createElement("div",{style:{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}},"\u26A0\uFE0F "+(fr?"Les deux tables de logs sont inaccessibles":"Both log tables inaccessible")),
-      React.createElement("div",{style:{fontSize:12,color:"var(--text-secondary)",marginBottom:8}},"admin_action_logs: " + (adminLogsError||"—")),
-      React.createElement("div",{style:{fontSize:12,color:"var(--text-secondary)",marginBottom:16}},"employee_logs: " + (employeeLogsError||"—")),
-      React.createElement("button",{onClick:handleRefresh,style:{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}},"\u{1F504} "+(fr?"Réessayer":"Retry"))
-    );
-  }
-
-  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
-    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F4CB} "+(fr?"Log Center":"Log Center")),
-    (adminLogsError || employeeLogsError) && React.createElement("div",{style:{marginBottom:12,display:"flex",flexWrap:"wrap",gap:8}},
-      adminLogsError && React.createElement("div",{style:{padding:8,background:"var(--danger-muted)",borderRadius:8,fontSize:11,color:"var(--danger)",flex:1,minWidth:200}},"admin_action_logs: " + adminLogsError),
-      employeeLogsError && React.createElement("div",{style:{padding:8,background:"var(--danger-muted)",borderRadius:8,fontSize:11,color:"var(--danger)",flex:1,minWidth:200}},"employee_logs: " + employeeLogsError),
-      React.createElement("button",{onClick:handleRefresh,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}},"\u{1F504} "+(fr?"Rafraîchir":"Refresh"))
-    ),
-    React.createElement("div",{style:{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(3,1fr)",gap:10,marginBottom:16}},
-      React.createElement("div",{style:{background:"var(--bg-overlay)",borderRadius:10,padding:12,border:"1px solid var(--border)"}},
-        React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Total affiché":"Total displayed")),
-        React.createElement("div",{style:{fontSize:18,fontWeight:800,color:"var(--accent)"}},String(filteredRows.length))
-      ),
-      React.createElement("div",{style:{background:"var(--bg-overlay)",borderRadius:10,padding:12,border:"1px solid var(--border)"}},
-        React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"Admin"),
-        React.createElement("div",{style:{fontSize:18,fontWeight:800,color:"var(--success)"}},String(adminCount))
-      ),
-      React.createElement("div",{style:{background:"var(--bg-overlay)",borderRadius:10,padding:12,border:"1px solid var(--border)"}},
-        React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"Employee"),
-        React.createElement("div",{style:{fontSize:18,fontWeight:800,color:"var(--blue-accent)"}},String(employeeCount))
-      )
-    ),
-    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16,alignItems:"center"}},
-      React.createElement("select",{value:filterSource,onChange:function(e){setFilterSource(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:100}},
-        React.createElement("option",{value:"all"},fr?"Toutes sources":"All sources"),
-        React.createElement("option",{value:"admin"},"Admin"),
-        React.createElement("option",{value:"employee"},"Employee")
-      ),
-      React.createElement("select",{value:filterType,onChange:function(e){setFilterType(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
-        React.createElement("option",{value:""},fr?"Tous types":"All types"),
-        typeOpts.map(function(t){ return React.createElement("option",{key:t,value:t},t); })
-      ),
-      React.createElement("select",{value:filterRole,onChange:function(e){setFilterRole(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
-        React.createElement("option",{value:""},fr?"Tous rôles":"All roles"),
-        roleOpts.map(function(r){ return React.createElement("option",{key:r,value:r},r); })
-      ),
-      React.createElement("input",{type:"date",value:filterDateFrom,onChange:function(e){setFilterDateFrom(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
-      React.createElement("input",{type:"date",value:filterDateTo,onChange:function(e){setFilterDateTo(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
-      React.createElement("input",{type:"text",placeholder:fr?"Rechercher...":"Search...",value:filterSearch,onChange:function(e){setFilterSearch(e.target.value);},style:{flex:1,minWidth:140,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}})
-    ),
-    React.createElement("div",{className:"table-wrap",style:{overflowX:"auto"}},
-      React.createElement("table",{className:"table",style:{fontSize:12}},
-        React.createElement("thead",null,
-          React.createElement("tr",null,
-            React.createElement("th",null,fr?"Date":"Date"),
-            React.createElement("th",null,fr?"Source":"Source"),
-            React.createElement("th",null,fr?"Type":"Type"),
-            React.createElement("th",null,fr?"Rôle":"Role"),
-            React.createElement("th",null,fr?"User":"User"),
-            React.createElement("th",null,fr?"Label / Cible":"Label / Target"),
-            React.createElement("th",null,"Meta"),
-            React.createElement("th",null,fr?"Action":"Action")
-          )
-        ),
-        React.createElement("tbody",null,
-          filteredRows.length === 0 ? React.createElement("tr",null,React.createElement("td",{colSpan:8,style:{padding:32,textAlign:"center",color:"var(--text-tertiary)"}},fr?"Aucun log":"No logs")) :
-          filteredRows.map(function(row, idx){
-            var rowKey = (row.raw && row.raw.id != null) ? row.source + "-" + row.raw.id : "idx-" + idx;
-            var metaStr = metaPreview(row.meta, 50);
-            var isExpanded = !!expandedMeta[rowKey];
-            return React.createElement("tr",{key:rowKey},
-              React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)",whiteSpace:"nowrap"}},formatDateSafe(row.created_at)),
-              React.createElement("td",null,React.createElement("span",{style:{padding:"2px 6px",borderRadius:6,fontSize:10,fontWeight:600,background:row.source==="admin"?"var(--success-muted)":"var(--blue-accent-muted)",color:row.source==="admin"?"var(--success)":"var(--blue-accent)"}},row.source)),
-              React.createElement("td",{style:{fontFamily:"monospace",fontSize:11}},safeText(row.type)),
-              React.createElement("td",{style:{color:"var(--text-secondary)"}},safeText(row.role)),
-              React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},row.actorUserId && row.actorUserId !== "—" ? String(row.actorUserId).slice(0,8)+"…" : "—"),
-              React.createElement("td",{style:{maxWidth:180,overflow:"hidden",textOverflow:"ellipsis"}},safeText(row.label)),
-              React.createElement("td",{style:{fontSize:10,fontFamily:"monospace",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis"}},metaStr),
-              React.createElement("td",null,React.createElement("button",{onClick:function(){toggleMetaExpand(rowKey);},style:{padding:"4px 8px",borderRadius:6,border:"1px solid var(--border)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:10,cursor:"pointer"}},isExpanded?(fr?"Masquer":"Hide"):(fr?"Voir JSON":"View JSON")))
-            );
-          })
-        )
-      )
-    ),
-    expandedMeta && Object.keys(expandedMeta).filter(function(k){ return expandedMeta[k]; }).length > 0 && React.createElement("div",{style:{marginTop:12,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-      filteredRows.map(function(row, idx){
-        var rowKey = (row.raw && row.raw.id != null) ? row.source + "-" + row.raw.id : "idx-" + idx;
-        if (!expandedMeta[rowKey]) return null;
-        var metaStr = "—";
-        try { metaStr = JSON.stringify(row.meta, null, 2); } catch(_){ metaStr = row.meta != null ? String(row.meta) : "—"; }
-        return React.createElement("pre",{key:rowKey,style:{fontSize:11,fontFamily:"monospace",color:"var(--text-secondary)",overflow:"auto",maxHeight:200,marginBottom:8}},metaStr);
-      })
-    )
-  );
-};
-
-// =============================================
-// AD7 — ADMIN PARAMÈTRES (app_settings, JSON safe)
-// =============================================
-const AdminSettingsTab = ({lang, refreshTick}) => {
-  var fr = lang === "fr";
-  var addToast = useToast();
-  var [adminSettingsRows, setAdminSettingsRows] = useState([]);
-  var [adminSettingsLoading, setAdminSettingsLoading] = useState(true);
-  var [adminSettingsError, setAdminSettingsError] = useState(null);
-  var [selectedAdminSetting, setSelectedAdminSetting] = useState(null);
-  var [editDescription, setEditDescription] = useState("");
-  var [editValueText, setEditValueText] = useState("");
-  var [saveError, setSaveError] = useState(null);
-  var [saving, setSaving] = useState(false);
-  var [createForm, setCreateForm] = useState({ setting_key: "", description: "", setting_value: "{}" });
-  var [creating, setCreating] = useState(false);
-  var [createError, setCreateError] = useState(null);
-
-  var loadAdminSettings = useCallback(function(){
-    setAdminSettingsLoading(true);
-    setAdminSettingsError(null);
-    if (!window.sb) { setAdminSettingsRows([]); setAdminSettingsError("Supabase non initialisé"); setAdminSettingsLoading(false); return; }
-    window.sb.from("app_settings").select("*").order("setting_key", { ascending: true }).then(function(res){
-      if (res && res.error) { setAdminSettingsError(res.error.message || "Erreur"); setAdminSettingsRows([]); }
-      else { setAdminSettingsRows(safeArray(res && res.data)); }
-      setAdminSettingsLoading(false);
-    }).catch(function(e){ setAdminSettingsError(e && e.message ? e.message : "Erreur"); setAdminSettingsRows([]); setAdminSettingsLoading(false); });
-  }, []);
-
-  useEffect(function(){ loadAdminSettings(); }, [loadAdminSettings, refreshTick]);
-
-  useEffect(function(){
-    if (selectedAdminSetting) {
-      setEditDescription(selectedAdminSetting.description || "");
-      setEditValueText(safeJsonStringify(selectedAdminSetting.setting_value, "{}"));
-      setSaveError(null);
-    }
-  }, [selectedAdminSetting]);
-
-  var handleReset = useCallback(function(){
-    if (!selectedAdminSetting) return;
-    setEditDescription(selectedAdminSetting.description || "");
-    setEditValueText(safeJsonStringify(selectedAdminSetting.setting_value, "{}"));
-    setSaveError(null);
-  }, [selectedAdminSetting]);
-
-  var handleSave = useCallback(async function(){
-    if (!selectedAdminSetting || !selectedAdminSetting.id) return;
-    var parsed = tryParseJson(editValueText);
-    if (parsed === undefined) {
-      setSaveError(fr ? "JSON invalide. Vérifiez la syntaxe (guillemets, virgules, accolades)." : "Invalid JSON. Check syntax (quotes, commas, braces).");
-      return;
-    }
-    setSaving(true);
-    setSaveError(null);
-    try {
-      var res = await sb.from("app_settings").update({ description: editDescription, setting_value: parsed }).eq("id", selectedAdminSetting.id).select().single();
-      if (res && res.error) throw new Error(res.error.message);
-      loadAdminSettings();
-      setSelectedAdminSetting(res && res.data ? res.data : Object.assign({}, selectedAdminSetting, { description: editDescription, setting_value: parsed }));
-      addToast(fr ? "Enregistré ✓" : "Saved ✓", "success");
-      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_update", "app_settings", selectedAdminSetting.setting_key, { key: selectedAdminSetting.setting_key });
-      else logAdminUiEvent("settings_update_ok", { key: selectedAdminSetting.setting_key });
-    } catch (e) {
-      var msg = e && e.message ? e.message : String(e);
-      setSaveError(msg);
-      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
-      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_update_fail", "app_settings", selectedAdminSetting.setting_key, { err: msg });
-      else logAdminUiEvent("settings_update_fail", { key: selectedAdminSetting.setting_key, err: msg });
-    }
-    setSaving(false);
-  }, [selectedAdminSetting, editDescription, editValueText, fr, addToast, loadAdminSettings]);
-
-  var handleCreate = useCallback(async function(){
-    var key = (createForm.setting_key || "").trim();
-    if (!key) { setCreateError(fr ? "Clé requise" : "Key required"); return; }
-    var parsed = tryParseJson(createForm.setting_value || "{}");
-    if (parsed === undefined) { setCreateError(fr ? "JSON invalide" : "Invalid JSON"); return; }
-    setCreating(true);
-    setCreateError(null);
-    try {
-      var res = await sb.from("app_settings").insert({ setting_key: key, description: (createForm.description || "").trim(), setting_value: parsed }).select().single();
-      if (res && res.error) throw new Error(res.error.message);
-      loadAdminSettings();
-      setCreateForm({ setting_key: "", description: "", setting_value: "{}" });
-      addToast(fr ? "Setting créé ✓" : "Setting created ✓", "success");
-      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_create", "app_settings", key, { key: key });
-      else logAdminUiEvent("settings_create_ok", { key: key });
-    } catch (e) {
-      var msg = e && e.message ? e.message : String(e);
-      setCreateError(msg);
-      addToast((fr ? "Erreur: " : "Error: ") + msg, "error");
-      if (typeof appendAdminActionLog === "function") appendAdminActionLog("settings_create_fail", "app_settings", key, { err: msg });
-      else logAdminUiEvent("settings_create_fail", { key: key, err: msg });
-    }
-    setCreating(false);
-  }, [createForm, fr, addToast, loadAdminSettings]);
-
-  if (adminSettingsLoading) {
-    return React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: 32, textAlign: "center", color: "var(--text-tertiary)" } }, "\u{1F504} " + (fr ? "Chargement..." : "Loading..."));
-  }
-  if (adminSettingsError) {
-    return React.createElement("div", { style: { background: "var(--danger-muted)", border: "1px solid var(--danger)", borderRadius: 14, padding: 24, textAlign: "center" } },
-      React.createElement("div", { style: { fontSize: 15, fontWeight: 700, color: "var(--danger)", marginBottom: 12 } }, "\u26A0\uFE0F " + adminSettingsError),
-      React.createElement("button", { onClick: loadAdminSettings, style: { padding: "8px 16px", borderRadius: 10, border: "none", background: "var(--danger)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" } }, "\u{1F504} " + (fr ? "Réessayer" : "Retry"))
-    );
-  }
-
-  var rows = safeArray(adminSettingsRows);
-
-  return React.createElement("div", { style: { display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr", gap: 16 } },
-    React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: "16px 20px", overflow: "hidden" } },
-      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 14 } }, "\u2699\uFE0F " + (fr ? "Paramètres" : "Settings")),
-      rows.length === 0 ? React.createElement("div", { style: { padding: 32, textAlign: "center", color: "var(--text-tertiary)" } }, fr ? "Aucun paramètre" : "No settings") :
-      React.createElement("div", { className: "table-wrap", style: { overflowX: "auto" } },
-        React.createElement("table", { className: "table", style: { fontSize: 12 } },
-          React.createElement("thead", null, React.createElement("tr", null, React.createElement("th", null, "setting_key"), React.createElement("th", null, "description"), React.createElement("th", null, "updated_at"))),
-          React.createElement("tbody", null,
-            rows.map(function(r) {
-              var isSel = selectedAdminSetting && selectedAdminSetting.id === r.id;
-              return React.createElement("tr", { key: r.id || r.setting_key, onClick: function() { setSelectedAdminSetting(r); }, style: { cursor: "pointer", background: isSel ? "var(--accent-muted)" : "transparent" } },
-                React.createElement("td", { style: { fontFamily: "monospace", fontSize: 12 } }, safeText(r.setting_key)),
-                React.createElement("td", { style: { maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" } }, safeText(r.description)),
-                React.createElement("td", { style: { fontSize: 11, color: "var(--text-tertiary)" } }, formatDateSafe(r.updated_at))
-              );
-            })
-          )
-        )
-      )
-    ),
-    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 16 } },
-      selectedAdminSetting && React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: "16px 20px" } },
-        React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: "var(--text)", marginBottom: 12 } }, fr ? "Détail" : "Detail"),
-        React.createElement("div", { style: { marginBottom: 10 } },
-          React.createElement("label", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", display: "block", marginBottom: 4 } }, "setting_key"),
-          React.createElement("input", { type: "text", value: selectedAdminSetting.setting_key || "", readOnly: true, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text-tertiary)", fontSize: 13 } })
-        ),
-        React.createElement("div", { style: { marginBottom: 10 } },
-          React.createElement("label", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", display: "block", marginBottom: 4 } }, "description"),
-          React.createElement("input", { type: "text", value: editDescription, onChange: function(e) { setEditDescription(e.target.value); }, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 13, outline: "none" } })
-        ),
-        React.createElement("div", { style: { marginBottom: 12 } },
-          React.createElement("label", { style: { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", display: "block", marginBottom: 4 } }, "setting_value (JSON)"),
-          React.createElement("textarea", { value: editValueText, onChange: function(e) { setEditValueText(e.target.value); }, rows: 10, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 12, fontFamily: "monospace", outline: "none", resize: "vertical" } })
-        ),
-        saveError && React.createElement("div", { style: { marginBottom: 10, padding: 8, background: "var(--danger-muted)", borderRadius: 8, fontSize: 12, color: "var(--danger)" } }, saveError),
-        React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } },
-          React.createElement("button", { onClick: handleSave, disabled: saving, style: { padding: "8px 16px", borderRadius: 10, border: "none", background: saving ? "var(--surface2)" : "var(--success)", color: saving ? "var(--muted2)" : "#fff", fontSize: 13, fontWeight: 700, cursor: saving ? "not-allowed" : "pointer" } }, saving ? (fr ? "..." : "...") : (fr ? "Enregistrer" : "Save")),
-          React.createElement("button", { onClick: handleReset, style: { padding: "8px 16px", borderRadius: 10, border: "1px solid var(--border)", background: "transparent", color: "var(--text-secondary)", fontSize: 13, cursor: "pointer" } }, fr ? "Reset" : "Reset")
-        )
-      ),
-      React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: "16px 20px" } },
-        React.createElement("div", { style: { fontSize: 14, fontWeight: 700, color: "var(--text)", marginBottom: 12 } }, fr ? "Créer un setting" : "Create setting"),
-        React.createElement("div", { style: { marginBottom: 10 } },
-          React.createElement("input", { type: "text", placeholder: "setting_key", value: createForm.setting_key, onChange: function(e) { setCreateForm(function(p) { return Object.assign({}, p, { setting_key: e.target.value }); }); }, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 13, outline: "none" } })
-        ),
-        React.createElement("div", { style: { marginBottom: 10 } },
-          React.createElement("input", { type: "text", placeholder: "description", value: createForm.description, onChange: function(e) { setCreateForm(function(p) { return Object.assign({}, p, { description: e.target.value }); }); }, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 13, outline: "none" } })
-        ),
-        React.createElement("div", { style: { marginBottom: 10 } },
-          React.createElement("textarea", { placeholder: "{}", value: createForm.setting_value, onChange: function(e) { setCreateForm(function(p) { return Object.assign({}, p, { setting_value: e.target.value }); }); }, rows: 6, style: { width: "100%", padding: "8px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 12, fontFamily: "monospace", outline: "none", resize: "vertical" } })
-        ),
-        createError && React.createElement("div", { style: { marginBottom: 10, padding: 8, background: "var(--danger-muted)", borderRadius: 8, fontSize: 12, color: "var(--danger)" } }, createError),
-        React.createElement("button", { onClick: handleCreate, disabled: creating, style: { padding: "8px 16px", borderRadius: 10, border: "none", background: creating ? "var(--surface2)" : "var(--accent)", color: creating ? "var(--muted2)" : "#fff", fontSize: 13, fontWeight: 700, cursor: creating ? "not-allowed" : "pointer" } }, creating ? (fr ? "..." : "...") : (fr ? "Créer" : "Create"))
-      )
-    )
-  );
-};
-
-// =============================================
-// AD8 — ADMIN QA / MAINTENANCE (smoke checks, diagnostics, refresh)
-// =============================================
-const AdminQAMaintenanceTab = ({user, lang, refreshTick, onRefreshAll}) => {
-  var fr = lang === "fr";
-  var [checks, setChecks] = useState({});
-  var [loading, setLoading] = useState(true);
-  var [lastRefresh, setLastRefresh] = useState(null);
-  var [refreshing, setRefreshing] = useState(false);
-
-  var runSmokeChecks = useCallback(function(){
-    if (!window.sb) {
-      setChecks({ admin: "error", users: "error", rolePerms: "error", assign: "skip", logs: "error", settings: "error" });
-      setLoading(false);
-      return;
-    }
-    setLoading(true);
-    var cfg = adminAssignmentsConfig || {};
-    var tbl = (cfg.tableName || "").trim();
-    var results = { admin: isAdminUser(user) ? "ok" : "warning", users: "pending", assign: tbl ? "pending" : "skip", logs: "pending", settings: "pending" };
-    var counts = { users: 0, logsAdmin: 0, logsEmployee: 0, settings: 0 };
-    var profileKeys = [];
-    var lastErr = null;
-
-    var done = function(){ setChecks(results); setLoading(false); };
-
-    var p1 = window.sb.from("profiles").select("*").limit(5).then(function(r){
-      try {
-        if (r && r.error) { results.users = "error"; lastErr = r.error.message; return; }
-        var arr = safeArray(r && r.data);
-        counts.users = arr.length;
-        results.users = "ok";
-        if (arr.length > 0 && arr[0]) profileKeys = Object.keys(arr[0]);
-      } catch(e){ results.users = "error"; lastErr = e && e.message; }
-    }).catch(function(e){ results.users = "error"; lastErr = e && e.message; });
-
-    var p3 = tbl ? window.sb.from(tbl).select("*").limit(1).then(function(r){
-      try {
-        if (r && r.error) { results.assign = "error"; if(!lastErr) lastErr = r.error.message; return; }
-        results.assign = "ok";
-      } catch(e){ results.assign = "error"; if(!lastErr) lastErr = e && e.message; }
-    }).catch(function(e){ results.assign = "error"; if(!lastErr) lastErr = e && e.message; }) : Promise.resolve();
-
-    var logsOk = false;
-    var p4a = window.sb.from("admin_action_logs").select("id", { count: "exact", head: true }).limit(1).then(function(r){
-      try { if (!r || r.error) return; logsOk = true; counts.logsAdmin = r.count != null ? r.count : 0; } catch(_){}
-    }).catch(function(){});
-    var p4b = window.sb.from("employee_logs").select("id", { count: "exact", head: true }).limit(1).then(function(r){
-      try { if (!r || r.error) return; logsOk = true; counts.logsEmployee = r.count != null ? r.count : 0; } catch(_){}
-    }).catch(function(){});
-    var p4 = Promise.all([p4a, p4b]).then(function(){
-      results.logs = logsOk ? "ok" : "error";
-    }).catch(function(e){ results.logs = "error"; if(!lastErr) lastErr = e && e.message; });
-
-    var p5 = window.sb.from("app_settings").select("*").then(function(r){
-      try {
-        if (r && r.error) { results.settings = "error"; if(!lastErr) lastErr = r.error.message; return; }
-        counts.settings = safeArray(r && r.data).length;
-        results.settings = "ok";
-      } catch(e){ results.settings = "error"; if(!lastErr) lastErr = e && e.message; }
-    }).catch(function(e){ results.settings = "error"; if(!lastErr) lastErr = e && e.message; });
-
-    Promise.all([p1, p3, p4, p5]).then(function(){
-      setChecks(Object.assign({}, results, { _counts: counts, _profileKeys: profileKeys, _lastErr: lastErr }));
-      setLoading(false);
-    }).catch(function(){ setLoading(false); });
-  }, [user]);
-
-  useEffect(function(){ runSmokeChecks(); }, [runSmokeChecks, refreshTick]);
-
-  var handleRefreshAll = useCallback(function(){
-    setRefreshing(true);
-    if (typeof onRefreshAll === "function") onRefreshAll();
-    setLastRefresh(new Date().toISOString());
-    if (typeof appendAdminActionLog === "function") { try { appendAdminActionLog("qa.refresh_all", "qa", null, {}); } catch(_){ console.warn("[AdminUI] qa.refresh_all log fail"); } }
-    setTimeout(function(){ runSmokeChecks(); setRefreshing(false); }, 800);
-  }, [onRefreshAll, runSmokeChecks]);
-
-  var handleRefreshSection = useCallback(function(section){
-    setRefreshing(true);
-    if (typeof onRefreshAll === "function") onRefreshAll();
-    if (typeof appendAdminActionLog === "function") { try { appendAdminActionLog("qa.refresh_section", "qa", section, {}); } catch(_){ console.warn("[AdminUI] qa.refresh_section log fail"); } }
-    setTimeout(function(){ runSmokeChecks(); setRefreshing(false); }, 600);
-  }, [onRefreshAll, runSmokeChecks]);
-
-  var StatusBadge = function(s){ var c = s==="ok" ? "var(--success)" : s==="warning" ? "var(--warning)" : s==="skip" ? "var(--text-tertiary)" : "var(--danger)"; var l = s==="ok" ? (fr?"OK":"OK") : s==="warning" ? (fr?"Avert.":"Warn") : s==="skip" ? "—" : (fr?"Erreur":"Err"); return React.createElement("span",{style:{padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:700,background:c+"20",color:c}},l); };
-
-  var c = checks._counts || {};
-  var keys = checks._profileKeys || [];
-  var hasEmail = keys.indexOf("email") >= 0;
-  var cfg = adminAssignmentsConfig || {};
-
-  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
-    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F6E0} "+(fr?"QA / Maintenance":"QA / Maintenance")),
-    loading ? React.createElement("div",{style:{padding:24,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Vérification...":"Checking...")) :
-    React.createElement("div",null,
-      React.createElement("div",{style:{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fit,minmax(200px,1fr))",gap:12,marginBottom:16}},
-        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Accès admin":"Admin access"),
-          StatusBadge(checks.admin)
-        ),
-        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"profiles":"profiles"),
-          StatusBadge(checks.users),
-          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"n="+(c.users||0))
-        ),
-        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Assignations":"Assignations"),
-          StatusBadge(checks.assign)
-        ),
-        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Logs":"Logs"),
-          StatusBadge(checks.logs),
-          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"admin:"+(c.logsAdmin||0)+" emp:"+(c.logsEmployee||0))
-        ),
-        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"app_settings"),
-          StatusBadge(checks.settings),
-          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"n="+(c.settings||0))
-        )
-      ),
-      React.createElement("div",{style:{marginBottom:16,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-        React.createElement("div",{style:{fontSize:12,fontWeight:700,color:"var(--text-tertiary)",marginBottom:8,textTransform:"uppercase"}},fr?"Boutons maintenance":"Maintenance buttons"),
-        React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:8}},
-          React.createElement("button",{onClick:function(){handleRefreshSection("users");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Utilisateurs":"Refresh Users"),
-          React.createElement("button",{onClick:function(){handleRefreshSection("assignments");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Assignations":"Refresh Assignations"),
-          React.createElement("button",{onClick:function(){handleRefreshSection("logs");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Logs":"Refresh Logs"),
-          React.createElement("button",{onClick:function(){handleRefreshSection("settings");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Paramètres":"Refresh Settings"),
-          React.createElement("button",{onClick:handleRefreshAll,disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--accent)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:12,fontWeight:700,cursor:refreshing?"not-allowed":"pointer"}},refreshing?(fr?"...":"..."):(fr?"Rafraîchir Tout":"Refresh All")}
-        )
-      ),
-      React.createElement("div",{style:{marginBottom:12,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
-        React.createElement("div",{style:{fontSize:12,fontWeight:700,color:"var(--text-tertiary)",marginBottom:8,textTransform:"uppercase"}},fr?"Diagnostics":"Diagnostics"),
-        React.createElement("div",{style:{fontSize:11,color:"var(--text-secondary)",marginBottom:4}},(fr?"Clés profiles (échantillon):":"Profile keys (sample):")+" "+(keys.length?keys.join(", "):"—")),
-        React.createElement("div",{style:{fontSize:11,color:"var(--text-secondary)",marginBottom:4}},"adminAssignmentsConfig.tableName: ", React.createElement("code",{style:{background:"var(--surface)",padding:"2px 6px",borderRadius:4}},(cfg.tableName||"(vide)")),
-        React.createElement("div",{style:{fontSize:11,color:"var(--text-secondary)",marginTop:8,padding:8,background:hasEmail?"var(--warning-muted)":"var(--success-muted)",borderRadius:8,border:"1px solid "+(hasEmail?"var(--warning)":"var(--success)")}},hasEmail ? (fr?"profiles.email présent (attention)":"profiles.email present (caution)") : (fr?"profiles.email absent en prod (attendu)":"profiles.email absent in prod (expected)"))
-      ),
-      lastRefresh && React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:8}}, (fr?"Dernier refresh:":"Last refresh:")+" "+lastRefresh),
-      checks._lastErr && React.createElement("div",{style:{marginTop:12,padding:8,background:"var(--danger-muted)",borderRadius:8,fontSize:11,color:"var(--danger)"}}, (fr?"Dernière erreur:":"Last error:")+" "+checks._lastErr)
-    )
-  );
-};
-
-// =============================================
-// AD1 — ADMIN SHELL (PR-A0 RECOVERY: stub Babel-safe, reprise complète en PR séparée)
-// =============================================
-const AdminShell = function(props) {
-  var pad = (typeof _isMobile !== "undefined" && _isMobile) ? "0 12px" : 0;
-  return React.createElement("div", { style: { maxWidth: 1200, margin: "0 auto", padding: pad } },
-    React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 8 } }, "\u2699\uFE0F Admin"),
-    React.createElement("div", { style: { background: "var(--surface)", borderRadius: 14, border: "1px solid var(--border)", padding: 24, textAlign: "center", color: "var(--text-tertiary)", fontSize: 13 } }, "Admin temporairement désactivé (reprise demain)")
+const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
+  const [adminLoading, setAdminLoading] = useState(false);
+  const [adminError, setAdminError] = useState(null);
+  const [adminRefreshTick, setAdminRefreshTick] = useState(0);
+  const adminTabs = PAGE_TABS.admin;
+  const activeSub = subTab || (adminTabs&&adminTabs[0]?adminTabs[0].id:"overview");
+  const handleRefresh = () => { setAdminError(null); setAdminRefreshTick(function(t){return t+1;}); if(onRefresh) onRefresh(); };
+  const handleRetry = () => { setAdminError(null); if(onRefresh) onRefresh(); };
+  const tabStyle = (id) => ({ padding: "7px 13px", borderRadius: 9, border: "1px solid " + (activeSub===id ? "#8b5cf6" : "var(--border)"), background: activeSub===id ? "rgba(139,92,246,0.15)" : "var(--surface)", color: activeSub===id ? "#c4b5fd" : "var(--text)", fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0 });
+  return (
+    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
+      <div style={{marginBottom:18,display:"flex",flexWrap:"wrap",alignItems:"center",gap:12}}>
+        <div>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{"\u2699\uFE0F"} Admin</div>
+          <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>Utilisateurs, rôles, logs et paramètres</div>
+        </div>
+        <div style={{display:"flex",gap:8,marginLeft:"auto"}}>
+          <button onClick={handleRefresh} style={{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{"\u{1F504}"} Rafraîchir</button>
+          {adminError&&<button onClick={handleRetry} style={{padding:"6px 12px",borderRadius:8,border:"1px solid var(--danger)",background:"var(--danger-muted)",color:"var(--danger)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{"\u{1F504}"} Réessayer</button>}
+        </div>
+      </div>
+      {adminError&&<div style={{marginBottom:16,padding:12,background:"rgba(239,68,68,0.12)",border:"1px solid rgba(239,68,68,0.25)",borderRadius:10,fontSize:13,color:"#EF4444"}}>{"\u26A0\uFE0F"} {adminError}</div>}
+      <div className="compta-tabs" style={{overflowX:"auto",overflowY:"hidden",WebkitOverflowScrolling:"touch",marginBottom:18,borderBottom:"1px solid var(--border-subtle)",borderRadius:0}}>
+        <div style={{display:"flex",gap:8,flexWrap:"nowrap",minWidth:"min-content",alignItems:"center",paddingBottom:4}}>
+          {adminTabs.map(tb=>(
+            <button key={tb.id} onClick={()=>setSubTab(tb.id)} style={tabStyle(tb.id)}>{tb.icon} {tb.label}</button>
+          ))}
+        </div>
+      </div>
+      {activeSub==="overview"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F4CA}"} Vue d'ensemble — AD2 à venir</div>}
+      {activeSub==="users"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} />}
+      {activeSub==="roles"&&(
+        <div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflowX:"auto"}}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{"\u{1F510}"} {t(lang,"roles_access")}</div>
+          <div className="table-wrap">
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr><th>{t(lang,"role")}</th><th>{t(lang,"accessible_pages")}</th></tr></thead>
+              <tbody>
+                {Object.entries(ROLE_ACCESS).map(function(e){ var role=e[0]; var pages=e[1]; return React.createElement("tr",{key:role},React.createElement("td",{style:{fontWeight:700,textTransform:"capitalize",color:"var(--text)"}},role),React.createElement("td",{style:{color:"var(--text-secondary)"}},Array.isArray(pages)?pages.join(", "):"")); })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+      {activeSub==="assignments"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F504}"} Assignations — AD4 à venir</div>}
+      {activeSub==="logs"&&<LogsAuditTab lang={lang} txs={txs} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} profiles={profiles} spenders={spenders} />}
+      {activeSub==="settings"&&<PlaceholderTab title={t(lang,"settings")} />}
+      {activeSub==="qa"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F6E0}"} QA / Maintenance — AD8 à venir</div>}
+      {activeSub==="export"&&<ExportRapportsTab lang={lang} txs={txs} spenders={spenders} expenses={expenses} models={models} profiles={profiles} payslips={payslips} payouts={payouts} invoices={invoices} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} />}
+    </div>
   );
 };
 
@@ -23347,7 +22492,7 @@ const App = () => {
   const [showSearch, setShowSearch] = useState(false);
   const [fabSaving, setFabSaving] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [messagerieSubTab, setMessagerieSubTab] = useState("telegram_beta");
+  const [messagerieSubTab, setMessagerieSubTab] = useState("whatsapp");
   const [simuEnabled, setSimuEnabled] = useState(() => { try { return localStorage.getItem("dadash_tg_simu_enabled") === "1"; } catch(_) { return false; } });
   const [simuChatterId, setSimuChatterId] = useState(() => { try { return localStorage.getItem("dadash_tg_simu_chatter") || ""; } catch(_) { return ""; } });
   const [canInstallPwa, setCanInstallPwa] = useState(!!window.__deferredInstallPrompt);
@@ -23359,8 +22504,8 @@ const App = () => {
     window.addEventListener('pwa-install-ready', handler);
     return () => window.removeEventListener('pwa-install-ready', handler);
   }, []);
-  // AD1 — Init subTab when tab is admin; fallback roles->overview (RECOVERY: permissions removed)
-  useEffect(function(){ if(tab==="admin"&&isAdminUser(user)){ if(!subTab){ var t=PAGE_TABS.admin; setSubTab(t&&t[0]?t[0].id:"overview"); } else if(subTab==="roles"){ setSubTab("overview"); } } }, [tab, user, subTab]);
+  // AD1 — Init subTab when tab is admin and subTab null (admin/ceo first load)
+  useEffect(function(){ if(tab==="admin"&&isAdminUser(user)&&!subTab){ var t=PAGE_TABS.admin; setSubTab(t&&t[0]?t[0].id:"overview"); } }, [tab, user, subTab]);
   const handleInstallPwa = async () => {
     const prompt = window.__deferredInstallPrompt;
     if (!prompt) return;
@@ -24016,8 +23161,8 @@ const App = () => {
         return (<>
           <div style={{overflowX:"auto",overflowY:"hidden",WebkitOverflowScrolling:"touch",marginBottom:24,borderBottom:"1px solid var(--border-subtle)"}}>
             <div style={{display:"flex",gap:8,flexWrap:"nowrap",minWidth:"min-content",alignItems:"center",paddingBottom:4}}>
-              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={msgTabStyle("telegram_beta")}>Telegram BETA</button>
               <button onClick={()=>setMessagerieSubTab("whatsapp")} style={msgTabStyle("whatsapp")}>WhatsApp</button>
+              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={msgTabStyle("telegram_beta")}>Telegram BETA</button>
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("admin_panel")} style={msgTabStyle("admin_panel")}>{"\u{1F6E0}"} Admin Panel</button>}
               {simuEnabled&&<span style={{padding:"4px 10px",borderRadius:10,background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,marginLeft:4,flexShrink:0}}>{"\u{1F4DD}"} Mode test</span>}
             </div>
@@ -24379,8 +23524,8 @@ const App = () => {
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} onRefresh={onRefresh} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
             <div style={{display:"flex",flexWrap:"nowrap",gap:8,marginBottom:16,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:4,scrollbarWidth:"none"}}>
-              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="telegram_beta"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="telegram_beta"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="telegram_beta"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>Telegram</button>
               <button onClick={()=>setMessagerieSubTab("whatsapp")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="whatsapp"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="whatsapp"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="whatsapp"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>WhatsApp</button>
+              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="telegram_beta"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="telegram_beta"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="telegram_beta"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>Telegram</button>
               <button onClick={()=>setMessagerieSubTab("escalades")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="escalades"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="escalades"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="escalades"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>{"\u{1F4A5}"} {lang==="fr"?"Escalades":"Escalations"}</button>
             </div>
             {messagerieSubTab==="whatsapp"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} models={models} />}
