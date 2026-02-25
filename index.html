@@ -2028,7 +2028,7 @@ const MiniSparkline = ({data, width=120, height=28, color="var(--accent)"}) => {
 
 // ═══ ROLE ACCESS ═══
 const ROLE_ACCESS = {
-  gerant: ["dashboard","business","equipe","messagerie","compta","automation","bots","admin"],
+  gerant: ["dashboard","business","equipe","messagerie","compta","automation","bots","ia-insights","admin"],
   admin: ["admin"],
   ceo: ["admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments"],
@@ -2078,6 +2078,7 @@ const GERANT_NAV = [
   { id: "compta", icon: "\u{1F4CA}", label: "Compta" },
   { id: "automation", icon: "\u{1F916}", label: "Push" },
   { id: "bots", icon: "\u{1F916}", label: "Bots" },
+  { id: "ia-insights", icon: "🤖", label: "IA Insights" },
   { id: "admin", icon: "⚙️", label: "Admin" },
 ];
 
@@ -22563,6 +22564,351 @@ const VideosTab = ({user, lang, models, modelVideos, videoSessions, dbSpenders, 
 };
 
 // =============================================
+// IA INSIGHTS PAGE — 6 Agents IA
+// =============================================
+const IAInsightsPage = ({ user, txs, spenders, profiles, models, lang, onNavigate }) => {
+  const addToast = useToast();
+  const { convertAmount, currencySymbol } = useCurrency();
+
+  // ALL HOOKS BEFORE EARLY RETURNS
+  const [activeAgent, setActiveAgent] = useState(null);
+  const [nowTime, setNowTime] = useState(() => new Date());
+  const panelRef = useRef(null);
+
+  useEffect(() => {
+    const iv = setInterval(() => setNowTime(new Date()), 60000);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    if (activeAgent && panelRef.current) {
+      setTimeout(() => panelRef.current && panelRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" }), 80);
+    }
+  }, [activeAgent]);
+
+  const agentData = useMemo(() => {
+    const isValid = (tx) => tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee";
+    const allTxs = txs || [];
+    const validTxs = allTxs.filter(isValid);
+    const allSpenders = spenders || [];
+    const allProfiles = profiles || [];
+    const now = Date.now();
+
+    // 1. Whale Hunter — spenders 3+ TX/30j, total 100-499 CHF, jamais > 100 CHF
+    const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+    const whaleSpenders = allSpenders.filter((sp) => {
+      const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
+      const recent = spTxs.filter((tx) => new Date(tx.date || tx.created_at).getTime() >= thirtyDaysAgo);
+      const total = spTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const maxTx = spTxs.length > 0 ? Math.max(...spTxs.map((tx) => convertAmount(Number(tx.amount || 0), tx.currency))) : 0;
+      return recent.length >= 3 && total >= 100 && total < 500 && maxTx < 100;
+    }).map((sp) => {
+      const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
+      const total = spTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      return { handle: sp.handle, total: Math.round(total), txCount: spTxs.length, potential: Math.round(total * 2.5) };
+    });
+    const whalePotential = whaleSpenders.reduce((s, sp) => s + sp.potential, 0);
+
+    // 2. Churn Detector — sans TX validée depuis > 14j
+    const fourteenDaysAgo = now - 14 * 24 * 60 * 60 * 1000;
+    const churnSpenders = allSpenders.filter((sp) => {
+      const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
+      if (spTxs.length === 0) return false;
+      const lastTx = Math.max(...spTxs.map((tx) => new Date(tx.date || tx.created_at).getTime()));
+      return lastTx < fourteenDaysAgo;
+    }).map((sp) => {
+      const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
+      const total = spTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const lastTxTime = Math.max(...spTxs.map((tx) => new Date(tx.date || tx.created_at).getTime()));
+      const daysInactive = Math.floor((now - lastTxTime) / (24 * 60 * 60 * 1000));
+      return { handle: sp.handle, total: Math.round(total), daysInactive };
+    }).sort((a, b) => b.total - a.total);
+
+    // 3. Revenue Optimizer — taux conv par tag
+    const tagMap = {};
+    allTxs.forEach((tx) => {
+      const tag = tx.product_tag || tx.tag || "Sans tag";
+      if (!tagMap[tag]) tagMap[tag] = { tag, valid: 0, total: 0, ca: 0 };
+      tagMap[tag].total += 1;
+      if (isValid(tx)) { tagMap[tag].valid += 1; tagMap[tag].ca += convertAmount(Number(tx.amount || 0), tx.currency); }
+    });
+    const productRates = Object.values(tagMap).filter((p) => p.total >= 2).map((p) => ({
+      tag: p.tag, rate: (p.valid / p.total) * 100, ca: Math.round(p.ca), valid: p.valid, total: p.total
+    })).sort((a, b) => b.rate - a.rate);
+    const avgRate = productRates.length > 0 ? productRates.reduce((s, p) => s + p.rate, 0) / productRates.length : 0;
+    const top3products = productRates.slice(0, 3);
+    const bottom3products = productRates.slice(-Math.min(3, productRates.length)).reverse();
+    const potentialGain = Math.max(0, Math.round(bottom3products.reduce((s, p) => s + (p.ca * (avgRate - p.rate) / 100), 0)));
+
+    // 4. Best Time — grouper TX validées par heure
+    const hourBuckets = {};
+    validTxs.forEach((tx) => {
+      const h = new Date(tx.date || tx.created_at).getHours();
+      if (!hourBuckets[h]) hourBuckets[h] = { hour: h, count: 0, ca: 0 };
+      hourBuckets[h].count += 1;
+      hourBuckets[h].ca += convertAmount(Number(tx.amount || 0), tx.currency);
+    });
+    const allHours = Array.from({ length: 24 }, (_, h) => hourBuckets[h] || { hour: h, count: 0, ca: 0 });
+    const sortedHours = [...allHours].sort((a, b) => b.count - a.count);
+    const topHour = sortedHours[0] ? sortedHours[0].hour : 20;
+    const currentHour = new Date().getHours();
+    const nextTopHour = topHour > currentHour ? topHour : topHour; // prochain créneau
+    const nextTime = String(topHour).padStart(2, "0") + "h00";
+    const maxCount = sortedHours[0] ? sortedHours[0].count : 1;
+
+    // 5. Chatter Coach — taux conv par chatter
+    const chatters = allProfiles.filter((p) => p.role === "chatter");
+    const chatterStats = chatters.map((ch) => {
+      const chTxs = allTxs.filter((tx) => tx.chatter_id === ch.id);
+      const chValid = chTxs.filter(isValid);
+      const conv = chTxs.length > 0 ? (chValid.length / chTxs.length) * 100 : 0;
+      const ca = chValid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      return { id: ch.id, name: ch.name || ch.email || "?", txTotal: chTxs.length, txValid: chValid.length, conv: Math.round(conv * 10) / 10, ca: Math.round(ca) };
+    }).sort((a, b) => b.conv - a.conv);
+    const avgConv = chatterStats.length > 0 ? Math.round((chatterStats.reduce((s, c) => s + c.conv, 0) / chatterStats.length) * 10) / 10 : 0;
+    const bestConv = chatterStats.length > 0 ? chatterStats[0].conv : 0;
+
+    // 6. Forecast — projection CA fin de mois
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+    const monthEnd = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    const daysInMonth = monthEnd.getDate();
+    const dayOfMonth = today.getDate();
+    const daysLeft = daysInMonth - dayOfMonth;
+    const last7Start = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const last7Txs = validTxs.filter((tx) => new Date(tx.date || tx.created_at) >= last7Start);
+    const last7CA = last7Txs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const avgPerDay = last7CA / 7;
+    const monthTxs = validTxs.filter((tx) => new Date(tx.date || tx.created_at) >= monthStart);
+    const monthCA = monthTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const projection = Math.round(monthCA + avgPerDay * daysLeft);
+    const modelBreakdown = (models || []).map((m) => {
+      const mTxs = monthTxs.filter((tx) => tx.model_id === m.id);
+      const mCA = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      return { name: m.name, ca: Math.round(mCA) };
+    }).filter((m) => m.ca > 0).sort((a, b) => b.ca - a.ca).slice(0, 3);
+
+    return {
+      whale: { spenders: whaleSpenders, potential: Math.round(whalePotential) },
+      churn: { spenders: churnSpenders },
+      revenue: { top3: top3products, bottom3: bottom3products, potentialGain, avgRate: Math.round(avgRate) },
+      bestTime: { top3: sortedHours.slice(0, 3), allHours, topHour, nextTime, maxCount: maxCount || 1 },
+      coach: { chatters: chatterStats, avgConv, bestConv },
+      forecast: { projection, monthCA: Math.round(monthCA), daysLeft, daysInMonth, dayOfMonth, modelBreakdown }
+    };
+  }, [txs, spenders, profiles, models, convertAmount]);
+
+  const agents = [
+    { id: "whale", icon: "🐋", name: "Whale Hunter", desc: "Spenders à fort potentiel non exploités", color: "#a78bfa", metricLabel: "POTENTIEL", metricValue: `${agentData.whale.potential} ${currencySymbol}` },
+    { id: "churn", icon: "📉", name: "Churn Detector", desc: "Spenders inactifs à risque de départ", color: "#f59e0b", metricLabel: "À RISQUE", metricValue: `${agentData.churn.spenders.length} spenders` },
+    { id: "revenue", icon: "💰", name: "Revenue Optimizer", desc: "Produits et stratégies de vente à optimiser", color: "#10b981", metricLabel: "GAIN EST.", metricValue: `+${agentData.revenue.potentialGain} ${currencySymbol}/mois` },
+    { id: "besttime", icon: "⏰", name: "Best Time", desc: "Créneaux optimaux pour convertir", color: "#06b6d4", metricLabel: "PROCHAIN", metricValue: agentData.bestTime.nextTime },
+    { id: "coach", icon: "🎯", name: "Chatter Coach", desc: "Performance chatters et axes d'amélioration", color: "#ec4899", metricLabel: "CONV. MOY.", metricValue: `${agentData.coach.avgConv}% → ${agentData.coach.bestConv}%` },
+    { id: "forecast", icon: "📊", name: "Forecast", desc: "Projection CA fin de mois", color: "#f97316", metricLabel: "PROJECTION", metricValue: `~${agentData.forecast.projection} ${currencySymbol}` },
+  ];
+
+  const activeAgentObj = agents.find((a) => a.id === activeAgent);
+
+  const getPanelContent = (agentId) => {
+    const cur = currencySymbol;
+    const d = agentData;
+    if (agentId === "whale") {
+      return {
+        insights: d.whale.spenders.slice(0, 8).map((sp) => ({ dot: "#a78bfa", main: `@${sp.handle}`, sub: `${sp.total} ${cur} · ${sp.txCount} TX · potentiel ~${sp.potential} ${cur}` })),
+        actions: [{ icon: "💬", name: "Relancer", impact: `${d.whale.spenders.length} spenders à contacter`, onClick: () => onNavigate && onNavigate("messagerie") }]
+      };
+    }
+    if (agentId === "churn") {
+      return {
+        insights: d.churn.spenders.slice(0, 8).map((sp) => ({ dot: sp.daysInactive > 30 ? "#ef4444" : "#f59e0b", main: `@${sp.handle}`, sub: `${sp.daysInactive > 30 ? "🔴" : "🟡"} Inactif depuis ${sp.daysInactive}j · ${sp.total} ${cur} total` })),
+        actions: [{ icon: "📢", name: "Broadcast", impact: `Relancer ${d.churn.spenders.length} spenders inactifs`, onClick: () => onNavigate && onNavigate("automation") }]
+      };
+    }
+    if (agentId === "revenue") {
+      return {
+        insights: [
+          ...d.revenue.top3.map((p) => ({ dot: "#10b981", main: `✅ ${p.tag}`, sub: `Conv. ${p.rate.toFixed(0)}% · ${p.ca} ${cur}` })),
+          ...d.revenue.bottom3.map((p) => ({ dot: "#ef4444", main: `⚠️ ${p.tag}`, sub: `Conv. ${p.rate.toFixed(0)}% vs moy. ${d.revenue.avgRate}%` }))
+        ],
+        actions: [{ icon: "🗣️", name: "Brief chatters", impact: `Gain potentiel +${d.revenue.potentialGain} ${cur}/mois`, onClick: () => addToast("📊 Brief chatters — préparer le plan de vente", "info") }]
+      };
+    }
+    if (agentId === "besttime") {
+      return {
+        insights: d.bestTime.top3.map((h, i) => ({ dot: "#06b6d4", main: `${String(h.hour).padStart(2, "0")}h00 — ${h.count} TX`, sub: `Créneau #${i + 1} · ${Math.round(h.ca)} ${cur} CA` })),
+        actions: [{ icon: "📅", name: "Planifier", impact: `Prochain créneau optimal : ${d.bestTime.nextTime}`, onClick: () => onNavigate && onNavigate("automation") }]
+      };
+    }
+    if (agentId === "coach") {
+      return {
+        insights: d.coach.chatters.map((ch, i) => ({ dot: i === 0 ? "#f59e0b" : ch.conv < d.coach.avgConv ? "#ef4444" : "#10b981", main: `${i === 0 ? "🏆" : ch.conv < d.coach.avgConv ? "⚠️" : "✅"} ${ch.name}`, sub: `Conv. ${ch.conv}% · CA ${ch.ca} ${cur}` })),
+        actions: [{ icon: "👥", name: "Voir équipe", impact: `${d.coach.chatters.length} chatters analysés`, onClick: () => onNavigate && onNavigate("equipe") }]
+      };
+    }
+    if (agentId === "forecast") {
+      const { monthCA, projection, daysLeft, daysInMonth, dayOfMonth, modelBreakdown } = d.forecast;
+      const pct = projection > 0 ? Math.min((monthCA / projection) * 100, 100) : 0;
+      return {
+        insights: [
+          { dot: "#f97316", main: `CA ce mois : ${monthCA} ${cur}`, sub: `${dayOfMonth}/${daysInMonth} jours · ${Math.round(pct)}% de l'objectif` },
+          { dot: "#f97316", main: `Projection : ~${projection} ${cur}`, sub: `${daysLeft} jours restants` },
+          ...modelBreakdown.map((m) => ({ dot: "#f97316", main: m.name, sub: `${m.ca} ${cur} ce mois` }))
+        ],
+        actions: [{ icon: "⏳", name: "TX en attente", impact: `Valider pour atteindre ~${projection} ${cur}`, onClick: () => onNavigate && onNavigate("business") }]
+      };
+    }
+    return { insights: [], actions: [] };
+  };
+
+  return (
+    <div style={{ maxWidth: 1200, margin: "0 auto", padding: _isMobile ? "0 0 40px" : "0 0 40px" }}>
+      {/* TOPBAR PAGE */}
+      <div style={{ background: "var(--surface)", borderBottom: "1px solid var(--border)", padding: "20px 24px", marginBottom: 24, borderRadius: 12, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: "var(--text)", marginBottom: 4 }}>🤖 IA Insights</div>
+          <div style={{ fontSize: 13, color: "var(--muted)" }}>Agents IA — Analyse &amp; actions en temps réel</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#10b981", animation: "livePulse 2s ease-in-out infinite" }} />
+          <span style={{ fontSize: 12, color: "#10b981", fontFamily: "'Space Mono', monospace", fontWeight: 700 }}>Live</span>
+          <span style={{ fontSize: 12, color: "var(--muted)", fontFamily: "'Space Mono', monospace" }}>{nowTime.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}</span>
+        </div>
+      </div>
+
+      {/* SECTION LABEL + REFRESH */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <div style={{ fontSize: 11, textTransform: "uppercase", color: "var(--muted)", letterSpacing: "1.5px", fontWeight: 600 }}>
+          {agents.length} AGENTS ACTIFS
+        </div>
+        <button onClick={() => setNowTime(new Date())} style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--muted)", fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 6, fontFamily: "'DM Sans', sans-serif" }}>
+          ↻ Rafraîchir
+        </button>
+      </div>
+
+      {/* GRID AGENTS — 3 col / 2 tablet / 1 mobile */}
+      <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(auto-fill, minmax(300px, 1fr))", gap: 16, marginBottom: 16 }}>
+        {agents.map((agent) => {
+          const isActive = activeAgent === agent.id;
+          return (
+            <div
+              key={agent.id}
+              onClick={() => setActiveAgent(isActive ? null : agent.id)}
+              style={{
+                background: "var(--surface)",
+                border: `1px solid ${isActive ? agent.color : "var(--border)"}`,
+                borderTop: `3px solid ${isActive ? agent.color : "transparent"}`,
+                borderRadius: 12,
+                padding: 20,
+                cursor: "pointer",
+                transition: "all 0.2s",
+                transform: isActive ? "translateY(-2px)" : "none",
+                boxShadow: isActive ? "0 8px 24px rgba(0,0,0,0.3)" : "none",
+              }}
+              onMouseEnter={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.borderColor = agent.color;
+                  e.currentTarget.style.borderTopColor = agent.color;
+                  e.currentTarget.style.transform = "translateY(-2px)";
+                  e.currentTarget.style.boxShadow = "0 8px 24px rgba(0,0,0,0.3)";
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.borderColor = "var(--border)";
+                  e.currentTarget.style.borderTopColor = "transparent";
+                  e.currentTarget.style.transform = "none";
+                  e.currentTarget.style.boxShadow = "none";
+                }
+              }}
+            >
+              {/* Ligne 1 : icône + badge ACTIF */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <div style={{ width: 40, height: 40, borderRadius: 10, background: agent.color + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>
+                  {agent.icon}
+                </div>
+                <div style={{ padding: "3px 10px", borderRadius: 20, background: agent.color + "22", color: agent.color, fontSize: 10, fontWeight: 700, letterSpacing: 0.5 }}>
+                  ACTIF
+                </div>
+              </div>
+              {/* Ligne 2 : Nom */}
+              <div style={{ fontSize: 15, fontWeight: 700, color: "var(--text)", marginBottom: 6 }}>{agent.name}</div>
+              {/* Ligne 3 : Description */}
+              <div style={{ fontSize: 12, color: "var(--muted2)", marginBottom: 12, lineHeight: 1.5, minHeight: 36 }}>{agent.desc}</div>
+              {/* Ligne 4 : Métrique clé */}
+              <div style={{ background: "rgba(0,0,0,0.3)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px" }}>
+                <div style={{ fontSize: 11, textTransform: "uppercase", color: "var(--muted)", letterSpacing: 0.8, marginBottom: 4 }}>{agent.metricLabel}</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: agent.color, fontFamily: "'Space Mono', monospace" }}>{agent.metricValue}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* PANEL ANALYSE — visible si agent actif */}
+      {activeAgent && activeAgentObj && (() => {
+        const panel = getPanelContent(activeAgent);
+        return (
+          <div ref={panelRef} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderTop: `3px solid ${activeAgentObj.color}`, borderRadius: 12, marginTop: 16, animation: "fadeInTab 0.25s ease" }}>
+            {/* Header panel */}
+            <div style={{ background: "var(--surface2)", padding: "16px 20px", borderBottom: "1px solid var(--border)", borderRadius: "12px 12px 0 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 8, background: activeAgentObj.color + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>
+                  {activeAgentObj.icon}
+                </div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text)" }}>{activeAgentObj.name}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", fontFamily: "'Space Mono', monospace" }}>mis à jour il y a 0 min</div>
+                </div>
+              </div>
+              <button onClick={() => setActiveAgent(null)} style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--muted)", padding: "4px 12px", borderRadius: 6, fontSize: 14, cursor: "pointer", fontFamily: "'DM Sans', sans-serif" }}>✕</button>
+            </div>
+            {/* Body panel — 2 colonnes */}
+            <div style={{ padding: 20, display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr", gap: 24 }}>
+              {/* Colonne Insights */}
+              <div>
+                <div style={{ fontSize: 11, textTransform: "uppercase", color: "var(--muted)", letterSpacing: "1.5px", fontWeight: 600, marginBottom: 12 }}>INSIGHTS DÉTECTÉS</div>
+                {panel.insights.length === 0 ? (
+                  <div style={{ color: "var(--muted)", fontSize: 13, padding: "16px 0" }}>Aucun insight détecté avec les données actuelles.</div>
+                ) : panel.insights.map((item, i) => (
+                  <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "10px 0", borderBottom: "1px solid var(--border2)" }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: item.dot, flexShrink: 0, marginTop: 5 }} />
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{item.main}</div>
+                      <div style={{ fontSize: 12, color: "var(--muted2)", marginTop: 2 }}>{item.sub}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {/* Colonne Actions */}
+              <div>
+                <div style={{ fontSize: 11, textTransform: "uppercase", color: "var(--muted)", letterSpacing: "1.5px", fontWeight: 600, marginBottom: 12 }}>ACTIONS RECOMMANDÉES</div>
+                {panel.actions.map((action, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: 14, border: "1px solid var(--border)", borderRadius: 10, marginBottom: 10, background: "var(--surface2)" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                      <span style={{ fontSize: 20, flexShrink: 0 }}>{action.icon}</span>
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{action.name}</div>
+                        <div style={{ fontSize: 11, color: "var(--muted2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{action.impact}</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); action.onClick(); }}
+                      style={{ padding: "7px 14px", borderRadius: 8, border: "none", background: activeAgentObj.color, color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, fontFamily: "'DM Sans', sans-serif" }}
+                    >
+                      {action.name} →
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+};
+
+// =============================================
 // GLOBAL SEARCH — CMD+K MODAL
 // =============================================
 const SearchModal = ({open, onClose, lang, user, txs, spenders, profiles, models, invoices, products, onNavigate, onDrill}) => {
@@ -23526,6 +23872,8 @@ const App = () => {
         </>);
       case "bots":
         return <BotsManagementPage lang={lang} />;
+      case "ia-insights":
+        return <IAInsightsPage user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} lang={lang} onNavigate={navigateTo} />;
       case "admin":
         return <AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} />;
       default:
