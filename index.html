@@ -8411,11 +8411,15 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
   const fr = lang === "fr";
   const payFilteredTxs = dr.filterByDate(txs, "date");
 
+  // C1: beneficiary_type compat — fallback chatter si null/absent
+  const getBeneficiaryType = (p) => (p && (p.beneficiary_type || p.type)) || "chatter";
+  const chatterPayouts = (payouts || []).filter(p => p.user_id && getBeneficiaryType(p) === "chatter");
+
   const getChatterData = (chatterId) => {
     const chTx = payFilteredTxs.filter(tx=>tx.chatter_id===chatterId && tx.status==="validated");
     const totalComm = chTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
-    const paidAmount = payouts.filter(p=>p.user_id===chatterId && p.status==="done").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
-    const pendingAmount = payouts.filter(p=>p.user_id===chatterId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const paidAmount = chatterPayouts.filter(p=>p.user_id===chatterId && p.status==="done").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
+    const pendingAmount = chatterPayouts.filter(p=>p.user_id===chatterId && p.status==="pending").reduce((s,p)=>s+convertAmount(Number(p.amount),p.currency),0);
     const chPayslips = (payslips||[]).filter(p=>p.user_id===chatterId);
     const paidPayslips = chPayslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
     return {totalEarned:totalComm, paidAmount, pendingAmount, balance:totalComm-paidAmount, chPayslips, paidPayslips};
@@ -8433,7 +8437,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
     if(!form.date) { addToast(fr?"Date requise":"Date required","error"); return; }
     setSaving(true);
     try {
-      const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), currency:form.currency, method:form.method, date:form.date, status:"pending"}).select().single();
+      const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), currency:form.currency, method:form.method, date:form.date, status:"pending", type:"chatter"}).select().single();
       if(error) { addToast("Erreur payout: " + error.message, "error"); setSaving(false); return; }
       if(inserted && user.role==="gerant") {
         try { await generateChatterInvoice({id:inserted.id, user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { addToast(fr?"Erreur génération facture":"Invoice generation error","error"); }
@@ -8454,7 +8458,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
 
   // Breakdown modal data
   const bdCh = breakdownChatter ? allChatterData.find(c=>c.id===breakdownChatter) : null;
-  const bdPayouts = bdCh ? payouts.filter(p=>p.user_id===bdCh.id).sort((a,b)=>new Date(b.date)-new Date(a.date)) : [];
+  const bdPayouts = bdCh ? chatterPayouts.filter(p=>p.user_id===bdCh.id).sort((a,b)=>new Date(b.date)-new Date(a.date)) : [];
   const bdPayslips = bdCh ? (bdCh.data.chPayslips||[]).sort((a,b)=>b.period?.localeCompare(a.period)) : [];
   const bdTxs = bdCh ? payFilteredTxs.filter(tx=>tx.chatter_id===bdCh.id && tx.status==="validated").sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,20) : [];
 
@@ -8527,7 +8531,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
       {/* ── CHATTER CARDS ── */}
       {allChatterData.map(ch=>{
         const {data} = ch;
-        const chPayouts = payouts.filter(p=>p.user_id===ch.id).sort((a,b)=>new Date(b.date)-new Date(a.date));
+        const chPayouts = chatterPayouts.filter(p=>p.user_id===ch.id).sort((a,b)=>new Date(b.date)-new Date(a.date));
         const lastPayout = chPayouts[0];
         return (
           <div key={ch.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,marginBottom:16,cursor:"pointer",transition:"all 0.2s"}} onClick={()=>setBreakdownChatter(ch.id)}>
@@ -8551,7 +8555,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
             </div>
             {lastPayout && (
               <div style={{marginTop:10,fontSize:11,color:"var(--text-tertiary)"}}>
-                {fr?"Dernier paiement":"Last payment"}: {fmtDate(lastPayout.date)} — {fmtAmount(lastPayout.amount)} ({lastPayout.method}) <span className={`badge ${lastPayout.status==="done"?"badge-done":"badge-pending"}`} style={{fontSize:9}}>{lastPayout.status}</span>
+                {fr?"Dernier paiement":"Last payment"}: {fmtDate(lastPayout.date)} — {fmtAmount(lastPayout.amount)} ({lastPayout.method}) <span style={{fontSize:9,color:"var(--text-quaternary)",marginLeft:4}}>{getBeneficiaryType(lastPayout)==="modele"?(fr?"Modèle":"Model"):""}</span> <span className={`badge ${lastPayout.status==="done"?"badge-done":"badge-pending"}`} style={{fontSize:9}}>{lastPayout.status}</span>
               </div>
             )}
           </div>
@@ -8657,13 +8661,14 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
               ) : (
                 <div className="table-wrap">
                   <table className="table" style={{fontSize:12}}>
-                    <thead><tr><th>{t(lang,"date")||"Date"}</th><th>{t(lang,"amount")||"Montant"}</th><th>{t(lang,"method")||"Méthode"}</th><th>Status</th></tr></thead>
+                    <thead><tr><th>{t(lang,"date")||"Date"}</th><th>{t(lang,"amount")||"Montant"}</th><th>{t(lang,"method")||"Méthode"}</th><th>{fr?"Type":"Type"}</th><th>Status</th></tr></thead>
                     <tbody>
                       {bdPayouts.map(p=>(
                         <tr key={p.id}>
                           <td>{fmtDate(p.date)}</td>
                           <td style={{fontWeight:700}}>{fmtAmount(p.amount)}</td>
                           <td>{p.method}</td>
+                          <td><span style={{fontSize:10,color:"var(--text-tertiary)"}}>{getBeneficiaryType(p)==="modele"?(fr?"Modèle":"Model"):(fr?"Chatter":"Chatter")}</span></td>
                           <td><span className={`badge ${p.status==="done"?"badge-done":"badge-pending"}`}>{p.status==="done"?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span></td>
                         </tr>
                       ))}
