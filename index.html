@@ -13972,12 +13972,17 @@ const ChatterDashboardTab = ({user, lang, txs, spenders, models}) => {
 };
 
 // =============================================
-// CHATTER ROLE — TRANSACTIONS
+// CHATTER ROLE — TRANSACTIONS (EC4)
 // =============================================
 const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, onRefresh}) => {
   const addToast = useToast();
   const { fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
+  const ctx = getChatterContext(user, models);
+  const { assignedModelIds, assignedModels } = ctx;
+  const myModelIds = assignedModelIds;
+  const myModels = assignedModels;
+
   const {sort, onSort, doSort} = useSortable("date", "desc");
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounce(search, DEBOUNCE_DELAY);
@@ -13986,9 +13991,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({spender_handle:"",amount:"",currency:"EUR",model_id:"",product:"",tag:"",notes:""});
 
-  const myModelIds = user.assigned_models || [];
-  const myModels = models.filter(m => myModelIds.includes(m.id));
-  const myTxs = txs.filter(tx => myModelIds.includes(tx.model_id));
+  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
 
   const filtered = useMemo(() => {
     let list = myTxs;
@@ -14000,12 +14003,13 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
         (tx.notes || "").toLowerCase().includes(q)
       );
     }
-    return doSort(list, {date: x => x.date, amount: x => Number(x.amount), spender_handle: x => x.spender_handle});
+    return doSort(list, {date: x => x.date || x.created_at, amount: x => Number(x.amount || 0), spender_handle: x => (x.spender_handle || "").toLowerCase()});
   }, [myTxs, debouncedSearch, sort]);
 
   const pag = usePagination(filtered);
 
   const startEdit = (tx) => {
+    if (tx.status !== "pending") return;
     setEditingTx(tx);
     setForm({spender_handle: tx.spender_handle || "", amount: String(tx.amount || ""), currency: tx.currency || "EUR", model_id: tx.model_id || "", product: tx.product || "", tag: tx.tag || "", notes: tx.notes || ""});
     setShowForm(true);
@@ -14020,21 +14024,18 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const handleSubmit = async () => {
     if (!form.spender_handle.trim()) { addToast(fr ? "Spender requis" : "Spender required", "error"); return; }
     if (!form.amount || isNaN(parseFloat(form.amount)) || parseFloat(form.amount) <= 0) { addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return; }
-    if (!form.model_id) { addToast(fr ? "Modèle requis" : "Model required", "error"); return; }
+    if (!form.model_id || !myModelIds.includes(form.model_id)) { addToast(fr ? "Modèle requis (parmi tes modèles)" : "Model required (from your models)", "error"); return; }
     setSaving(true);
     try {
       const handle = form.spender_handle.trim().replace(/^@/, "");
-      // Upsert spender
       try { await sb.from("spenders").upsert({handle, name: handle, status: "active"}, {onConflict: "handle"}); } catch(e) { /* Spender upsert best-effort */ }
 
       if (editingTx) {
-        // Update existing TX
         const updates = {spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "EUR", model_id: form.model_id, product: form.product || null, tag: form.tag || null, notes: form.notes || null};
-        const {error} = await sb.from("transactions").update(updates).eq("id", editingTx.id);
+        const {error} = await sb.from("transactions").update(updates).eq("id", editingTx.id).eq("status","pending");
         if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
         addToast(fr ? "TX modifiée" : "TX updated", "success");
       } else {
-        // Create new TX
         const now = new Date();
         const dateUTC1 = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Paris"}));
         const txRow = {date: dateUTC1.toISOString(), spender_handle: handle, amount: parseFloat(form.amount), status: "pending", model_id: form.model_id, chatter_id: user.id, notes: form.notes || null};
@@ -14050,7 +14051,6 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
       setEditingTx(null);
       await onRefresh();
     } catch (e) {
-      // TX submit failed
       setSaving(false);
       addToast("Erreur: " + e.message, "error");
     }
@@ -14062,88 +14062,99 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
     return React.createElement("span", {style:{padding:"2px 8px",borderRadius:10,background:c+"15",color:c,fontSize:10,fontWeight:700}}, l);
   };
 
+  const colCount = 7;
+
   return (
-    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18,flexWrap:"wrap",gap:8}}>
-        <div>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{"\u{1F4B0}"} {fr ? "Mes Transactions" : "My Transactions"}</div>
-          <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>{filtered.length} TX</div>
-        </div>
-        <button onClick={startCreate} style={{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>{fr ? "+ Nouvelle TX" : "+ New TX"}</button>
-      </div>
-      {(()=>{
-        const vTx = myTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee");
-        const pTx = myTxs.filter(tx=>tx.status==="pending");
-        const caGross = vTx.reduce((s,tx)=>s+Number(tx.amount||0),0);
-        const caPend = pTx.reduce((s,tx)=>s+Number(tx.amount||0),0);
-        const uniqueSpenders = new Set(myTxs.map(tx=>tx.spender_handle)).size;
-        return (
-          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4, 1fr)",gap:10,marginBottom:18}}>
-            <KPICard label={fr?"CA Brut":"Gross Revenue"} value={`${Math.round(caGross).toLocaleString()}${currencySymbol}`} icon={"\u{1F4B0}"}/>
-            <KPICard label={fr?"Nb TX":"TX Count"} value={`${myTxs.length}`} icon={"\u{1F4CB}"}/>
-            <KPICard label="Spenders" value={`${uniqueSpenders} ${fr?"actifs":"active"}`} icon={"\u{1F465}"}/>
-            <KPICard label={fr?"TX Pending":"TX Pending"} value={`${pTx.length}`} icon={"⏳"} className="warning"/>
+    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":"0 24px"}}>
+      <div className="ui-section-header">
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+          <div>
+            <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4B0}"} {t(lang,"transactions")}</h2>
+            <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr?"Mes transactions — modèles assignés uniquement":"My transactions — assigned models only"}</p>
           </div>
-        );
-      })()}
+          <button className="ui-btn-primary" onClick={startCreate}>{fr ? "+ Nouvelle TX" : "+ New TX"}</button>
+        </div>
+      </div>
 
       {myModelIds.length === 0 && (
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:48,textAlign:"center"}}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucun modèle attribué" : "No models assigned"}</div>
+        <div className="ui-panel" style={{padding:48,textAlign:"center"}}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucune assignation trouvée" : "No assignments found"}</div>
+          <div style={{fontSize:13,color:"var(--muted2)"}}>{fr ? "Contacte ton gérant." : "Contact your manager."}</div>
         </div>
       )}
-      {myModelIds.length > 0 && (<>
-        <input type="text" value={search} onChange={e=>setSearch(e.target.value)} placeholder={fr ? "Rechercher spender, produit..." : "Search spender, product..."} style={{width:"100%",marginBottom:14,padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} />
-        {showForm && (
-          <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
-            <div style={{fontSize:14,fontWeight:700,color:"var(--text)",marginBottom:14}}>{editingTx ? (fr ? "Modifier TX" : "Edit TX") : (fr ? "Nouvelle Transaction" : "New Transaction")}</div>
-            <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:12}}>
-              <div><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>Spender</label><input style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle" /></div>
-              <div><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{fr ? "Montant" : "Amount"}</label><input type="number" style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} placeholder="0" /></div>
-              <div><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{fr ? "Devise" : "Currency"}</label><select style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none"}} value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}><option value="EUR">EUR</option><option value="USD">USD</option><option value="CHF">CHF</option><option value="GBP">GBP</option></select></div>
-              <div><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{fr ? "Modèle" : "Model"}</label><select style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none"}} value={form.model_id} onChange={e=>setForm({...form,model_id:e.target.value})}><option value="">{fr ? "Choisir..." : "Select..."}</option>{myModels.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></div>
-              <div><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>{fr ? "Produit" : "Product"}</label><input style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} value={form.product} onChange={e=>setForm({...form,product:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
-              <div><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>Tag</label><input style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} value={form.tag} onChange={e=>setForm({...form,tag:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
-            </div>
-            <div style={{marginTop:12}}><label style={{display:"block",fontSize:10,color:"var(--muted)",fontWeight:600,textTransform:"uppercase",marginBottom:4}}>Notes</label><input style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder={fr ? "Notes optionnelles" : "Optional notes"} /></div>
-            <div style={{display:"flex",gap:8,marginTop:16}}>
-              <button onClick={handleSubmit} disabled={saving} style={{padding:"8px 16px",borderRadius:10,border:"none",background:saving?"var(--surface2)":"var(--accent)",color:saving?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}}>{saving ? React.createElement(Spinner) : (editingTx ? (fr ? "Sauvegarder" : "Save") : (fr ? "Créer" : "Create"))}</button>
-              <button onClick={()=>{setShowForm(false);setEditingTx(null);}} style={{padding:"8px 16px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer"}}>{fr ? "Annuler" : "Cancel"}</button>
-            </div>
-          </div>
-        )}
 
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,overflow:"hidden"}}>
-          <div style={{overflowX:"auto"}}>
-            <table className="table" style={{fontSize:12}}>
-              <thead><tr>
-                <SortTh label="Date" sortKey="date" sort={sort} onSort={onSort} />
-                <SortTh label="Spender" sortKey="spender_handle" sort={sort} onSort={onSort} />
-                <th>{fr ? "Modèle" : "Model"}</th>
-                <th>{fr ? "Produit" : "Product"}</th>
-                <SortTh label={fr ? "Montant" : "Amount"} sortKey="amount" sort={sort} onSort={onSort} />
-                <th>{fr ? "Statut" : "Status"}</th>
-                <th></th>
-              </tr></thead>
-              <tbody>
-                {pag.paginatedData.map(tx => (
-                  <tr key={tx.id}>
-                    <td>{fmtDate(tx.date)}</td>
-                    <td style={{fontWeight:600}}>@{tx.spender_handle}</td>
-                    <td>{models.find(m=>m.id===tx.model_id)?.name || "—"}</td>
-                    <td>{tx.product || "—"}{tx.tag ? ` (${tx.tag})` : ""}</td>
-                    <td style={{fontWeight:700}}>{fmtAmount(tx.amount)}</td>
-                    <td>{statusBadge(tx.status)}</td>
-                    <td><button onClick={()=>startEdit(tx)} style={{padding:"5px 12px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:11,fontWeight:600,cursor:"pointer"}}>{fr ? "Modifier" : "Edit"}</button></td>
-                  </tr>
-                ))}
-                {pag.paginatedData.length === 0 && <tr><td colSpan={7} style={{textAlign:"center",color:"var(--muted2)",padding:32}}>{fr ? "Aucune transaction" : "No transactions"}</td></tr>}
-              </tbody>
-            </table>
+      {myModelIds.length > 0 && (
+        <>
+          {(()=>{
+            const vTx = myTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee");
+            const pTx = myTxs.filter(tx=>tx.status==="pending");
+            const caGross = vTx.reduce((s,tx)=>s+Number(tx.amount||0),0);
+            const uniqueSpenders = new Set(myTxs.map(tx=>tx.spender_handle||tx.spender_id).filter(Boolean)).size;
+            return (
+              <div className="kpi-grid ui-mb-md" style={{marginBottom:20,display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4, 1fr)",gap:10}}>
+                <KPICard label={fr?"CA Brut":"Gross Revenue"} value={`${Math.round(caGross).toLocaleString()}${currencySymbol}`} icon={"\u{1F4B0}"}/>
+                <KPICard label={fr?"Nb TX":"TX Count"} value={`${myTxs.length}`} icon={"\u{1F4CB}"}/>
+                <KPICard label="Spenders" value={`${uniqueSpenders} ${fr?"actifs":"active"}`} icon={"\u{1F465}"}/>
+                <KPICard label={fr?"TX Pending":"TX Pending"} value={`${pTx.length}`} icon={"⏳"} className={pTx.length>0?"warning":""}/>
+              </div>
+            );
+          })()}
+
+          <input type="text" className="form-input ui-input" value={search} onChange={e=>setSearch(e.target.value)} placeholder={fr ? "Rechercher spender, produit..." : "Search spender, product..."} style={{width:"100%",marginBottom:14,padding:"10px 14px",borderRadius:10,border:"1px solid var(--border-subtle)",background:"var(--bg-raised)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} />
+
+          {showForm && (
+            <div className="ui-panel" style={{marginBottom:20}}>
+              <div style={{fontSize:14,fontWeight:700,color:"var(--text)",marginBottom:14}}>{editingTx ? (fr ? "Modifier TX" : "Edit TX") : (fr ? "Nouvelle Transaction" : "New Transaction")}</div>
+              <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:12}}>
+                <div className="form-group-modal"><label className="form-label">Spender *</label><input className="form-input ui-input" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle" /></div>
+                <div className="form-group-modal"><label className="form-label">{fr ? "Montant" : "Amount"} *</label><input type="number" className="form-input ui-input" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} placeholder="0" /></div>
+                <div className="form-group-modal"><label className="form-label">{fr ? "Devise" : "Currency"}</label><select className="filter-select ui-input" style={{width:"100%"}} value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}><option value="EUR">EUR</option><option value="USD">USD</option><option value="CHF">CHF</option><option value="GBP">GBP</option></select></div>
+                <div className="form-group-modal"><label className="form-label">{fr ? "Modèle" : "Model"} *</label><select className="filter-select ui-input" style={{width:"100%"}} value={form.model_id} onChange={e=>setForm({...form,model_id:e.target.value})}><option value="">{fr ? "Choisir..." : "Select..."}</option>{myModels.map(m => <option key={m.id} value={m.id}>{m.name || "—"}</option>)}</select></div>
+                <div className="form-group-modal"><label className="form-label">{fr ? "Produit" : "Product"}</label><input className="form-input ui-input" value={form.product} onChange={e=>setForm({...form,product:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
+                <div className="form-group-modal"><label className="form-label">Tag</label><input className="form-input ui-input" value={form.tag} onChange={e=>setForm({...form,tag:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
+              </div>
+              <div style={{marginTop:12}}><label className="form-label">Notes</label><input className="form-input ui-input" value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder={fr ? "Notes optionnelles" : "Optional notes"} /></div>
+              <div style={{display:"flex",gap:8,marginTop:16}}>
+                <button className="ui-btn-primary" onClick={handleSubmit} disabled={saving}>{saving ? React.createElement(Spinner) : (editingTx ? (fr ? "Sauvegarder" : "Save") : (fr ? "Créer" : "Create"))}</button>
+                <button className="ui-btn-secondary" onClick={()=>{setShowForm(false);setEditingTx(null);}}>{fr ? "Annuler" : "Cancel"}</button>
+              </div>
+            </div>
+          )}
+
+          <div className="ui-panel">
+            <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+              <table className="table" style={{fontSize:12,minWidth:_isMobile?500:undefined}}>
+                <thead><tr>
+                  <SortTh label="Date" sortKey="date" sort={sort} onSort={onSort} />
+                  <SortTh label="Spender" sortKey="spender_handle" sort={sort} onSort={onSort} />
+                  <th>{fr ? "Modèle" : "Model"}</th>
+                  <th>{fr ? "Produit" : "Product"}</th>
+                  <SortTh label={fr ? "Montant" : "Amount"} sortKey="amount" sort={sort} onSort={onSort} />
+                  <th>{fr ? "Statut" : "Status"}</th>
+                  <th></th>
+                </tr></thead>
+                <tbody>
+                  {pag.paginatedData.map(tx => (
+                    <tr key={tx.id} className={tx.status==="pending"?"pending-row":""}>
+                      <td style={{fontFamily:"monospace",fontSize:12,whiteSpace:"nowrap"}}>{fmtDate(tx.date || tx.created_at)}</td>
+                      <td style={{fontWeight:600}}>@{tx.spender_handle || tx.spender_id || "—"}</td>
+                      <td>{(models||[]).find(m=>m.id===tx.model_id)?.name || "—"}</td>
+                      <td>{(tx.product || "—")}{(tx.tag ? ` (${tx.tag})` : "")}</td>
+                      <td style={{fontWeight:700}}>{fmtAmount(Number(tx.amount || 0), tx.currency)}</td>
+                      <td>{statusBadge(tx.status)}</td>
+                      <td style={{whiteSpace:"nowrap"}}>
+                        {tx.status==="pending" && <button className="ui-btn-ghost" style={{padding:"4px 8px"}} onClick={()=>startEdit(tx)}>✏️ {fr ? "Modifier" : "Edit"}</button>}
+                      </td>
+                    </tr>
+                  ))}
+                  {pag.paginatedData.length === 0 && <tr><td colSpan={colCount} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr ? "Aucune transaction" : "No transactions"}</td></tr>}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
-        <PaginationControls pag={pag} lang={lang} />
-      </>)}
+          <PaginationControls pag={pag} lang={lang} />
+        </>
+      )}
     </div>
   );
 };
