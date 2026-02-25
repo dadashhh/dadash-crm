@@ -8405,6 +8405,32 @@ const CompetitionTab = ({user, lang, txs, profiles}) => {
 };
 
 // =============================================
+// PAYOUTS SCHEMA HARDENING (C7) — normalisation lecture/écriture
+// =============================================
+const normalizePayout = (p) => {
+  if (!p || typeof p !== "object") return p;
+  const bt = String(p.beneficiary_type || p.type || "chatter").toLowerCase();
+  const norm = { ...p, _date: p.date || p.created_at, _beneficiaryType: bt === "model" ? "modele" : bt };
+  if (!norm.beneficiary_type && norm.type) norm.beneficiary_type = norm.type;
+  return norm;
+};
+const normalizePayouts = (arr) => (arr || []).map(normalizePayout);
+const getPayoutBeneficiaryType = (p) => (p && (p._beneficiaryType || p.beneficiary_type || p.type || "").toLowerCase()) || "chatter";
+const isModelePayout = (p) => ["modele", "model"].includes(getPayoutBeneficiaryType(p));
+
+const insertPayoutWithSchemaFallback = async (row, addToast, fr) => {
+  const rowFull = { ...row, type: row.type || row.beneficiary_type, beneficiary_type: row.beneficiary_type || row.type };
+  const rowMinimal = { amount: row.amount, currency: row.currency || "CHF", method: row.method || "Virement", date: row.date, status: row.status, notes: row.notes, type: row.type || row.beneficiary_type };
+  if (row.user_id) rowMinimal.user_id = row.user_id; else if (row.model_id) rowMinimal.model_id = row.model_id;
+  let res = await sb.from("payouts").insert(rowFull).select().single();
+  if (res.error && /column.*does not exist|beneficiary_type/i.test(String(res.error.message || ""))) {
+    if (typeof console !== "undefined") console.warn("[DADASH Compta] Insert retry sans beneficiary_type:", res.error.message);
+    res = await sb.from("payouts").insert(rowMinimal).select().single();
+  }
+  return res;
+};
+
+// =============================================
 // PAIES TAB
 // =============================================
 const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefresh, invoices}) => {
@@ -8421,9 +8447,8 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
   const [form, setForm] = useState({beneficiary_id:defaultBeneficiary?.id||"",beneficiary_type:defaultBeneficiary?.type||"chatter",amount:"",currency:"CHF",method:"Virement",date:""});
   const fr = lang === "fr";
   const payFilteredTxs = dr.filterByDate(txs, "date");
-  const getBeneficiaryType = (p) => (p && (p.beneficiary_type || p.type)) || "chatter";
-  const chatterPayouts = (payouts || []).filter(p => p.user_id && getBeneficiaryType(p) === "chatter");
-  const modelPayouts = (payouts || []).filter(p => p.model_id && getBeneficiaryType(p) === "modele");
+  const chatterPayouts = (payouts || []).filter(p => p.user_id && getPayoutBeneficiaryType(p) === "chatter");
+  const modelPayouts = (payouts || []).filter(p => p.model_id && isModelePayout(p));
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -8467,17 +8492,25 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
       const row = {amount:parseFloat(form.amount), currency:form.currency, method:form.method, date:form.date, status:"pending", type:bt, beneficiary_type:bt};
       if (bt === "chatter") { row.user_id = form.beneficiary_id; }
       else { row.model_id = form.beneficiary_id; }
-      const {data:inserted, error} = await sb.from("payouts").insert(row).select().single();
-      if(error) { addToast("Erreur payout: " + error.message, "error"); setSaving(false); return; }
+      const {data:inserted, error} = await insertPayoutWithSchemaFallback(row, addToast, fr);
+      if(error) {
+        const msg = error.message || "";
+        if (/permission|denied|policy/i.test(msg)) addToast(fr?"Droits insuffisants pour créer un payout.":"Insufficient permissions to create payout.","error");
+        else if (/column|does not exist/i.test(msg)) addToast(fr?"Schéma payouts incompatible. Exécutez la migration SQL (beneficiary_type).":"Payouts schema incompatible. Run SQL migration (beneficiary_type).","error");
+        else addToast(fr?"Erreur insert payout: ":"Insert payout error: " + msg, "error");
+        if (user.role==="gerant" && typeof console !== "undefined") console.warn("[DADASH Compta] Insert payout failed:", msg, row);
+        setSaving(false); return;
+      }
       if(inserted && user.role==="gerant" && bt === "chatter") {
         try { await generateChatterInvoice({id:inserted.id, user_id:form.beneficiary_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { addToast(fr?"Erreur génération facture":"Invoice generation error","error"); }
       }
+      if (user.role==="gerant" && typeof console !== "undefined") console.log("[DADASH Compta] Payout ajouté:", bt, inserted?.id, row.amount);
       const nextDefault = chatters[0] ? {id:chatters[0].id,type:"chatter"} : (modelList[0] ? {id:modelList[0].id,type:"modele"} : null);
       setForm({beneficiary_id:nextDefault?.id||"",beneficiary_type:nextDefault?.type||"chatter",amount:"",currency:"CHF",method:"Virement",date:""});
       setShowForm(false);
       await onRefresh();
       addToast(t(lang,"payout_added")||"Payout ajouté","success");
-    } catch(e) { addToast("Erreur payout: " + e.message, "error"); }
+    } catch(e) { addToast(fr?"Erreur inattendue: ":"Unexpected error: " + (e.message||e), "error"); if (user.role==="gerant") console.error("[DADASH Compta] handleAddPayout:", e); }
     setSaving(false);
   };
 
@@ -8491,11 +8524,19 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
       const row = {amount:data.balance, date:new Date().toISOString().slice(0,10), status:"done", type:bt, beneficiary_type:bt, notes:"Marqué payé depuis Compta", currency:"CHF", method:"Virement"};
       if (bt === "chatter") { row.user_id = beneficiary.id; }
       else { row.model_id = beneficiary.id; }
-      const {error} = await sb.from("payouts").insert(row);
-      if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
+      const {error} = await insertPayoutWithSchemaFallback(row, addToast, fr);
+      if (error) {
+        const msg = error.message || "";
+        if (/permission|denied|policy/i.test(msg)) addToast(fr?"Droits insuffisants.":"Insufficient permissions.","error");
+        else if (/column|does not exist/i.test(msg)) addToast(fr?"Schéma payouts incompatible. Migration SQL requise.":"Payouts schema incompatible. SQL migration required.","error");
+        else addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + msg, "error");
+        if (user.role==="gerant") console.warn("[DADASH Compta] handleMarkPaid failed:", msg, row);
+        setSaving(false); return;
+      }
+      if (user.role==="gerant") console.log("[DADASH Compta] Marqué payé:", bt, beneficiary.name || beneficiary.id);
       await onRefresh();
       addToast(fr?"Marqué payé ✓":"Marked paid ✓","success");
-    } catch (err) { addToast("Erreur: " + (err.message||err), "error"); }
+    } catch (err) { addToast(fr?"Erreur inattendue: ":"Unexpected error: " + (err.message||err), "error"); if (user.role==="gerant") console.error("[DADASH Compta] handleMarkPaid:", err); }
     setSaving(false);
   };
 
@@ -8728,7 +8769,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
                           <td>{fmtDate(p.date)}</td>
                           <td style={{fontWeight:700}}>{fmtAmount(p.amount)}</td>
                           <td>{p.method}</td>
-                          <td><span style={{fontSize:10,color:"var(--text-tertiary)"}}>{getBeneficiaryType(p)==="modele"?(fr?"Modèle":"Model"):(fr?"Chatter":"Chatter")}</span></td>
+                          <td><span style={{fontSize:10,color:"var(--text-tertiary)"}}>{isModelePayout(p)?(fr?"Modèle":"Model"):(fr?"Chatter":"Chatter")}</span></td>
                           <td><span className={`badge ${p.status==="done"?"badge-done":"badge-pending"}`}>{p.status==="done"?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span></td>
                         </tr>
                       ))}
@@ -9269,7 +9310,7 @@ const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spende
   const cs = currencySymbol;
   const comptaFiltered = dr.filterByDate(txs || [], "date");
   const validTxs = comptaFiltered.filter(tx=>tx.status==="validated");
-  const payoutsWithDate = (payouts || []).map(p => ({ ...p, _date: p.date || p.created_at }));
+  const payoutsWithDate = (payouts || []).map(p => ({ ...p, _date: p._date || p.date || p.created_at }));
   const filteredPayouts = dr.filterByDate(payoutsWithDate, "_date");
 
   // ── Fallback colonnes TX (amount, net_amount, chatter_commission, provider_fee, dada_fee) ──
@@ -9638,16 +9679,15 @@ const ResultatsDadashTab = ({user, lang, txs, expenses, payouts, models, profile
   const comptaFiltered = dr.filterByDate(txs || [], "date");
   const validTxs = comptaFiltered.filter(tx => tx.status === "validated");
 
-  // ── Payouts filtrés par période (fallback beneficiary_type → type) ──
-  const getBeneficiaryType = (p) => (p && (p.beneficiary_type || p.type || "")).toLowerCase() || "chatter";
-  const payoutsWithDate = (payouts || []).map(p => ({ ...p, _date: p.date || p.created_at }));
+  // ── Payouts filtrés par période (normalisés via normalizePayouts) ──
+  const payoutsWithDate = (payouts || []).map(p => ({ ...p, _date: p._date || p.date || p.created_at }));
   const filteredPayouts = dr.filterByDate(payoutsWithDate, "_date");
 
   // ── C5 CALCULS ──
   const caNet = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.net_amount ?? tx.amount ?? 0), tx.currency), 0);
   const commissionDadash = caNet * 0.1;
-  const chargesChatters = filteredPayouts.filter(p => getBeneficiaryType(p) === "chatter").reduce((s, p) => s + convertAmount(Number(p.amount || 0), p.currency || "CHF"), 0);
-  const chargesModeles = filteredPayouts.filter(p => ["modele", "model"].includes(getBeneficiaryType(p))).reduce((s, p) => s + convertAmount(Number(p.amount || 0), p.currency || "CHF"), 0);
+  const chargesChatters = filteredPayouts.filter(p => getPayoutBeneficiaryType(p) === "chatter").reduce((s, p) => s + convertAmount(Number(p.amount || 0), p.currency || "CHF"), 0);
+  const chargesModeles = filteredPayouts.filter(p => isModelePayout(p)).reduce((s, p) => s + convertAmount(Number(p.amount || 0), p.currency || "CHF"), 0);
   const resultatNetDadash = commissionDadash - chargesChatters - chargesModeles;
 
   // ── Commission DADASH par modèle (10% du CA Net par modèle) ──
@@ -9682,9 +9722,8 @@ const ResultatsDadashTab = ({user, lang, txs, expenses, payouts, models, profile
       const key = (p.date || p.created_at || p._date || "").toString().slice(0, 7);
       if (byMonth[key]) {
         const amt = convertAmount(Number(p.amount || 0), p.currency || "CHF");
-        const kind = getBeneficiaryType(p);
-        if (kind === "chatter") byMonth[key].charges_chatters += amt;
-        else if (["modele", "model"].includes(kind)) byMonth[key].charges_modeles += amt;
+        if (getPayoutBeneficiaryType(p) === "chatter") byMonth[key].charges_chatters += amt;
+        else if (isModelePayout(p)) byMonth[key].charges_modeles += amt;
       }
     });
     return Object.values(byMonth).map(d => ({
@@ -22405,7 +22444,9 @@ const App = () => {
     setSpenders(spenderData);
     setProfiles(profileData);
     setModels(modelData);
-    setPayouts(payoutData);
+    const normPayouts = normalizePayouts(payoutData);
+    setPayouts(normPayouts);
+    if (currentUser?.role==="gerant" && normPayouts.length > 0 && typeof console !== "undefined") console.log("[DADASH Compta] Payouts chargés:", normPayouts.length, "| sample:", normPayouts[0]?.id, normPayouts[0]?._beneficiaryType || normPayouts[0]?.type, normPayouts[0]?._date?.slice?.(0,10));
     setPayslips((psR&&psR.data)||[]);
     setExpenses(expenseData);
     setProviderPayouts(ppData);
