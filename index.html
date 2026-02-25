@@ -15064,7 +15064,7 @@ const ChatterDashboardTab = ({user, lang, txs, spenders, models, profiles}) => {
 // =============================================
 // CHATTER ROLE — TRANSACTIONS (EC4)
 // =============================================
-const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, onRefresh}) => {
+const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, profiles, onRefresh}) => {
   const addToast = useToast();
   const { fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
@@ -15072,6 +15072,8 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const { assignedModelIds, assignedModels } = ctx;
   const myModelIds = assignedModelIds;
   const myModels = assignedModels;
+  const activeProducts = (products||[]).filter(p => p.active !== false);
+  const activeTags = (productTags||[]).filter(t => t.active !== false);
 
   const {sort, onSort, doSort} = useSortable("date", "desc");
   const [search, setSearch] = useState("");
@@ -15079,7 +15081,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const [showForm, setShowForm] = useState(false);
   const [editingTx, setEditingTx] = useState(null);
   const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState({spender_handle:"",amount:"",currency:"EUR",model_id:"",product:"",tag:"",notes:""});
+  const [form, setForm] = useState({spender_handle:"",amount:"",currency:"CHF",model_id:"",provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:"",payment_method:"",product_contents:[]});
 
   const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
 
@@ -15101,37 +15103,48 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const startEdit = (tx) => {
     if (tx.status !== "pending") return;
     setEditingTx(tx);
-    setForm({spender_handle: tx.spender_handle || "", amount: String(tx.amount || ""), currency: tx.currency || "EUR", model_id: tx.model_id || "", product: tx.product || "", tag: tx.tag || "", notes: tx.notes || ""});
+    setForm({spender_handle: tx.spender_handle || "", amount: String(tx.amount || ""), currency: tx.currency || "CHF", model_id: tx.model_id || "", provider_id: tx.provider_id || "", product: tx.product || "", tag: tx.tag || "", product_id: tx.product_id || "", product_tag_id: tx.product_tag_id || "", notes: tx.notes || "", payment_method: tx.payment_method || "", product_contents: tx.product_contents || []});
     setShowForm(true);
   };
 
   const startCreate = () => {
     setEditingTx(null);
-    setForm({spender_handle:"",amount:"",currency:"EUR",model_id: myModelIds.length === 1 ? myModelIds[0] : "",product:"",tag:"",notes:""});
+    setForm({spender_handle:"",amount:"",currency:"CHF",model_id: myModelIds.length === 1 ? myModelIds[0] : "",provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:"",payment_method:"",product_contents:[]});
     setShowForm(true);
   };
 
   const handleSubmit = async () => {
     if (!form.spender_handle.trim()) { addToast(fr ? "Spender requis" : "Spender required", "error"); return; }
-    if (!form.amount || isNaN(parseFloat(form.amount)) || parseFloat(form.amount) <= 0) { addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return; }
     if (!form.model_id || !myModelIds.includes(form.model_id)) { addToast(fr ? "Modèle requis (parmi tes modèles)" : "Model required (from your models)", "error"); return; }
+    if (!form.provider_id) { addToast(fr ? "Provider requis" : "Provider required", "error"); return; }
+    if (!form.product) { addToast(fr ? "Produit requis" : "Product required", "error"); return; }
+    if (!form.amount || isNaN(parseFloat(form.amount)) || parseFloat(form.amount) <= 0) { addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return; }
+    if (!form.payment_method) { addToast(fr ? "Méthode de paiement requise" : "Payment method required", "error"); return; }
     setSaving(true);
+    const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     try {
       const handle = form.spender_handle.trim().replace(/^@/, "");
       try { await sb.from("spenders").upsert({handle, name: handle, status: "active"}, {onConflict: "handle"}); } catch(e) { /* Spender upsert best-effort */ }
 
       if (editingTx) {
-        const updates = {spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "EUR", model_id: form.model_id, product: form.product || null, tag: form.tag || null, notes: form.notes || null};
+        const updates = {spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "CHF", model_id: form.model_id, product: form.product || null, tag: form.tag || null, notes: form.notes || null, payment_method: form.payment_method || null};
+        if (isUUID(form.provider_id)) updates.provider_id = form.provider_id;
+        if (isUUID(form.product_id)) updates.product_id = form.product_id;
+        if (isUUID(form.product_tag_id)) updates.product_tag_id = form.product_tag_id;
+        if (form.product_contents && form.product_contents.length > 0) updates.product_contents = form.product_contents;
         const {error} = await sb.from("transactions").update(updates).eq("id", editingTx.id).eq("status","pending");
         if (error) { addToast("Erreur: " + error.message, "error"); setSaving(false); return; }
         addToast(fr ? "TX modifiée" : "TX updated", "success");
       } else {
         const now = new Date();
         const dateUTC1 = new Date(now.toLocaleString("en-US", {timeZone: "Europe/Paris"}));
-        const txRow = {date: dateUTC1.toISOString(), spender_handle: handle, amount: parseFloat(form.amount), status: "pending", model_id: form.model_id, chatter_id: user.id, notes: form.notes || null};
-        if (form.currency && form.currency !== "EUR") txRow.currency = form.currency;
+        const txRow = {date: dateUTC1.toISOString(), spender_handle: handle, amount: parseFloat(form.amount), currency: form.currency || "CHF", status: "pending", model_id: form.model_id, chatter_id: user.id, notes: form.notes || null, payment_method: form.payment_method || null};
+        if (isUUID(form.provider_id)) txRow.provider_id = form.provider_id;
         if (form.product) txRow.product = form.product;
         if (form.tag) txRow.tag = form.tag;
+        if (isUUID(form.product_id)) txRow.product_id = form.product_id;
+        if (isUUID(form.product_tag_id)) txRow.product_tag_id = form.product_tag_id;
+        if (form.product_contents && form.product_contents.length > 0) txRow.product_contents = form.product_contents;
         const res = await safeInsertTx(txRow);
         if (res.error) { addToast("Erreur: " + (res.error.message || "insert failed"), "error"); setSaving(false); return; }
         addToast(fr ? "TX créée" : "TX created", "success");
@@ -15193,20 +15206,107 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
           <input type="text" className="form-input ui-input" value={search} onChange={e=>setSearch(e.target.value)} placeholder={fr ? "Rechercher spender, produit..." : "Search spender, product..."} style={{width:"100%",marginBottom:14,padding:"10px 14px",borderRadius:10,border:"1px solid var(--border-subtle)",background:"var(--bg-raised)",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}} />
 
           {showForm && (
-            <div className="ui-panel" style={{marginBottom:20}}>
-              <div style={{fontSize:14,fontWeight:700,color:"var(--text)",marginBottom:14}}>{editingTx ? (fr ? "Modifier TX" : "Edit TX") : (fr ? "Nouvelle Transaction" : "New Transaction")}</div>
-              <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:12}}>
-                <div className="form-group-modal"><label className="form-label">Spender *</label><input className="form-input ui-input" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle" /></div>
-                <div className="form-group-modal"><label className="form-label">{fr ? "Montant" : "Amount"} *</label><input type="number" className="form-input ui-input" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} placeholder="0" /></div>
-                <div className="form-group-modal"><label className="form-label">{fr ? "Devise" : "Currency"}</label><select className="filter-select ui-input" style={{width:"100%"}} value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}><option value="EUR">EUR</option><option value="USD">USD</option><option value="CHF">CHF</option><option value="GBP">GBP</option></select></div>
-                <div className="form-group-modal"><label className="form-label">{fr ? "Modèle" : "Model"} *</label><select className="filter-select ui-input" style={{width:"100%"}} value={form.model_id} onChange={e=>setForm({...form,model_id:e.target.value})}><option value="">{fr ? "Choisir..." : "Select..."}</option>{myModels.map(m => <option key={m.id} value={m.id}>{m.name || "—"}</option>)}</select></div>
-                <div className="form-group-modal"><label className="form-label">{fr ? "Produit" : "Product"}</label><input className="form-input ui-input" value={form.product} onChange={e=>setForm({...form,product:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
-                <div className="form-group-modal"><label className="form-label">Tag</label><input className="form-input ui-input" value={form.tag} onChange={e=>setForm({...form,tag:e.target.value})} placeholder={fr ? "Optionnel" : "Optional"} /></div>
-              </div>
-              <div style={{marginTop:12}}><label className="form-label">Notes</label><input className="form-input ui-input" value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder={fr ? "Notes optionnelles" : "Optional notes"} /></div>
-              <div style={{display:"flex",gap:8,marginTop:16}}>
-                <button className="ui-btn-primary" onClick={handleSubmit} disabled={saving}>{saving ? React.createElement(Spinner) : (editingTx ? (fr ? "Sauvegarder" : "Save") : (fr ? "Créer" : "Create"))}</button>
-                <button className="ui-btn-secondary" onClick={()=>{setShowForm(false);setEditingTx(null);}}>{fr ? "Annuler" : "Cancel"}</button>
+            <div className="modal-overlay" onClick={()=>{setShowForm(false);setEditingTx(null);}}>
+              <div className="ui-panel" style={{maxWidth:560,width:"100%",margin:16,maxHeight:"92vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+                <div className="ui-flex" style={{justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+                  <div className="ui-section-title" style={{fontSize:16}}>💸 {editingTx ? (fr ? "Modifier TX" : "Edit TX") : (fr ? "Nouvelle Transaction" : "New Transaction")}</div>
+                  <button onClick={()=>{setShowForm(false);setEditingTx(null);}} style={{background:"none",border:"none",color:"var(--text-secondary)",fontSize:22,cursor:"pointer",lineHeight:1,padding:"0 4px"}}>×</button>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:14}}>
+                  <div className="form-group-modal">
+                    <label className="form-label">Spender *</label>
+                    <input className="form-input ui-input" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@handle TG" />
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">{fr ? "Modèle" : "Model"} *</label>
+                    <select className="filter-select ui-input" style={{width:"100%"}} value={form.model_id} onChange={e=>setForm({...form,model_id:e.target.value})}>
+                      <option value="">— {fr ? "Choisir" : "Select"} —</option>
+                      {myModels.map(m=><option key={m.id} value={m.id}>{m.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">Provider *</label>
+                    <select className="filter-select ui-input" style={{width:"100%"}} value={form.provider_id} onChange={e=>setForm({...form,provider_id:e.target.value})}>
+                      <option value="">— {fr ? "Choisir" : "Select"} —</option>
+                      {(profiles||[]).filter(p=>p.role==="provider").map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">{fr ? "Produit" : "Product"} *</label>
+                    <select className="filter-select ui-input" style={{width:"100%"}} value={form.product} onChange={e=>{
+                      setForm({...form, product:e.target.value, product_id:"", product_tag_id:"", tag:"", amount:""});
+                    }}>
+                      <option value="">— {fr ? "Choisir" : "Select"} —</option>
+                      {[...new Set(activeProducts.map(p=>p.category).filter(Boolean))].sort((a,b)=>{const ia=PRODUCT_CATEGORIES.indexOf(a),ib=PRODUCT_CATEGORIES.indexOf(b);return(ia<0?99:ia)-(ib<0?99:ib)||a.localeCompare(b);}).map(cat=>(
+                        <option key={cat} value={cat}>{CATEGORY_ICONS[cat]||"📦"} {cat}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">{fr ? "Détail produit" : "Product detail"}</label>
+                    {(()=>{
+                      const catProds = form.product ? activeProducts.filter(p=>p.category===form.product) : [];
+                      const selProd = catProds.find(p=>p.id===form.product_id);
+                      return (<>
+                        <select className="filter-select ui-input" style={{width:"100%"}} value={form.product_id} onChange={e=>{
+                          const pid = e.target.value;
+                          const prod = catProds.find(p=>p.id===pid);
+                          if(prod) {
+                            setForm({...form, product_id:pid, product_tag_id:"", tag:prod.name, amount:prod.price_chf>0?String(prod.price_chf):"", currency:prod.price_chf>0?"CHF":form.currency});
+                          } else {
+                            setForm({...form, product_id:"", product_tag_id:"", tag:"", amount:""});
+                          }
+                        }}>
+                          <option value="">— {fr ? "Aucun" : "None"} —</option>
+                          {catProds.map(p=>(
+                            <option key={p.id} value={p.id}>{p.icon?p.icon+" ":""}{p.name}{p.duration_minutes?` · ${p.duration_minutes}min`:""}{p.price_chf>0?` (${p.price_chf} CHF)`:""}</option>
+                          ))}
+                        </select>
+                        {selProd&&selProd.duration_minutes&&(
+                          <div style={{fontSize:11,color:"var(--text-secondary)",marginTop:4}}>⏱ {fr ? "Durée" : "Duration"} : {selProd.duration_minutes} min</div>
+                        )}
+                      </>);
+                    })()}
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">{fr ? "Montant" : "Amount"} * (CHF)</label>
+                    <input className="form-input ui-input" type="number" value={form.amount} onChange={e=>setForm({...form,amount:e.target.value})} placeholder="0.00" min="0" step="0.01" />
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">{fr ? "Méthode paiement" : "Payment method"} *</label>
+                    <select className="filter-select ui-input" style={{width:"100%"}} value={form.payment_method} onChange={e=>setForm({...form,payment_method:e.target.value})}>
+                      <option value="">— {fr ? "Choisir" : "Select"} —</option>
+                      {PAYMENT_METHODS.map(pm=>{const ptc=PAYMENT_TYPE_COLORS[pm]||PAYMENT_TYPE_COLORS["Autre"];return <option key={pm} value={pm}>{ptc.icon} {pm}</option>;})}
+                    </select>
+                  </div>
+                  <div className="form-group-modal">
+                    <label className="form-label">Chatter</label>
+                    <input className="form-input ui-input" value={user.name || user.email || "—"} disabled style={{opacity:0.6,cursor:"not-allowed"}} />
+                  </div>
+                  <div className="form-group-modal" style={{gridColumn:"1/-1"}}>
+                    <label className="form-label">Notes <span style={{color:"var(--text-tertiary)",fontWeight:400,fontSize:11}}>(optionnel)</span></label>
+                    <textarea className="form-input ui-input" rows={2} value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder={fr ? "Remarque, contexte…" : "Note, context…"} style={{resize:"vertical"}}/>
+                  </div>
+                </div>
+                {form.product_id&&(
+                  <div style={{marginTop:12}}>
+                    <label className="form-label" style={{marginBottom:6,display:"block"}}>{fr ? "Contenu associé" : "Associated content"}</label>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                      {activeTags.filter(t=>t.product_id===form.product_id).map((t,i)=>{
+                        const sel = (form.product_contents||[]).includes(t.name);
+                        const tc = TAG_COLORS[i%TAG_COLORS.length];
+                        return <button key={t.id} type="button" onClick={()=>{
+                          const cur = form.product_contents||[];
+                          setForm({...form, product_contents: sel ? cur.filter(n=>n!==t.name) : [...cur, t.name]});
+                        }} style={{padding:"4px 12px",borderRadius:10,border:sel?`2px solid ${tc.bg}`:"2px solid transparent",background:sel?tc.bg+"33":"rgba(255,255,255,0.04)",color:sel?tc.bg:"var(--text-tertiary)",fontSize:12,fontWeight:600,cursor:"pointer",transition:"all 0.15s"}}>{t.name}</button>;
+                      })}
+                    </div>
+                  </div>
+                )}
+                <div className="ui-flex ui-gap-md" style={{marginTop:20}}>
+                  <button className="ui-btn-secondary" onClick={()=>{setShowForm(false);setEditingTx(null);}} style={{flex:1}}>{fr ? "Annuler" : "Cancel"}</button>
+                  <button className="ui-btn-primary" onClick={handleSubmit} disabled={saving} style={{flex:1}}>{saving ? React.createElement(Spinner) : (editingTx ? (fr ? "Sauvegarder" : "Save") : (fr ? "Créer" : "Create"))}</button>
+                </div>
               </div>
             </div>
           )}
@@ -25656,7 +25756,7 @@ const App = () => {
           )}
           {/* ── Chatter-only pages — UNCHANGED ── */}
           {tab==="chatter_dashboard"&&user.role==="chatter"&&<ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
-          {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} onRefresh={onRefresh} />}
+          {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} onRefresh={onRefresh} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
             <div style={{display:"flex",flexWrap:"nowrap",gap:8,marginBottom:16,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:4,scrollbarWidth:"none"}}>
