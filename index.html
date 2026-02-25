@@ -16074,12 +16074,17 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
 };
 
 // =============================================
-// CHATTER ROLE — COMPTA (Fiches de paie)
+// CHATTER ROLE — COMPTA (Fiches de paie + commission)
 // =============================================
-const ChatterComptaTab = ({user, lang, payslips: allPayslips}) => {
+const ChatterComptaTab = ({user, lang, payslips: allPayslips, txs}) => {
   const fr = lang === "fr";
-  const { fmtAmount } = useCurrency();
+  const { fmtAmount, convertAmount } = useCurrency();
   const payslips = (allPayslips||[]).filter(p=>p.user_id===user.id);
+
+  const myTxs = (txs||[]).filter(tx=>tx.chatter_id===user.id&&(tx.status==="validated"||tx.status==="confirmee"));
+  const totalEarned = myTxs.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency||"EUR"),0);
+  const totalPaid = payslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
+  const balanceDue = totalEarned - totalPaid;
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -16087,18 +16092,21 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips}) => {
   const totalAllTime = payslips.filter(p => p.status === "paid").reduce((s, p) => s + Number(p.total || 0), 0);
   const nextPayslip = payslips.find(p => p.status === "pending");
 
+  const kpiCards = [
+    {label: fr ? "Total gagné" : "Total earned", value: fmtAmount(totalEarned), icon: "\u{1F4B0}", color: "var(--accent)"},
+    {label: fr ? "Déjà payé" : "Already paid", value: fmtAmount(totalPaid), icon: "\u{1F4C5}", color: "var(--success)"},
+    {label: fr ? "Solde dû" : "Balance due", value: fmtAmount(Math.max(0, balanceDue)), icon: "\u{1F4E8}", color: balanceDue > 0 ? "var(--warning)" : "var(--text-tertiary)"},
+    {label: fr ? "Prochain paiement" : "Next payment", value: nextPayslip ? fmtAmount(nextPayslip.total) : "—", icon: "\u{1F4E8}", color: "var(--pink)"},
+  ];
+
   return (
     <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
       <div style={{marginBottom:18}}>
         <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{"\u{1F4C4}"} {fr ? "Ma Compta" : "My Accounting"}</div>
-        <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>{fr ? "Mes fiches de paie" : "My payslips"}</div>
+        <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>{fr ? "Commissions & fiches de paie" : "Commissions & payslips"}</div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(3,1fr)",gap:10,marginBottom:18}}>
-        {[
-          {label: fr ? "Reçu ce mois" : "Received this month", value: fmtAmount(totalThisMonth), icon: "\u{1F4C5}", color: "var(--accent)"},
-          {label: fr ? "Total reçu" : "Total received", value: fmtAmount(totalAllTime), icon: "\u{1F4B0}", color: "var(--success)"},
-          {label: fr ? "Prochain paiement" : "Next payment", value: nextPayslip ? fmtAmount(nextPayslip.total) : "—", icon: "\u{1F4E8}", color: "var(--pink)"},
-        ].map(k => (
+      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4,1fr)",gap:10,marginBottom:18}}>
+        {kpiCards.map(k => (
           <div key={k.label} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"14px 16px"}}>
             <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:4}}>{k.icon} {k.label}</div>
             <div style={{fontSize:20,fontWeight:800,color:k.color}}>{k.value}</div>
@@ -16165,6 +16173,9 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
   const fr = lang === "fr";
   const [period, setPeriod] = useState("month");
   const [section, setSection] = useState("classement");
+  const [rankingFromApi, setRankingFromApi] = useState(null);
+  const [rankingLoading, setRankingLoading] = useState(false);
+  const [rankingError, setRankingError] = useState(null);
 
   const chatters = useMemo(() => profiles.filter(p => p.role === "chatter"), [profiles]);
 
@@ -16186,7 +16197,38 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
     return new Date();
   }, [period]);
 
-  const ranking = useMemo(() => {
+  useEffect(() => {
+    let cancelled = false;
+    const fetchRanking = async () => {
+      setRankingLoading(true);
+      setRankingError(null);
+      try {
+        const { data, error } = await sb.rpc("get_chatter_competition_ranking", {
+          p_period_start: periodFilter.toISOString(),
+          p_period_end: periodEnd.toISOString()
+        });
+        if (cancelled) return;
+        if (error) { setRankingError(error.message); setRankingFromApi(null); return; }
+        const mapped = (data || []).map(r => ({
+          user: { id: r.chatter_id, name: r.display_name },
+          ca: Number(r.ca || 0),
+          nbTx: Number(r.nb_tx || 0),
+          activeSpenders: Number(r.active_spenders || 0),
+          totalSpenders: Number(r.total_spenders || 0),
+          convRate: Number(r.conv_rate || 0),
+          score: Number(r.score || 0)
+        }));
+        setRankingFromApi(mapped);
+      } catch (e) {
+        if (!cancelled) { setRankingError(e.message || "Erreur"); setRankingFromApi(null); }
+      }
+      if (!cancelled) setRankingLoading(false);
+    };
+    fetchRanking();
+    return () => { cancelled = true; };
+  }, [periodFilter, periodEnd]);
+
+  const rankingClient = useMemo(() => {
     return chatters.map(ch => {
       const chModelIds = ch.assigned_models || [];
       const chTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= periodFilter && new Date(tx.date) < periodEnd);
@@ -16203,6 +16245,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
       return { user: ch, ca, nbTx, activeSpenders, totalSpenders, convRate, score };
     }).sort((a, b) => b.score - a.score);
   }, [chatters, txs, periodFilter, periodEnd, convertAmount]);
+
+  const ranking = rankingFromApi || rankingClient;
 
   // My stats
   const myRank = useMemo(() => ranking.find(r => r.user.id === user.id), [ranking, user.id]);
@@ -16308,6 +16352,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
 
   const getInitials = (name) => (name || "?").split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
   const avatarColor = (id) => { let h = 0; for (let i = 0; i < (id || "").length; i++) h = (id || "").charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h) % 360}, 60%, 50%)`; };
+  /* Anonymiser les autres chatters: seul le user connecté voit son vrai nom */
+  const getDisplayName = (r, idx) => r.user.id === user.id ? (r.user.name || r.user.email || "?") : (fr ? "Chatter " + (idx + 1) : "Chatter " + (idx + 1));
 
   const periodOpts = [
     { k: "week", l: fr ? "Cette semaine" : "This week" },
@@ -16337,12 +16383,23 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
       {section === "classement" && (<>
         <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
           {periodOpts.map(p => (
-            <button key={p.k} onClick={() => setPeriod(p.k)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${period===p.k?"#8b5cf6":"var(--border)"}`,background:period===p.k?"rgba(139,92,246,0.15)":"var(--surface)",color:period===p.k?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{p.l}</button>
+            <button key={p.k} onClick={() => setPeriod(p.k)} disabled={rankingLoading} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${period===p.k?"#8b5cf6":"var(--border)"}`,background:period===p.k?"rgba(139,92,246,0.15)":"var(--surface)",color:period===p.k?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:rankingLoading?"not-allowed":"pointer",opacity:rankingLoading?0.7:1}}>{p.l}</button>
           ))}
         </div>
-        {chatters.length === 0 && (
+        {rankingLoading && (
+          <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:32,textAlign:"center",marginBottom:18}}>
+            <div className="spinner" style={{margin:"0 auto 12px"}}></div>
+            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{fr ? "Chargement du classement..." : "Loading ranking..."}</div>
+          </div>
+        )}
+        {rankingError && (
+          <div style={{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:16,marginBottom:18,fontSize:13,color:"var(--danger)"}}>
+            {fr ? "Erreur classement: " : "Ranking error: "}{rankingError}
+          </div>
+        )}
+        {ranking.length === 0 && !rankingLoading && (
           <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:48,textAlign:"center"}}>
-            <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucun chatter trouvé" : "No chatters found"}</div>
+            <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucun chatter dans le classement" : "No chatters in ranking"}</div>
           </div>
         )}
 
@@ -16355,8 +16412,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
               return (
                 <div key={r.user.id} style={{background:isMe ? "rgba(139,92,246,0.12)" : "var(--surface)",border:`2px solid ${medalColors[idx]}`,borderRadius:14,padding:20,textAlign:"center",position:"relative",transition:"all 0.2s"}}>
                   <div style={{fontSize:32,marginBottom:8}}>{medals[idx]}</div>
-                  <div style={{width:56,height:56,borderRadius:"50%",background:avatarColor(r.user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff",margin:"0 auto 10px"}}>{getInitials(r.user.name)}</div>
-                  <div style={{fontSize:15,fontWeight:800,marginBottom:2}}>{r.user.name}</div>
+                  <div style={{width:56,height:56,borderRadius:"50%",background:avatarColor(r.user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff",margin:"0 auto 10px"}}>{getInitials(getDisplayName(r, idx))}</div>
+                  <div style={{fontSize:15,fontWeight:800,marginBottom:2}}>{getDisplayName(r, idx)}</div>
                   <div style={{fontSize:11,color:lvl.color,marginBottom:10}}>{lvl.icon} {lvl.name}</div>
                   <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:4}}>CA</div>
                   <div style={{fontSize:20,fontWeight:800,color:"var(--accent)",marginBottom:8}}>{fmtAmount(r.ca)}</div>
@@ -16399,8 +16456,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
                         <td style={{fontWeight:700,color:"var(--text-tertiary)"}}>{idx + 4}</td>
                         <td>
                           <div style={{display:"flex",alignItems:"center",gap:8}}>
-                            <div style={{width:28,height:28,borderRadius:"50%",background:avatarColor(r.user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,color:"#fff"}}>{getInitials(r.user.name)}</div>
-                            <span style={{fontWeight:600}}>{r.user.name}</span>
+                            <div style={{width:28,height:28,borderRadius:"50%",background:avatarColor(r.user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:800,color:"#fff"}}>{getInitials(getDisplayName(r, idx + 3))}</div>
+                            <span style={{fontWeight:600}}>{getDisplayName(r, idx + 3)}</span>
                             <span style={{fontSize:10,color:lvl.color}}>{lvl.icon}</span>
                             {isMe && <span style={{fontSize:9,color:"#8B5CF6",fontWeight:700}}>({fr ? "Toi" : "You"})</span>}
                           </div>
@@ -22547,8 +22604,7 @@ const App = () => {
     setProviderPaymentMethods((ppmR&&ppmR.data)||[]);
     setChatterLogs((chLogR&&chLogR.data)||[]);
     setClTotal(chLogR.count||(chLogR.data||[]).length||0);
-    setScreenshotChecks((scR&&scR.data)||[]); window.__screenshotChecks=(scR&&scR.data)||[];
-    setScTotal(scR.count||(scR.data||[]).length||0);
+    (()=>{ let scData=(scR&&scR.data)||[]; if(currentUser&&currentUser.role==="chatter"){ scData=scData.filter(sc=>(sc.checked_by||sc.checker_id||sc.chatter_id)===currentUser.id); } setScreenshotChecks(scData); window.__screenshotChecks=scData; setScTotal(scData.length); })();
     setBroadcasts((bcR&&bcR.data)||[]);
     // Load escalation count for messagerie badge
     if (currentUser && currentUser.role === "gerant") {
@@ -23274,7 +23330,7 @@ const App = () => {
             {messagerieSubTab==="whatsapp"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} />}
             {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
           </>)}
-          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} />}
+          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} txs={txSummary} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
