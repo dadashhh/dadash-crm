@@ -13191,6 +13191,105 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
   const [saving, setSaving] = useState(false);
   const [resetLoading, setResetLoading] = useState(null);
   const users = safeArray(profiles);
+
+  // ── Permissions custom state ──
+  // allUserPermsMap: { [userId]: { [feature]: { can_view, can_edit, overrides_role } } }
+  const [allUserPermsMap, setAllUserPermsMap] = useState({});
+  const [permModal, setPermModal] = useState(false);
+  const [permUser, setPermUser] = useState(null);
+  // localPerms: { [feature]: { can_view, can_edit, overrides_role } } — draft being edited
+  const [localPerms, setLocalPerms] = useState({});
+  const [permSaving, setPermSaving] = useState(false);
+
+  useEffect(() => { loadAllUserPerms(); }, []);
+
+  const loadAllUserPerms = async () => {
+    try {
+      const { data } = await sb.from("user_permissions").select("user_id,feature,can_view,can_edit,overrides_role");
+      if (!data) return;
+      const map = {};
+      data.forEach(row => {
+        if (!map[row.user_id]) map[row.user_id] = {};
+        map[row.user_id][row.feature] = { can_view: row.can_view, can_edit: row.can_edit, overrides_role: row.overrides_role };
+      });
+      setAllUserPermsMap(map);
+    } catch (_) { /* table may not exist yet */ }
+  };
+
+  const openPermModal = (u) => {
+    setPermUser(u);
+    // Initialize localPerms from existing overrides (or empty)
+    const existing = allUserPermsMap[u.id] || {};
+    const draft = {};
+    PERM_FEATURES.forEach(f => {
+      draft[f.id] = existing[f.id]
+        ? { ...existing[f.id] }
+        : { can_view: false, can_edit: false, overrides_role: false };
+    });
+    setLocalPerms(draft);
+    setPermModal(true);
+  };
+
+  const toggleLocalPerm = (featureId, type) => {
+    setLocalPerms(prev => {
+      const cur = prev[featureId] || { can_view: false, can_edit: false, overrides_role: false };
+      let next;
+      if (type === "can_edit") {
+        // Enabling edit implies view
+        const newEdit = !cur.can_edit;
+        next = { ...cur, can_edit: newEdit, can_view: newEdit ? true : cur.can_view, overrides_role: true };
+      } else {
+        // Disabling view implies removing edit
+        const newView = !cur.can_view;
+        next = { ...cur, can_view: newView, can_edit: newView ? cur.can_edit : false, overrides_role: true };
+      }
+      // If both false, mark overrides_role false (no active override)
+      if (!next.can_view && !next.can_edit) next.overrides_role = false;
+      return { ...prev, [featureId]: next };
+    });
+  };
+
+  const handleSavePerms = async () => {
+    if (!permUser) return;
+    setPermSaving(true);
+    try {
+      // Build upsert rows only for features that have an active override
+      const rows = Object.entries(localPerms)
+        .filter(([, p]) => p.overrides_role)
+        .map(([feature, p]) => ({
+          user_id: permUser.id,
+          feature,
+          can_view: p.can_view,
+          can_edit: p.can_edit,
+          overrides_role: true,
+        }));
+
+      // Delete existing overrides for this user first
+      await sb.from("user_permissions").delete().eq("user_id", permUser.id);
+
+      // Re-insert active overrides
+      if (rows.length > 0) {
+        const { error } = await sb.from("user_permissions").insert(rows);
+        if (error) throw error;
+      }
+
+      addToast(fr ? "Permissions custom sauvegardées ✓" : "Custom permissions saved ✓", "success");
+      setPermModal(false);
+      await loadAllUserPerms();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setPermSaving(false);
+  };
+
+  const handleDeleteAllPerms = async () => {
+    if (!permUser) return;
+    if (!window.confirm(fr ? "Supprimer tous les overrides pour cet utilisateur ?" : "Remove all overrides for this user?")) return;
+    try {
+      await sb.from("user_permissions").delete().eq("user_id", permUser.id);
+      addToast(fr ? "Permissions custom supprimées" : "Custom permissions removed", "success");
+      setPermModal(false);
+      await loadAllUserPerms();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+  };
   const inputS = {width:"100%",padding:"9px 12px",borderRadius:9,border:"1px solid rgba(255,255,255,0.08)",background:"#131926",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"};
   const labelS = {display:"block",fontSize:10,fontWeight:600,color:"var(--text-secondary)",textTransform:"uppercase",marginBottom:5,letterSpacing:"0.8px"};
   const openCreate = () => { setEditUser(null); setForm({name:"",email:"",role:"chatter",commission_pct:10,assigned_models:[],is_active:true}); setShowModal(true); };
@@ -13252,9 +13351,13 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
               {users.map(u => {
                 const isActive = u.is_active !== false;
                 const assignedNames = (u.assigned_models||[]).map(mid=>(models||[]).find(m=>m.id===mid)?.name).filter(Boolean);
+                const hasCustomPerms = !!(allUserPermsMap[u.id] && Object.keys(allUserPermsMap[u.id]).length > 0);
                 return (
                   <tr key={u.id}>
-                    <td style={{fontWeight:600,color:"var(--text)"}}>{displayUserName(u)}</td>
+                    <td style={{fontWeight:600,color:"var(--text)"}}>
+                      {displayUserName(u)}
+                      {hasCustomPerms && <span title="Permissions custom actives" style={{marginLeft:6,padding:"1px 6px",borderRadius:6,background:"rgba(245,158,11,0.18)",color:"#f59e0b",fontSize:9,fontWeight:700,verticalAlign:"middle"}}>CUSTOM</span>}
+                    </td>
                     <td style={{color:"var(--text-secondary)",fontSize:11}}>{u.email||"—"}</td>
                     <td><span style={{padding:"3px 8px",borderRadius:8,fontSize:10,fontWeight:700,background:roleBg(u.role),color:roleClr(u.role)}}>{u.role||"—"}</span></td>
                     <td style={{color:"var(--text-secondary)",fontSize:11,maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{assignedNames.length?assignedNames.join(", "):"—"}</td>
@@ -13262,6 +13365,7 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
                     <td><span style={{padding:"3px 10px",borderRadius:8,fontSize:10,fontWeight:700,background:isActive?"rgba(16,185,129,0.15)":"rgba(239,68,68,0.15)",color:isActive?"var(--success)":"var(--danger)"}}>{isActive?"ACTIF":"INACTIF"}</span></td>
                     <td style={{whiteSpace:"nowrap"}}>
                       <button onClick={()=>openEdit(u)} title="Modifier" style={{padding:"4px 9px",borderRadius:7,border:"1px solid var(--accent)",background:"rgba(139,92,246,0.1)",color:"var(--accent)",fontSize:11,cursor:"pointer",marginRight:4}}>✏️</button>
+                      <button onClick={()=>openPermModal(u)} title="Permissions custom" style={{padding:"4px 9px",borderRadius:7,border:"1px solid rgba(245,158,11,0.5)",background:"rgba(245,158,11,0.1)",color:"#f59e0b",fontSize:11,cursor:"pointer",marginRight:4}}>🔧</button>
                       <button onClick={()=>handleToggleActive(u)} title={isActive?"Désactiver":"Activer"} style={{padding:"4px 9px",borderRadius:7,border:"1px solid "+(isActive?"var(--danger)":"var(--success)"),background:isActive?"rgba(239,68,68,0.1)":"rgba(16,185,129,0.1)",color:isActive?"var(--danger)":"var(--success)",fontSize:11,cursor:"pointer",marginRight:4}}>{isActive?"🔒":"🔓"}</button>
                       {u.email&&<button onClick={()=>handleReset(u)} disabled={resetLoading===u.id} title="Reset password" style={{padding:"4px 9px",borderRadius:7,border:"1px solid var(--warning)",background:"rgba(245,158,11,0.1)",color:"var(--warning)",fontSize:11,cursor:"pointer"}}>{resetLoading===u.id?"...":"🔑"}</button>}
                     </td>
@@ -13310,25 +13414,134 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
           </div>
         </div>
       )}
+
+      {/* ── MODAL PERMISSIONS CUSTOM ── */}
+      {permModal && permUser && (
+        <div className="modal-overlay" onClick={()=>setPermModal(false)}>
+          <div style={{background:"var(--modal-bg)",borderRadius:16,padding:24,maxWidth:600,width:"95%",maxHeight:"92vh",overflowY:"auto",border:"1px solid var(--border-default)"}} onClick={e=>e.stopPropagation()}>
+            {/* Header */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+              <h3 style={{fontSize:16,fontWeight:700,color:"var(--text)",margin:0}}>🔧 {fr?"Permissions custom":"Custom permissions"}</h3>
+              <button onClick={()=>setPermModal(false)} style={{background:"var(--bg-overlay)",border:"none",color:"var(--text-tertiary)",fontSize:18,cursor:"pointer",padding:"4px 10px",borderRadius:8}}>✕</button>
+            </div>
+            {/* Sub-header */}
+            <div style={{padding:"8px 12px",borderRadius:9,background:"rgba(245,158,11,0.08)",border:"1px solid rgba(245,158,11,0.2)",marginBottom:18,fontSize:12,color:"#f59e0b"}}>
+              ⚠️ {fr?"Ces permissions s'appliquent uniquement à":"These permissions apply only to"} <strong>{displayUserName(permUser)}</strong> ({permUser.role}).
+              {fr?" Elles remplacent les permissions de son rôle quand activées.":" They override role permissions when enabled."}
+            </div>
+            {/* Legend */}
+            <div style={{display:"flex",gap:16,marginBottom:14,fontSize:11,color:"var(--muted2)"}}>
+              <span>✅ {fr?"Peut voir":"Can view"}</span>
+              <span>✏️ {fr?"Peut modifier":"Can edit"}</span>
+              <span>❌ {fr?"Pas d'accès":"No access"}</span>
+            </div>
+            {/* Permissions table */}
+            <div style={{background:"var(--surface)",borderRadius:12,border:"1px solid var(--border)",overflow:"hidden",marginBottom:18}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+                <thead>
+                  <tr style={{background:"#131926"}}>
+                    <th style={{padding:"9px 14px",textAlign:"left",fontSize:10,fontWeight:600,color:"var(--muted2)",textTransform:"uppercase",letterSpacing:"0.8px"}}>{fr?"Fonctionnalité":"Feature"}</th>
+                    <th style={{padding:"9px 14px",textAlign:"center",fontSize:10,fontWeight:600,color:"var(--muted2)",textTransform:"uppercase",letterSpacing:"0.8px"}}>{fr?"Rôle (défaut)":"Role (default)"}</th>
+                    <th style={{padding:"9px 14px",textAlign:"center",fontSize:10,fontWeight:600,color:"var(--muted2)",textTransform:"uppercase",letterSpacing:"0.8px"}}>{fr?"Peut voir":"Can view"}</th>
+                    <th style={{padding:"9px 14px",textAlign:"center",fontSize:10,fontWeight:600,color:"var(--muted2)",textTransform:"uppercase",letterSpacing:"0.8px"}}>{fr?"Peut modifier":"Can edit"}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {PERM_FEATURES.map((f, i) => {
+                    const p = localPerms[f.id] || { can_view: false, can_edit: false, overrides_role: false };
+                    const roleDefault = ROLE_PERMISSIONS[permUser.role]?.[f.id] || "none";
+                    const hasOverride = p.overrides_role;
+                    const cellBg = i%2===0?"var(--surface)":"var(--surface2)";
+                    const overrideBg = hasOverride ? "rgba(245,158,11,0.06)" : cellBg;
+                    return (
+                      <tr key={f.id} style={{background:overrideBg}}>
+                        <td style={{padding:"9px 14px",fontWeight:600,color:"var(--text)",borderBottom:"1px solid var(--border2)"}}>
+                          {f.label}
+                          {hasOverride && <span style={{marginLeft:6,padding:"1px 5px",borderRadius:5,background:"rgba(245,158,11,0.18)",color:"#f59e0b",fontSize:9,fontWeight:700}}>OVERRIDE</span>}
+                        </td>
+                        <td style={{padding:"9px 14px",textAlign:"center",color:"var(--muted2)",fontSize:14,borderBottom:"1px solid var(--border2)"}}>
+                          {roleDefault==="edit"?"✏️":roleDefault==="view"?"✅":"❌"}
+                        </td>
+                        <td style={{padding:"9px 14px",textAlign:"center",borderBottom:"1px solid var(--border2)"}}>
+                          <button onClick={()=>toggleLocalPerm(f.id,"can_view")}
+                            style={{width:32,height:32,borderRadius:8,border:"1px solid "+(p.can_view?"rgba(16,185,129,0.5)":"rgba(255,255,255,0.08)"),background:p.can_view?"rgba(16,185,129,0.18)":"transparent",fontSize:14,cursor:"pointer",transition:"all 0.15s"}}>
+                            {p.can_view?"✅":"❌"}
+                          </button>
+                        </td>
+                        <td style={{padding:"9px 14px",textAlign:"center",borderBottom:"1px solid var(--border2)"}}>
+                          <button onClick={()=>toggleLocalPerm(f.id,"can_edit")}
+                            style={{width:32,height:32,borderRadius:8,border:"1px solid "+(p.can_edit?"rgba(139,92,246,0.5)":"rgba(255,255,255,0.08)"),background:p.can_edit?"rgba(139,92,246,0.18)":"transparent",fontSize:14,cursor:"pointer",transition:"all 0.15s"}}>
+                            {p.can_edit?"✏️":"❌"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {/* Footer buttons */}
+            <div style={{display:"flex",gap:8,justifyContent:"space-between",alignItems:"center",flexWrap:"wrap"}}>
+              <button onClick={handleDeleteAllPerms}
+                style={{padding:"8px 14px",borderRadius:10,border:"1px solid rgba(239,68,68,0.3)",background:"rgba(239,68,68,0.08)",color:"var(--danger)",fontSize:12,cursor:"pointer"}}>
+                🗑 {fr?"Réinitialiser":"Reset all"}
+              </button>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>setPermModal(false)} style={{padding:"8px 16px",borderRadius:10,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+                <button onClick={handleSavePerms} disabled={permSaving}
+                  style={{padding:"8px 20px",borderRadius:10,border:"none",background:permSaving?"var(--surface2)":"#f59e0b",color:permSaving?"var(--muted2)":"#000",fontSize:13,fontWeight:700,cursor:permSaving?"not-allowed":"pointer"}}>
+                  {permSaving?"...":(fr?"Sauvegarder":"Save")}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
+};
+
+// ── Shared permission constants (used by AdminRolesTab + AdminUsersTab + resolvePermission) ──
+const PERM_FEATURES = [
+  {id:"dashboard",label:"Dashboard"},{id:"business",label:"Business"},{id:"equipe",label:"Équipe"},
+  {id:"messagerie",label:"Messagerie"},{id:"compta",label:"Compta"},{id:"automation",label:"Automation / Push"},
+  {id:"bots",label:"Bots"},{id:"admin",label:"Admin"},{id:"transactions",label:"Transactions"},
+  {id:"spenders",label:"Spenders"},{id:"modeles",label:"Modèles"},{id:"export",label:"Export"},{id:"logs",label:"Logs"},
+];
+const ROLE_PERMISSIONS = {
+  gerant:  {dashboard:"edit",business:"edit",equipe:"edit",messagerie:"edit",compta:"edit",automation:"edit",bots:"edit",admin:"edit",transactions:"edit",spenders:"edit",modeles:"edit",export:"edit",logs:"edit"},
+  chatter: {dashboard:"view",business:"none",equipe:"none",messagerie:"edit",compta:"none",automation:"none",bots:"none",admin:"none",transactions:"edit",spenders:"view",modeles:"none",export:"none",logs:"none"},
+  modele:  {dashboard:"none",business:"none",equipe:"none",messagerie:"none",compta:"none",automation:"none",bots:"none",admin:"none",transactions:"none",spenders:"none",modeles:"view",export:"none",logs:"none"},
+  provider:{dashboard:"none",business:"none",equipe:"none",messagerie:"none",compta:"view",automation:"none",bots:"none",admin:"none",transactions:"view",spenders:"none",modeles:"none",export:"none",logs:"none"},
+};
+
+/**
+ * Resolves the final permission level for a user on a given feature.
+ * Priority: user_permissions override (if overrides_role=true) > role default.
+ * Returns "edit" | "view" | "none"
+ */
+const resolvePermission = (role, feature, userOverridesMap) => {
+  const override = userOverridesMap?.[feature];
+  if (override && override.overrides_role) {
+    return override.can_edit ? "edit" : override.can_view ? "view" : "none";
+  }
+  return ROLE_PERMISSIONS[role]?.[feature] || "none";
+};
+
+// Context that holds the logged-in user's permission overrides
+// Shape: { role: string, permOverrides: { [feature]: { can_view, can_edit, overrides_role } } }
+const UserPermsContext = React.createContext({ role: "chatter", permOverrides: {} });
+
+// Hook — returns { canView, canEdit } for the current user on a given feature
+const useCanAccess = (feature) => {
+  const { role, permOverrides } = React.useContext(UserPermsContext);
+  const level = resolvePermission(role, feature, permOverrides);
+  return { canView: level !== "none", canEdit: level === "edit" };
 };
 
 // ── Tab 2: Rôles & Permissions ──
 const AdminRolesTab = ({lang}) => {
   const fr = lang === "fr";
-  const FEATURES = [
-    {id:"dashboard",label:"Dashboard"},{id:"business",label:"Business"},{id:"equipe",label:"Équipe"},
-    {id:"messagerie",label:"Messagerie"},{id:"compta",label:"Compta"},{id:"automation",label:"Automation"},
-    {id:"bots",label:"Bots"},{id:"admin",label:"Admin"},{id:"transactions",label:"Transactions"},
-    {id:"spenders",label:"Spenders"},{id:"modeles",label:"Modèles"},{id:"export",label:"Export"},{id:"logs",label:"Logs"},
-  ];
-  const PERMISSIONS = {
-    gerant:  {dashboard:"edit",business:"edit",equipe:"edit",messagerie:"edit",compta:"edit",automation:"edit",bots:"edit",admin:"edit",transactions:"edit",spenders:"edit",modeles:"edit",export:"edit",logs:"edit"},
-    chatter: {dashboard:"view",business:"none",equipe:"none",messagerie:"edit",compta:"none",automation:"none",bots:"none",admin:"none",transactions:"edit",spenders:"view",modeles:"none",export:"none",logs:"none"},
-    modele:  {dashboard:"none",business:"none",equipe:"none",messagerie:"none",compta:"none",automation:"none",bots:"none",admin:"none",transactions:"none",spenders:"none",modeles:"view",export:"none",logs:"none"},
-    provider:{dashboard:"none",business:"none",equipe:"none",messagerie:"none",compta:"view",automation:"none",bots:"none",admin:"none",transactions:"view",spenders:"none",modeles:"none",export:"none",logs:"none"},
-  };
   const ROLES = ["gerant","chatter","modele","provider"];
   const ROLE_LABELS = {gerant:"GÉRANT",chatter:"CHATTER",modele:"MODÈLE",provider:"PROVIDER"};
   const cellIcon = (p) => p==="edit"?"✏️":p==="view"?"✅":"❌";
@@ -13336,6 +13549,13 @@ const AdminRolesTab = ({lang}) => {
   const tdS = {padding:"10px 14px",textAlign:"center",fontSize:14,borderBottom:"1px solid var(--border2)"};
   return (
     <div>
+      {/* Note d'information */}
+      <div style={{padding:"10px 14px",borderRadius:10,background:"rgba(139,92,246,0.08)",border:"1px solid rgba(139,92,246,0.2)",marginBottom:18,fontSize:12,color:"var(--text-secondary)"}}>
+        ℹ️ {fr
+          ? "Ces permissions s'appliquent à tous les membres d'un rôle. Pour personnaliser un utilisateur précis, allez dans "
+          : "These permissions apply to all members of a role. To customise a specific user, go to "}
+        <strong style={{color:"var(--accent)"}}>{fr?"Users → Permissions custom":"Users → Custom permissions"}</strong>.
+      </div>
       <div style={{marginBottom:20}}>
         <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>🔐 {fr?"Rôles & Permissions":"Roles & Permissions"}</div>
         <div style={{display:"flex",gap:16,marginTop:6,fontSize:11,color:"var(--muted2)"}}><span>✅ peut voir</span><span>✏️ peut modifier</span><span>❌ pas d'accès</span></div>
@@ -13350,10 +13570,10 @@ const AdminRolesTab = ({lang}) => {
               </tr>
             </thead>
             <tbody>
-              {FEATURES.map((f,i)=>(
+              {PERM_FEATURES.map((f,i)=>(
                 <tr key={f.id} style={{background:i%2===0?"var(--surface)":"var(--surface2)"}}>
                   <td style={{...tdS,textAlign:"left",fontWeight:600,color:"var(--text)",position:"sticky",left:0,background:i%2===0?"var(--surface)":"var(--surface2)"}}>{f.label}</td>
-                  {ROLES.map(r=><td key={r} style={tdS}>{cellIcon(PERMISSIONS[r]?.[f.id])}</td>)}
+                  {ROLES.map(r=><td key={r} style={tdS}>{cellIcon(ROLE_PERMISSIONS[r]?.[f.id])}</td>)}
                 </tr>
               ))}
             </tbody>
@@ -24066,6 +24286,8 @@ const App = () => {
   const {drillDown, closeDrill, openEntity} = useNav();
   const cardModal = useCardModal();
   const [user, setUser] = useState(null);
+  // User permission overrides: { [feature]: { can_view, can_edit, overrides_role } }
+  const [userPermOverrides, setUserPermOverrides] = useState({});
   const [lang, setLang] = useState(() => { try { const s=localStorage.getItem("dadash-lang"); return s&&["fr","de","en","ru","uk","es"].includes(s)?s:"fr"; } catch { return "fr"; } });
   const [theme, setTheme] = useState(() => {
     try { return localStorage.getItem("dadash-theme") || "dark"; } catch { return "dark"; }
@@ -24558,6 +24780,17 @@ const App = () => {
             setUser(fullUser);
             if(fullUser.role === "provider") setTab("transactions");
             if(fullUser.role === "modele") setTab("model_checklist");
+            // Load custom permission overrides for this user
+            try {
+              const { data: permsData } = await sb.from("user_permissions")
+                .select("feature,can_view,can_edit,overrides_role")
+                .eq("user_id", fullUser.id);
+              if (permsData) {
+                const map = {};
+                permsData.forEach(r => { map[r.feature] = { can_view: r.can_view, can_edit: r.can_edit, overrides_role: r.overrides_role }; });
+                setUserPermOverrides(map);
+              }
+            } catch (_) { /* user_permissions may not exist yet — graceful fallback */ }
             await loadData(fullUser);
           }
         }
@@ -24662,6 +24895,17 @@ const App = () => {
     if(u.role === "provider") setTab("transactions");
     if(u.role === "modele") setTab("model_checklist");
     if(u.role === "chatter") setTab("chatter_dashboard");
+    // Load custom permission overrides for this user
+    try {
+      const { data: permsData } = await sb.from("user_permissions")
+        .select("feature,can_view,can_edit,overrides_role")
+        .eq("user_id", u.id);
+      if (permsData) {
+        const map = {};
+        permsData.forEach(r => { map[r.feature] = { can_view: r.can_view, can_edit: r.can_edit, overrides_role: r.overrides_role }; });
+        setUserPermOverrides(map);
+      }
+    } catch (_) { /* user_permissions may not exist yet — graceful fallback */ }
     setLoading(true);
     setLoadError(null);
     try {
@@ -24677,6 +24921,7 @@ const App = () => {
     closeDrill();
     await sb.auth.signOut();
     setUser(null);
+    setUserPermOverrides({});
     setTab("dashboard");
     setTxs([]);
     setProfiles([]);
@@ -24951,6 +25196,7 @@ const App = () => {
   };
 
   return (
+    <UserPermsContext.Provider value={{ role: user?.role || "chatter", permOverrides: userPermOverrides }}>
     <CurrencyContext.Provider value={currencyCtx}>
     <TimezoneContext.Provider value={timezone}>
     <div className="app-wrap" style={{background:"var(--bg-base)"}}>
@@ -25493,6 +25739,7 @@ const App = () => {
     </TimezoneContext.Provider>
     {user&&isGerant&&<SearchModal open={showSearch} onClose={()=>setShowSearch(false)} lang={lang} user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} invoices={invoices} products={products} onNavigate={(pid,sid)=>navigateTo(pid,sid)} onDrill={(type,id)=>{if(type==="spender"){closeDrill();setSelectedSpenderKey(id);navigateTo("business","spenders");}else{closeDrill();navigateTo("equipe",type==="model"?"modeles":type==="chatter"?"chatters":"providers");}}} />}
     </CurrencyContext.Provider>
+    </UserPermsContext.Provider>
   );
 };
 
