@@ -1938,6 +1938,8 @@ const buildHasColumn = (rows) => { var keys = {}; (safeArray(rows)).forEach(func
 const logAdminUiEvent = function(type, meta){ try { if (type==="save_ok") console.log("[AdminUI]", type, meta); else if (type==="save_fail") console.warn("[AdminUI]", type, meta); else console.log("[AdminUI]", type, meta); } catch(_){} };
 // AD4 — Helper hasPermission(role, permissionKey, rows)
 const hasPermission = function(role, permissionKey, rows){ var list=safeArray(rows); var r=role!= null?String(role).trim():""; var k=permissionKey!=null?String(permissionKey).trim():""; if(!r||!k)return false; var found=list.find(function(x){return x&&(x.role||"")===r&&(x.permission_key||"")===k;}); return found&&(found.allowed===true||found.allowed==="true"||found.allowed===1); };
+// AD5 — Config assignations (schéma tolérant). Mettre tableName pour activer. Ex: { tableName:"chatter_model_assignments", colId:"id", colChatterId:"chatter_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" }
+var adminAssignmentsConfig = { tableName:"", colId:"id", colChatterId:"chatter_id", colProviderId:"provider_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" };
 
 // ═══ EC2 — CHATTER CONTEXT HELPERS (réutilisables par toutes les sous-pages chatter) ═══
 const isChatterUser = (u) => !!(u && u.role === "chatter");
@@ -13629,6 +13631,204 @@ const AdminRolesPermissionsTab = ({lang, refreshTick}) => {
 };
 
 // =============================================
+// AD5 — ADMIN ASSIGNATIONS (lecture + édition minimale, schéma tolérant)
+// =============================================
+const AdminAssignmentsTab = ({lang, profiles, models, refreshTick}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  var cfg = adminAssignmentsConfig || {};
+  var tableName = (cfg.tableName||"").trim();
+  var colId = cfg.colId || "id";
+  var colChatterId = cfg.colChatterId || "chatter_id";
+  var colProviderId = cfg.colProviderId || "provider_id";
+  var colModelId = cfg.colModelId || "model_id";
+  var colStatus = cfg.colStatus || "status";
+  var colCreatedAt = cfg.colCreatedAt || "created_at";
+  var colUpdatedAt = cfg.colUpdatedAt || "updated_at";
+
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterChatter, setFilterChatter] = useState("");
+  const [filterProvider, setFilterProvider] = useState("");
+  const [filterModel, setFilterModel] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  var buildHasColumn = function(r){ var k={}; safeArray(r).forEach(function(x){ if(x&&typeof x==="object") Object.keys(x).forEach(function(c){ k[c]=1; }); }); return function(c){ return !!k[c]; }; };
+  var hasCol = rows.length > 0 ? buildHasColumn(rows) : function(){ return false; };
+
+  var loadAdminAssignments = useCallback(async function(){
+    if (!tableName) return;
+    setLoading(true);
+    setError(null);
+    try {
+      var res = await sb.from(tableName).select("*");
+      if (res.error) throw new Error(res.error.message);
+      var data = safeArray(res.data);
+      var first = data[0];
+      if (data.length > 0 && first) {
+        var hasUpd = first[colUpdatedAt] != null;
+        var hasCre = first[colCreatedAt] != null;
+        if (hasUpd) data.sort(function(a,b){ var da=new Date(a[colUpdatedAt]||0).getTime(); var db=new Date(b[colUpdatedAt]||0).getTime(); return db-da; });
+        else if (hasCre) data.sort(function(a,b){ var da=new Date(a[colCreatedAt]||0).getTime(); var db=new Date(b[colCreatedAt]||0).getTime(); return db-da; });
+        else data.sort(function(a,b){ return String(a[colId]||"").localeCompare(String(b[colId]||"")); });
+      }
+      setRows(data);
+      logAdminUiEvent("assignments_load_ok",{count:data.length});
+    } catch (e) {
+      var msg = e&&e.message?e.message:String(e);
+      setError(msg);
+      setRows([]);
+      logAdminUiEvent("assignments_load_fail",{err:msg});
+    }
+    setLoading(false);
+  }, [tableName, colUpdatedAt, colCreatedAt, colId]);
+
+  useEffect(function(){ if (tableName) loadAdminAssignments(); }, [loadAdminAssignments, refreshTick, tableName]);
+
+  var statusVals = useMemo(function(){
+    if (!hasCol(colStatus)) return [];
+    var s={};
+    safeArray(rows).forEach(function(r){ var v=r[colStatus]; if(v!=null&&String(v).trim()) s[String(v).trim()]=1; });
+    return Object.keys(s).sort();
+  }, [rows, colStatus, hasCol]);
+
+  var filtered = useMemo(function(){
+    var list = safeArray(rows);
+    var q = (searchQuery||"").trim().toLowerCase();
+    if (q) list = list.filter(function(r){
+      var parts = [];
+      if (hasCol(colStatus)) parts.push(String(r[colStatus]||""));
+      if (hasCol(colChatterId)) parts.push(String(r[colChatterId]||""));
+      if (hasCol(colProviderId)) parts.push(String(r[colProviderId]||""));
+      if (hasCol(colModelId)) parts.push(String(r[colModelId]||""));
+      if (hasCol(colId)) parts.push(String(r[colId]||""));
+      return parts.join(" ").toLowerCase().indexOf(q) >= 0;
+    });
+    if (filterStatus && hasCol(colStatus)) list = list.filter(function(r){ return (r[colStatus]||"") === filterStatus; });
+    if (filterChatter && hasCol(colChatterId)) list = list.filter(function(r){ return (r[colChatterId]||"") === filterChatter; });
+    if (filterProvider && hasCol(colProviderId)) list = list.filter(function(r){ return (r[colProviderId]||"") === filterProvider; });
+    if (filterModel && hasCol(colModelId)) list = list.filter(function(r){ return (r[colModelId]||"") === filterModel; });
+    return list;
+  }, [rows, searchQuery, filterStatus, filterChatter, filterProvider, filterModel, colId, colStatus, colChatterId, colProviderId, colModelId, hasCol]);
+
+  var startEdit = function(r){
+    if (!r) return;
+    var id = r[colId];
+    setEditingId(id);
+    var f = {};
+    if (hasCol(colStatus)) f.status = r[colStatus] != null ? String(r[colStatus]) : "";
+    if (hasCol(colChatterId)) f.chatterId = r[colChatterId] != null ? String(r[colChatterId]) : "";
+    if (hasCol(colProviderId)) f.providerId = r[colProviderId] != null ? String(r[colProviderId]) : "";
+    if (hasCol(colModelId)) f.modelId = r[colModelId] != null ? String(r[colModelId]) : "";
+    setEditForm(f);
+  };
+
+  var handleSave = useCallback(async function(){
+    if (!editingId) return;
+    var payload = {};
+    var r = rows.find(function(x){ return x[colId] === editingId; });
+    if (!r) return;
+    if (hasCol(colStatus) && (editForm.status||"") !== (r[colStatus]||"")) payload[colStatus] = editForm.status || null;
+    if (hasCol(colChatterId) && (editForm.chatterId||"") !== (r[colChatterId]||"")) payload[colChatterId] = editForm.chatterId || null;
+    if (hasCol(colProviderId) && (editForm.providerId||"") !== (r[colProviderId]||"")) payload[colProviderId] = editForm.providerId || null;
+    if (hasCol(colModelId) && (editForm.modelId||"") !== (r[colModelId]||"")) payload[colModelId] = editForm.modelId || null;
+    if (Object.keys(payload).length === 0) { addToast(fr?"Aucune modification":"No changes","info"); return; }
+    setSaving(true);
+    try {
+      var res = await sb.from(tableName).update(payload).eq(colId, editingId).select().single();
+      if (res.error) throw new Error(res.error.message);
+      setRows(function(prev){ return prev.map(function(x){ return x[colId]===editingId ? (res.data||x) : x; }); });
+      setEditingId(null);
+      addToast(fr?"Enregistré ✓":"Saved ✓","success");
+      logAdminUiEvent("assignments_update_ok",{id:editingId});
+    } catch (e) {
+      var msg = e&&e.message?e.message:String(e);
+      addToast((fr?"Erreur: ":"Error: ")+msg,"error");
+      logAdminUiEvent("assignments_update_fail",{id:editingId,err:msg});
+    }
+    setSaving(false);
+  }, [editingId, editForm, rows, colId, colStatus, colChatterId, colProviderId, colModelId, tableName, fr, addToast, hasCol]);
+
+  var colsOk = [];
+  var colsMiss = [];
+  [colId,colChatterId,colProviderId,colModelId,colStatus,colCreatedAt,colUpdatedAt].forEach(function(c){ if(c&&(hasCol(c))) colsOk.push(c); else if(c) colsMiss.push(c); });
+
+  if (!tableName) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:700,marginBottom:8}},"\u{1F504} "+(fr?"Config assignations manquante":"Assignments config missing")),
+    React.createElement("div",{style:{fontSize:12,marginBottom:12}},(fr?"Définir adminAssignmentsConfig.tableName (ex: chatter_model_assignments) dans index.html":"Set adminAssignmentsConfig.tableName (e.g. chatter_model_assignments) in index.html"))
+  );
+
+  if (loading) return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Chargement...":"Loading..."));
+  if (error) return React.createElement("div",{style:{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}},"\u26A0\uFE0F "+error),
+    React.createElement("button",{onClick:loadAdminAssignments,style:{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}},"\u{1F504} "+(fr?"Réessayer":"Retry"))
+  );
+
+  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F504} "+(fr?"Assignations":"Assignments")),
+    colsMiss.length > 0 && React.createElement("div",{style:{marginBottom:12,padding:8,background:"var(--warning-muted)",borderRadius:8,fontSize:11,color:"var(--warning)"}},(fr?"Colonnes absentes: ":"Missing columns: ")+colsMiss.join(", ")),
+    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}},
+      React.createElement("input",{type:"text",placeholder:fr?"Rechercher":"Search",value:searchQuery,onChange:function(e){setSearchQuery(e.target.value);},style:{flex:"1",minWidth:140,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+      hasCol(colStatus) && React.createElement("select",{value:filterStatus,onChange:function(e){setFilterStatus(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:100}},
+        React.createElement("option",{value:""},fr?"Statut":"Status"),
+        statusVals.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
+      ),
+      hasCol(colChatterId) && React.createElement("select",{value:filterChatter,onChange:function(e){setFilterChatter(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:140}},
+        React.createElement("option",{value:""},fr?"Chatter":"Chatter"),
+        safeArray(profiles).filter(function(p){ return p&&p.role==="chatter"; }).map(function(p){ return React.createElement("option",{key:p.id,value:p.id},displayUserName(p)); })
+      ),
+      hasCol(colProviderId) && React.createElement("select",{value:filterProvider,onChange:function(e){setFilterProvider(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Provider":"Provider"),
+        safeArray(profiles).filter(function(p){ return p&&p.role==="provider"; }).map(function(p){ return React.createElement("option",{key:p.id,value:p.id},displayUserName(p)); })
+      ),
+      hasCol(colModelId) && React.createElement("select",{value:filterModel,onChange:function(e){setFilterModel(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Modèle":"Model"),
+        safeArray(models).map(function(m){ return React.createElement("option",{key:m.id,value:m.id},m.name||m.id); })
+      )
+    ),
+    React.createElement("div",{className:"table-wrap",style:{overflowX:"auto"}},
+      React.createElement("table",{className:"table",style:{fontSize:12}},
+        React.createElement("thead",null,React.createElement("tr",null,
+          hasCol(colId) && React.createElement("th",null,"ID"),
+          hasCol(colChatterId) && React.createElement("th",null,fr?"Chatter":"Chatter"),
+          hasCol(colProviderId) && React.createElement("th",null,fr?"Provider":"Provider"),
+          hasCol(colModelId) && React.createElement("th",null,fr?"Modèle":"Model"),
+          hasCol(colStatus) && React.createElement("th",null,fr?"Statut":"Status"),
+          hasCol(colCreatedAt) && React.createElement("th",null,fr?"Créé":"Created"),
+          hasCol(colUpdatedAt) && React.createElement("th",null,fr?"MAJ":"Updated"),
+          React.createElement("th",null,fr?"Actions":"Actions")
+        )),
+        React.createElement("tbody",null,
+          filtered.length === 0 ? React.createElement("tr",null,React.createElement("td",{colSpan:99,style:{padding:32,textAlign:"center",color:"var(--text-tertiary)"}},fr?"Aucune assignation":"No assignments")) :
+          filtered.map(function(r){
+            var id = r[colId];
+            var isEdit = editingId === id;
+            return React.createElement("tr",{key:String(id)},
+              hasCol(colId) && React.createElement("td",{style:{fontSize:11,fontFamily:"monospace",color:"var(--text-tertiary)"}},String(id).slice(0,8)+"…"),
+              hasCol(colChatterId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.chatterId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{chatterId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : (function(){ var p=safeArray(profiles).find(function(x){return x&&x.id===r[colChatterId];}); return safeText(p?displayUserName(p):r[colChatterId]); })()),
+              hasCol(colProviderId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.providerId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{providerId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : (function(){ var p=safeArray(profiles).find(function(x){return x&&x.id===r[colProviderId];}); return safeText(p?displayUserName(p):r[colProviderId]); })()),
+              hasCol(colModelId) && React.createElement("td",null,isEdit ? React.createElement("input",{value:editForm.modelId||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{modelId:e.target.value});});},style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}}) : (function(){ var m=safeArray(models).find(function(x){return x&&x.id===r[colModelId];}); return safeText(m?m.name:r[colModelId]); })()),
+              hasCol(colStatus) && React.createElement("td",null,isEdit ? (statusVals.length > 0 ? React.createElement("select",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},style:{padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}},
+                React.createElement("option",{value:""},"—"),
+                statusVals.map(function(s){ return React.createElement("option",{key:s,value:s},s); })
+              ) : React.createElement("input",{value:editForm.status||"",onChange:function(e){setEditForm(function(p){return Object.assign({},p,{status:e.target.value});});},placeholder:fr?"Statut":"Status",style:{width:"100%",padding:4,borderRadius:6,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:12}})) : safeText(r[colStatus])),
+              hasCol(colCreatedAt) && React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},formatDateSafe(r[colCreatedAt])),
+              hasCol(colUpdatedAt) && React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},formatDateSafe(r[colUpdatedAt])),
+              React.createElement("td",null,isEdit ? React.createElement("span",null,React.createElement("button",{onClick:handleSave,disabled:saving,style:{padding:"4px 10px",borderRadius:6,border:"none",background:"var(--success)",color:"#fff",fontSize:11,fontWeight:600,cursor:saving?"not-allowed":"pointer",marginRight:6}},saving?"...":(fr?"Enregistrer":"Save")),React.createElement("button",{onClick:function(){setEditingId(null);},style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:11,cursor:"pointer"}},fr?"Annuler":"Cancel"))) : React.createElement("button",{onClick:function(){startEdit(r);},style:{padding:"4px 10px",borderRadius:6,border:"1px solid var(--border)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer"}},fr?"Modifier":"Edit")))
+            );
+          })
+        )
+      )
+    )
+  );
+};
+
+// =============================================
 // AD1 — ADMIN SHELL (tabs, state, placeholders pour AD2→AD8)
 // =============================================
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
@@ -13663,7 +13863,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
       {activeSub==="overview"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F4CA}"} Vue d'ensemble — AD2 à venir</div>}
       {activeSub==="users"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} adminRefreshTick={adminRefreshTick} />}
       {activeSub==="roles"&&<AdminRolesPermissionsTab lang={lang} refreshTick={adminRefreshTick} />}
-      {activeSub==="assignments"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F504}"} Assignations — AD5 à venir</div>}
+      {activeSub==="assignments"&&<AdminAssignmentsTab lang={lang} profiles={profiles} models={models} refreshTick={adminRefreshTick} />}
       {activeSub==="logs"&&<LogsAuditTab lang={lang} txs={txs} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} profiles={profiles} spenders={spenders} />}
       {activeSub==="settings"&&<PlaceholderTab title={t(lang,"settings")} />}
       {activeSub==="qa"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F6E0}"} QA / Maintenance — AD8 à venir</div>}
