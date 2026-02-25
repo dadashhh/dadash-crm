@@ -6317,6 +6317,15 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [txCardFilter, setTxCardFilter] = useState(null);
   const [txChartMetric, setTxChartMetric] = useState("ca");
+  const [spSearch, setSpSearch] = useState("");
+  const [showSpDrop, setShowSpDrop] = useState(false);
+  const spDropRef = React.useRef(null);
+  useEffect(()=>{
+    if(!showSpDrop) return;
+    const h = (e) => { if(spDropRef.current && !spDropRef.current.contains(e.target)) setShowSpDrop(false); };
+    document.addEventListener("mousedown",h);
+    return ()=>document.removeEventListener("mousedown",h);
+  },[showSpDrop]);
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
   const {sort, onSort, doSort} = useSortable();
@@ -6382,12 +6391,15 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     return Object.values(g).sort((a,b)=>a.day<b.day?-1:1).map(d=>({...d,label:d.day.slice(5).replace("-","/"),validated:Math.round(d.validated),pending:Math.round(d.pending)}));
   },[displayTxs]);
 
-  // Build spender list for autocomplete
-  const spenderOptions = React.useMemo(() => {
-    const set = new Set();
-    (dbSpenders || []).forEach(s => set.add(s.handle || s.name));
-    txs.forEach(tx => { if(tx.spender_handle) set.add(tx.spender_handle); });
-    return [...set].sort();
+  // Build spender list for searchable dropdown (FIX 1+2)
+  const spenderObjects = React.useMemo(() => {
+    const map = {};
+    (dbSpenders || []).forEach(s => {
+      const handle = s.handle || s.name;
+      if (handle) map[handle] = { handle, first_name: s.first_name || null, telegram_id: s.telegram_id || null };
+    });
+    txs.forEach(tx => { if(tx.spender_handle && !map[tx.spender_handle]) map[tx.spender_handle] = { handle: tx.spender_handle, first_name: null, telegram_id: null }; });
+    return Object.values(map).sort((a,b) => a.handle.localeCompare(b.handle));
   }, [dbSpenders, txs]);
 
   const handleCreate = async () => {
@@ -6398,6 +6410,16 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     try {
       // Step 1: UPSERT le Spender en DB
       const handle = trimmedHandle;
+      // FIX 3 — Dedup: warn if telegram_id already linked to a different handle
+      if (form.telegram_id && form.telegram_id.trim()) {
+        const tgVal = form.telegram_id.trim().replace(/^@/, "");
+        const dup = (dbSpenders||[]).find(s => {
+          const h = s.handle || s.name;
+          if (h === handle) return false;
+          return String(s.telegram_id) === tgVal || (s.telegram_username && s.telegram_username.replace(/^@/,"") === tgVal);
+        });
+        if (dup) { addToast(`⚠️ Spender déjà existant : @${dup.handle||dup.name}`, "warning"); setSaving(false); return; }
+      }
       try {
         await safeUpsertSpender({handle, name: handle, status: "active", last_seen: new Date().toISOString()});
       } catch(e) { /* Spender upsert best-effort */ }
@@ -6604,10 +6626,29 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
               <button onClick={()=>setShowForm(false)} style={{background:"none",border:"none",color:"var(--text-secondary)",fontSize:22,cursor:"pointer",lineHeight:1,padding:"0 4px"}}>×</button>
             </div>
             <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:14}}>
-              <div className="form-group-modal">
+              <div className="form-group-modal" ref={spDropRef} style={{position:"relative"}}>
                 <label className="form-label">{t(lang,"spender")||"Spender"} *</label>
-                <input className="form-input ui-input" list="tx-create-spender-list" value={form.spender_handle} onChange={e=>setForm({...form,spender_handle:e.target.value})} placeholder="@spender" autoComplete="off" />
-                <datalist id="tx-create-spender-list">{spenderOptions.map(s=><option key={s} value={s}/>)}</datalist>
+                <input className="form-input ui-input"
+                  value={showSpDrop ? spSearch : form.spender_handle}
+                  onChange={e=>{setSpSearch(e.target.value);setShowSpDrop(true);setForm(f=>({...f,spender_handle:e.target.value}));}}
+                  onFocus={()=>{setSpSearch(form.spender_handle);setShowSpDrop(true);}}
+                  placeholder="@spender" autoComplete="off" />
+                {showSpDrop&&(()=>{
+                  const q=(spSearch||"").toLowerCase();
+                  const filtered=spenderObjects.filter(s=>!q||s.handle.toLowerCase().includes(q)||(s.first_name&&s.first_name.toLowerCase().includes(q))||(s.telegram_id&&String(s.telegram_id).includes(q))).slice(0,12);
+                  if(!filtered.length) return null;
+                  return <div style={{position:"absolute",top:"calc(100% + 2px)",left:0,right:0,zIndex:999,background:"var(--surface)",border:"1px solid var(--border)",borderRadius:8,maxHeight:200,overflowY:"auto",boxShadow:"0 8px 24px rgba(0,0,0,0.35)"}}>
+                    {filtered.map(s=>{
+                      const lbl=`${s.handle}${s.first_name?" — "+s.first_name:""}${s.telegram_id?" (ID: "+s.telegram_id+")":""}`;
+                      return <div key={s.handle}
+                        onMouseDown={e=>{e.preventDefault();setForm(f=>({...f,spender_handle:s.handle,telegram_id:s.telegram_id?String(s.telegram_id):f.telegram_id}));setShowSpDrop(false);setSpSearch("");}}
+                        style={{padding:"7px 12px",cursor:"pointer",fontSize:12,color:"var(--text-secondary)",borderBottom:"1px solid var(--border-subtle)"}}
+                        onMouseEnter={e=>e.currentTarget.style.background="var(--bg-hover)"}
+                        onMouseLeave={e=>e.currentTarget.style.background="none"}
+                      >{lbl}</div>;
+                    })}
+                  </div>;
+                })()}
               </div>
               <div className="form-group-modal">
                 <label className="form-label">Telegram ID</label>
@@ -6746,7 +6787,16 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                   <tr key={tx.id} className={tx.status==="pending"?"pending-row":""}>
                     <td style={{fontFamily:"monospace",fontSize:12,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{fmtDate(tx.created_at||tx.date)}{" "}<span style={{color:"var(--text-tertiary)"}}>{fmtTime(tx.created_at||tx.date)}</span></td>
                     {user.role!=="provider"&&<td><Tag type="spender" label={tx.spender_handle} id={tx.spender_handle}/></td>}
-                    {user.role==="gerant"&&<td style={{fontSize:12,whiteSpace:"nowrap",fontFamily:"monospace",color:"var(--text-secondary)"}}>{tx.telegram_id||(dbSpenders||[]).find(s=>(s.handle||s.name)===tx.spender_handle)?.telegram_username||"—"}</td>}
+                    {user.role==="gerant"&&<td style={{fontSize:12,whiteSpace:"nowrap",fontFamily:"monospace",color:"var(--text-secondary)"}}>
+                      {(()=>{
+                        const dbSp=(dbSpenders||[]).find(s=>(s.handle||s.name)===tx.spender_handle);
+                        const numId=tx.telegram_id||dbSp?.telegram_id;
+                        const usrName=dbSp?.telegram_username;
+                        if(numId) return numId;
+                        if(usrName) return <span style={{fontStyle:"italic",color:"var(--text-tertiary)"}}>{usrName}</span>;
+                        return "—";
+                      })()}
+                    </td>}
                     {user.role!=="provider"&&<td><Tag type="model" label={models.find(m=>m.id===tx.model_id)?.name||"?"} id={tx.model_id}/></td>}
                     {user.role!=="provider"&&<td><Tag type="provider" label={provName} id={tx.provider_id}/></td>}
                     {user.role!=="provider"&&<td style={{fontSize:11,whiteSpace:"nowrap"}}>{tx.product||"—"}</td>}
@@ -6897,6 +6947,14 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     setSpSavingProfile(true);
     try {
       const handle = newSpForm.handle.trim().replace(/^@/, "");
+      // FIX 3 — Dedup: warn if handle or telegram_id already exists
+      const existingByHandle = (dbSpenders||[]).find(s=>(s.handle||s.name)===handle);
+      if (existingByHandle) { addToast(`⚠️ Spender déjà existant : @${handle}`, "warning"); setSpSavingProfile(false); return; }
+      if (newSpForm.telegram_username && newSpForm.telegram_username.trim()) {
+        const tgVal = newSpForm.telegram_username.trim().replace(/^@/, "");
+        const dupTg = (dbSpenders||[]).find(s => String(s.telegram_id) === tgVal || (s.telegram_username && s.telegram_username.replace(/^@/,"") === tgVal));
+        if (dupTg) { addToast(`⚠️ Spender déjà existant : @${dupTg.handle||dupTg.name}`, "warning"); setSpSavingProfile(false); return; }
+      }
       const {error} = await sb.from("spenders").upsert({handle, name: handle, status: newSpForm.status||"active", first_name: newSpForm.first_name||null, age: newSpForm.age?parseInt(newSpForm.age):null, city: newSpForm.city||null, country: newSpForm.country||null, job: newSpForm.job||null, source: newSpForm.source||null, langue: newSpForm.langue||"FR", timezone: newSpForm.timezone||"Europe/Zurich", budget_range: newSpForm.budget_range||null, telegram_username: newSpForm.telegram_username||null, whatsapp_phone: newSpForm.whatsapp_phone||null, classification: newSpForm.classification||"new", notes: newSpForm.chatter_notes||null}, {onConflict: "handle"});
       if (error) { addToast("Erreur: " + error.message, "error"); setSpSavingProfile(false); return; }
       setSpSavingProfile(false); setShowNewSpender(false); setNewSpForm({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
