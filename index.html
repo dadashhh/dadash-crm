@@ -9246,7 +9246,7 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
 // =============================================
 // COMPTA TAB (gerant only)
 // =============================================
-const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRefresh}) => {
+const ComptaTab = ({user, lang, txs, expenses, payouts, models, profiles, spenders, onRefresh}) => {
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const addToast = useToast();
   const dr = useDateRange("all");
@@ -9256,29 +9256,40 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRef
   const [form, setForm] = useState({name:"",amount:"",category:"ops"});
   const fr = lang === "fr";
   const cs = currencySymbol;
-  const comptaFiltered = dr.filterByDate(txs, "date");
+  const comptaFiltered = dr.filterByDate(txs || [], "date");
   const validTxs = comptaFiltered.filter(tx=>tx.status==="validated");
+  const payoutsWithDate = (payouts || []).map(p => ({ ...p, _date: p.date || p.created_at }));
+  const filteredPayouts = dr.filterByDate(payoutsWithDate, "_date");
+
+  // ── Fallback colonnes TX (amount, net_amount, chatter_commission, provider_fee, dada_fee) ──
+  const txAmount = (tx) => { const v = tx.amount; if (v == null && typeof console !== "undefined") console.warn("[P&L] TX sans amount:", tx.id || tx); return Number(v ?? 0); };
+  const txNet = (tx) => Number(tx.net_amount ?? tx.amount ?? 0);
+  const txComm = (tx) => Number(tx.chatter_commission ?? 0);
+  const txProvFee = (tx) => Number(tx.provider_fee ?? 0);
+  const txDadaFee = (tx) => Number(tx.dada_fee ?? 0);
 
   // ── P&L KPIs (CHF via convertAmount) ──
-  const grossRev = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
-  const totalProvFees = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.provider_fee||0),tx.currency),0);
-  const totalDadaFees = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.dada_fee||0),tx.currency),0);
-  const totalNet = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
-  const totalComms = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
-  const totalExpenses = expenses.reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0);
+  const grossRev = validTxs.reduce((s,tx)=>s+convertAmount(txAmount(tx),tx.currency),0);
+  const totalProvFees = validTxs.reduce((s,tx)=>s+convertAmount(txProvFee(tx),tx.currency),0);
+  const totalDadaFees = validTxs.reduce((s,tx)=>s+convertAmount(txDadaFee(tx),tx.currency),0);
+  const totalNet = validTxs.reduce((s,tx)=>s+convertAmount(txNet(tx),tx.currency),0);
+  const totalComms = validTxs.reduce((s,tx)=>s+convertAmount(txComm(tx),tx.currency),0);
+  const totalCharges = filteredPayouts.reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"CHF"),0);
+  const totalExpenses = (expenses||[]).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency),0);
   const grossMargin = totalNet - totalComms;
   const netProfit = grossMargin - totalExpenses;
+  const margeNette = totalNet - totalCharges;
   const marginPct = grossRev > 0 ? ((grossMargin / grossRev) * 100).toFixed(1) : "0";
   const profitPct = grossRev > 0 ? ((netProfit / grossRev) * 100).toFixed(1) : "0";
 
   // ── Breakdown par modèle ──
   const modelBreakdown = useMemo(() => {
-    return models.map(m => {
+    return (models||[]).map(m => {
       const mTxs = validTxs.filter(tx => tx.model_id === m.id);
-      const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
-      const net = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
-      const comm = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
-      const fees = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.provider_fee || 0), tx.currency), 0);
+      const ca = mTxs.reduce((s, tx) => s + convertAmount(txAmount(tx), tx.currency), 0);
+      const net = mTxs.reduce((s, tx) => s + convertAmount(txNet(tx), tx.currency), 0);
+      const comm = mTxs.reduce((s, tx) => s + convertAmount(txComm(tx), tx.currency), 0);
+      const fees = mTxs.reduce((s, tx) => s + convertAmount(txProvFee(tx), tx.currency), 0);
       return { name: m.name, id: m.id, ca, net, comm, fees, txCount: mTxs.length, margin: net - comm };
     }).filter(m => m.ca > 0).sort((a, b) => b.ca - a.ca);
   }, [validTxs, models, convertAmount]);
@@ -9290,32 +9301,41 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRef
       const sp = (spenders || []).find(s => (s.handle || s.name || "").toLowerCase() === (tx.spender_handle || "").toLowerCase());
       const lng = sp && sp.langue ? sp.langue : "N/A";
       if (!byLang[lng]) byLang[lng] = { code: lng, ca: 0, net: 0, txCount: 0, flag: LANG_FLAGS[lng] || "" };
-      byLang[lng].ca += convertAmount(Number(tx.amount), tx.currency);
-      byLang[lng].net += convertAmount(Number(tx.net_amount || 0), tx.currency);
+      byLang[lng].ca += convertAmount(txAmount(tx), tx.currency);
+      byLang[lng].net += convertAmount(txNet(tx), tx.currency);
       byLang[lng].txCount++;
     });
     return Object.values(byLang).sort((a, b) => b.ca - a.ca);
   }, [validTxs, spenders, convertAmount]);
 
-  // ── Chart data: CA par jour (30 derniers jours) ──
-  const dailyRevData = useMemo(() => {
-    const map = {};
+  // ── Chart data: mensuel Multi Smooth (style Dashboard) ──
+  const monthlyRevData = useMemo(() => {
     const now = new Date();
-    for (let i = 29; i >= 0; i--) {
-      const d = new Date(now); d.setDate(d.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
-      map[key] = { date: key, label: key.slice(5), ca: 0, net: 0, profit: 0 };
+    const byMonth = {};
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const key = d.toISOString().slice(0, 7);
+      byMonth[key] = { month: key, label: d.toLocaleDateString("fr-CH", { month: "short", year: "2-digit" }), ca_brut: 0, ca_net: 0, charges: 0, marge_nette: 0 };
     }
     validTxs.forEach(tx => {
-      const key = (tx.date || "").slice(0, 10);
-      if (map[key]) {
-        map[key].ca += convertAmount(Number(tx.amount), tx.currency);
-        map[key].net += convertAmount(Number(tx.net_amount || 0), tx.currency);
-        map[key].profit += convertAmount(Number(tx.net_amount || 0), tx.currency) - convertAmount(Number(tx.chatter_commission || 0), tx.currency);
+      const key = (tx.date || tx.created_at || "").toString().slice(0, 7);
+      if (byMonth[key]) {
+        byMonth[key].ca_brut += convertAmount(txAmount(tx), tx.currency);
+        byMonth[key].ca_net += convertAmount(txNet(tx), tx.currency);
       }
     });
-    return Object.values(map).map(d => ({ ...d, ca: Math.round(d.ca), net: Math.round(d.net), profit: Math.round(d.profit) }));
-  }, [validTxs, convertAmount]);
+    filteredPayouts.forEach(p => {
+      const key = (p.date || p.created_at || p._date || "").toString().slice(0, 7);
+      if (byMonth[key]) byMonth[key].charges += convertAmount(Number(p.amount || 0), p.currency || "CHF");
+    });
+    return Object.values(byMonth).map(d => ({
+      ...d,
+      ca_brut: Math.round(d.ca_brut),
+      ca_net: Math.round(d.ca_net),
+      charges: Math.round(d.charges),
+      marge_nette: Math.round(d.ca_net - d.charges),
+    }));
+  }, [validTxs, filteredPayouts, convertAmount]);
 
   // ── Chart data: modèle bar chart ──
   const modelChartData = modelBreakdown.slice(0, 8).map(m => ({ name: m.name.length > 10 ? m.name.slice(0, 10) + ".." : m.name, CA: Math.round(m.ca), Net: Math.round(m.net), Comm: Math.round(m.comm) }));
@@ -9375,18 +9395,24 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRef
     setTimeout(() => setExporting(null), 1500);
   };
 
+  const missingAmountCount = validTxs.filter(tx => tx.amount == null).length;
+
   return (
     <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
       <GlobalFilterBar lang={lang} dr={dr} />
+      {missingAmountCount > 0 && (
+        <div style={{padding:"10px 14px",background:"rgba(245,158,11,0.15)",border:"1px solid var(--warning)",borderRadius:10,marginBottom:14,fontSize:12,color:"var(--text)"}}>
+          ⚠️ {missingAmountCount} TX sans colonne amount — fallback 0. Vérifiez le schéma transactions.
+        </div>
+      )}
 
-      {/* ── KPI CARDS (aligné Dashboard) ── */}
-      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(5, 1fr)",gap:10,marginBottom:18}}>
+      {/* ── KPI CARDS (C4: CA Brut, CA Net, Charges totales, Marge nette) ── */}
+      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4, 1fr)",gap:10,marginBottom:18}}>
         {[
           {label:fr?"CA Brut":"Gross Rev",value:fmtAmount(grossRev),color:"var(--text)"},
           {label:fr?"CA Net":"Net",value:fmtAmount(totalNet),color:"var(--text)"},
-          {label:fr?"Charges":"Expenses",value:fmtAmount(totalExpenses+totalComms+totalProvFees+totalDadaFees),color:"var(--danger)"},
-          {label:fr?"Marge":"Margin",value:`${fmtAmount(grossMargin)} (${marginPct}%)`,color:"var(--text)"},
-          {label:"Commission DADASH",value:fmtAmount(totalDadaFees),color:"var(--accent)"},
+          {label:fr?"Charges totales":"Total Charges",value:fmtAmount(totalCharges),color:"var(--danger)"},
+          {label:fr?"Marge nette":"Net Margin",value:fmtAmount(margeNette),color:margeNette>=0?"var(--success)":"var(--danger)"},
         ].map((k,i)=>(
           <div key={i} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
             <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{k.label}</div>
@@ -9420,22 +9446,23 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRef
         </div>
       </div>
 
-      {/* ── GRAPH 1: CA / Net / Profit par jour (AreaChart) ── */}
-      {rechartsReady && dailyRevData.length > 0 && (
+      {/* ── GRAPH 1: Graphe mensuel Multi Smooth (style Dashboard) ── */}
+      {rechartsReady && monthlyRevData.length > 0 && (
         <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{fr ? "CA / Net / Profit — 30 derniers jours" : "Revenue / Net / Profit — Last 30 days"}</div>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>{fr ? "Évolution mensuelle — CA / Net / Charges / Marge nette" : "Monthly evolution — CA / Net / Charges / Net margin"}</div>
           <div style={{ width: "100%", height: 260 }}>
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={dailyRevData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" />
-                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} interval={4} />
+              <LineChart data={monthlyRevData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-subtle)" vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} interval="preserveStartEnd" />
                 <YAxis tick={{ fontSize: 10, fill: "var(--text-tertiary)" }} tickFormatter={v => v >= 1000 ? (v / 1000).toFixed(0) + "k" : v} />
                 <RechartsTooltip contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 10, fontSize: 12 }} formatter={(v) => fmtAmount(v)} />
-                <Area type="monotone" dataKey="ca" name={fr ? "CA Brut" : "Gross"} stroke="#8B5CF6" fill="#8B5CF620" strokeWidth={2} />
-                <Area type="monotone" dataKey="net" name="Net" stroke="#3B82F6" fill="#3B82F620" strokeWidth={2} />
-                <Area type="monotone" dataKey="profit" name="Profit" stroke="#10B981" fill="#10B98120" strokeWidth={2} />
+                <Line type="monotone" dataKey="ca_brut" name={fr ? "CA Brut" : "Gross"} stroke="#8B5CF6" strokeWidth={2} dot={false} activeDot={{ r: 5, fill: "#8B5CF6" }} />
+                <Line type="monotone" dataKey="ca_net" name="Net" stroke="#3B82F6" strokeWidth={2} dot={false} activeDot={{ r: 5, fill: "#3B82F6" }} />
+                <Line type="monotone" dataKey="charges" name={fr ? "Charges" : "Charges"} stroke="#EF4444" strokeWidth={2} dot={false} activeDot={{ r: 5, fill: "#EF4444" }} />
+                <Line type="monotone" dataKey="marge_nette" name={fr ? "Marge nette" : "Net margin"} stroke="#10B981" strokeWidth={2} dot={false} activeDot={{ r: 5, fill: "#10B981" }} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
-              </AreaChart>
+              </LineChart>
             </ResponsiveContainer>
           </div>
         </div>
@@ -9579,7 +9606,7 @@ const ComptaTab = ({user, lang, txs, expenses, models, profiles, spenders, onRef
           <table className="table" style={{ fontSize: 12 }}>
             <thead><tr><th>{fr ? "Nom" : "Name"}</th><th>{fr ? "Catégorie" : "Category"}</th><th>{fr ? "Montant" : "Amount"}</th></tr></thead>
             <tbody>
-              {expenses.map(e => (
+              {(expenses||[]).map(e => (
                 <tr key={e.id}><td>{e.name}</td><td><span className="badge badge-pending" style={{ fontSize: 10 }}>{e.category}</span></td><td style={{ fontWeight: 700 }}>{fmtAmount(e.amount)}</td></tr>
               ))}
             </tbody>
@@ -22738,7 +22765,7 @@ const App = () => {
               <button key={tb.id} onClick={()=>setSubTab(tb.id)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${subTab===tb.id?"#8b5cf6":"var(--border)"}`,background:subTab===tb.id?"rgba(139,92,246,0.15)":"var(--surface)",color:subTab===tb.id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>{tb.icon} {tb.label}</button>
             ))}
           </div>
-          {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txSummary} expenses={expenses} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
+          {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
           {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} />}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
