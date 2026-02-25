@@ -1940,6 +1940,10 @@ const logAdminUiEvent = function(type, meta){ try { if (type==="save_ok") consol
 const hasPermission = function(role, permissionKey, rows){ var list=safeArray(rows); var r=role!= null?String(role).trim():""; var k=permissionKey!=null?String(permissionKey).trim():""; if(!r||!k)return false; var found=list.find(function(x){return x&&(x.role||"")===r&&(x.permission_key||"")===k;}); return found&&(found.allowed===true||found.allowed==="true"||found.allowed===1); };
 // AD5 — Config assignations (schéma tolérant). Mettre tableName pour activer. Ex: { tableName:"chatter_model_assignments", colId:"id", colChatterId:"chatter_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" }
 var adminAssignmentsConfig = { tableName:"", colId:"id", colChatterId:"chatter_id", colProviderId:"provider_id", colModelId:"model_id", colStatus:"status", colCreatedAt:"created_at", colUpdatedAt:"updated_at" };
+// AD6 — appendAdminActionLog: insert best-effort dans admin_action_logs (ne jamais crasher)
+var appendAdminActionLog = function(actionType, targetType, targetId, meta){ try { if (!window.sb) return; var m = {}; try { m = meta && typeof meta === "object" ? JSON.parse(JSON.stringify(meta)) : {}; } catch(_){ m = {}; } var payload = { action_type: actionType || "unknown", target_type: targetType || null, target_id: targetId != null ? String(targetId) : null, meta: m }; window.sb.from("admin_action_logs").insert(payload).then(function(r){ if (r && r.error) { console.warn("[AdminUI] appendAdminActionLog error", r.error); } else { logAdminUiEvent("admin_action_log_ok", { actionType: actionType }); } }).catch(function(e){ console.warn("[AdminUI] appendAdminActionLog fail", e); }); } catch(e){ console.warn("[AdminUI] appendAdminActionLog", e); } };
+// AD6 — safeLower pour filtres recherche
+var safeLower = function(v){ try { return (v != null ? String(v) : "").toLowerCase(); } catch(_){ return ""; } };
 
 // ═══ EC2 — CHATTER CONTEXT HELPERS (réutilisables par toutes les sous-pages chatter) ═══
 const isChatterUser = (u) => !!(u && u.role === "chatter");
@@ -13372,7 +13376,7 @@ const AdminUsersSection = ({lang, onRefresh, models, refreshTick}) => {
         var statusOpts = statusValues.length > 0 ? statusValues : ["active","inactive","pending","paused"];
         var detailFields = ["full_name","username","display_name","telegram_handle","whatsapp","whatsapp_phone","phone"];
         var hasDetailField = function(f){ return hasColumn(f); };
-        return React.createElement(AdminUserDetailPanel,{key:su.id,user:su,lang:lang,fr:fr,addToast:addToast,canEditRole:canEditRole,canEditStatus:canEditStatus,canEditIsActive:canEditIsActive,hasAnyEditable:hasAnyEditable,roleOpts:roleOpts,statusOpts:statusOpts,detailFields:detailFields,hasDetailField:hasDetailField,hasCreatedAt:hasCreatedAt,hasUpdatedAt:hasUpdatedAt,onClose:function(){setSelectedUser(null);},onSaveSuccess:function(updated){loadAdminUsers();setSelectedUser(updated||null);addToast(fr?"Sauvegardé ✓":"Saved ✓","success");logAdminUiEvent("save_ok",{userId:su.id});},onSaveFail:function(err){addToast((fr?"Erreur: ":"Error: ")+(err||""),"error");logAdminUiEvent("save_fail",{userId:su.id,err:err});},adminUsers:adminUsers,loadAdminUsers:loadAdminUsers});
+        return React.createElement(AdminUserDetailPanel,{key:su.id,user:su,lang:lang,fr:fr,addToast:addToast,canEditRole:canEditRole,canEditStatus:canEditStatus,canEditIsActive:canEditIsActive,hasAnyEditable:hasAnyEditable,roleOpts:roleOpts,statusOpts:statusOpts,detailFields:detailFields,hasDetailField:hasDetailField,hasCreatedAt:hasCreatedAt,hasUpdatedAt:hasUpdatedAt,onClose:function(){setSelectedUser(null);},onSaveSuccess:function(updated){loadAdminUsers();setSelectedUser(updated||null);addToast(fr?"Sauvegardé ✓":"Saved ✓","success");logAdminUiEvent("save_ok",{userId:su.id});appendAdminActionLog("user_save","profile",su.id,{role:updated&&updated.role,status:updated&&updated.status,is_active:updated&&updated.is_active});},onSaveFail:function(err){addToast((fr?"Erreur: ":"Error: ")+(err||""),"error");logAdminUiEvent("save_fail",{userId:su.id,err:err});},adminUsers:adminUsers,loadAdminUsers:loadAdminUsers});
       })()}
     </div>
   );
@@ -13548,6 +13552,7 @@ const AdminRolesPermissionsTab = ({lang, refreshTick}) => {
       });
       addToast(fr?"Permission mise à jour":"Permission updated","success");
       logAdminUiEvent("permission_toggle_ok",{id:row.id,allowed:newAllowed});
+      appendAdminActionLog("permission_toggle","role_permission",row.id,{allowed:newAllowed,role:row.role,permission_key:row.permission_key});
     } catch (e) {
       var msg = e&&e.message?e.message:String(e);
       addToast((fr?"Erreur: ":"Error: ")+msg,"error");
@@ -13568,6 +13573,7 @@ const AdminRolesPermissionsTab = ({lang, refreshTick}) => {
       loadAdminRolePermissions();
       addToast(fr?"Permission ajoutée":"Permission added","success");
       logAdminUiEvent("permission_add_ok",{role:role,permission_key:key});
+      appendAdminActionLog("permission_add","role_permission",role+"."+key,{role:role,permission_key:key,allowed:!!addForm.allowed});
     } catch (e) {
       var msg = e&&e.message?e.message:String(e);
       addToast((fr?"Erreur: ":"Error: ")+msg,"error");
@@ -13829,6 +13835,207 @@ const AdminAssignmentsTab = ({lang, profiles, models, refreshTick}) => {
 };
 
 // =============================================
+// AD6 — ADMIN LOGS CENTER (admin_action_logs + employee_logs)
+// =============================================
+const AdminLogsCenterTab = ({lang, refreshTick}) => {
+  var fr = lang === "fr";
+  var [adminLogs, setAdminLogs] = useState([]);
+  var [adminLogsLoading, setAdminLogsLoading] = useState(true);
+  var [adminLogsError, setAdminLogsError] = useState(null);
+  var [employeeLogs, setEmployeeLogs] = useState([]);
+  var [employeeLogsLoading, setEmployeeLogsLoading] = useState(true);
+  var [employeeLogsError, setEmployeeLogsError] = useState(null);
+  var [filterSource, setFilterSource] = useState("all");
+  var [filterType, setFilterType] = useState("");
+  var [filterRole, setFilterRole] = useState("");
+  var [filterDateFrom, setFilterDateFrom] = useState("");
+  var [filterDateTo, setFilterDateTo] = useState("");
+  var [filterSearch, setFilterSearch] = useState("");
+  var [expandedMeta, setExpandedMeta] = useState({});
+
+  var loadAdminActionLogs = useCallback(function(){
+    setAdminLogsLoading(true);
+    setAdminLogsError(null);
+    if (!window.sb) { setAdminLogs([]); setAdminLogsError("Supabase non initialisé"); setAdminLogsLoading(false); return; }
+    window.sb.from("admin_action_logs").select("*").then(function(res){
+      if (res && res.error) { setAdminLogsError(res.error.message || "Erreur"); setAdminLogs([]); logAdminUiEvent("admin_action_logs_load_fail", {err: res.error.message}); }
+      else {
+        var data = safeArray(res && res.data);
+        data.sort(function(a,b){ var da=new Date(a.updated_at||a.created_at||0).getTime(); var db=new Date(b.updated_at||b.created_at||0).getTime(); return db-da; });
+        setAdminLogs(data);
+        logAdminUiEvent("admin_action_logs_load_ok", {count: data.length});
+      }
+      setAdminLogsLoading(false);
+    }).catch(function(e){ setAdminLogsError(e&&e.message?e.message:"Erreur"); setAdminLogs([]); setAdminLogsLoading(false); logAdminUiEvent("admin_action_logs_load_fail", {err: String(e)}); });
+  }, []);
+
+  var loadEmployeeLogs = useCallback(function(){
+    setEmployeeLogsLoading(true);
+    setEmployeeLogsError(null);
+    if (!window.sb) { setEmployeeLogs([]); setEmployeeLogsError("Supabase non initialisé"); setEmployeeLogsLoading(false); return; }
+    window.sb.from("employee_logs").select("*").then(function(res){
+      if (res && res.error) { setEmployeeLogsError(res.error.message || "Erreur"); setEmployeeLogs([]); logAdminUiEvent("employee_logs_load_fail", {err: res.error.message}); }
+      else {
+        var data = safeArray(res && res.data);
+        data.sort(function(a,b){ var da=new Date(a.created_at||0).getTime(); var db=new Date(b.created_at||0).getTime(); return db-da; });
+        setEmployeeLogs(data);
+        logAdminUiEvent("employee_logs_load_ok", {count: data.length});
+      }
+      setEmployeeLogsLoading(false);
+    }).catch(function(e){ setEmployeeLogsError(e&&e.message?e.message:"Erreur"); setEmployeeLogs([]); setEmployeeLogsLoading(false); logAdminUiEvent("employee_logs_load_fail", {err: String(e)}); });
+  }, []);
+
+  useEffect(function(){ loadAdminActionLogs(); }, [loadAdminActionLogs, refreshTick]);
+  useEffect(function(){ loadEmployeeLogs(); }, [loadEmployeeLogs, refreshTick]);
+
+  var unifiedRows = useMemo(function(){
+    var out = [];
+    safeArray(adminLogs).forEach(function(r){
+      if (!r) return;
+      var created = r.created_at || r.updated_at || null;
+      var label = (r.target_type || "") + (r.target_id != null ? " #" + String(r.target_id).slice(0,12) : "");
+      if (!label.trim()) label = "—";
+      out.push({ created_at: created, source: "admin", type: r.action_type || "—", role: r.actor_role || "—", actorUserId: r.actor_user_id || "—", label: label, target_type: r.target_type, target_id: r.target_id, meta: r.meta, raw: r });
+    });
+    safeArray(employeeLogs).forEach(function(r){
+      if (!r) return;
+      var created = r.created_at || null;
+      out.push({ created_at: created, source: "employee", type: r.event_type || r.action_type || "—", role: r.role || "—", actorUserId: r.user_id || "—", label: r.event_label || "—", target_type: null, target_id: null, meta: r.meta, raw: r });
+    });
+    out.sort(function(a,b){ var da=new Date(a.created_at||0).getTime(); var db=new Date(b.created_at||0).getTime(); return db-da; });
+    return out;
+  }, [adminLogs, employeeLogs]);
+
+  var typeOpts = useMemo(function(){ var s={}; unifiedRows.forEach(function(r){ var t=r.type; if(t&&t!=="—") s[t]=1; }); return Object.keys(s).sort(); }, [unifiedRows]);
+  var roleOpts = useMemo(function(){ var s={}; unifiedRows.forEach(function(r){ var t=r.role; if(t&&t!=="—") s[t]=1; }); return Object.keys(s).sort(); }, [unifiedRows]);
+
+  var filteredRows = useMemo(function(){
+    var list = unifiedRows;
+    if (filterSource === "admin") list = list.filter(function(r){ return r.source === "admin"; });
+    else if (filterSource === "employee") list = list.filter(function(r){ return r.source === "employee"; });
+    if (filterType) list = list.filter(function(r){ return r.type === filterType; });
+    if (filterRole) list = list.filter(function(r){ return r.role === filterRole; });
+    var q = (filterSearch||"").trim();
+    if (q) {
+      var ql = safeLower(q);
+      list = list.filter(function(r){
+        return safeLower(r.type).indexOf(ql) >= 0 || safeLower(r.role).indexOf(ql) >= 0 || safeLower(r.actorUserId).indexOf(ql) >= 0 || safeLower(r.label).indexOf(ql) >= 0 || (r.target_id != null && safeLower(String(r.target_id)).indexOf(ql) >= 0) || (r.target_type != null && safeLower(String(r.target_type)).indexOf(ql) >= 0);
+      });
+    }
+    if (filterDateFrom) { var df = new Date(filterDateFrom); list = list.filter(function(r){ var d = new Date(r.created_at); return !isNaN(d.getTime()) && d >= df; }); }
+    if (filterDateTo) { var dt = new Date(filterDateTo); dt.setHours(23,59,59,999); list = list.filter(function(r){ var d = new Date(r.created_at); return !isNaN(d.getTime()) && d <= dt; }); }
+    return list;
+  }, [unifiedRows, filterSource, filterType, filterRole, filterSearch, filterDateFrom, filterDateTo]);
+
+  var adminCount = filteredRows.filter(function(r){ return r.source === "admin"; }).length;
+  var employeeCount = filteredRows.filter(function(r){ return r.source === "employee"; }).length;
+
+  var metaPreview = function(meta, len){
+    if (meta == null) return "—";
+    try { var s = JSON.stringify(meta); return (s.length > (len||60) ? s.slice(0,len||60) + "…" : s) || "—"; } catch(_){ return "—"; }
+  };
+  var toggleMetaExpand = function(key){ setExpandedMeta(function(p){ var n = Object.assign({}, p); n[key] = !p[key]; return n; }); };
+
+  var handleRefresh = function(){ loadAdminActionLogs(); loadEmployeeLogs(); };
+
+  if (adminLogsLoading && employeeLogsLoading && unifiedRows.length === 0) {
+    return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:32,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Chargement...":"Loading..."));
+  }
+  if (adminLogsError && employeeLogsError && unifiedRows.length === 0) {
+    return React.createElement("div",{style:{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:24,textAlign:"center"}},
+      React.createElement("div",{style:{fontSize:15,fontWeight:700,color:"var(--danger)",marginBottom:12}},"\u26A0\uFE0F "+(fr?"Les deux tables de logs sont inaccessibles":"Both log tables inaccessible")),
+      React.createElement("div",{style:{fontSize:12,color:"var(--text-secondary)",marginBottom:8}},"admin_action_logs: " + (adminLogsError||"—")),
+      React.createElement("div",{style:{fontSize:12,color:"var(--text-secondary)",marginBottom:16}},"employee_logs: " + (employeeLogsError||"—")),
+      React.createElement("button",{onClick:handleRefresh,style:{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--danger)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}},"\u{1F504} "+(fr?"Réessayer":"Retry"))
+    );
+  }
+
+  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F4CB} "+(fr?"Log Center":"Log Center")),
+    (adminLogsError || employeeLogsError) && React.createElement("div",{style:{marginBottom:12,display:"flex",flexWrap:"wrap",gap:8}},
+      adminLogsError && React.createElement("div",{style:{padding:8,background:"var(--danger-muted)",borderRadius:8,fontSize:11,color:"var(--danger)",flex:1,minWidth:200}},"admin_action_logs: " + adminLogsError),
+      employeeLogsError && React.createElement("div",{style:{padding:8,background:"var(--danger-muted)",borderRadius:8,fontSize:11,color:"var(--danger)",flex:1,minWidth:200}},"employee_logs: " + employeeLogsError),
+      React.createElement("button",{onClick:handleRefresh,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}},"\u{1F504} "+(fr?"Rafraîchir":"Refresh"))
+    ),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(3,1fr)",gap:10,marginBottom:16}},
+      React.createElement("div",{style:{background:"var(--bg-overlay)",borderRadius:10,padding:12,border:"1px solid var(--border)"}},
+        React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Total affiché":"Total displayed")),
+        React.createElement("div",{style:{fontSize:18,fontWeight:800,color:"var(--accent)"}},String(filteredRows.length))
+      ),
+      React.createElement("div",{style:{background:"var(--bg-overlay)",borderRadius:10,padding:12,border:"1px solid var(--border)"}},
+        React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"Admin"),
+        React.createElement("div",{style:{fontSize:18,fontWeight:800,color:"var(--success)"}},String(adminCount))
+      ),
+      React.createElement("div",{style:{background:"var(--bg-overlay)",borderRadius:10,padding:12,border:"1px solid var(--border)"}},
+        React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"Employee"),
+        React.createElement("div",{style:{fontSize:18,fontWeight:800,color:"var(--blue-accent)"}},String(employeeCount))
+      )
+    ),
+    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16,alignItems:"center"}},
+      React.createElement("select",{value:filterSource,onChange:function(e){setFilterSource(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:100}},
+        React.createElement("option",{value:"all"},fr?"Toutes sources":"All sources"),
+        React.createElement("option",{value:"admin"},"Admin"),
+        React.createElement("option",{value:"employee"},"Employee")
+      ),
+      React.createElement("select",{value:filterType,onChange:function(e){setFilterType(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Tous types":"All types"),
+        typeOpts.map(function(t){ return React.createElement("option",{key:t,value:t},t); })
+      ),
+      React.createElement("select",{value:filterRole,onChange:function(e){setFilterRole(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none",minWidth:120}},
+        React.createElement("option",{value:""},fr?"Tous rôles":"All roles"),
+        roleOpts.map(function(r){ return React.createElement("option",{key:r,value:r},r); })
+      ),
+      React.createElement("input",{type:"date",value:filterDateFrom,onChange:function(e){setFilterDateFrom(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+      React.createElement("input",{type:"date",value:filterDateTo,onChange:function(e){setFilterDateTo(e.target.value);},style:{padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}}),
+      React.createElement("input",{type:"text",placeholder:fr?"Rechercher...":"Search...",value:filterSearch,onChange:function(e){setFilterSearch(e.target.value);},style:{flex:1,minWidth:140,padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--bg-overlay)",color:"var(--text)",fontSize:13,outline:"none"}})
+    ),
+    React.createElement("div",{className:"table-wrap",style:{overflowX:"auto"}},
+      React.createElement("table",{className:"table",style:{fontSize:12}},
+        React.createElement("thead",null,
+          React.createElement("tr",null,
+            React.createElement("th",null,fr?"Date":"Date"),
+            React.createElement("th",null,fr?"Source":"Source"),
+            React.createElement("th",null,fr?"Type":"Type"),
+            React.createElement("th",null,fr?"Rôle":"Role"),
+            React.createElement("th",null,fr?"User":"User"),
+            React.createElement("th",null,fr?"Label / Cible":"Label / Target"),
+            React.createElement("th",null,"Meta"),
+            React.createElement("th",null,fr?"Action":"Action")
+          )
+        ),
+        React.createElement("tbody",null,
+          filteredRows.length === 0 ? React.createElement("tr",null,React.createElement("td",{colSpan:8,style:{padding:32,textAlign:"center",color:"var(--text-tertiary)"}},fr?"Aucun log":"No logs")) :
+          filteredRows.map(function(row, idx){
+            var rowKey = (row.raw && row.raw.id != null) ? row.source + "-" + row.raw.id : "idx-" + idx;
+            var metaStr = metaPreview(row.meta, 50);
+            var isExpanded = !!expandedMeta[rowKey];
+            return React.createElement("tr",{key:rowKey},
+              React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)",whiteSpace:"nowrap"}},formatDateSafe(row.created_at)),
+              React.createElement("td",null,React.createElement("span",{style:{padding:"2px 6px",borderRadius:6,fontSize:10,fontWeight:600,background:row.source==="admin"?"var(--success-muted)":"var(--blue-accent-muted)",color:row.source==="admin"?"var(--success)":"var(--blue-accent)"}},row.source)),
+              React.createElement("td",{style:{fontFamily:"monospace",fontSize:11}},safeText(row.type)),
+              React.createElement("td",{style:{color:"var(--text-secondary)"}},safeText(row.role)),
+              React.createElement("td",{style:{fontSize:11,color:"var(--text-tertiary)"}},row.actorUserId && row.actorUserId !== "—" ? String(row.actorUserId).slice(0,8)+"…" : "—"),
+              React.createElement("td",{style:{maxWidth:180,overflow:"hidden",textOverflow:"ellipsis"}},safeText(row.label)),
+              React.createElement("td",{style:{fontSize:10,fontFamily:"monospace",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis"}},metaStr),
+              React.createElement("td",null,React.createElement("button",{onClick:function(){toggleMetaExpand(rowKey);},style:{padding:"4px 8px",borderRadius:6,border:"1px solid var(--border)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:10,cursor:"pointer"}},isExpanded?(fr?"Masquer":"Hide"):(fr?"Voir JSON":"View JSON")))
+            );
+          })
+        )
+      )
+    ),
+    expandedMeta && Object.keys(expandedMeta).filter(function(k){ return expandedMeta[k]; }).length > 0 && React.createElement("div",{style:{marginTop:12,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+      filteredRows.map(function(row, idx){
+        var rowKey = (row.raw && row.raw.id != null) ? row.source + "-" + row.raw.id : "idx-" + idx;
+        if (!expandedMeta[rowKey]) return null;
+        var metaStr = "—";
+        try { metaStr = JSON.stringify(row.meta, null, 2); } catch(_){ metaStr = row.meta != null ? String(row.meta) : "—"; }
+        return React.createElement("pre",{key:rowKey,style:{fontSize:11,fontFamily:"monospace",color:"var(--text-secondary)",overflow:"auto",maxHeight:200,marginBottom:8}},metaStr);
+      })
+    )
+  );
+};
+
+// =============================================
 // AD1 — ADMIN SHELL (tabs, state, placeholders pour AD2→AD8)
 // =============================================
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
@@ -13864,7 +14071,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
       {activeSub==="users"&&<AdminTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} adminRefreshTick={adminRefreshTick} />}
       {activeSub==="roles"&&<AdminRolesPermissionsTab lang={lang} refreshTick={adminRefreshTick} />}
       {activeSub==="assignments"&&<AdminAssignmentsTab lang={lang} profiles={profiles} models={models} refreshTick={adminRefreshTick} />}
-      {activeSub==="logs"&&<LogsAuditTab lang={lang} txs={txs} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} profiles={profiles} spenders={spenders} />}
+      {activeSub==="logs"&&<AdminLogsCenterTab lang={lang} refreshTick={adminRefreshTick} />}
       {activeSub==="settings"&&<PlaceholderTab title={t(lang,"settings")} />}
       {activeSub==="qa"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F6E0}"} QA / Maintenance — AD8 à venir</div>}
       {activeSub==="export"&&<ExportRapportsTab lang={lang} txs={txs} spenders={spenders} expenses={expenses} models={models} profiles={profiles} payslips={payslips} payouts={payouts} invoices={invoices} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} />}
