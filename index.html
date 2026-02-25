@@ -14208,6 +14208,163 @@ const AdminSettingsTab = ({lang, refreshTick}) => {
 };
 
 // =============================================
+// AD8 — ADMIN QA / MAINTENANCE (smoke checks, diagnostics, refresh)
+// =============================================
+const AdminQAMaintenanceTab = ({user, lang, refreshTick, onRefreshAll}) => {
+  var fr = lang === "fr";
+  var [checks, setChecks] = useState({});
+  var [loading, setLoading] = useState(true);
+  var [lastRefresh, setLastRefresh] = useState(null);
+  var [refreshing, setRefreshing] = useState(false);
+
+  var runSmokeChecks = useCallback(function(){
+    if (!window.sb) {
+      setChecks({ admin: "error", users: "error", rolePerms: "error", assign: "skip", logs: "error", settings: "error" });
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    var cfg = adminAssignmentsConfig || {};
+    var tbl = (cfg.tableName || "").trim();
+    var results = { admin: isAdminUser(user) ? "ok" : "warning", users: "pending", rolePerms: "pending", assign: tbl ? "pending" : "skip", logs: "pending", settings: "pending" };
+    var counts = { users: 0, rolePerms: 0, logsAdmin: 0, logsEmployee: 0, settings: 0 };
+    var profileKeys = [];
+    var lastErr = null;
+
+    var done = function(){ setChecks(results); setLoading(false); };
+
+    var p1 = window.sb.from("profiles").select("*").limit(5).then(function(r){
+      try {
+        if (r && r.error) { results.users = "error"; lastErr = r.error.message; return; }
+        var arr = safeArray(r && r.data);
+        counts.users = arr.length;
+        results.users = "ok";
+        if (arr.length > 0 && arr[0]) profileKeys = Object.keys(arr[0]);
+      } catch(e){ results.users = "error"; lastErr = e && e.message; }
+    }).catch(function(e){ results.users = "error"; lastErr = e && e.message; });
+
+    var p2 = window.sb.from("role_permissions").select("*").then(function(r){
+      try {
+        if (r && r.error) { results.rolePerms = "error"; if(!lastErr) lastErr = r.error.message; return; }
+        counts.rolePerms = safeArray(r && r.data).length;
+        results.rolePerms = "ok";
+      } catch(e){ results.rolePerms = "error"; if(!lastErr) lastErr = e && e.message; }
+    }).catch(function(e){ results.rolePerms = "error"; if(!lastErr) lastErr = e && e.message; });
+
+    var p3 = tbl ? window.sb.from(tbl).select("*").limit(1).then(function(r){
+      try {
+        if (r && r.error) { results.assign = "error"; if(!lastErr) lastErr = r.error.message; return; }
+        results.assign = "ok";
+      } catch(e){ results.assign = "error"; if(!lastErr) lastErr = e && e.message; }
+    }).catch(function(e){ results.assign = "error"; if(!lastErr) lastErr = e && e.message; }) : Promise.resolve();
+
+    var logsOk = false;
+    var p4a = window.sb.from("admin_action_logs").select("id", { count: "exact", head: true }).limit(1).then(function(r){
+      try { if (!r || r.error) return; logsOk = true; counts.logsAdmin = r.count != null ? r.count : 0; } catch(_){}
+    }).catch(function(){});
+    var p4b = window.sb.from("employee_logs").select("id", { count: "exact", head: true }).limit(1).then(function(r){
+      try { if (!r || r.error) return; logsOk = true; counts.logsEmployee = r.count != null ? r.count : 0; } catch(_){}
+    }).catch(function(){});
+    var p4 = Promise.all([p4a, p4b]).then(function(){
+      results.logs = logsOk ? "ok" : "error";
+    }).catch(function(e){ results.logs = "error"; if(!lastErr) lastErr = e && e.message; });
+
+    var p5 = window.sb.from("app_settings").select("*").then(function(r){
+      try {
+        if (r && r.error) { results.settings = "error"; if(!lastErr) lastErr = r.error.message; return; }
+        counts.settings = safeArray(r && r.data).length;
+        results.settings = "ok";
+      } catch(e){ results.settings = "error"; if(!lastErr) lastErr = e && e.message; }
+    }).catch(function(e){ results.settings = "error"; if(!lastErr) lastErr = e && e.message; });
+
+    Promise.all([p1, p2, p3, p4, p5]).then(function(){
+      setChecks(Object.assign({}, results, { _counts: counts, _profileKeys: profileKeys, _lastErr: lastErr }));
+      setLoading(false);
+    }).catch(function(){ setLoading(false); });
+  }, [user]);
+
+  useEffect(function(){ runSmokeChecks(); }, [runSmokeChecks, refreshTick]);
+
+  var handleRefreshAll = useCallback(function(){
+    setRefreshing(true);
+    if (typeof onRefreshAll === "function") onRefreshAll();
+    setLastRefresh(new Date().toISOString());
+    if (typeof appendAdminActionLog === "function") { try { appendAdminActionLog("qa.refresh_all", "qa", null, {}); } catch(_){ console.warn("[AdminUI] qa.refresh_all log fail"); } }
+    setTimeout(function(){ runSmokeChecks(); setRefreshing(false); }, 800);
+  }, [onRefreshAll, runSmokeChecks]);
+
+  var handleRefreshSection = useCallback(function(section){
+    setRefreshing(true);
+    if (typeof onRefreshAll === "function") onRefreshAll();
+    if (typeof appendAdminActionLog === "function") { try { appendAdminActionLog("qa.refresh_section", "qa", section, {}); } catch(_){ console.warn("[AdminUI] qa.refresh_section log fail"); } }
+    setTimeout(function(){ runSmokeChecks(); setRefreshing(false); }, 600);
+  }, [onRefreshAll, runSmokeChecks]);
+
+  var StatusBadge = function(s){ var c = s==="ok" ? "var(--success)" : s==="warning" ? "var(--warning)" : s==="skip" ? "var(--text-tertiary)" : "var(--danger)"; var l = s==="ok" ? (fr?"OK":"OK") : s==="warning" ? (fr?"Avert.":"Warn") : s==="skip" ? "—" : (fr?"Erreur":"Err"); return React.createElement("span",{style:{padding:"2px 8px",borderRadius:6,fontSize:10,fontWeight:700,background:c+"20",color:c}},l); };
+
+  var c = checks._counts || {};
+  var keys = checks._profileKeys || [];
+  var hasEmail = keys.indexOf("email") >= 0;
+  var cfg = adminAssignmentsConfig || {};
+
+  return React.createElement("div",{style:{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:"16px 20px",overflow:"hidden"}},
+    React.createElement("div",{style:{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}},"\u{1F6E0} "+(fr?"QA / Maintenance":"QA / Maintenance")),
+    loading ? React.createElement("div",{style:{padding:24,textAlign:"center",color:"var(--text-tertiary)"}},"\u{1F504} "+(fr?"Vérification...":"Checking...")) :
+    React.createElement("div",null,
+      React.createElement("div",{style:{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fit,minmax(200px,1fr))",gap:12,marginBottom:16}},
+        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Accès admin":"Admin access"),
+          StatusBadge(checks.admin)
+        ),
+        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"profiles":"profiles"),
+          StatusBadge(checks.users),
+          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"n="+(c.users||0))
+        ),
+        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"role_permissions"),
+          StatusBadge(checks.rolePerms),
+          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"n="+(c.rolePerms||0))
+        ),
+        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Assignations":"Assignations"),
+          StatusBadge(checks.assign)
+        ),
+        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},fr?"Logs":"Logs"),
+          StatusBadge(checks.logs),
+          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"admin:"+(c.logsAdmin||0)+" emp:"+(c.logsEmployee||0))
+        ),
+        React.createElement("div",{style:{padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+          React.createElement("div",{style:{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}},"app_settings"),
+          StatusBadge(checks.settings),
+          React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:4}},"n="+(c.settings||0))
+        )
+      ),
+      React.createElement("div",{style:{marginBottom:16,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+        React.createElement("div",{style:{fontSize:12,fontWeight:700,color:"var(--text-tertiary)",marginBottom:8,textTransform:"uppercase"}},fr?"Boutons maintenance":"Maintenance buttons"),
+        React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:8}},
+          React.createElement("button",{onClick:function(){handleRefreshSection("users");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Utilisateurs":"Refresh Users"),
+          React.createElement("button",{onClick:function(){handleRefreshSection("permissions");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Permissions":"Refresh Permissions"),
+          React.createElement("button",{onClick:function(){handleRefreshSection("assignments");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Assignations":"Refresh Assignations"),
+          React.createElement("button",{onClick:function(){handleRefreshSection("logs");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Logs":"Refresh Logs"),
+          React.createElement("button",{onClick:function(){handleRefreshSection("settings");},disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:refreshing?"not-allowed":"pointer"}},fr?"Rafraîchir Paramètres":"Refresh Settings"),
+          React.createElement("button",{onClick:handleRefreshAll,disabled:refreshing,style:{padding:"6px 12px",borderRadius:8,border:"1px solid var(--accent)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:12,fontWeight:700,cursor:refreshing?"not-allowed":"pointer"}},refreshing?(fr?"...":"..."):(fr?"Rafraîchir Tout":"Refresh All")}
+        )
+      ),
+      React.createElement("div",{style:{marginBottom:12,padding:12,background:"var(--bg-overlay)",borderRadius:10,border:"1px solid var(--border)"}},
+        React.createElement("div",{style:{fontSize:12,fontWeight:700,color:"var(--text-tertiary)",marginBottom:8,textTransform:"uppercase"}},fr?"Diagnostics":"Diagnostics"),
+        React.createElement("div",{style:{fontSize:11,color:"var(--text-secondary)",marginBottom:4}},(fr?"Clés profiles (échantillon):":"Profile keys (sample):")+" "+(keys.length?keys.join(", "):"—")),
+        React.createElement("div",{style:{fontSize:11,color:"var(--text-secondary)",marginBottom:4}},"adminAssignmentsConfig.tableName: ", React.createElement("code",{style:{background:"var(--surface)",padding:"2px 6px",borderRadius:4}},(cfg.tableName||"(vide)")),
+        React.createElement("div",{style:{fontSize:11,color:"var(--text-secondary)",marginTop:8,padding:8,background:hasEmail?"var(--warning-muted)":"var(--success-muted)",borderRadius:8,border:"1px solid "+(hasEmail?"var(--warning)":"var(--success)")}},hasEmail ? (fr?"profiles.email présent (attention)":"profiles.email present (caution)") : (fr?"profiles.email absent en prod (attendu)":"profiles.email absent in prod (expected)"))
+      ),
+      lastRefresh && React.createElement("div",{style:{fontSize:11,color:"var(--text-quaternary)",marginTop:8}}, (fr?"Dernier refresh:":"Last refresh:")+" "+lastRefresh),
+      checks._lastErr && React.createElement("div",{style:{marginTop:12,padding:8,background:"var(--danger-muted)",borderRadius:8,fontSize:11,color:"var(--danger)"}}, (fr?"Dernière erreur:":"Last error:")+" "+checks._lastErr)
+    )
+  );
+};
+
+// =============================================
 // AD1 — ADMIN SHELL (tabs, state, placeholders pour AD2→AD8)
 // =============================================
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
@@ -14245,7 +14402,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
       {activeSub==="assignments"&&<AdminAssignmentsTab lang={lang} profiles={profiles} models={models} refreshTick={adminRefreshTick} />}
       {activeSub==="logs"&&<AdminLogsCenterTab lang={lang} refreshTick={adminRefreshTick} />}
       {activeSub==="settings"&&<AdminSettingsTab lang={lang} refreshTick={adminRefreshTick} />}
-      {activeSub==="qa"&&<div style={{background:"var(--surface)",borderRadius:14,border:"1px solid var(--border)",padding:24,textAlign:"center",color:"var(--text-tertiary)"}}>{"\u{1F6E0}"} QA / Maintenance — AD8 à venir</div>}
+      {activeSub==="qa"&&<AdminQAMaintenanceTab user={user} lang={lang} refreshTick={adminRefreshTick} onRefreshAll={handleRefresh} />}
       {activeSub==="export"&&<ExportRapportsTab lang={lang} txs={txs} spenders={spenders} expenses={expenses} models={models} profiles={profiles} payslips={payslips} payouts={payouts} invoices={invoices} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} />}
     </div>
   );
