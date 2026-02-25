@@ -8398,7 +8398,7 @@ const CompetitionTab = ({user, lang, txs, profiles}) => {
 // =============================================
 // PAIES TAB
 // =============================================
-const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invoices}) => {
+const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefresh, invoices}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const dr = useDateRange("all");
@@ -8407,7 +8407,9 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
   const [payesSubTab, setPayesSubTab] = useState("paies");
   const [breakdownChatter, setBreakdownChatter] = useState(null);
   const chatters = user.role==="chatter" ? profiles.filter(u=>u.id===user.id) : profiles.filter(u=>u.role==="chatter");
-  const [form, setForm] = useState({user_id:chatters[0]?.id||"",amount:"",currency:"CHF",method:"Virement",date:""});
+  const modelList = models || [];
+  const defaultBeneficiary = chatters[0] ? {id:chatters[0].id,type:"chatter"} : (modelList[0] ? {id:modelList[0].id,type:"modele"} : null);
+  const [form, setForm] = useState({beneficiary_id:defaultBeneficiary?.id||"",beneficiary_type:defaultBeneficiary?.type||"chatter",amount:"",currency:"CHF",method:"Virement",date:""});
   const fr = lang === "fr";
   const payFilteredTxs = dr.filterByDate(txs, "date");
 
@@ -8433,16 +8435,22 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
   const globalBalance = allChatterData.reduce((s,c)=>s+c.data.balance,0);
 
   const handleAddPayout = async () => {
+    if(!form.beneficiary_id) { addToast(fr?"Sélectionnez un bénéficiaire":"Select a beneficiary","error"); return; }
     if(!form.amount||isNaN(parseFloat(form.amount))||parseFloat(form.amount)<=0) { addToast(fr?"Montant invalide (> 0)":"Invalid amount (> 0)","error"); return; }
     if(!form.date) { addToast(fr?"Date requise":"Date required","error"); return; }
     setSaving(true);
     try {
-      const {data:inserted, error} = await sb.from("payouts").insert({user_id:form.user_id, amount:parseFloat(form.amount), currency:form.currency, method:form.method, date:form.date, status:"pending", type:"chatter"}).select().single();
+      const bt = form.beneficiary_type || "chatter";
+      const row = {amount:parseFloat(form.amount), currency:form.currency, method:form.method, date:form.date, status:"pending", type:bt};
+      if (bt === "chatter") { row.user_id = form.beneficiary_id; }
+      else { row.model_id = form.beneficiary_id; }
+      const {data:inserted, error} = await sb.from("payouts").insert(row).select().single();
       if(error) { addToast("Erreur payout: " + error.message, "error"); setSaving(false); return; }
-      if(inserted && user.role==="gerant") {
-        try { await generateChatterInvoice({id:inserted.id, user_id:form.user_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { addToast(fr?"Erreur génération facture":"Invoice generation error","error"); }
+      if(inserted && user.role==="gerant" && bt === "chatter") {
+        try { await generateChatterInvoice({id:inserted.id, user_id:form.beneficiary_id, amount:parseFloat(form.amount), method:form.method, date:form.date}, txs, profiles, user.id); } catch(e) { addToast(fr?"Erreur génération facture":"Invoice generation error","error"); }
       }
-      setForm({user_id:chatters[0]?.id||"",amount:"",currency:"CHF",method:"Virement",date:""});
+      const nextDefault = chatters[0] ? {id:chatters[0].id,type:"chatter"} : (modelList[0] ? {id:modelList[0].id,type:"modele"} : null);
+      setForm({beneficiary_id:nextDefault?.id||"",beneficiary_type:nextDefault?.type||"chatter",amount:"",currency:"CHF",method:"Virement",date:""});
       setShowForm(false);
       await onRefresh();
       addToast(t(lang,"payout_added")||"Payout ajouté","success");
@@ -8570,9 +8578,11 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, onRefresh, invo
             <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
               <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:14}}>
                 <div>
-                  <label style={{fontSize:10,fontWeight:700,color:"var(--muted)",textTransform:"uppercase",marginBottom:4,display:"block"}}>Chatter</label>
-                  <select value={form.user_id} onChange={e=>setForm({...form,user_id:e.target.value})} style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,cursor:"pointer"}}>
-                    {chatters.map(u=><option key={u.id} value={u.id}>{u.name}</option>)}
+                  <label style={{fontSize:10,fontWeight:700,color:"var(--muted)",textTransform:"uppercase",marginBottom:4,display:"block"}}>{fr?"Bénéficiaire":"Beneficiary"}</label>
+                  <select value={(form.beneficiary_id && (chatters.some(u=>u.id===form.beneficiary_id)||modelList.some(m=>m.id===form.beneficiary_id))) ? form.beneficiary_type + "|" + form.beneficiary_id : ""} onChange={e=>{const v=e.target.value;if(!v)return;const [t,id]=v.split("|");setForm({...form,beneficiary_type:t||"chatter",beneficiary_id:id||""})}} style={{width:"100%",padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,cursor:"pointer"}}>
+                    <option value="">{fr?"— Choisir —":"— Select —"}</option>
+                    {chatters.length>0&&<optgroup label={fr?"CHATTERS":"CHATTERS"}>{chatters.map(u=><option key={"chatter|"+u.id} value={"chatter|"+u.id}>{(u.handle?"@"+u.handle:u.name)||u.id}</option>)}</optgroup>}
+                    {modelList.length>0&&<optgroup label={fr?"MODÈLES":"MODELS"}>{modelList.map(m=><option key={"modele|"+m.id} value={"modele|"+m.id}>{m.name||m.id}</option>)}</optgroup>}
                   </select>
                 </div>
                 <div>
@@ -22690,7 +22700,7 @@ const App = () => {
             ))}
           </div>
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txSummary} expenses={expenses} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
-          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} onRefresh={onRefresh} invoices={invoices} />}
+          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} />}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
           {subTab==="resultats_dadash"&&<ResultatsDadashTab user={user} lang={lang} txs={txSummary} expenses={expenses} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
