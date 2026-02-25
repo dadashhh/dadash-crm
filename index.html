@@ -6174,6 +6174,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
   const [editingTx, setEditingTx] = useState(null);
   const [processingTxId, setProcessingTxId] = useState(null);
   const [confirmRefuse, setConfirmRefuse] = useState(null);
+  const [txCardFilter, setTxCardFilter] = useState(null);
+  const [txChartMetric, setTxChartMetric] = useState("ca");
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
   const {sort, onSort, doSort} = useSortable();
@@ -6217,14 +6219,27 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     }
   }, [filtersKey, fetchTxPage]);
 
-  // Client-side sort on server-fetched page data
-  const sortedFiltered = doSort(displayTxs, {
+  // Client-side sort on server-fetched page data (card filter applied first)
+  const _txCardBase = txCardFilter==="validated"?displayTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee"):txCardFilter==="pending"?displayTxs.filter(tx=>tx.status==="pending"):displayTxs;
+  const sortedFiltered = doSort(_txCardBase, {
     date: x=>x.date, amount: x=>Number(x.amount)||0, spender_handle: x=>(x.spender_handle||"").toLowerCase(),
     model_id: x=>(models.find(m=>m.id===x.model_id)?.name||"").toLowerCase(),
     provider_id: x=>(profiles.find(p=>p.id===x.provider_id)?.name||"").toLowerCase(),
     chatter_id: x=>(profiles.find(p=>p.id===x.chatter_id)?.name||"").toLowerCase(),
     product: x=>(x.product||"").toLowerCase(), status: x=>(x.status||"").toLowerCase(),
   });
+  const txChartData = React.useMemo(()=>{
+    const g={};
+    (displayTxs||[]).forEach(tx=>{
+      const d=(tx.date||tx.created_at||"").slice(0,10);
+      if(!d)return;
+      if(!g[d])g[d]={day:d,validated:0,pending:0,nbV:0,nbP:0};
+      const a=Number(tx.amount||0);
+      if(tx.status==="validated"||tx.status==="confirmee"){g[d].validated+=a;g[d].nbV++;}
+      if(tx.status==="pending"){g[d].pending+=a;g[d].nbP++;}
+    });
+    return Object.values(g).sort((a,b)=>a.day<b.day?-1:1).map(d=>({...d,label:d.day.slice(5).replace("-","/"),validated:Math.round(d.validated),pending:Math.round(d.pending)}));
+  },[displayTxs]);
 
   // Build spender list for autocomplete
   const spenderOptions = React.useMemo(() => {
@@ -6377,25 +6392,65 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
         provider={txProvider} setProvider={setTxProvider} showProviderFilter={user.role==="gerant"}
         chatter={chatter} setChatter={setChatter} showChatterFilter={user.role==="gerant"}
         status={status} setStatus={setStatus} showStatusFilter />
-      {/* ── KPI strip (6 cards) ── */}
+      {/* ── KPI strip (6 cards, cliquables) ── */}
       {(()=>{
         const vTx = displayTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee");
         const pTx = displayTxs.filter(tx=>tx.status==="pending");
-        const caBrut = vTx.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+        const caBrut = displayTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
         const caNet  = vTx.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||tx.amount||0),tx.currency),0);
         const caEnAttente = pTx.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
-        const panierMoyen = vTx.length>0 ? Math.round(caBrut/vTx.length) : 0;
+        const panierMoyen = vTx.length>0 ? Math.round(caNet/vTx.length) : 0;
+        const togCard = (f)=>()=>setTxCardFilter(p=>p===f?null:f);
+        const mkCard = (label,value,icon,filter,cls="")=>{
+          const isActive=filter&&txCardFilter===filter;
+          return <div key={label} className={`kpi ${cls}`} style={{...(filter?{cursor:"pointer"}:{}),transition:"all 0.18s",...(isActive?{boxShadow:"0 0 0 2px #8b5cf6",background:"rgba(139,92,246,0.1)"}:{})}} onClick={filter?togCard(filter):undefined}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}><span className="kpi-label">{label}</span>{icon&&<span style={{fontSize:18}}>{icon}</span>}</div>
+            <div className="kpi-value">{value}</div>
+          </div>;
+        };
         return (
-          <div className="kpi-grid ui-mb-md" style={{marginBottom:20}}>
-            <KPICard label="CA Brut" value={`${Math.round(caBrut).toLocaleString()}${currencySymbol}`} icon="💰"/>
-            <KPICard label="CA Net" value={`${Math.round(caNet).toLocaleString()}${currencySymbol}`} icon="🏦"/>
-            <KPICard label="CA En attente" value={`${Math.round(caEnAttente).toLocaleString()}${currencySymbol}`} icon="⏳" className="warning"/>
-            <KPICard label="TX Validées" value={`${vTx.length}`} icon="✅"/>
-            <KPICard label="TX Pending" value={`${pTx.length}`} icon="🕐" className={pTx.length>0?"warning":""}/>
-            <KPICard label="Panier Moyen" value={`${panierMoyen.toLocaleString()}${currencySymbol}`} icon="🛒"/>
+          <div className="kpi-grid ui-mb-md" style={{marginBottom:12}}>
+            {mkCard("CA Brut",`${Math.round(caBrut).toLocaleString()}${currencySymbol}`,"💰","all")}
+            {mkCard("CA Net",`${Math.round(caNet).toLocaleString()}${currencySymbol}`,"🏦","validated")}
+            {mkCard("CA En attente",`${Math.round(caEnAttente).toLocaleString()}${currencySymbol}`,"⏳","pending","warning")}
+            {mkCard("TX Validées",`${vTx.length}`,"✅","validated")}
+            {mkCard("TX Pending",`${pTx.length}`,"🕐","pending",pTx.length>0?"warning":"")}
+            {mkCard("Panier Moyen",`${panierMoyen.toLocaleString()}${currencySymbol}`,"🛒",null)}
           </div>
         );
       })()}
+      {/* ── Graphe TX (barres empilées par jour) ── */}
+      {rechartsReady&&(
+        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px 8px",marginBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:10}}>
+            {[{v:"ca",l:"CA"},{v:"nb",l:"NB TX"}].map(m=>(
+              <button key={m.v} type="button" onClick={()=>setTxChartMetric(m.v)} style={{padding:"3px 12px",borderRadius:7,border:`1px solid ${txChartMetric===m.v?"#8b5cf6":"var(--border)"}`,background:txChartMetric===m.v?"rgba(139,92,246,0.18)":"var(--surface2)",color:txChartMetric===m.v?"#c4b5fd":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer",transition:"all 0.15s"}}>{m.l}</button>
+            ))}
+            {txCardFilter&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--text-tertiary)",alignSelf:"center"}}>Filtre : {txCardFilter==="validated"?"✅ validées":txCardFilter==="pending"?"⏳ pending":"tous statuts"}</span>}
+          </div>
+          {txChartData.length>0?(
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={txChartData} barCategoryGap="35%" barGap={0}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false}/>
+                <XAxis dataKey="label" tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false}/>
+                <YAxis tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false} width={36}/>
+                <RechartsTooltip content={({active,payload,label})=>{
+                  if(!active||!payload||!payload.length)return null;
+                  const d=payload[0]?.payload||{};
+                  const showV=!txCardFilter||txCardFilter==="all"||txCardFilter==="validated";
+                  const showP=!txCardFilter||txCardFilter==="all"||txCardFilter==="pending";
+                  return <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:8,padding:"10px 14px",fontSize:12}}>
+                    <div style={{fontWeight:700,marginBottom:5,color:"var(--text)"}}>{label}</div>
+                    {txChartMetric==="ca"?<>{showV&&<div style={{color:"#10b981"}}>✅ Validé : {(d.validated||0).toLocaleString()} CHF</div>}{showP&&<div style={{color:"#f59e0b"}}>⏳ Pending : {(d.pending||0).toLocaleString()} CHF</div>}</>:<>{showV&&<div style={{color:"#10b981"}}>✅ TX validées : {d.nbV||0}</div>}{showP&&<div style={{color:"#f59e0b"}}>⏳ TX pending : {d.nbP||0}</div>}</>}
+                  </div>;
+                }}/>
+                {(!txCardFilter||txCardFilter==="all"||txCardFilter==="validated")&&<Bar dataKey={txChartMetric==="ca"?"validated":"nbV"} stackId="a" fill="#10b981" radius={txCardFilter==="validated"?[3,3,3,3]:[0,0,3,3]} name="Validées"/>}
+                {(!txCardFilter||txCardFilter==="all"||txCardFilter==="pending")&&<Bar dataKey={txChartMetric==="ca"?"pending":"nbP"} stackId="a" fill="#f59e0b" radius={txCardFilter==="pending"?[3,3,3,3]:[3,3,0,0]} name="Pending"/>}
+              </BarChart>
+            </ResponsiveContainer>
+          ):<div style={{height:200,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-tertiary)",fontSize:13}}>Aucune donnée pour cette période</div>}
+        </div>
+      )}
       {(user.role==="gerant"||user.role==="chatter")&&(
         <button className="ui-btn-primary" style={{marginBottom:20}} onClick={()=>setShowForm(true)}>+ {t(lang,"new_tx")||"Nouvelle TX"}</button>
       )}
@@ -6610,6 +6665,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [filterBadge, setFilterBadge] = useState("");
   const [filterLangue, setFilterLangue] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
+  const [spCardFilter, setSpCardFilter] = useState(null);
+  const [spChartMetric, setSpChartMetric] = useState("nouveaux");
 
   // Platform presence lookup: handle → Set<platform>
   const [spenderPlatforms, setSpenderPlatforms] = useState({});
@@ -6815,7 +6872,24 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   else if(sortBy==="model_ca" && filterModel) sorted.sort((a,b)=>(b.byModel[filterModel]?.ca||0)-(a.byModel[filterModel]?.ca||0));
   else sorted.sort((a,b)=>b.ltv-a.ltv);
 
-  const spPag = usePagination(sorted);
+  // Apply card filter to spender list
+  let spCardSorted=sorted;
+  if(spCardFilter==="actifs7j"){const c=Date.now()-7*86400000;spCardSorted=sorted.filter(s=>s.lastTxDate&&new Date(s.lastTxDate).getTime()>c);}
+  else if(spCardFilter==="whales"){spCardSorted=sorted.filter(s=>computeSpenderBadges(s).some(b=>b.label==="WHALE"));}
+  else if(spCardFilter==="nouveaux"){const ms=new Date();ms.setDate(1);ms.setHours(0,0,0,0);spCardSorted=sorted.filter(s=>{if(!s.txs||!s.txs.length)return false;const e=[...s.txs].sort((a,b)=>new Date(a.date||0)-new Date(b.date||0))[0];return e&&new Date(e.date)>=ms;});}
+
+  const spPag = usePagination(spCardSorted);
+  const spChartData = React.useMemo(()=>{
+    if(spChartMetric==="ltv"){
+      return [...spenders].sort((a,b)=>b.ltv-a.ltv).slice(0,10).map(s=>({name:"@"+(s.name||"?"),ltv:Math.round(s.ltv||0)}));
+    }
+    const g={};
+    (spenders||[]).forEach(s=>{
+      (s.txs||[]).forEach(tx=>{const d=(tx.date||tx.created_at||"").slice(0,10);if(!d)return;if(!g[d])g[d]={day:d,nouveaux:0,actifs:new Set()};g[d].actifs.add(s.name);});
+      if(s.txs&&s.txs.length>0){const first=[...s.txs].sort((a,b)=>new Date(a.date||0)-new Date(b.date||0))[0];const d=(first.date||first.created_at||"").slice(0,10);if(d){if(!g[d])g[d]={day:d,nouveaux:0,actifs:new Set()};g[d].nouveaux++;}}
+    });
+    return Object.values(g).sort((a,b)=>a.day<b.day?-1:1).map(d=>({...d,label:d.day.slice(5).replace("-","/"),actifs:d.actifs.size}));
+  },[spenders,spChartMetric]);
   const avgLtv = sorted.length>0 ? sorted.reduce((s,x)=>s+x.ltv,0)/sorted.length : 0;
   const multiModelCount = sorted.filter(s=>s.modelCount>1).length;
   const totalValidated = sorted.reduce((s,x)=>s+x.validCA,0);
@@ -6839,29 +6913,70 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       {/* ── Filtre global (aligné Dashboard) ── */}
       <GlobalFilterBar lang={lang} dr={dr} models={models} profiles={null}
         model={filterModel} setModel={(v)=>{setFilterModel(v);setSelected(null);}} showModelFilter />
-      {/* ── KPI STRIP (aligné Dashboard) ── */}
-      <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(5, 1fr)",gap:10,marginBottom:18}}>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
-          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{t(lang,"spenders")}</div>
-          <div style={{fontSize:20,fontWeight:800,color:"var(--text)",lineHeight:1.1}}>{spenders.length}</div>
+      {/* ── KPI STRIP (cliquables) ── */}
+      {(()=>{
+        const togSp=(f)=>()=>setSpCardFilter(p=>p===f?null:f);
+        const mkSp=(label,val,filter,green=false)=>{
+          const isA=filter&&spCardFilter===filter;
+          return <div key={label} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.18s",...(filter?{cursor:"pointer"}:{}),...(isA?{boxShadow:"0 0 0 2px #8b5cf6",background:"rgba(139,92,246,0.1)"}:{})}} onClick={filter?togSp(filter):undefined}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{label}</div>
+            <div style={{fontSize:20,fontWeight:800,color:green?"var(--success)":"var(--text)",lineHeight:1.1}}>{val}</div>
+          </div>;
+        };
+        return <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(5, 1fr)",gap:10,marginBottom:12}}>
+          {mkSp(t(lang,"spenders"),spenders.length,null)}
+          {mkSp(fr?"Actifs 7j":"Active 7d",_actifs7j,"actifs7j")}
+          {mkSp("Whales",_whales,"whales")}
+          {mkSp(fr?"Nouveaux ce mois":"New this month",_nouveaux,"nouveaux")}
+          {mkSp("CA Total",`${Math.round(_caTotal).toLocaleString()}${currencySymbol}`,null,true)}
+        </div>;
+      })()}
+      {/* ── Graphe Spenders ── */}
+      {rechartsReady&&(
+        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px 8px",marginBottom:16}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:10}}>
+            {[{v:"nouveaux",l:"NOUVEAUX"},{v:"actifs",l:"ACTIFS"},{v:"ltv",l:"LTV"}].map(m=>(
+              <button key={m.v} type="button" onClick={()=>setSpChartMetric(m.v)} style={{padding:"3px 12px",borderRadius:7,border:`1px solid ${spChartMetric===m.v?"#8b5cf6":"var(--border)"}`,background:spChartMetric===m.v?"rgba(139,92,246,0.18)":"var(--surface2)",color:spChartMetric===m.v?"#c4b5fd":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer",transition:"all 0.15s"}}>{m.l}</button>
+            ))}
+            {spCardFilter&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--text-tertiary)",alignSelf:"center"}}>Filtre : {spCardFilter==="actifs7j"?"🔥 actifs 7j":spCardFilter==="whales"?"🐋 whales":"⭐ nouveaux"}</span>}
+          </div>
+          {spChartMetric==="ltv"?(
+            spChartData.length>0?(
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={spChartData} layout="vertical" margin={{left:4,right:8}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" horizontal={false}/>
+                  <XAxis type="number" tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false}/>
+                  <YAxis type="category" dataKey="name" tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false} width={76}/>
+                  <RechartsTooltip content={({active,payload,label})=>active&&payload&&payload.length?<div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:8,padding:"10px 14px",fontSize:12}}><div style={{fontWeight:700,marginBottom:4,color:"var(--text)"}}>{label}</div><div style={{color:"#8b5cf6"}}>LTV : {(payload[0]?.value||0).toLocaleString()} CHF</div></div>:null}/>
+                  <Bar dataKey="ltv" fill="#8b5cf6" radius={[0,3,3,0]}/>
+                </BarChart>
+              </ResponsiveContainer>
+            ):<div style={{height:200,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-tertiary)",fontSize:13}}>Aucun spender</div>
+          ):(
+            spChartData.length>0?(
+              <ResponsiveContainer width="100%" height={200}>
+                <LineChart data={spChartData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false}/>
+                  <XAxis dataKey="label" tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false}/>
+                  <YAxis tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false} width={28} allowDecimals={false}/>
+                  <RechartsTooltip content={({active,payload,label})=>{
+                    if(!active||!payload||!payload.length)return null;
+                    const pN=payload.find(p=>p.dataKey==="nouveaux");
+                    const pA=payload.find(p=>p.dataKey==="actifs");
+                    return <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:8,padding:"10px 14px",fontSize:12}}>
+                      <div style={{fontWeight:700,marginBottom:4,color:"var(--text)"}}>{label}</div>
+                      {pN&&<div style={{color:"#8b5cf6"}}>⭐ Nouveaux : {pN.value||0}</div>}
+                      {pA&&<div style={{color:"#10b981"}}>🔥 Actifs : {pA.value||0}</div>}
+                    </div>;
+                  }}/>
+                  {spChartMetric==="nouveaux"&&<Line type="monotone" dataKey="nouveaux" stroke="#8b5cf6" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#8b5cf6"}}/>}
+                  {spChartMetric==="actifs"&&<Line type="monotone" dataKey="actifs" stroke="#10b981" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#10b981"}}/>}
+                </LineChart>
+              </ResponsiveContainer>
+            ):<div style={{height:200,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-tertiary)",fontSize:13}}>Aucune donnée pour cette période</div>
+          )}
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
-          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{fr?"Actifs 7j":"Active 7d"}</div>
-          <div style={{fontSize:20,fontWeight:800,color:"var(--text)",lineHeight:1.1}}>{_actifs7j}</div>
-        </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
-          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>Whales</div>
-          <div style={{fontSize:20,fontWeight:800,color:"var(--text)",lineHeight:1.1}}>{_whales}</div>
-        </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
-          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{fr?"Nouveaux ce mois":"New this month"}</div>
-          <div style={{fontSize:20,fontWeight:800,color:"var(--text)",lineHeight:1.1}}>{_nouveaux}</div>
-        </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",transition:"all 0.2s"}}>
-          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>CA Total</div>
-          <div style={{fontSize:20,fontWeight:800,color:"var(--success)",lineHeight:1.1}}>{Math.round(_caTotal).toLocaleString()}{currencySymbol}</div>
-        </div>
-      </div>
+      )}
 
       {/* ── Toolbar recherche + filtres (aligné Dashboard) ── */}
       <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
