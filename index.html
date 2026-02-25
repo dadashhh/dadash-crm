@@ -2115,7 +2115,8 @@ const PAGE_TABS = {
     { id: "resultats_dadash", label: "Résultats DADASH", icon: "\u{1F4B0}" },
   ],
   automation: [
-    { id: "broadcasts", label: "Broadcasts", icon: "\u{1F4E2}" },
+    { id: "push",   label: "💬 Push",   icon: "" },
+    { id: "scans",  label: "📷 Scans",  icon: "" },
   ],
   admin: [
     { id: "overview", label: "Vue d'ensemble", icon: "\u{1F4CA}" },
@@ -23380,6 +23381,409 @@ const SearchModal = ({open, onClose, lang, user, txs, spenders, profiles, models
 };
 
 // =============================================
+// PUSH PAGE V1 — Zones A / B / C
+// =============================================
+const PushPageV1 = ({ user, lang, models, spenders, botStats, onRefresh }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+
+  // ── Zone A ──
+  const [botDetail, setBotDetail] = useState(null);
+  const [botActionLoading, setBotActionLoading] = useState(null);
+
+  // ── Zone B ──
+  const [channel, setChannel] = useState("telegram");
+  const [compModelId, setCompModelId] = useState("");
+  const [targetType, setTargetType] = useState("all");
+  const [targetValue, setTargetValue] = useState("");
+  const [contentType, setContentType] = useState("text");
+  const [message, setMessage] = useState("");
+  const [mediaFile, setMediaFile] = useState(null);
+  const [mediaPreview, setMediaPreview] = useState(null);
+  const [pushLang, setPushLang] = useState(lang || "fr");
+  const [timing, setTiming] = useState("now");
+  const [scheduledAt, setScheduledAt] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // ── Zone C ──
+  const [campaigns, setCampaigns] = useState([]);
+  const [logsLoading, setLogsLoading] = useState(true);
+  const [filterChannel, setFilterChannel] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterFrom, setFilterFrom] = useState("");
+  const [filterTo, setFilterTo] = useState("");
+  const [retrying, setRetrying] = useState(null);
+
+  // ── Hooks (avant tout return) ──
+  const BOT_DEFS = [
+    { id: "telegram", name: "Bot Telegram",   platform: "telegram",  icon: "✈️" },
+    { id: "chatting", name: "Chatting Bot",    platform: "whatsapp",  icon: "💬" },
+    { id: "scan",     name: "Scan Checker",    platform: "scan",      icon: "📷" },
+  ];
+
+  const bots = useMemo(() => {
+    return BOT_DEFS.map(b => {
+      const stats = (botStats || []).filter(s => s.channel === b.platform).sort((a, c) => new Date(c.timestamp) - new Date(a.timestamp));
+      const latest = stats[0];
+      const ageMs = latest ? Date.now() - new Date(latest.timestamp).getTime() : Infinity;
+      const status = latest?.status === "paused" ? "paused"
+        : latest?.status === "error" ? "error"
+        : ageMs < 300000 ? "active"
+        : latest ? "inactive" : "unknown";
+      return { ...b, status, uptimeMins: latest?.uptime_minutes ?? null, lastActivity: latest?.timestamp ?? null, stats,
+        messages: stats.reduce((s, x) => s + (x.messages_sent || 0), 0),
+        errors: stats.filter(x => x.status === "error").length };
+    });
+  }, [botStats]);
+
+  useEffect(() => { fetchCampaigns(); }, []);
+
+  const fetchCampaigns = async () => {
+    setLogsLoading(true);
+    try {
+      const { data } = await sb.from("push_campaigns").select("*").order("created_at", { ascending: false }).limit(100);
+      setCampaigns(data || []);
+    } catch (_) { setCampaigns([]); }
+    setLogsLoading(false);
+  };
+
+  const handleBotAction = async (botId, action) => {
+    const bot = BOT_DEFS.find(b => b.id === botId);
+    if (!bot) return;
+    setBotActionLoading(botId + "_" + action);
+    try {
+      const newStatus = action === "pause" ? "paused" : action === "start" ? "running" : "restarting";
+      const { error } = await sb.from("bot_status").update({ status: newStatus }).eq("channel", bot.platform);
+      if (error) throw error;
+      addToast(`${bot.name} — ${action}`, "success");
+    } catch (e) { addToast("Erreur: " + (e?.message || "bot_status non configuré"), "warning"); }
+    setBotActionLoading(null);
+  };
+
+  const handleMediaChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setMediaFile(file);
+    const reader = new FileReader();
+    reader.onload = ev => setMediaPreview(ev.target.result);
+    reader.readAsDataURL(file);
+  };
+
+  const handleSend = async () => {
+    if (!compModelId) return addToast(fr ? "Sélectionne un modèle" : "Select a model", "error");
+    if (contentType === "text" && !message.trim()) return addToast(fr ? "Message vide" : "Empty message", "error");
+    if (timing === "scheduled" && !scheduledAt) return addToast(fr ? "Date requise" : "Schedule date required", "error");
+    setSending(true);
+    const { error } = await sb.from("push_campaigns").insert({
+      created_by: user.id,
+      channel,
+      model_id: compModelId || null,
+      target_type: targetType,
+      target_value: targetType !== "all" ? targetValue || null : null,
+      content_type: contentType,
+      message: contentType === "text" ? message.trim() || null : null,
+      language: pushLang,
+      scheduled_at: timing === "scheduled" ? new Date(scheduledAt).toISOString() : null,
+      status: timing === "scheduled" ? "scheduled" : "pending",
+    });
+    setSending(false);
+    if (error) { addToast("Erreur: " + error.message, "error"); return; }
+    addToast(timing === "scheduled" ? "⏰ Push planifié !" : "💬 Push créé !", "success");
+    setMessage(""); setMediaFile(null); setMediaPreview(null);
+    fetchCampaigns();
+    if (onRefresh) onRefresh();
+  };
+
+  const handleRetry = async (id) => {
+    setRetrying(id);
+    await sb.from("push_campaigns").update({ status: "pending" }).eq("id", id);
+    setRetrying(null);
+    addToast("🔄 Relancé", "success");
+    fetchCampaigns();
+  };
+
+  const filteredCampaigns = useMemo(() => campaigns.filter(c => {
+    if (filterChannel && c.channel !== filterChannel) return false;
+    if (filterStatus && c.status !== filterStatus) return false;
+    if (filterFrom && new Date(c.created_at) < new Date(filterFrom)) return false;
+    if (filterTo && new Date(c.created_at) > new Date(filterTo + "T23:59:59")) return false;
+    return true;
+  }), [campaigns, filterChannel, filterStatus, filterFrom, filterTo]);
+
+  const statusBadge = (s) => {
+    const m = { pending:["🔄","#F59E0B",fr?"En cours":"Pending"], sent:["✅","#10B981",fr?"Envoyé":"Sent"],
+      failed:["❌","#EF4444",fr?"Échec":"Failed"], error:["❌","#EF4444",fr?"Erreur":"Error"],
+      scheduled:["⏰","#8B5CF6",fr?"Planifié":"Scheduled"] };
+    const [icon, color, label] = m[s] || ["❓","#6B7280", s||"-"];
+    return <span style={{padding:"2px 8px",borderRadius:8,background:color+"20",color,fontSize:11,fontWeight:700}}>{icon} {label}</span>;
+  };
+
+  const CHANNELS = [
+    { id:"telegram",  label:"Telegram",  icon:"✈️",  active:true  },
+    { id:"onlyfans",  label:"OnlyFans",  icon:"🔒",  active:false },
+    { id:"mym",       label:"MYM",       icon:"💜",  active:false },
+    { id:"whatsapp",  label:"WhatsApp",  icon:"💬",  active:false },
+  ];
+
+  const botStatusIcon  = s => ({ active:"✅", paused:"⏸️", error:"🔴", inactive:"⚠️", unknown:"❓" }[s]||"❓");
+  const botStatusColor = s => ({ active:"#10B981", paused:"#F59E0B", error:"#EF4444", inactive:"#6B7280", unknown:"#6B7280" }[s]||"#6B7280");
+
+  const inputSt = { width:"100%",padding:"10px 14px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:13,fontFamily:"'DM Sans',sans-serif",outline:"none",boxSizing:"border-box" };
+  const labelSt = { fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",fontWeight:700,letterSpacing:0.5,marginBottom:6 };
+
+  const activeModels = (models || []).filter(m => m.is_active !== false);
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:24,maxWidth:1100,margin:"0 auto"}}>
+
+      {/* ══ ZONE A — BOTS ACTIFS ══ */}
+      <div>
+        <div style={{fontSize:11,fontWeight:700,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:1,marginBottom:12}}>🤖 {fr?"Bots actifs":"Active Bots"}</div>
+        <div style={{display:"flex",gap:12,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:4}}>
+          {bots.map(bot => (
+            <div key={bot.id} onClick={()=>setBotDetail(bot)} style={{cursor:"pointer",minWidth:200,flex:"0 0 auto",background:"var(--card-bg)",border:"1px solid var(--border)",borderLeft:`3px solid ${botStatusColor(bot.status)}`,borderRadius:14,padding:"14px 16px",transition:"box-shadow 0.15s"}} onMouseEnter={e=>e.currentTarget.style.boxShadow=`0 0 0 1px ${botStatusColor(bot.status)}40`} onMouseLeave={e=>e.currentTarget.style.boxShadow="none"}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+                <div style={{display:"flex",alignItems:"center",gap:7}}>
+                  <span style={{fontSize:18}}>{bot.icon}</span>
+                  <span style={{fontSize:13,fontWeight:700}}>{bot.name}</span>
+                </div>
+                <span style={{fontSize:15}}>{botStatusIcon(bot.status)}</span>
+              </div>
+              <div style={{fontSize:11,color:botStatusColor(bot.status),fontWeight:600,marginBottom:6}}>{bot.status.charAt(0).toUpperCase()+bot.status.slice(1)}</div>
+              {bot.uptimeMins!=null && <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:3}}>Uptime: {bot.uptimeMins>=60?`${Math.floor(bot.uptimeMins/60)}h ${bot.uptimeMins%60}m`:`${bot.uptimeMins}m`}</div>}
+              {bot.lastActivity && <div style={{fontSize:10,color:"var(--text-quaternary)",marginBottom:10}}>{formatTimeAgo(bot.lastActivity)}</div>}
+              <div style={{display:"flex",gap:5}} onClick={e=>e.stopPropagation()}>
+                {[["start","▶","#10B981"],["pause","⏸","#F59E0B"],["restart","↺","#8B5CF6"]].map(([action,sym,col])=>(
+                  <button key={action} onClick={()=>handleBotAction(bot.id,action)} disabled={!!botActionLoading} style={{flex:1,padding:"5px 0",borderRadius:7,border:`1px solid ${col}40`,background:col+"12",color:col,fontSize:13,fontWeight:700,cursor:"pointer",opacity:botActionLoading?0.5:1}}>{sym}</button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ══ ZONE B — COMPOSER ══ */}
+      <div style={{background:"var(--card-bg)",border:"1px solid var(--border)",borderRadius:16,padding:_isMobile?14:24}}>
+        <div style={{fontSize:15,fontWeight:800,marginBottom:20}}>💬 {fr?"Nouveau Push":"New Push"}</div>
+        <div style={{display:"flex",flexDirection:"column",gap:18}}>
+
+          {/* Canal */}
+          <div>
+            <div style={labelSt}>{fr?"Canal":"Channel"}</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {CHANNELS.map(ch=>(
+                <button key={ch.id} onClick={()=>{if(ch.active)setChannel(ch.id);}} style={{padding:"8px 14px",borderRadius:10,border:`1px solid ${channel===ch.id&&ch.active?"var(--accent)":"var(--border)"}`,background:channel===ch.id&&ch.active?"var(--accent-muted)":ch.active?"var(--surface)":"rgba(255,255,255,0.02)",color:ch.active?(channel===ch.id?"var(--accent)":"var(--text)"):"var(--text-quaternary)",fontSize:13,fontWeight:600,cursor:ch.active?"pointer":"not-allowed",display:"flex",alignItems:"center",gap:6}}>
+                  {ch.icon} {ch.label}
+                  {!ch.active&&<span style={{fontSize:9,padding:"1px 5px",borderRadius:5,background:"rgba(255,255,255,0.06)",marginLeft:2}}>{fr?"Bientôt":"Soon"}</span>}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Modèle + Langue */}
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:14}}>
+            <div>
+              <div style={labelSt}>{fr?"Compte / Modèle":"Account / Model"} *</div>
+              <select value={compModelId} onChange={e=>setCompModelId(e.target.value)} style={inputSt}>
+                <option value="">{fr?"Sélectionner...":"Select..."}</option>
+                {activeModels.map(m=><option key={m.id} value={m.id}>{m.name||m.display_name}</option>)}
+              </select>
+            </div>
+            <div>
+              <div style={labelSt}>{fr?"Langue":"Language"}</div>
+              <div style={{display:"flex",gap:0,borderRadius:10,border:"1px solid var(--border)",overflow:"hidden"}}>
+                {[["fr","🇫🇷"],["en","🇬🇧"],["de","🇩🇪"]].map(([l,flag])=>(
+                  <button key={l} onClick={()=>setPushLang(l)} style={{flex:1,padding:"10px 4px",border:"none",background:pushLang===l?"var(--accent-muted)":"var(--surface)",color:pushLang===l?"var(--accent)":"var(--text-secondary)",fontSize:12,fontWeight:700,cursor:"pointer"}}>{flag} {l.toUpperCase()}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Cible */}
+          <div>
+            <div style={labelSt}>{fr?"Cible":"Target"}</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:targetType!=="all"?10:0}}>
+              {[{id:"all",label:fr?"Tous les actifs":"All active"},{id:"segment",label:"Segment"},{id:"single",label:fr?"Spender unique":"Single spender"}].map(t=>(
+                <button key={t.id} onClick={()=>{setTargetType(t.id);setTargetValue("");}} style={{padding:"7px 14px",borderRadius:9,border:`1px solid ${targetType===t.id?"var(--accent)":"var(--border)"}`,background:targetType===t.id?"var(--accent-muted)":"var(--surface)",color:targetType===t.id?"var(--accent)":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{t.label}</button>
+              ))}
+            </div>
+            {targetType==="segment"&&<input value={targetValue} onChange={e=>setTargetValue(e.target.value)} placeholder={fr?"Ex: whale, VIP, inactif...":"Ex: whale, VIP, inactive..."} style={inputSt}/>}
+            {targetType==="single"&&(
+              <select value={targetValue} onChange={e=>setTargetValue(e.target.value)} style={inputSt}>
+                <option value="">{fr?"Sélectionner un spender...":"Select a spender..."}</option>
+                {(spenders||[]).map(s=><option key={s.id||s.handle} value={s.id||s.handle}>{s.handle||s.name}</option>)}
+              </select>
+            )}
+          </div>
+
+          {/* Type contenu */}
+          <div>
+            <div style={labelSt}>{fr?"Type de contenu":"Content type"}</div>
+            <div style={{display:"inline-flex",gap:0,borderRadius:10,border:"1px solid var(--border)",overflow:"hidden",marginBottom:14}}>
+              {[["text","✏️","Texte"],["audio","🎵","Audio"],["photo","📷","Photo"],["video","🎬","Vidéo"]].map(([id,icon,label])=>(
+                <button key={id} onClick={()=>{setContentType(id);setMediaFile(null);setMediaPreview(null);}} style={{padding:"8px 14px",border:"none",background:contentType===id?"var(--accent-muted)":"var(--surface)",color:contentType===id?"var(--accent)":"var(--text-secondary)",fontSize:12,fontWeight:600,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>{icon} {label}</button>
+              ))}
+            </div>
+            {contentType==="text"?(
+              <div>
+                <textarea value={message} onChange={e=>setMessage(e.target.value)} rows={5} placeholder={fr?"Votre message...\nVariables : {prenom} {modele}":"Your message...\nVariables: {prenom} {modele}"} style={{...inputSt,resize:"vertical",lineHeight:1.6}}/>
+                <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}}>
+                  {["{prenom}","{modele}"].map(v=>(
+                    <button key={v} onClick={()=>setMessage(m=>m+v)} style={{padding:"3px 10px",borderRadius:7,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--accent)",fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"monospace"}}>{v}</button>
+                  ))}
+                </div>
+              </div>
+            ):(
+              <div style={{border:"2px dashed var(--border)",borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",background:"var(--surface)"}}
+                onClick={()=>document.getElementById("push-media-upload").click()}
+                onDragOver={e=>{e.preventDefault();e.currentTarget.style.borderColor="var(--accent)";}}
+                onDragLeave={e=>{e.currentTarget.style.borderColor="var(--border)";}}
+                onDrop={e=>{e.preventDefault();e.currentTarget.style.borderColor="var(--border)";const f=e.dataTransfer.files[0];if(f){setMediaFile(f);const r=new FileReader();r.onload=ev=>setMediaPreview(ev.target.result);r.readAsDataURL(f);}}}>
+                <input id="push-media-upload" type="file" accept={contentType==="audio"?"audio/*":contentType==="photo"?"image/*":"video/*"} style={{display:"none"}} onChange={handleMediaChange}/>
+                {mediaPreview?(
+                  <div>
+                    {contentType==="photo"&&<img src={mediaPreview} alt="preview" style={{maxHeight:160,maxWidth:"100%",borderRadius:8,marginBottom:8}}/>}
+                    {contentType==="audio"&&<audio controls src={mediaPreview} style={{width:"100%",marginBottom:8}}/>}
+                    {contentType==="video"&&<video controls src={mediaPreview} style={{maxHeight:160,maxWidth:"100%",borderRadius:8,marginBottom:8}}/>}
+                    <div style={{fontSize:12,color:"var(--text-secondary)"}}>{mediaFile?.name}</div>
+                  </div>
+                ):(
+                  <>
+                    <div style={{fontSize:36,marginBottom:8}}>{contentType==="photo"?"📷":contentType==="audio"?"🎵":"🎬"}</div>
+                    <div style={{fontSize:13,color:"var(--text-secondary)"}}>{fr?"Glissez votre fichier ici ou cliquez":"Drag & drop or click to upload"}</div>
+                    <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:4}}>{contentType==="photo"?"JPG, PNG, GIF":contentType==="audio"?"MP3, OGG, WAV":"MP4, MOV, WEBM"}</div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Timing */}
+          <div>
+            <div style={labelSt}>{fr?"Envoi":"Timing"}</div>
+            <div style={{display:"flex",gap:8,marginBottom:timing==="scheduled"?10:0}}>
+              {[["now","⚡",fr?"Maintenant":"Now"],["scheduled","📅",fr?"Planifié":"Scheduled"]].map(([id,icon,label])=>(
+                <button key={id} onClick={()=>setTiming(id)} style={{padding:"8px 16px",borderRadius:9,border:`1px solid ${timing===id?"var(--accent)":"var(--border)"}`,background:timing===id?"var(--accent-muted)":"var(--surface)",color:timing===id?"var(--accent)":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{icon} {label}</button>
+              ))}
+            </div>
+            {timing==="scheduled"&&<input type="datetime-local" value={scheduledAt} onChange={e=>setScheduledAt(e.target.value)} style={inputSt}/>}
+          </div>
+
+          {/* Bouton envoyer */}
+          <div style={{display:"flex",justifyContent:"flex-end"}}>
+            <button onClick={handleSend} disabled={sending||!compModelId} style={{padding:"12px 32px",borderRadius:12,border:"none",background:(!compModelId||sending)?"rgba(255,255,255,0.06)":"var(--accent)",color:(!compModelId||sending)?"var(--text-tertiary)":"#fff",fontWeight:800,fontSize:14,cursor:(!compModelId||sending)?"not-allowed":"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:8,transition:"background 0.2s"}}>
+              {sending?<>🔄 {fr?"Envoi...":"Sending..."}</>:<>💬 {timing==="scheduled"?(fr?"Planifier":"Schedule"):(fr?"Envoyer":"Send")}</>}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ══ ZONE C — LOGS D'ENVOI ══ */}
+      <div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:10}}>
+          <div style={{fontSize:15,fontWeight:800}}>📋 {fr?"Logs d'envoi":"Send Logs"}</div>
+          <button onClick={fetchCampaigns} style={{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}}>🔄 {fr?"Rafraîchir":"Refresh"}</button>
+        </div>
+
+        {/* Filtres */}
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14}}>
+          <select value={filterChannel} onChange={e=>setFilterChannel(e.target.value)} style={{...inputSt,width:"auto",minWidth:110}}>
+            <option value="">{fr?"Tous canaux":"All channels"}</option>
+            {["telegram","onlyfans","mym","whatsapp"].map(c=><option key={c} value={c}>{c}</option>)}
+          </select>
+          <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={{...inputSt,width:"auto",minWidth:110}}>
+            <option value="">{fr?"Tous statuts":"All statuses"}</option>
+            {["pending","sent","failed","scheduled","error"].map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+          <input type="date" value={filterFrom} onChange={e=>setFilterFrom(e.target.value)} style={{...inputSt,width:"auto"}}/>
+          <input type="date" value={filterTo}   onChange={e=>setFilterTo(e.target.value)}   style={{...inputSt,width:"auto"}}/>
+          {(filterChannel||filterStatus||filterFrom||filterTo)&&<button onClick={()=>{setFilterChannel("");setFilterStatus("");setFilterFrom("");setFilterTo("");}} style={{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}}>✕ {fr?"Effacer":"Clear"}</button>}
+        </div>
+
+        {logsLoading?(
+          <div style={{textAlign:"center",padding:32,color:"var(--text-tertiary)"}}>{fr?"Chargement...":"Loading..."}</div>
+        ):filteredCampaigns.length===0?(
+          <div style={{textAlign:"center",padding:40,color:"var(--text-quaternary)",background:"var(--surface)",borderRadius:12,border:"1px solid var(--border)"}}>
+            <div style={{fontSize:32,marginBottom:8}}>💬</div>
+            <div style={{fontSize:13}}>{fr?"Aucun push pour l'instant":"No pushes yet"}</div>
+            <div style={{fontSize:11,color:"var(--text-quaternary)",marginTop:4}}>{fr?"Les campagnes apparaîtront ici après envoi.":"Campaigns will appear here after sending."}</div>
+          </div>
+        ):(
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
+              <thead>
+                <tr style={{borderBottom:"1px solid var(--border)"}}>
+                  {[fr?"Date":"Date",fr?"Canal":"Channel",fr?"Modèle":"Model",fr?"Cible":"Target",fr?"Type":"Type",fr?"Statut":"Status",""].map((h,i)=>(
+                    <th key={i} style={{padding:"8px 12px",textAlign:"left",fontSize:10,fontWeight:700,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,whiteSpace:"nowrap"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filteredCampaigns.map(c=>{
+                  const m = (models||[]).find(x=>x.id===c.model_id);
+                  return (
+                    <tr key={c.id} style={{borderBottom:"1px solid var(--border-subtle)"}}>
+                      <td style={{padding:"10px 12px",color:"var(--text-secondary)",whiteSpace:"nowrap",fontSize:12}}>{c.created_at?new Date(c.created_at).toLocaleString(fr?"fr-FR":"en-US",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}):"-"}</td>
+                      <td style={{padding:"10px 12px"}}><span style={{padding:"2px 8px",borderRadius:8,background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:700}}>{c.channel||"-"}</span></td>
+                      <td style={{padding:"10px 12px",color:"var(--text)",fontSize:12}}>{m?.name||m?.display_name||"-"}</td>
+                      <td style={{padding:"10px 12px",color:"var(--text-secondary)",fontSize:11}}>{c.target_type==="all"?(fr?"Tous":"All"):c.target_value||c.target_type||"-"}</td>
+                      <td style={{padding:"10px 12px",color:"var(--text-secondary)",fontSize:11,textTransform:"capitalize"}}>{c.content_type||"-"}</td>
+                      <td style={{padding:"10px 12px"}}>{statusBadge(c.status)}</td>
+                      <td style={{padding:"10px 12px"}}>
+                        {(c.status==="failed"||c.status==="error")&&(
+                          <button onClick={()=>handleRetry(c.id)} disabled={retrying===c.id} style={{padding:"4px 10px",borderRadius:7,border:"1px solid var(--danger)",background:"transparent",color:"var(--danger)",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                            {retrying===c.id?"...":"↺ "+(fr?"Relancer":"Retry")}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ══ BOT DETAIL MODAL ══ */}
+      {botDetail&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:10000}} onClick={()=>setBotDetail(null)}>
+          <div style={{maxWidth:540,width:"92vw",maxHeight:"80vh",background:"var(--bg-raised)",border:"1px solid var(--border)",borderRadius:20,overflow:"hidden",display:"flex",flexDirection:"column"}} onClick={e=>e.stopPropagation()}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"18px 22px",borderBottom:"1px solid var(--border)"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:22}}>{botDetail.icon}</span>
+                <div>
+                  <div style={{fontSize:16,fontWeight:800}}>{botDetail.name}</div>
+                  <div style={{fontSize:11,color:botStatusColor(botDetail.status),fontWeight:600}}>{botStatusIcon(botDetail.status)} {botDetail.status}</div>
+                </div>
+              </div>
+              <button onClick={()=>setBotDetail(null)} style={{background:"none",border:"none",color:"var(--text-tertiary)",fontSize:22,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{overflowY:"auto",padding:"16px 22px",flex:1}}>
+              <div style={{fontSize:11,fontWeight:700,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>{fr?"Derniers signaux":"Recent signals"}</div>
+              {botDetail.stats.length===0?(
+                <div style={{textAlign:"center",padding:28,color:"var(--text-quaternary)",fontSize:13}}>{fr?"Aucun signal enregistré":"No signals recorded"}</div>
+              ):botDetail.stats.slice(0,20).map((s,i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderRadius:8,background:"var(--surface)",marginBottom:4,border:`1px solid ${s.status==="error"?"rgba(239,68,68,0.2)":"var(--border-subtle)"}`}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,flex:1,minWidth:0}}>
+                    <span style={{fontSize:12,flexShrink:0}}>{s.status==="error"?"❌":s.status==="paused"?"⏸️":"✅"}</span>
+                    <div style={{minWidth:0}}>
+                      <div style={{fontSize:12,fontWeight:600,color:"var(--text)"}}>{s.status||"OK"}{s.messages_sent?` — ${s.messages_sent} msg`:""}</div>
+                      {s.error_message&&<div style={{fontSize:10,color:"var(--danger)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{s.error_message}</div>}
+                    </div>
+                  </div>
+                  <div style={{fontSize:10,color:"var(--text-quaternary)",flexShrink:0,marginLeft:8}}>{s.timestamp?formatTimeAgo(s.timestamp):"-"}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // MAIN APP
 // =============================================
 const App = () => {
@@ -23442,7 +23846,7 @@ const App = () => {
     const safeTab = (t) => {
       // Legacy gérant tab → new page mapping
       if (user && user.role === "gerant") {
-        const legacyMap = {transactions:"business",spenders:"business",products:"business",modeles:"equipe",model_mgmt:"equipe",chatters:"equipe",providers:"equipe",invoices:"compta",paies:"compta",compta:"compta",agents:"automation",telegram:"automation",whatsapp:"messagerie",videos:"equipe",mes_spenders:"business",objectifs:"dashboard",competition:"dashboard",admin:"admin"};
+        const legacyMap = {transactions:"business",spenders:"business",products:"business",modeles:"equipe",model_mgmt:"equipe",chatters:"equipe",providers:"equipe",invoices:"compta",paies:"compta",compta:"compta",agents:"automation",telegram:"automation",push:"automation",broadcasts:"automation",whatsapp:"messagerie",videos:"equipe",mes_spenders:"business",objectifs:"dashboard",competition:"dashboard",admin:"admin"};
         if (legacyMap[t]) { _setTab(legacyMap[t]); const tabs=PAGE_TABS[legacyMap[t]]; setSubTab(tabs?tabs[0].id:null); window.history.replaceState({tab:legacyMap[t]},"",`#${legacyMap[t]}`); return; }
       }
       if (user && isAdminUser(user) && t === "admin") { _setTab("admin"); const tabs=PAGE_TABS.admin; setSubTab(tabs&&tabs[0]?tabs[0].id:"overview"); window.history.replaceState({tab:"admin"},"","#admin"); return; }
@@ -24197,7 +24601,7 @@ const App = () => {
       case "automation":
         return (<>{renderGerantTabBar("automation")}
           {subTab==="scans"&&<ScansTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} products={products} providerPaymentMethods={providerPaymentMethods} screenshotChecks={screenshotChecks} scTotal={scTotal} onRefresh={onRefresh} />}
-          {subTab==="broadcasts"&&<BroadcastsTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} broadcasts={broadcasts} onRefresh={onRefresh} />}
+          {(subTab==="push"||subTab==="broadcasts"||!subTab)&&<PushPageV1 user={user} lang={lang} models={models} spenders={spenders} botStats={botStats} onRefresh={onRefresh} />}
         </>);
       case "bots":
         return <BotsManagementPage lang={lang} />;
@@ -24223,7 +24627,7 @@ const App = () => {
       if (user.role === "chatter") { _setTab("chatter_scan"); window.history.pushState({tab:"chatter_scan"},"","#chatter_scan"); }
       else { navigateTo("automation","scans"); }
     }
-    else if (actionId === "create_push") { navigateTo("automation","broadcasts"); }
+    else if (actionId === "create_push") { navigateTo("automation","push"); }
     else if (actionId === "create_todo") { setFabTodoForm({ title: "" }); setFabTodoModal(true); }
     else if (actionId === "create_depense") { setFabDepenseForm({ amount: "", category: "", description: "", date: new Date().toISOString().split("T")[0] }); setFabDepenseModal(true); }
   };
