@@ -16236,14 +16236,14 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
 };
 
 // =============================================
-// CHATTER ROLE — COMPETITION + GAMIFICATION
+// CHATTER ROLE — COMPETITION + GAMIFICATION (EC8)
 // =============================================
 const CHATTER_LEVELS = [
-  { name: "Débutant", icon: "\u{1F331}", minScore: 0, color: "#6B7280" },
-  { name: "Apprenti", icon: "⭐", minScore: 500, color: "#3B82F6" },
-  { name: "Confirmé", icon: "\u{1F525}", minScore: 2000, color: "#F59E0B" },
-  { name: "Expert", icon: "\u{1F48E}", minScore: 5000, color: "#8B5CF6" },
-  { name: "Légende", icon: "\u{1F451}", minScore: 10000, color: "#EF4444" },
+  { name: "Rookie", icon: "\u{1F331}", minScore: 0, color: "#6B7280" },
+  { name: "Junior", icon: "⭐", minScore: 500, color: "#3B82F6" },
+  { name: "Senior", icon: "\u{1F525}", minScore: 2000, color: "#F59E0B" },
+  { name: "Hustler", icon: "\u{1F48E}", minScore: 5000, color: "#8B5CF6" },
+  { name: "Elite", icon: "\u{1F451}", minScore: 10000, color: "#EF4444" },
 ];
 
 const getChatterLevel = (score) => {
@@ -16262,11 +16262,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
   const fr = lang === "fr";
   const [period, setPeriod] = useState("month");
   const [section, setSection] = useState("classement");
-  const [rankingFromApi, setRankingFromApi] = useState(null);
-  const [rankingLoading, setRankingLoading] = useState(false);
-  const [rankingError, setRankingError] = useState(null);
 
-  const chatters = useMemo(() => profiles.filter(p => p.role === "chatter"), [profiles]);
+  const chatters = useMemo(() => (profiles || []).filter(p => p && p.role === "chatter"), [profiles]);
 
   const periodFilter = useMemo(() => {
     const now = new Date();
@@ -16286,56 +16283,42 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
     return new Date();
   }, [period]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const fetchRanking = async () => {
-      setRankingLoading(true);
-      setRankingError(null);
-      try {
-        const { data, error } = await sb.rpc("get_chatter_competition_ranking", {
-          p_period_start: periodFilter.toISOString(),
-          p_period_end: periodEnd.toISOString()
-        });
-        if (cancelled) return;
-        if (error) { setRankingError(error.message); setRankingFromApi(null); return; }
-        const mapped = (data || []).map(r => ({
-          user: { id: r.chatter_id, name: r.display_name },
-          ca: Number(r.ca || 0),
-          nbTx: Number(r.nb_tx || 0),
-          activeSpenders: Number(r.active_spenders || 0),
-          totalSpenders: Number(r.total_spenders || 0),
-          convRate: Number(r.conv_rate || 0),
-          score: Number(r.score || 0)
-        }));
-        setRankingFromApi(mapped);
-      } catch (e) {
-        if (!cancelled) { setRankingError(e.message || "Erreur"); setRankingFromApi(null); }
-      }
-      if (!cancelled) setRankingLoading(false);
-    };
-    fetchRanking();
-    return () => { cancelled = true; };
-  }, [periodFilter, periodEnd]);
-
-  const rankingClient = useMemo(() => {
+  const ranking = useMemo(() => {
+    const allTxs = txs || [];
     return chatters.map(ch => {
-      const chModelIds = ch.assigned_models || [];
-      const chTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= periodFilter && new Date(tx.date) < periodEnd);
+      const ctx = getChatterContext(ch, models);
+      const chModelIds = ctx.assignedModelIds;
+      const chTxs = allTxs.filter(tx => (chModelIds.includes(tx.model_id) || tx.chatter_id === ch.id) && new Date(tx.date || 0) >= periodFilter && new Date(tx.date || 0) < periodEnd);
       const validTxs = chTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
-      const ca = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+      const ca = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency || "EUR"), 0);
       const nbTx = chTxs.length;
       const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600000);
-      const spenderHandles = new Set(chTxs.filter(tx => new Date(tx.date) >= thirtyDaysAgo).map(tx => tx.spender_handle));
+      const spenderHandles = new Set(chTxs.filter(tx => new Date(tx.date || 0) >= thirtyDaysAgo).map(tx => tx.spender_handle).filter(Boolean));
       const activeSpenders = spenderHandles.size;
-      const allSpenderHandles = new Set(txs.filter(tx => chModelIds.includes(tx.model_id)).map(tx => tx.spender_handle));
+      const allSpenderHandles = new Set(allTxs.filter(tx => chModelIds.includes(tx.model_id) || tx.chatter_id === ch.id).map(tx => tx.spender_handle).filter(Boolean));
       const totalSpenders = allSpenderHandles.size;
       const convRate = totalSpenders > 0 ? Math.round((activeSpenders / totalSpenders) * 100) : 0;
+      const commPct = getChatterCommissionPct(ch);
+      const commission = validTxs.reduce((s, tx) => {
+        const stored = Number(tx.chatter_commission || 0);
+        if (stored > 0) return s + convertAmount(stored, tx.currency || "EUR");
+        return s + convertAmount(Number(tx.amount || 0) * commPct, tx.currency || "EUR");
+      }, 0);
       const score = Math.round((ca / 10) + (nbTx * 5) + (activeSpenders * 10) + (convRate * 3));
-      return { user: ch, ca, nbTx, activeSpenders, totalSpenders, convRate, score };
+      return { user: ch, ca, nbTx, activeSpenders, totalSpenders, convRate, commission, score };
     }).sort((a, b) => b.score - a.score);
-  }, [chatters, txs, periodFilter, periodEnd, convertAmount]);
+  }, [chatters, txs, models, periodFilter, periodEnd, convertAmount]);
 
-  const ranking = rankingFromApi || rankingClient;
+  const teamAvg = useMemo(() => {
+    if (ranking.length === 0) return { ca: 0, nbTx: 0, activeSpenders: 0, commission: 0 };
+    const n = ranking.length;
+    return {
+      ca: ranking.reduce((s, r) => s + r.ca, 0) / n,
+      nbTx: Math.round(ranking.reduce((s, r) => s + r.nbTx, 0) / n),
+      activeSpenders: Math.round(ranking.reduce((s, r) => s + r.activeSpenders, 0) / n),
+      commission: ranking.reduce((s, r) => s + (r.commission || 0), 0) / n
+    };
+  }, [ranking]);
 
   // My stats
   const myRank = useMemo(() => ranking.find(r => r.user.id === user.id), [ranking, user.id]);
@@ -16344,94 +16327,74 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
   const myLevel = getChatterLevel(myScore);
   const nextLevel = getNextLevel(myScore);
 
-  // Previous month stats for variation %
-  const prevMonthStats = useMemo(() => {
-    const now = new Date();
-    const prevStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const prevEnd = new Date(now.getFullYear(), now.getMonth(), 1);
-    const chModelIds = user.assigned_models || [];
-    const prevTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= prevStart && new Date(tx.date) < prevEnd);
-    const prevValid = prevTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
-    const prevCA = prevValid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-    const prevSpenders = new Set(prevTxs.map(tx => tx.spender_handle)).size;
-    return { ca: prevCA, nbTx: prevTxs.length, spenders: prevSpenders };
-  }, [txs, user.assigned_models, convertAmount]);
-
-  // Badges computation
+  // Badges EC8: Top vendeur, Streak 7j, Whale catcher, Rookie of the month
   const badges = useMemo(() => {
-    const chModelIds = user.assigned_models || [];
-    const allMyTxs = txs.filter(tx => chModelIds.includes(tx.model_id));
+    const ctx = getChatterContext(user, models);
+    const chModelIds = ctx.assignedModelIds;
+    const allMyTxs = (txs || []).filter(tx => chModelIds.includes(tx.model_id) || tx.chatter_id === user.id);
     const validMyTxs = allMyTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
 
-    // First Blood: first TX created
-    const firstBlood = allMyTxs.length > 0;
+    // Top vendeur: #1 in current ranking
+    const topVendeur = myIdx === 0 && ranking.length >= 1;
 
-    // Centurion: 100 TX total
-    const centurion = allMyTxs.length >= 100;
-
-    // Whale Hunter: 1 spender with TX > 500 CHF
-    const whaleHunter = validMyTxs.some(tx => convertAmount(Number(tx.amount || 0), tx.currency) > 500);
-
-    // On Fire: 10 TX in 1 day
-    const txByDay = {};
-    allMyTxs.forEach(tx => { const d = (tx.date || "").slice(0, 10); txByDay[d] = (txByDay[d] || 0) + 1; });
-    const onFire = Object.values(txByDay).some(c => c >= 10);
-
-    // Top Dog: #1 in current ranking
-    const topDog = myIdx === 0 && ranking.length > 1;
-
-    // Rising Star: best progression % vs last month
-    const currCA = myRank?.ca || 0;
-    const prevCA = prevMonthStats.ca;
-    let isBestProgression = false;
-    if (prevCA > 0 && chatters.length > 1) {
-      const now = new Date();
-      const prevStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-      const prevEnd = new Date(now.getFullYear(), now.getMonth(), 1);
-      const curStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      const progressions = chatters.map(ch => {
-        const ids = ch.assigned_models || [];
-        const pTxs = txs.filter(tx => ids.includes(tx.model_id) && new Date(tx.date) >= prevStart && new Date(tx.date) < prevEnd);
-        const pCA = pTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-        const cTxs = txs.filter(tx => ids.includes(tx.model_id) && new Date(tx.date) >= curStart);
-        const cCA = cTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee").reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-        const prog = pCA > 0 ? ((cCA - pCA) / pCA) * 100 : 0;
-        return { id: ch.id, prog };
-      });
-      const best = progressions.sort((a, b) => b.prog - a.prog)[0];
-      isBestProgression = best && best.id === user.id && best.prog > 0;
+    // Streak 7j: 7 jours consécutifs avec au moins 1 TX
+    const txDates = [...new Set(allMyTxs.map(tx => (tx.date || "").slice(0, 10)).filter(Boolean))].sort();
+    let streak7 = false;
+    if (txDates.length >= 7) {
+      for (let i = 0; i <= txDates.length - 7; i++) {
+        const start = new Date(txDates[i] + "T12:00:00Z");
+        let consec = 1;
+        for (let j = 1; j < 7; j++) {
+          const next = new Date(start); next.setUTCDate(next.getUTCDate() + j);
+          const nextStr = next.toISOString().slice(0, 10);
+          if (txDates.includes(nextStr)) consec++; else break;
+        }
+        if (consec >= 7) { streak7 = true; break; }
+      }
     }
 
+    // Whale catcher: 1 TX > 500 (CHF/EUR converti)
+    const whaleCatcher = validMyTxs.some(tx => convertAmount(Number(tx.amount || 0), tx.currency || "EUR") > 500);
+
+    // Rookie of the month: premier mois avec au moins 1 TX validée = mois courant
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const txsThisMonth = validMyTxs.filter(tx => { const d = new Date(tx.date || 0); return d >= monthStart && d < monthEnd; });
+    const allMonthsWithTx = [...new Set(validMyTxs.map(tx => { const d = new Date(tx.date || 0); return d.getMonth() + d.getFullYear() * 12; }))].sort((a,b)=>a-b);
+    const isFirstMonthEver = allMonthsWithTx.length > 0 && allMonthsWithTx[0] === (now.getMonth() + now.getFullYear() * 12);
+    const rookieOfMonth = txsThisMonth.length > 0 && isFirstMonthEver;
+
     return [
-      { id: "first_blood", icon: "\u{1F3AF}", name: "First Blood", desc: fr ? "Première TX créée" : "First TX created", unlocked: firstBlood },
-      { id: "centurion", icon: "\u{1F4AF}", name: "Centurion", desc: fr ? "100 TX au total" : "100 TX total", unlocked: centurion },
-      { id: "whale_hunter", icon: "\u{1F40B}", name: "Whale Hunter", desc: fr ? "1 spender avec TX > 500 CHF" : "1 spender with TX > 500 CHF", unlocked: whaleHunter },
-      { id: "on_fire", icon: "\u{1F525}", name: "On Fire", desc: fr ? "10 TX en 1 journée" : "10 TX in 1 day", unlocked: onFire },
-      { id: "top_dog", icon: "\u{1F451}", name: "Top Dog", desc: fr ? "#1 du classement" : "#1 in ranking", unlocked: topDog },
-      { id: "rising_star", icon: "\u{1F31F}", name: "Rising Star", desc: fr ? "Meilleure progression % vs mois dernier" : "Best progression % vs last month", unlocked: isBestProgression },
+      { id: "top_vendeur", icon: "\u{1F3C6}", name: fr ? "Top vendeur" : "Top seller", desc: fr ? "#1 du classement" : "#1 in ranking", unlocked: topVendeur },
+      { id: "streak_7j", icon: "\u{1F525}", name: fr ? "Streak 7j" : "7-day streak", desc: fr ? "7 jours consécutifs avec TX" : "7 consecutive days with TX", unlocked: streak7 },
+      { id: "whale_catcher", icon: "\u{1F40B}", name: fr ? "Whale catcher" : "Whale catcher", desc: fr ? "1 TX > 500 €" : "1 TX > 500", unlocked: whaleCatcher },
+      { id: "rookie_month", icon: "\u{2B50}", name: fr ? "Rookie of the month" : "Rookie of the month", desc: fr ? "Premier mois avec activité" : "First month with activity", unlocked: rookieOfMonth },
     ];
-  }, [txs, user, myIdx, myRank, prevMonthStats, ranking, chatters, convertAmount, fr]);
+  }, [txs, user, models, myIdx, ranking, convertAmount, fr]);
 
   // Score history (6 last months)
   const scoreHistory = useMemo(() => {
     const now = new Date();
     const months = [];
-    const chModelIds = user.assigned_models || [];
+    const ctx = getChatterContext(user, models);
+    const chModelIds = ctx.assignedModelIds;
+    const allTxs = txs || [];
     for (let i = 5; i >= 0; i--) {
       const mStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const mEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
       const label = mStart.toLocaleDateString(fr ? "fr-FR" : "en-US", { month: "short" });
-      const mTxs = txs.filter(tx => chModelIds.includes(tx.model_id) && new Date(tx.date) >= mStart && new Date(tx.date) < mEnd);
+      const mTxs = allTxs.filter(tx => (chModelIds.includes(tx.model_id) || tx.chatter_id === user.id) && new Date(tx.date || 0) >= mStart && new Date(tx.date || 0) < mEnd);
       const valid = mTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee");
-      const ca = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-      const spH = new Set(mTxs.map(tx => tx.spender_handle)).size;
-      const totalSp = new Set(txs.filter(tx => chModelIds.includes(tx.model_id)).map(tx => tx.spender_handle)).size;
+      const ca = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency || "EUR"), 0);
+      const spH = new Set(mTxs.map(tx => tx.spender_handle).filter(Boolean)).size;
+      const totalSp = new Set(allTxs.filter(tx => chModelIds.includes(tx.model_id) || tx.chatter_id === user.id).map(tx => tx.spender_handle).filter(Boolean)).size;
       const conv = totalSp > 0 ? Math.round((spH / totalSp) * 100) : 0;
       const sc = Math.round((ca / 10) + (mTxs.length * 5) + (spH * 10) + (conv * 3));
       months.push({ name: label, score: sc });
     }
     return months;
-  }, [txs, user.assigned_models, convertAmount, fr]);
+  }, [txs, user, models, convertAmount, fr]);
 
   const medals = ["\u{1F947}", "\u{1F948}", "\u{1F949}"];
   const medalColors = ["#FFD700", "#C0C0C0", "#CD7F32"];
@@ -16441,8 +16404,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
 
   const getInitials = (name) => (name || "?").split(" ").map(w => w[0]).join("").toUpperCase().slice(0, 2);
   const avatarColor = (id) => { let h = 0; for (let i = 0; i < (id || "").length; i++) h = (id || "").charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h) % 360}, 60%, 50%)`; };
-  /* Anonymiser les autres chatters: seul le user connecté voit son vrai nom */
-  const getDisplayName = (r, idx) => r.user.id === user.id ? (r.user.name || r.user.email || "?") : (fr ? "Chatter " + (idx + 1) : "Chatter " + (idx + 1));
+  /* EC8: Anonymiser les autres — seul le chatter connecté voit "Vous" ou son nom */
+  const getDisplayName = (r, idx) => r.user.id === user.id ? (fr ? "Vous" : "You") : (fr ? "Chatter " + (idx + 1) : "Chatter " + (idx + 1));
 
   const periodOpts = [
     { k: "week", l: fr ? "Cette semaine" : "This week" },
@@ -16451,16 +16414,11 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
     { k: "3months", l: fr ? "3 mois" : "3 months" },
   ];
 
-  const varPct = (curr, prev) => {
-    if (!prev || prev === 0) return null;
-    return Math.round(((curr - prev) / prev) * 100);
-  };
-
   return (
-    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":0}}>
-      <div style={{marginBottom:18}}>
-        <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{"\u{1F3C6}"} {fr ? "Compétition" : "Competition"}</div>
-        <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>{fr ? "Classement & Gamification" : "Rankings & Gamification"}</div>
+    <div style={{maxWidth:1200,margin:"0 auto",padding:_isMobile?"0 12px":"0 24px"}}>
+      <div className="ui-section-header">
+        <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F3C6}"} {fr ? "Compétition" : "Competition"}</h2>
+        <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr ? "Classement anonymisé & gamification" : "Anonymous ranking & gamification"}</p>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:18,overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
         {[{k:"classement",l:fr?"Classement":"Rankings",ic:"\u{1F3C6}"},{k:"stats",l:fr?"Mes Stats":"My Stats",ic:"\u{1F4CA}"}].map(s => (
@@ -16472,21 +16430,10 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
       {section === "classement" && (<>
         <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
           {periodOpts.map(p => (
-            <button key={p.k} onClick={() => setPeriod(p.k)} disabled={rankingLoading} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${period===p.k?"#8b5cf6":"var(--border)"}`,background:period===p.k?"rgba(139,92,246,0.15)":"var(--surface)",color:period===p.k?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:rankingLoading?"not-allowed":"pointer",opacity:rankingLoading?0.7:1}}>{p.l}</button>
+            <button key={p.k} onClick={() => setPeriod(p.k)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${period===p.k?"#8b5cf6":"var(--border)"}`,background:period===p.k?"rgba(139,92,246,0.15)":"var(--surface)",color:period===p.k?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{p.l}</button>
           ))}
         </div>
-        {rankingLoading && (
-          <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:32,textAlign:"center",marginBottom:18}}>
-            <div className="spinner" style={{margin:"0 auto 12px"}}></div>
-            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{fr ? "Chargement du classement..." : "Loading ranking..."}</div>
-          </div>
-        )}
-        {rankingError && (
-          <div style={{background:"var(--danger-muted)",border:"1px solid var(--danger)",borderRadius:14,padding:16,marginBottom:18,fontSize:13,color:"var(--danger)"}}>
-            {fr ? "Erreur classement: " : "Ranking error: "}{rankingError}
-          </div>
-        )}
-        {ranking.length === 0 && !rankingLoading && (
+        {ranking.length === 0 && (
           <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:48,textAlign:"center"}}>
             <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucun chatter dans le classement" : "No chatters in ranking"}</div>
           </div>
@@ -16524,9 +16471,9 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
         )}
 
         {rest.length > 0 && (
-          <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,overflow:"hidden",marginBottom:18}}>
-            <div style={{overflowX:"auto"}}>
-              <table className="table">
+          <div className="ui-panel" style={{marginBottom:18}}>
+            <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+              <table className="table" style={{minWidth:_isMobile?420:undefined}}>
                 <thead><tr>
                   <th style={{width:50}}>#</th>
                   <th>{fr ? "Chatter" : "Chatter"}</th>
@@ -16568,23 +16515,23 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
         )}
       </>)}
 
-      {/* ─── SECTION: MES STATS ─── */}
+      {/* ─── SECTION: MES STATS (EC8: KPIs perso vs moyenne équipe) ─── */}
       {section === "stats" && (<>
-        <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(auto-fill,minmax(180px,1fr))",gap:10,marginBottom:18}}>
+        <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(2,1fr) repeat(2,1fr)",gap:12,marginBottom:18}}>
           {[
-            { label: fr ? "CA Généré" : "Revenue", value: fmtAmount(myRank?.ca || 0), prev: prevMonthStats.ca, curr: myRank?.ca || 0, icon: "\u{1F4B0}", color: "var(--accent)" },
-            { label: fr ? "Nb TX ce mois" : "TX this month", value: myRank?.nbTx || 0, prev: prevMonthStats.nbTx, curr: myRank?.nbTx || 0, icon: "\u{1F4B8}", color: "var(--success)" },
-            { label: fr ? "Spenders Actifs" : "Active Spenders", value: myRank?.activeSpenders || 0, prev: prevMonthStats.spenders, curr: myRank?.activeSpenders || 0, icon: "\u{1F465}", color: "#EC4899" },
-            { label: fr ? "Taux de Conversion" : "Conv. Rate", value: (myRank?.convRate || 0) + "%", prev: null, curr: null, icon: "\u{1F3AF}", color: "#8B5CF6" },
+            { label: fr ? "CA généré" : "Revenue", value: fmtAmount(myRank?.ca || 0), myNum: myRank?.ca || 0, avg: teamAvg.ca, icon: "\u{1F4B0}", color: "var(--accent)" },
+            { label: fr ? "Nb TX" : "TX count", value: (myRank?.nbTx || 0).toString(), myNum: myRank?.nbTx || 0, avg: teamAvg.nbTx, icon: "\u{1F4B8}", color: "var(--success)" },
+            { label: fr ? "Spenders actifs" : "Active spenders", value: (myRank?.activeSpenders || 0).toString(), myNum: myRank?.activeSpenders || 0, avg: teamAvg.activeSpenders, icon: "\u{1F465}", color: "#EC4899" },
+            { label: fr ? "Commission estimée" : "Est. commission", value: fmtAmount(myRank?.commission || 0), myNum: myRank?.commission || 0, avg: teamAvg.commission, icon: "\u{1F4E8}", color: "#8B5CF6" },
           ].map(k => {
-            const vPct = k.prev !== null ? varPct(k.curr, k.prev) : null;
+            const diffPct = (k.avg || 0) > 0 ? Math.round(((k.myNum - (k.avg || 0)) / (k.avg || 0)) * 100) : null;
             return (
-              <div key={k.label} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"14px 16px"}}>
-                <div style={{fontSize:10,color:"var(--muted)",textTransform:"uppercase",marginBottom:6}}>{k.icon} {k.label}</div>
-                <div style={{fontSize:26,fontWeight:800,color:k.color}}>{k.value}</div>
-                {vPct !== null && (
-                  <div style={{fontSize:11,marginTop:6,color:vPct >= 0 ? "#10B981" : "#EF4444",fontWeight:600}}>
-                    {vPct >= 0 ? "↑" : "↓"} {Math.abs(vPct)}% {fr ? "vs mois dernier" : "vs last month"}
+              <div key={k.label} className="ui-panel" style={{padding:16}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{k.icon} {k.label}</div>
+                <div style={{fontSize:22,fontWeight:800,color:k.color}}>{k.value}</div>
+                {diffPct !== null && (
+                  <div style={{fontSize:11,marginTop:8,color:diffPct >= 0 ? "#10B981" : "#EF4444",fontWeight:600}}>
+                    {diffPct >= 0 ? "↑" : "↓"} {Math.abs(diffPct)}% {fr ? "vs moyenne équipe" : "vs team avg"}
                   </div>
                 )}
               </div>
@@ -16594,13 +16541,13 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
 
         {/* Rank display */}
         <div style={{background:"#0e1420",border:"1px solid rgba(255,255,255,0.06)",borderRadius:16,padding:20,marginBottom:20,display:"flex",alignItems:"center",gap:16}}>
-          <div style={{width:48,height:48,borderRadius:"50%",background:avatarColor(user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:800,color:"#fff"}}>{getInitials(user.name)}</div>
+          <div style={{width:48,height:48,borderRadius:"50%",background:avatarColor(user.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:800,color:"#fff"}}>{getInitials(user.name || user.email || "?")}</div>
           <div style={{flex:1}}>
-            <div style={{fontSize:14,fontWeight:700}}>{user.name}</div>
-            <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Classement" : "Rank"}: <span style={{fontWeight:800,color:"#8B5CF6"}}>#{myIdx + 1}</span> / {ranking.length}</div>
+            <div style={{fontSize:14,fontWeight:700}}>{user.name || user.email || "—"}</div>
+            <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Classement" : "Rank"}: <span style={{fontWeight:800,color:"#8B5CF6"}}>#{myIdx >= 0 ? myIdx + 1 : "—"}</span> {ranking.length > 0 ? "/ " + ranking.length : ""}</div>
           </div>
           <div style={{textAlign:"right"}}>
-            <div style={{fontSize:22,fontWeight:800,color:"var(--accent)"}}>{myScore.toLocaleString()}</div>
+            <div style={{fontSize:22,fontWeight:800,color:"var(--accent)"}}>{(myScore || 0).toLocaleString()}</div>
             <div style={{fontSize:10,color:"var(--text-tertiary)"}}>Score</div>
           </div>
         </div>
