@@ -2039,6 +2039,25 @@ const ROLE_ACCESS = {
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
 const getRoleTabs = (role) => ROLE_ACCESS[role] || [];
+// Map tab IDs (ROLE_ACCESS) → feature IDs (user_permissions / DEFAULT_ROLE_PERMISSIONS)
+const TAB_TO_FEATURE = {
+  chatter_dashboard:"dashboard", chatter_transactions:"transactions",
+  chatter_spenders:"spenders", chatter_messagerie:"messagerie",
+  chatter_compta:"compta", chatter_competition:"dashboard",
+  chatter_scan:"automation", whatsapp:"messagerie",
+  model_checklist:"modeles", model_content:"modeles",
+  model_tasks:"modeles", model_payments:"modeles", model_dashboard:"modeles",
+  transactions:"transactions", provider_compta:"compta",
+};
+// canSeeWithPerms — checks user-specific perms first, then role defaults, then ROLE_ACCESS
+const canSeeWithPerms = (role, tabId, myPerms) => {
+  if (role === "gerant") return true;
+  const featureId = TAB_TO_FEATURE[tabId] || tabId;
+  if (myPerms && myPerms[featureId] !== undefined) return myPerms[featureId] !== "none";
+  const defaultPerm = (DEFAULT_ROLE_PERMISSIONS[role] || {})[featureId];
+  if (defaultPerm !== undefined) return defaultPerm !== "none";
+  return canSee(role, tabId); // existing ROLE_ACCESS behavior as final fallback
+};
 const DEFAULT_TAB = { gerant: "dashboard", admin: "admin", ceo: "admin", modele: "model_checklist", chatter: "chatter_dashboard", provider: "provider_dashboard" };
 // AD1 — Guard admin/gerant/ceo
 const isAdminUser = (user) => !!(user && user.role && ["admin","gerant","ceo"].includes(user.role));
@@ -24387,6 +24406,7 @@ const App = () => {
   });
   const [tab, _setTab] = useState("dashboard");
   const [subTab, setSubTab] = useState(null);
+  const [myPerms, setMyPerms] = useState({});
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [fabOpen, setFabOpen] = useState(false);
   const [fabSpenderModal, setFabSpenderModal] = useState(false);
@@ -24420,11 +24440,15 @@ const App = () => {
     const result = await prompt.userChoice;
     if (result.outcome === 'accepted') { setCanInstallPwa(false); window.__deferredInstallPrompt = null; }
   };
-  // Wrap setTab with pushState for browser history
+  // Wrap setTab with pushState for browser history + permission guard
   const setTab = useCallback((newTab) => {
+    if (user && user.role !== "gerant" && !canSeeWithPerms(user.role, newTab, myPerms)) {
+      addToast(lang === "fr" ? "Accès non autorisé" : "Access denied", "error");
+      return;
+    }
     _setTab(newTab);
     window.history.pushState({tab:newTab}, "", `#${newTab}`);
-  }, []);
+  }, [user, myPerms, lang, addToast]);
   // Gérant navigation: page + optional sub-tab
   const navigateTo = useCallback((pageId, tabId) => {
     _setTab(pageId);
@@ -24433,6 +24457,28 @@ const App = () => {
     setFabOpen(false);
     window.history.pushState({tab:pageId}, "", `#${pageId}`);
   }, []);
+  // ── Load user permissions from user_permissions table ──
+  useEffect(() => {
+    if (!user || user.role === "gerant") { setMyPerms({}); return; }
+    sb.from("user_permissions").select("*").eq("user_id", user.id)
+      .then(({ data }) => {
+        const map = {};
+        (data || []).forEach(row => {
+          map[row.feature] = row.can_edit ? "edit" : row.can_view ? "view" : "none";
+        });
+        setMyPerms(map);
+      });
+  }, [user?.id]);
+  // ── Redirect if current tab is blocked by permissions ──
+  useEffect(() => {
+    if (!user || user.role === "gerant" || Object.keys(myPerms).length === 0) return;
+    if (!canSeeWithPerms(user.role, tab, myPerms)) {
+      const allowed = (ROLE_ACCESS[user.role] || []).find(id => canSeeWithPerms(user.role, id, myPerms));
+      const def = allowed || DEFAULT_TAB[user.role] || "dashboard";
+      _setTab(def);
+      window.history.replaceState({tab: def}, "", `#${def}`);
+    }
+  }, [myPerms, user?.role, tab]);
   // Listen for browser back/forward button
   useEffect(() => {
     const safeTab = (t) => {
@@ -25317,7 +25363,7 @@ const App = () => {
         <div className="sidebar sidebar-desktop">
           <div className="sidebar-logo">D</div>
           <div className="sidebar-nav">
-            {otherTabs.filter(x=>x.show&&canSee(user.role,x.id)).map(x=>(
+            {otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).map(x=>(
               <button key={x.id} className={`sidebar-btn ${tab===x.id&&!drillDown?"active":""}`} onClick={()=>{closeDrill();setTab(x.id);}} title={x.label}>
                 {x.icon}
               </button>
@@ -25350,13 +25396,13 @@ const App = () => {
       )}
       {!isGerant && (
         <nav className="mobile-bottom-bar" style={user.role==="chatter"?{overflowX:"auto",WebkitOverflowScrolling:"touch",flexWrap:"nowrap",justifyContent:"flex-start",gap:0,padding:"0 8px"}:{}}>
-          {(user.role==="chatter"?otherTabs.filter(x=>x.show&&canSee(user.role,x.id)):otherTabs.filter(x=>x.show&&canSee(user.role,x.id)).slice(0,5)).map(x=>(
+          {(user.role==="chatter"?otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)):otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).slice(0,5)).map(x=>(
             <button key={x.id} className={`mobile-bottom-btn${tab===x.id&&!drillDown?" active":""}`} onClick={()=>{closeDrill();setTab(x.id);}} style={user.role==="chatter"?{flexShrink:0,minWidth:56}:{}}>
               <span className="mobile-bottom-icon">{typeof x.icon==="string"?x.icon:"\u{1F4CB}"}</span>
               <span className="mobile-bottom-label">{x.label}</span>
             </button>
           ))}
-          {user.role!=="chatter"&&otherTabs.filter(x=>x.show&&canSee(user.role,x.id)).length>5 && (
+          {user.role!=="chatter"&&otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).length>5 && (
             <button className={`mobile-bottom-btn${mobileMenuOpen?" active":""}`} onClick={()=>setMobileMenuOpen(!mobileMenuOpen)}>
               <span className="mobile-bottom-icon">{mobileMenuOpen?"✕":"☰"}</span>
               <span className="mobile-bottom-label">Plus</span>
@@ -25381,7 +25427,7 @@ const App = () => {
                   {n.id==="business"&&pendingTxCount>0&&<span style={{marginLeft:"auto",background:"var(--warning)",color:"#000",fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:10}}>{pendingTxCount}</span>}
                   {n.id==="messagerie"&&escalationCount>0&&<span style={{marginLeft:"auto",background:"var(--danger)",color:"#fff",fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:10}}>{escalationCount}</span>}
                 </button>
-              )) : otherTabs.filter(x=>x.show&&canSee(user.role,x.id)).map(x=>(
+              )) : otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).map(x=>(
                 <button key={x.id} onClick={()=>{closeDrill();setTab(x.id);setMobileMenuOpen(false);}} style={{display:"flex",alignItems:"center",gap:12,width:"100%",padding:"14px 16px",background:tab===x.id?"var(--accent-muted)":"none",border:"none",borderRadius:10,color:tab===x.id?"var(--accent)":"var(--text-secondary)",fontSize:15,fontWeight:tab===x.id?700:500,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",transition:"all 0.15s"}}>
                   <span style={{fontSize:20}}>{typeof x.icon==="string"?x.icon:"\u{1F4CB}"}</span>
                   <span>{x.label}</span>
