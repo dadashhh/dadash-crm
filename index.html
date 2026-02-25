@@ -1648,6 +1648,7 @@
     window.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxrcnpqd2Z3aGlpbXBuc3lldXhpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0NTYwNDgsImV4cCI6MjA4NzAzMjA0OH0.qs9yvOv_eb_QIHzv977qRwEBIIHDfyAvtKRvdJ4DKus";
     // Telegram Bot service (pour POST /sendMessage) — définir en déploiement
     window.TELEGRAM_BOT_URL = window.TELEGRAM_BOT_URL || "";
+    window.BOT_CAM_URL = window.BOT_CAM_URL || "";
     window.DADASH_INTERNAL_API_KEY = window.DADASH_INTERNAL_API_KEY || "";
 
     // ═══ SUPABASE CLIENT — with guard and connection check ═══
@@ -20192,23 +20193,36 @@ const BroadcastsTab = ({ user, lang, spenders, txs, models, broadcasts, onRefres
 const BOT_ORDER = [
   { id: "tg", key: "tg_bot", name: "Bot TG", icon: "\u{2708}\uFE0F", desc: "Telegram conversations, screenshots, escalades" },
   { id: "chatting", key: "chatting_bot", name: "Chatting Bot", icon: "\u{1F4AC}", desc: "Messages, notifications, relances" },
-  { id: "scan", key: "scan_checker", name: "Scan Checker", icon: "\u{1F50D}", desc: "Vérification captures, détection fake" }
+  { id: "scan", key: "scan_checker", name: "Scan Checker", icon: "\u{1F50D}", desc: "Vérification captures, détection fake" },
+  { id: "cam", key: "cam_bot", name: "Bot Cam", icon: "\u{1F3A5}", desc: "Appels vidéo automatiques, delivery vidéo" }
 ];
 const BotsManagementPage = ({ lang }) => {
   const fr = lang === "fr";
   const [statusRows, setStatusRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [botTabs, setBotTabs] = useState({ tg: "stats", chatting: "stats", scan: "stats" });
+  const [botTabs, setBotTabs] = useState({ tg: "stats", chatting: "stats", scan: "stats", cam: "stats" });
   const setBotTab = (id, tab) => setBotTabs(prev => ({ ...prev, [id]: tab }));
-  const [botLogs, setBotLogs] = useState({ tg: [], chatting: [], scan: [] });
-  const [botLogsLoading, setBotLogsLoading] = useState({ tg: false, chatting: false, scan: false });
-  const [botLogsError, setBotLogsError] = useState({ tg: null, chatting: null, scan: null });
+  const [botLogs, setBotLogs] = useState({ tg: [], chatting: [], scan: [], cam: [] });
+  const [botLogsLoading, setBotLogsLoading] = useState({ tg: false, chatting: false, scan: false, cam: false });
+  const [botLogsError, setBotLogsError] = useState({ tg: null, chatting: null, scan: null, cam: null });
   const [scanResults, setScanResults] = useState([]);
   const [scanLoading, setScanLoading] = useState(false);
   const [scanError, setScanError] = useState(null);
   const [selectedScan, setSelectedScan] = useState(null);
   const [selectedBot, setSelectedBot] = useState(null);
+  const [sessions, setSessions] = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState(null);
+  const [camModels, setCamModels] = useState([]);
+  const [showAddSession, setShowAddSession] = useState(false);
+  const [addStep, setAddStep] = useState(1);
+  const [addPhone, setAddPhone] = useState("");
+  const [addModelId, setAddModelId] = useState("");
+  const [addOtp, setAddOtp] = useState("");
+  const [addSaving, setAddSaving] = useState(false);
+  const [addErr, setAddErr] = useState(null);
+  const [deletingSessionId, setDeletingSessionId] = useState(null);
 
   const fetchScanResults = useCallback(async () => {
     if (!window.sb) { setScanError("Supabase non connecté"); setScanLoading(false); return; }
@@ -20255,6 +20269,77 @@ const BotsManagementPage = ({ lang }) => {
     window.addEventListener("keydown", handleEsc);
     return () => window.removeEventListener("keydown", handleEsc);
   }, [selectedBot]);
+
+  const fetchSessions = useCallback(async () => {
+    if (!window.sb) { setSessionsError("Supabase non connecté"); setSessionsLoading(false); return; }
+    setSessionsError(null);
+    try {
+      const { data, error: err } = await window.sb.from("bot_sessions").select("*").order("created_at", { ascending: false });
+      if (err && (err.code === "42P01" || err.code === "PGRST116")) { setSessions([]); }
+      else if (err) { setSessionsError(err.message || "Erreur"); setSessions([]); }
+      else setSessions(Array.isArray(data) ? data : []);
+    } catch (e) { setSessionsError(String(e && e.message) || "Erreur"); setSessions([]); }
+    setSessionsLoading(false);
+  }, []);
+
+  const fetchCamModels = useCallback(async () => {
+    if (!window.sb) return;
+    try {
+      const { data } = await window.sb.from("models").select("id,name").order("name");
+      if (data) setCamModels(Array.isArray(data) ? data : []);
+    } catch (_) {}
+  }, []);
+
+  useEffect(() => { fetchSessions(); fetchCamModels(); }, [fetchSessions, fetchCamModels]);
+
+  const handleSessionPause = async (sid) => {
+    try { await window.sb.from("bot_sessions").update({ status: "paused" }).eq("id", sid); fetchSessions(); } catch (_) {}
+  };
+  const handleSessionResume = async (sid) => {
+    try { await window.sb.from("bot_sessions").update({ status: "active", last_active_at: new Date().toISOString() }).eq("id", sid); fetchSessions(); } catch (_) {}
+  };
+  const handleSessionDelete = async (sid) => {
+    setDeletingSessionId(sid);
+  };
+  const confirmSessionDelete = async (sid) => {
+    try { await window.sb.from("bot_sessions").delete().eq("id", sid); fetchSessions(); } catch (_) {}
+    setDeletingSessionId(null);
+  };
+
+  const handleAddStep1 = async () => {
+    if (!addPhone.trim()) { setAddErr(fr ? "Numéro requis" : "Phone required"); return; }
+    setAddSaving(true); setAddErr(null);
+    try {
+      const botUrl = (window.BOT_CAM_URL || "").replace(/\/$/, "");
+      if (!botUrl) throw new Error(fr ? "BOT_CAM_URL non configuré" : "BOT_CAM_URL not set");
+      const res = await fetch(botUrl + "/sessions/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: addPhone.trim(), model_id: addModelId || null })
+      });
+      if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + (t ? ": " + t : "")); }
+      setAddStep(2);
+    } catch (e) { setAddErr(e.message || "Erreur"); }
+    setAddSaving(false);
+  };
+
+  const handleAddStep2 = async () => {
+    if (!addOtp.trim()) { setAddErr(fr ? "Code requis" : "Code required"); return; }
+    setAddSaving(true); setAddErr(null);
+    try {
+      const botUrl = (window.BOT_CAM_URL || "").replace(/\/$/, "");
+      if (!botUrl) throw new Error(fr ? "BOT_CAM_URL non configuré" : "BOT_CAM_URL not set");
+      const res = await fetch(botUrl + "/sessions/confirm-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: addPhone.trim(), code: addOtp.trim(), model_id: addModelId || null })
+      });
+      if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error("HTTP " + res.status + (t ? ": " + t : "")); }
+      setShowAddSession(false); setAddStep(1); setAddPhone(""); setAddModelId(""); setAddOtp("");
+      fetchSessions();
+    } catch (e) { setAddErr(e.message || "Erreur"); }
+    setAddSaving(false);
+  };
 
   const byKey = {};
   statusRows.forEach(r => { const k = r && r.bot_key; if (k) byKey[k] = r; });
@@ -20459,6 +20544,67 @@ const BotsManagementPage = ({ lang }) => {
         })}
       </div>
 
+      {/* ── SESSIONS TELEGRAM ── */}
+      <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 12 }}>
+        <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.5px" }}>{fr ? "Sessions Telegram" : "Telegram Sessions"}</div>
+        <button onClick={() => { setShowAddSession(true); setAddStep(1); setAddPhone(""); setAddModelId(""); setAddOtp(""); setAddErr(null); }} style={{ padding: "6px 14px", fontSize: 12, fontWeight: 700, borderRadius: 9, border: "1px solid var(--accent)", background: "var(--accent-muted)", color: "var(--accent)", cursor: "pointer" }}>+ {fr ? "Ajouter une session" : "Add session"}</button>
+      </div>
+      {sessionsError && <div style={{ background: "var(--danger-muted)", border: "1px solid var(--danger)", borderRadius: 10, padding: 10, marginBottom: 14, color: "var(--danger)", fontSize: 12 }}>{"\u26A0"} {sessionsError}</div>}
+      {sessionsLoading && sessions.length === 0 ? (
+        <div style={{ ...cardStyle, textAlign: "center", padding: 28, color: "var(--text-tertiary)", fontSize: 12, marginBottom: 28 }}>{"\u23F3"} {fr ? "Chargement sessions…" : "Loading sessions…"}</div>
+      ) : sessions.length === 0 ? (
+        <div style={{ ...cardStyle, textAlign: "center", padding: 28, color: "var(--text-tertiary)", fontSize: 12, marginBottom: 28 }}>{"\u{1F4F5}"} {fr ? "Aucune session active — cliquez sur + Ajouter" : "No active sessions — click + Add"}</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr", gap: 14, marginBottom: 28 }}>
+          {sessions.map(sess => {
+            const isActive = sess.status === "active";
+            const isPaused = sess.status === "paused";
+            const stColor = isActive ? "var(--success)" : isPaused ? "var(--warning)" : "var(--text-tertiary)";
+            const stBg = isActive ? "var(--success-muted)" : isPaused ? "var(--warning-muted)" : "var(--surface2)";
+            const stLabel = isActive ? "ACTIVE" : isPaused ? "PAUSED" : (sess.status || "INACTIVE").toUpperCase();
+            const maskedPhone = sess.phone_number ? sess.phone_number.slice(0, 5) + "•••" + sess.phone_number.slice(-3) : "—";
+            const isConfirmingDelete = deletingSessionId === sess.id;
+            return (
+              <div key={sess.id} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 16 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: "var(--text)" }}>{sess.model_name || "—"}</div>
+                    <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 2 }}>{maskedPhone}</div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "3px 9px", borderRadius: 20, background: stBg, fontSize: 10, fontWeight: 800, color: stColor, letterSpacing: 0.5 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: "50%", background: stColor, animation: isActive ? "pulse 2s infinite" : "none" }} />
+                    {stLabel}
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                  <div style={{ background: "var(--surface2)", borderRadius: 9, padding: "7px 10px", textAlign: "center" }}>
+                    <div style={{ fontSize: 9, color: "var(--muted)", textTransform: "uppercase", fontWeight: 600, marginBottom: 2 }}>{fr ? "Msgs/jour" : "Msgs/day"}</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: "var(--accent)" }}>{sess.messages_today != null ? sess.messages_today : "—"}</div>
+                  </div>
+                  <div style={{ background: "var(--surface2)", borderRadius: 9, padding: "7px 10px", textAlign: "center" }}>
+                    <div style={{ fontSize: 9, color: "var(--muted)", textTransform: "uppercase", fontWeight: 600, marginBottom: 2 }}>{fr ? "Dernière activité" : "Last active"}</div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-secondary)" }}>{sess.last_active_at ? fmtDate(sess.last_active_at) : "—"}</div>
+                  </div>
+                </div>
+                {isConfirmingDelete ? (
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: "var(--danger)", flex: 1 }}>{fr ? "Confirmer la suppression ?" : "Confirm delete?"}</span>
+                    <button onClick={() => confirmSessionDelete(sess.id)} style={{ ...btnStyle, color: "var(--danger)", borderColor: "var(--danger)" }}>{fr ? "Oui" : "Yes"}</button>
+                    <button onClick={() => setDeletingSessionId(null)} style={btnStyle}>{fr ? "Non" : "No"}</button>
+                  </div>
+                ) : (
+                  <div style={btnRow}>
+                    <button onClick={() => handleSessionPause(sess.id)} disabled={isPaused} style={{ ...btnStyle, opacity: isPaused ? 0.4 : 1 }}>{"\u23F8"} Pause</button>
+                    <button onClick={() => handleSessionResume(sess.id)} disabled={isActive} style={{ ...btnStyle, opacity: isActive ? 0.4 : 1 }}>{"\u25B6\uFE0F"} Resume</button>
+                    <button onClick={() => handleSessionDelete(sess.id)} style={{ ...btnStyle, color: "var(--danger)", borderColor: "var(--danger)" }}>{"\u{1F5D1}"} {fr ? "Supprimer" : "Delete"}</button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Section KPIs globaux */}
       <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.5px" }}>{fr ? "Bots Control" : "Bots Control"}</div>
       <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "repeat(4, 1fr)", gap: 14, marginBottom: 28 }}>
@@ -20556,6 +20702,54 @@ const BotsManagementPage = ({ lang }) => {
         </>
       )}
       {botDetailModal}
+      {showAddSession && (
+        <div onClick={() => { setShowAddSession(false); setAddStep(1); }} style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.65)", zIndex: 9999 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "var(--card-bg)", borderRadius: 16, padding: 24, width: "min(460px, 95vw)", boxShadow: "0 20px 60px rgba(0,0,0,0.4)", border: "1px solid var(--card-border)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)" }}>{"📱"} {fr ? "Ajouter une session" : "Add session"}</div>
+                <div style={{ fontSize: 11, color: "var(--muted2)", marginTop: 3 }}>{fr ? ("Étape " + addStep + " / 2") : ("Step " + addStep + " / 2")}</div>
+              </div>
+              <button onClick={() => { setShowAddSession(false); setAddStep(1); }} style={{ background: "none", border: "none", color: "var(--text-tertiary)", fontSize: 20, cursor: "pointer" }}>{"\u00D7"}</button>
+            </div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 20 }}>
+              {[1, 2].map(s => (
+                <div key={s} style={{ flex: 1, height: 3, borderRadius: 3, background: addStep >= s ? "var(--accent)" : "var(--border)" }} />
+              ))}
+            </div>
+            {addStep === 1 ? (
+              <div>
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 6 }}>{fr ? "Numéro Telegram" : "Telegram number"} <span style={{ color: "var(--danger)" }}>*</span></label>
+                  <input value={addPhone} onChange={e => setAddPhone(e.target.value)} placeholder="+41..." style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 14, fontFamily: "inherit", boxSizing: "border-box" }} />
+                </div>
+                <div style={{ marginBottom: 18 }}>
+                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 6 }}>{fr ? "Modèle associé" : "Associated model"}</label>
+                  <select value={addModelId} onChange={e => setAddModelId(e.target.value)} style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 14, fontFamily: "inherit", boxSizing: "border-box" }}>
+                    <option value="">{fr ? "— Aucun modèle —" : "— No model —"}</option>
+                    {camModels.map(m => <option key={m.id} value={m.id}>{m.name || m.id}</option>)}
+                  </select>
+                </div>
+                {addErr && <div style={{ color: "var(--danger)", fontSize: 12, marginBottom: 12 }}>{"\u26A0"} {addErr}</div>}
+                <button onClick={handleAddStep1} disabled={addSaving} style={{ width: "100%", padding: "11px", borderRadius: 9, border: "none", background: "var(--accent)", color: "#fff", fontWeight: 700, fontSize: 14, cursor: addSaving ? "default" : "pointer", opacity: addSaving ? 0.7 : 1 }}>{addSaving ? (fr ? "Envoi…" : "Sending…") : (fr ? "Envoyer OTP" : "Send OTP")}</button>
+              </div>
+            ) : (
+              <div>
+                <div style={{ marginBottom: 8, padding: 10, background: "var(--success-muted)", borderRadius: 9, fontSize: 12, color: "var(--success)", fontWeight: 600 }}>{"\u2713"} {fr ? ("OTP envoyé au " + addPhone) : ("OTP sent to " + addPhone)}</div>
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-secondary)", marginBottom: 6 }}>{fr ? "Code reçu par SMS" : "Code received by SMS"} <span style={{ color: "var(--danger)" }}>*</span></label>
+                  <input value={addOtp} onChange={e => setAddOtp(e.target.value)} placeholder="12345" maxLength={10} style={{ width: "100%", padding: "10px 12px", borderRadius: 9, border: "1px solid var(--border)", background: "var(--bg-overlay)", color: "var(--text)", fontSize: 18, fontFamily: "inherit", letterSpacing: 4, textAlign: "center", boxSizing: "border-box" }} />
+                </div>
+                {addErr && <div style={{ color: "var(--danger)", fontSize: 12, marginBottom: 12 }}>{"\u26A0"} {addErr}</div>}
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button onClick={() => { setAddStep(1); setAddErr(null); }} style={{ ...btnStyle, flex: 1, padding: "10px", fontSize: 13 }}>{fr ? "Retour" : "Back"}</button>
+                  <button onClick={handleAddStep2} disabled={addSaving} style={{ flex: 2, padding: "10px", borderRadius: 9, border: "none", background: "var(--accent)", color: "#fff", fontWeight: 700, fontSize: 14, cursor: addSaving ? "default" : "pointer", opacity: addSaving ? 0.7 : 1 }}>{addSaving ? (fr ? "Confirmation…" : "Confirming…") : (fr ? "Confirmer" : "Confirm")}</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
