@@ -1893,9 +1893,10 @@
     window.BOT_CAM_URL = window.BOT_CAM_URL || "https://dadash-telegram-bot-production.up.railway.app";
     window.DADASH_INTERNAL_API_KEY = window.DADASH_INTERNAL_API_KEY || "";
 
-    // ═══ SUPABASE CLIENT — with guard and connection check ═══
+    // ═══ SUPABASE CLIENT — robust init with LockManager guard ═══
     window.__sbReady = false;
     window.__sbError = null;
+    window.__appBuild = Date.now();
     try {
       if (!window.supabase || !window.supabase.createClient) {
         throw new Error("Supabase JS library not loaded. Check CDN or network.");
@@ -1903,15 +1904,17 @@
       window.sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
         auth: {
           lock: false,
-          persistSession: false
+          persistSession: true,
+          storageKey: 'dadash-auth',
+          autoRefreshToken: true,
+          detectSessionInUrl: false
         }
       });
       window.__sbReady = true;
-      console.log("[DADASH] Supabase client initialized ✓ →", window.SUPABASE_URL);
+      console.log("[APP] supabase_init ok url=" + window.SUPABASE_URL);
     } catch (e) {
       window.__sbError = e.message;
-      console.error("[DADASH] ❌ Supabase client init failed:", e.message);
-      // Create a stub so the app doesn't crash on sb.xxx calls
+      console.error("[APP] supabase_init FAIL:", e.message);
       window.sb = {
         auth: {
           getSession: function() { return Promise.resolve({data:{session:null}}); },
@@ -1920,23 +1923,49 @@
           onAuthStateChange: function() { return {data:{subscription:{unsubscribe:function(){}}}}; }
         },
         from: function() {
-          var chain = {select:function(){return chain;},eq:function(){return chain;},neq:function(){return chain;},not:function(){return chain;},is:function(){return chain;},in:function(){return chain;},order:function(){return chain;},limit:function(){return chain;},range:function(){return chain;},single:function(){return chain;},insert:function(){return chain;},update:function(){return chain;},delete:function(){return chain;},then:function(r){r({data:[],error:{message:"Supabase not connected"}}); return chain;}};
+          var chain = {select:function(){return chain;},eq:function(){return chain;},neq:function(){return chain;},not:function(){return chain;},is:function(){return chain;},in:function(){return chain;},ilike:function(){return chain;},order:function(){return chain;},limit:function(){return chain;},range:function(){return chain;},single:function(){return chain;},maybeSingle:function(){return chain;},insert:function(){return chain;},upsert:function(){return chain;},update:function(){return chain;},delete:function(){return chain;},gte:function(){return chain;},lte:function(){return chain;},returns:function(){return chain;},then:function(r){r({data:[],error:{message:"Supabase not connected"}}); return chain;}};
           return chain;
         },
+        rpc: function() { return Promise.resolve({data:null, error:{message:"Supabase not connected"}}); },
         channel: function() { return {on:function(){return this;},subscribe:function(){return this;}}; },
         removeChannel: function() {}
       };
     }
 
-    // ═══ CHRISTINE FIX — Service Worker: cleanup old caches + force update ═══
+    // ═══ SERVICE WORKER — network-first for index.html, stale-while-revalidate for assets ═══
+    window.__swActive = false;
     if ('serviceWorker' in navigator) {
-      // Unregister ALL old service workers to prevent stale cache issues
-      navigator.serviceWorker.getRegistrations().then(function(regs) {
-        regs.forEach(function(r) { r.unregister(); });
-      });
-      // Re-register with cache-bust param
-      navigator.serviceWorker.register('/sw.js?v=' + Date.now()).catch(function() {});
+      navigator.serviceWorker.register('/sw.js').then(function(reg) {
+        window.__swActive = true;
+        console.log("[APP] sw=registered scope=" + reg.scope);
+        reg.addEventListener('updatefound', function() {
+          var nw = reg.installing;
+          if (nw) nw.addEventListener('statechange', function() {
+            if (nw.state === 'activated') {
+              console.log("[APP] sw=updated (new version ready)");
+            }
+          });
+        });
+      }).catch(function(e) { console.warn("[APP] sw=failed", e.message); });
+    } else {
+      console.log("[APP] sw=unsupported");
     }
+
+    // ═══ HARD REFRESH — purge all caches + unregister SW + reload ═══
+    window.__hardRefresh = async function() {
+      console.log("[APP] hard_refresh triggered");
+      try {
+        if ('caches' in window) {
+          var keys = await caches.keys();
+          await Promise.all(keys.map(function(k) { return caches.delete(k); }));
+        }
+        if ('serviceWorker' in navigator) {
+          var regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map(function(r) { return r.unregister(); }));
+        }
+      } catch(e) { console.warn("[APP] hard_refresh cleanup error:", e.message); }
+      window.location.replace(window.location.pathname + '?_bust=' + Date.now());
+    };
 
     // ═══ PWA: Install Prompt ═══
     window.__deferredInstallPrompt = null;
@@ -1953,8 +1982,8 @@ const {useState, useEffect, useMemo, useCallback, useContext, createContext, use
 // ═══ MOBILE DETECTION (performance optimizations) ═══
 const _isMobile = window.innerWidth < 768;
 
-/* CHRISTINE FIX — App version for cache-busting and display */
-const APP_VERSION = "v2.1";
+const APP_VERSION = "v2.2";
+console.log("[APP] version=" + APP_VERSION + " sw=" + (window.__swActive ? "active" : "pending") + " sb=" + (window.__sbReady ? "ready" : "error"));
 const _isLowPower = _isMobile || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4);
 
 /* UI FOUNDATION — helpers inline réutilisables (Dashboard-style) */
@@ -7306,6 +7335,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [highlightSpenderId, setHighlightSpenderId] = useState(null);
   const [activityFeed, setActivityFeed] = useState([]);
   const [showActivityDrawer, setShowActivityDrawer] = useState(false);
+  const [activityTab, setActivityTab] = useState("all");
   const [recentFilter, setRecentFilter] = useState(null);
   const [sortRecents, setSortRecents] = useState(false);
   const [syncingTg, setSyncingTg] = useState(false);
@@ -7327,110 +7357,83 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     });
   }, []);
 
-  // ── Activity feed: fetch from spender_events enriched with spenders ──
-  const _spenderLabel = (sp, tg_user_id) => {
-    if (!sp) return tg_user_id ? "#" + tg_user_id : "?";
-    if (sp.username) return "@" + sp.username.replace(/^@/, "");
-    if (sp.display_name) return sp.display_name;
-    const tg = sp.meta?.profile?.telegram;
-    if (tg?.display) return tg.display;
-    if (tg?.input_value) return tg.input_value;
-    const h = sp.handle || sp.name;
-    if (h && h !== "?") return "@" + h;
-    return tg_user_id ? "#" + tg_user_id : "?";
-  };
+  // ── Activity feed: fetch from v_activity_feed view (joined events + spenders) ──
   const fetchActivityFeed = React.useCallback(async () => {
     try {
-      // ── DIAGNOSTIC: SB_FROM log so 404s appear clearly in Network + Console ──
-      console.info("[SB_FROM] spender_events", { select:"id,tg_user_id,event_type,summary,created_at", order:"created_at desc", limit:100 });
-      const { data: evData, error: evErr } = await sb.from("spender_events")
-        .select("id,tg_user_id,event_type,summary,created_at")
-        .order("created_at", { ascending: false }).limit(100);
-      if (evErr) {
-        console.error("[SB_ERR] spender_events", evErr.code || "", evErr.message || evErr);
-        throw evErr; // falls through to fallback below
+      const { data: vData, error: vErr } = await sb.from("v_activity_feed")
+        .select("id,event_type,tg_user_id,username,title,subtitle,created_at,data")
+        .order("created_at", { ascending: false }).limit(150);
+      if (vErr) throw vErr;
+      if (vData && vData.length > 0) {
+        console.log("[DATA] activity_loaded n=" + vData.length);
+        setActivityFeed(vData.map(ev => ({
+          id: ev.id,
+          tg_user_id: ev.tg_user_id,
+          label: ev.username || (ev.tg_user_id ? "#" + ev.tg_user_id : "?"),
+          message: ev.subtitle || ev.title || ev.event_type,
+          eventType: ev.event_type,
+          title: ev.title,
+          ts: ev.created_at,
+          data: ev.data,
+        })));
+        return;
       }
+    } catch (e) { console.warn("[DATA] v_activity_feed error, trying spender_events fallback:", e.message||e); }
+    // Fallback 1: raw spender_events
+    try {
+      const { data: evData, error: evErr } = await sb.from("spender_events")
+        .select("id,tg_user_id,event_type,data,created_at")
+        .order("created_at", { ascending: false }).limit(100);
+      if (evErr) throw evErr;
       if (evData && evData.length > 0) {
-        // Build spender info map by tg_user_id
         const tgIds = [...new Set(safeArr(evData).map(ev => ev.tg_user_id).filter(Boolean))];
         let spMap = {};
         if (tgIds.length > 0) {
           try {
-            console.info("[SB_FROM] spenders (enrich events)", { in_tg_user_ids: tgIds.length });
             const { data: spData } = await sb.from("spenders")
               .select("id,tg_user_id,username,display_name,meta,handle,name")
               .in("tg_user_id", tgIds);
             if (spData) spData.forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
-          } catch (e) { console.warn("[SB_ERR] spenders (enrich events)", e.message||e); }
+          } catch (_) {}
         }
-        // Deduplicate: keep first occurrence per (tg_user_id|event_type|summary|2-min-bucket)
-        const seen = new Set();
-        const deduped = [];
-        for (const ev of safeArr(evData)) {
-          const bucket = ev.created_at ? Math.floor(new Date(ev.created_at).getTime() / 120000) : 0;
-          const key = `${ev.tg_user_id}|${ev.event_type}|${ev.summary}|${bucket}`;
-          if (!seen.has(key)) { seen.add(key); deduped.push(ev); }
-        }
-        setActivityFeed(deduped.map(ev => {
+        console.log("[DATA] activity_loaded n=" + evData.length + " (fallback:spender_events)");
+        setActivityFeed(safeArr(evData).map(ev => {
           const sp = ev.tg_user_id ? spMap[String(ev.tg_user_id)] : null;
-          // Use global helper to avoid "@?" and null crashes
           const label = sp ? getSpenderDisplayName(sp) : (ev.tg_user_id ? "#" + ev.tg_user_id : "?");
-          return {
-            id: ev.id,
-            // store BOTH identifiers for click routing (E)
-            spender_id: sp ? sp.id : null,
-            tg_user_id: ev.tg_user_id,
-            label,
-            message: ev.summary || ev.event_type || "",
-            eventType: ev.event_type,
-            ts: ev.created_at,
-          };
+          return { id: ev.id, tg_user_id: ev.tg_user_id, spender_id: sp?.id, label, message: ev.data?.summary || ev.event_type, eventType: ev.event_type, ts: ev.created_at, data: ev.data };
         }));
         return;
       }
-    } catch (e) { console.warn("[SB_ERR] spender_events — falling back to spenders table:", e.message||e); }
-    // Fallback: synthetic feed from spenders table
+    } catch (e) { console.warn("[DATA] spender_events fallback error:", e.message||e); }
+    // Fallback 2: synthetic feed from spenders table
     try {
-      console.info("[SB_FROM] spenders (activity-feed fallback)", { select:"id,tg_user_id,...", order:"updated_at desc", limit:30 });
-      const { data: fbData, error: fbErr } = await sb.from("spenders")
-        .select("id,tg_user_id,username,display_name,meta,handle,name,created_at,updated_at,total_spent,status")
+      const { data: fbData } = await sb.from("spenders")
+        .select("id,tg_user_id,username,display_name,meta,handle,name,created_at,updated_at")
         .order("updated_at", { ascending: false }).limit(30);
-      if (fbErr) { console.error("[SB_ERR] spenders (activity-feed fallback)", fbErr.code||"", fbErr.message||fbErr); }
       if (fbData && fbData.length > 0) {
-        const now = Date.now();
-        const h24 = 24 * 60 * 60 * 1000;
+        const now = Date.now(), h24 = 86400000;
+        console.log("[DATA] activity_loaded n=" + fbData.length + " (fallback:spenders)");
         setActivityFeed(safeArr(fbData).map(sp => {
-          // Use global helper for consistent null-safe labelling (no "@?")
           const label = getSpenderDisplayName(sp);
           const isNew = sp.created_at && (now - new Date(sp.created_at).getTime()) < h24;
-          return {
-            id: sp.id,
-            // store BOTH identifiers for click routing (E)
-            spender_id: sp.id,
-            tg_user_id: sp.tg_user_id,
-            label,
-            message: isNew ? "nouveau spender" : "profil mis à jour",
-            eventType: isNew ? "spender_created" : "spender_updated",
-            ts: isNew ? sp.created_at : sp.updated_at,
-            spenderHandle: sp.handle || sp.name,
-          };
+          return { id: sp.id, spender_id: sp.id, tg_user_id: sp.tg_user_id, label, message: isNew ? "nouveau spender" : "profil mis à jour", eventType: isNew ? "new_spender" : "profile_updated", ts: isNew ? sp.created_at : sp.updated_at };
         }));
       }
-    } catch (e) { console.warn("[SB_ERR] spenders (activity-feed fallback):", e.message||e); }
+    } catch (e) { console.warn("[DATA] spenders fallback error:", e.message||e); }
   }, []);
 
   // Initial fetch on mount
   useEffect(() => { fetchActivityFeed(); }, [fetchActivityFeed]);
 
-  // Polling 5s — ONLY when drawer is open
+  // Polling: 10s background, 5s when drawer open
   useEffect(() => {
-    if (showActivityDrawer) {
-      fetchActivityFeed();
-      activityPollingRef.current = setInterval(fetchActivityFeed, 5000);
-    } else {
-      if (activityPollingRef.current) clearInterval(activityPollingRef.current);
-      activityPollingRef.current = null;
-    }
+    const interval = showActivityDrawer ? 5000 : 10000;
+    if (showActivityDrawer) fetchActivityFeed();
+    activityPollingRef.current = setInterval(() => {
+      fetchActivityFeed().then(() => {
+        if (activityFeed.length > 0) console.log("[SYNC] poll_ok events=" + activityFeed.length);
+      });
+    }, interval);
     return () => { if (activityPollingRef.current) clearInterval(activityPollingRef.current); };
   }, [showActivityDrawer, fetchActivityFeed]);
 
@@ -7440,11 +7443,26 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     if (_dbSpendersRef.current !== dbSpenders) { _dbSpendersRef.current = dbSpenders; fetchActivityFeed(); }
   }, [dbSpenders, fetchActivityFeed]);
 
-  // Activity count today
-  const activityTodayCount = useMemo(() => {
+  // Activity counts by category (24h)
+  const activityCounts = useMemo(() => {
     const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-    return activityFeed.filter(a => a.ts && new Date(a.ts) >= todayStart).length;
+    const recent = activityFeed.filter(a => a.ts && new Date(a.ts) >= todayStart);
+    return {
+      total: recent.length,
+      newSpender: recent.filter(a => a.eventType === "new_spender" || a.eventType === "spender_created").length,
+      enrichment: recent.filter(a => a.eventType === "profile_updated" || a.eventType === "classification_changed" || a.eventType === "handle_set" || a.eventType === "status_changed").length,
+      messages: recent.filter(a => a.eventType === "new_message" || a.eventType === "tx_created").length,
+    };
   }, [activityFeed]);
+  const activityTodayCount = activityCounts.total;
+
+  // Filtered feed by tab
+  const filteredActivityFeed = useMemo(() => {
+    if (activityTab === "new_spender") return activityFeed.filter(a => a.eventType === "new_spender" || a.eventType === "spender_created");
+    if (activityTab === "enrichment") return activityFeed.filter(a => a.eventType === "profile_updated" || a.eventType === "classification_changed" || a.eventType === "handle_set" || a.eventType === "status_changed");
+    if (activityTab === "messages") return activityFeed.filter(a => a.eventType === "new_message" || a.eventType === "tx_created");
+    return activityFeed;
+  }, [activityFeed, activityTab]);
 
   // ── Scroll + highlight + open modal from activity feed click ──
   const handleActivityClick = React.useCallback((feedItem) => {
@@ -7887,9 +7905,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       {/* ── ACTIVITY BAR — compact 1-line + drawer on click ── */}
       <div className="activity-bar-compact" onClick={() => { setShowActivityDrawer(true); fetchActivityFeed(); }}>
         <span style={{fontSize:13}}>{"⚡"}</span>
-        <span style={{fontSize:12,fontWeight:700,color:"var(--text)"}}>{fr?"Dernières activités":"Recent activity"}</span>
+        <span style={{fontSize:12,fontWeight:700,color:"var(--text)"}}>{fr?"Activités":"Activity"}</span>
         <span style={{fontSize:11,color:"var(--text-tertiary)"}}>—</span>
-        <span style={{fontSize:11,fontWeight:600,color:"var(--accent)"}}>{activityTodayCount} {fr?"aujourd'hui":"today"}</span>
+        {activityCounts.newSpender > 0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(34,211,161,0.12)",color:"var(--success)"}}>{"🟢"} {activityCounts.newSpender}</span>}
+        {activityCounts.enrichment > 0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(99,102,241,0.12)",color:"var(--accent)"}}>{"✏️"} {activityCounts.enrichment}</span>}
+        {activityCounts.messages > 0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(59,130,246,0.12)",color:"var(--info)"}}>{"💬"} {activityCounts.messages}</span>}
+        {activityTodayCount === 0 && <span style={{fontSize:11,color:"var(--text-quaternary)"}}>{fr?"aucune":"none"}</span>}
         <span style={{width:6,height:6,borderRadius:"50%",background:"#10b981",display:"inline-block",animation:"pulse 2s infinite",flexShrink:0}} title="live"/>
         <span style={{marginLeft:"auto",fontSize:11,fontWeight:600,color:"var(--accent)"}}>{fr?"Voir":"View"} →</span>
       </div>
@@ -8381,35 +8402,68 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           </div>
         </ModalShell>
 
-      {/* ═══ ACTIVITY DRAWER (slide-in panel) ═══ */}
+      {/* ═══ ACTIVITY DRAWER (slide-in panel) — 3 sections ═══ */}
       {showActivityDrawer && (<>
         <div className="activity-drawer-overlay" onClick={() => setShowActivityDrawer(false)} />
         <div className="activity-drawer">
           <div className="activity-drawer-header">
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               <span style={{fontSize:16}}>{"⚡"}</span>
-              <span style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{fr?"Dernières activités":"Recent activity"}</span>
+              <span style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>{fr?"Activités":"Activity"}</span>
               <span style={{width:6,height:6,borderRadius:"50%",background:"#10b981",display:"inline-block"}} title="live polling"/>
             </div>
-            <button onClick={() => setShowActivityDrawer(false)} style={{width:30,height:30,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border)",color:"var(--text-tertiary)",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"✕"}</button>
+            <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <button onClick={() => { if(window.__hardRefresh) window.__hardRefresh(); }} title={fr?"Forcer mise à jour":"Force refresh"} style={{width:30,height:30,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border)",color:"var(--warning)",fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"🔄"}</button>
+              <button onClick={() => setShowActivityDrawer(false)} style={{width:30,height:30,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border)",color:"var(--text-tertiary)",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"✕"}</button>
+            </div>
+          </div>
+          {/* ── Tab bar: 3 categories ── */}
+          <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border)",flexShrink:0}}>
+            {[
+              {key:"all",     label:fr?"Tout":"All",        icon:"⚡", count:activityCounts.total},
+              {key:"new_spender", label:fr?"Nouveaux":"New Spenders", icon:"🟢", count:activityCounts.newSpender},
+              {key:"enrichment",  label:fr?"Enrichis":"Enrichment",   icon:"✏️", count:activityCounts.enrichment},
+              {key:"messages",    label:fr?"Messages":"Messages",     icon:"💬", count:activityCounts.messages},
+            ].map(t => (
+              <button key={t.key} onClick={() => setActivityTab(t.key)} style={{
+                flex:1, padding:"10px 4px 8px", background:activityTab===t.key?"rgba(99,102,241,0.08)":"transparent",
+                border:"none", borderBottom:activityTab===t.key?"2px solid var(--accent)":"2px solid transparent",
+                color:activityTab===t.key?"var(--accent)":"var(--text-tertiary)", cursor:"pointer",
+                fontSize:11, fontWeight:700, display:"flex", flexDirection:"column", alignItems:"center", gap:2, transition:"all 0.15s"
+              }}>
+                <span>{t.icon} {t.count > 0 && <span style={{background:activityTab===t.key?"var(--accent)":"var(--bg-overlay)",color:activityTab===t.key?"#fff":"var(--text-secondary)",padding:"1px 6px",borderRadius:8,fontSize:10,fontWeight:700,marginLeft:2}}>{t.count}</span>}</span>
+                <span style={{fontSize:10}}>{t.label}</span>
+              </button>
+            ))}
           </div>
           <div className="activity-drawer-list">
-            {activityFeed.length === 0 && (
-              <div style={{padding:40,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucune activité récente":"No recent activity"}</div>
+            {filteredActivityFeed.length === 0 && (
+              <div style={{padding:40,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucune activité":"No activity"}{activityTab !== "all" && <span> ({activityTab})</span>}</div>
             )}
-            {activityFeed.map((item, idx) => {
-              const evIcon = item.eventType === "spender_created" ? "🟢" : item.eventType === "status_changed" ? "🔄" : item.eventType === "tx_created" ? "💰" : item.eventType === "handle_set" ? "🏷️" : "✏️";
+            {filteredActivityFeed.map((item, idx) => {
+              const evIcon = (item.eventType === "new_spender" || item.eventType === "spender_created") ? "🟢"
+                : item.eventType === "profile_updated" ? "✏️"
+                : item.eventType === "classification_changed" ? "🏅"
+                : item.eventType === "status_changed" ? "🔄"
+                : item.eventType === "new_message" ? "💬"
+                : item.eventType === "tx_created" ? "💰"
+                : item.eventType === "handle_set" ? "🏷️" : "📋";
               return (
                 <div key={item.id || idx} className="activity-drawer-item" onClick={() => handleActivityClick(item)}>
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label}</div>
-                    {item.message && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.message}</div>}
+                    {item.message && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.title ? item.title + " — " : ""}{item.message}</div>}
                   </div>
                   <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts)}</span>
                 </div>
               );
             })}
+          </div>
+          {/* ── Footer: version + hard refresh ── */}
+          <div style={{padding:"8px 16px",borderTop:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
+            <span style={{fontSize:10,color:"var(--text-quaternary)"}}>{APP_VERSION}</span>
+            <button onClick={() => { if(window.__hardRefresh) window.__hardRefresh(); }} style={{fontSize:10,color:"var(--warning)",background:"none",border:"none",cursor:"pointer",fontWeight:700,textDecoration:"underline"}}>{fr?"Forcer mise à jour (fix old version)":"Hard refresh (fix old version)"}</button>
           </div>
         </div>
       </>)}
@@ -26978,11 +27032,11 @@ const App = () => {
         /* PAYMENT SYSTEM — ledger_entries (RLS: owner_user_id = auth.uid() pour non-gérant) */
         safe(sb.from("ledger_entries").select("*").order("created_at",{ascending:false}).limit(500), "ledger_entries"),
       ]), _dataTimeout]);
-    } catch(e) { /* DB FIX — loadData timeout or critical failure */ console.error("[DADASH] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
-    // Discard results if a newer loadData call was started while we were awaiting
+    } catch(e) { console.error("[DATA] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
     if (thisVersion !== _loadVersion.current) return;
     let txData = txR.data||[];
     let txSumData = txSumR.data||[];
+    console.log("[DATA] spenders_loaded n=" + (spR.data||[]).length + " tx_loaded n=" + txData.length);
     let modelData = moR.data||[];
 
     // Filter data based on user role
