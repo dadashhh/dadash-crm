@@ -1,32 +1,51 @@
-/* CHRISTINE FIX — Network-first SW with proper cache invalidation */
-const CACHE_NAME = 'dadash-v2';
+/* dadash-telegram-autofill — Network-first SW, never stale index.html */
+const CACHE_NAME = 'dadash-v3';
+const NEVER_CACHE = ['index.html', '/'];
 
-self.addEventListener('install', e => {
-  /* Skip waiting immediately — don't serve stale content */
-  self.skipWaiting();
-});
+self.addEventListener('install', () => self.skipWaiting());
 
 self.addEventListener('activate', e => {
-  /* Clean ALL old caches on activation */
   e.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(keys.map(k => caches.delete(k)))
-    ).then(() => self.clients.claim())
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
   );
 });
 
 self.addEventListener('fetch', e => {
-  /* Network-first: always try network, only use cache as offline fallback */
-  e.respondWith(
-    fetch(e.request)
-      .then(response => {
-        /* Cache successful responses for offline use */
-        if (response.ok && e.request.method === 'GET') {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
-        }
-        return response;
+  const url = new URL(e.request.url);
+  const isNav = e.request.mode === 'navigate';
+  const isNeverCache = isNav || NEVER_CACHE.some(p => url.pathname === p || url.pathname.endsWith(p));
+
+  if (isNeverCache) {
+    e.respondWith(
+      fetch(e.request).catch(() => caches.match(e.request))
+    );
+    return;
+  }
+
+  if (e.request.method === 'GET' && url.origin === self.location.origin) {
+    e.respondWith(
+      caches.match(e.request).then(cached => {
+        const fetchPromise = fetch(e.request).then(response => {
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
+          }
+          return response;
+        }).catch(() => cached);
+        return cached || fetchPromise;
       })
-      .catch(() => caches.match(e.request))
-  );
+    );
+    return;
+  }
+
+  e.respondWith(fetch(e.request));
+});
+
+self.addEventListener('message', e => {
+  if (e.data === 'SKIP_WAITING') self.skipWaiting();
+  if (e.data === 'PURGE_ALL') {
+    caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))));
+  }
 });
