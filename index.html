@@ -2509,6 +2509,29 @@ const isAdminUser = (user) => !!(user && user.role && ["admin","gerant","ceo"].i
 // AD1 — Safe helpers (no map/filter on undefined)
 const safeArray = (v) => (Array.isArray(v) ? v : []);
 const safeText = (v, fallback) => (v != null && String(v).trim() !== "" ? String(v).trim() : (fallback || "—"));
+// ── GLOBAL NULL-SAFETY HELPERS (D1) ──────────────────────────────────────────
+// safeObj: guarantees an object, never null/undefined
+const safeObj  = (o) => (o && typeof o === "object" && !Array.isArray(o)) ? o : {};
+// safeArr: guarantees an array, never null/undefined
+const safeArr  = (a) => Array.isArray(a) ? a : [];
+// safeNum: guarantees a finite number, defaults to 0
+const safeNum  = (v, fb=0) => (v !== null && v !== undefined && !isNaN(Number(v))) ? Number(v) : fb;
+// safeVal: returns value or fallback string "—" (for UI display)
+const safeVal  = (v, fb="—") => (v !== null && v !== undefined && String(v).trim() !== "") ? v : fb;
+// sbFrom: Supabase query wrapper with SB_FROM / SB_ERR diagnostic logging
+const sbFrom   = (table, queryFn) => {
+  console.info("[SB_FROM]", table);
+  let q;
+  try { q = queryFn(sb.from(table)); }
+  catch(e) { console.error("[SB_ERR]", table, "build error:", e.message||e); return Promise.resolve({data:[], error:e}); }
+  return Promise.resolve(q)
+    .then(r => {
+      if (r && r.error) { console.error("[SB_ERR]", table, r.error.code||"", r.error.message||r.error); return {data:[], error:r.error}; }
+      return r || {data:[]};
+    })
+    .catch(e => { console.error("[SB_ERR]", table, "network:", e.message||e); return {data:[], error:e}; });
+};
+// ─────────────────────────────────────────────────────────────────────────────
 // TZ1 — Timezone utilities (Europe/Zurich par défaut)
 const getUserTimezone = () => {
   try { return localStorage.getItem('user_timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Zurich'; } catch(_) { return 'Europe/Zurich'; }
@@ -3565,14 +3588,24 @@ const fmtDayTime = (d) => {
 // ERROR BOUNDARY
 // =============================================
 class ErrorBoundary extends React.Component {
-  constructor(props) { super(props); this.state = {hasError:false, error:null}; }
+  constructor(props) { super(props); this.state = {hasError:false, error:null, info:null}; }
   static getDerivedStateFromError(error) { return {hasError:true, error}; }
+  componentDidCatch(error, info) {
+    this.setState({info});
+    console.error("[ErrorBoundary]", this.props.name||"App", error, info?.componentStack||"");
+  }
   render() {
     if(this.state.hasError) {
-      return React.createElement("div", {style:{padding:40,textAlign:"center",color:"var(--danger)"}},
-        React.createElement("h2", null, "Erreur"),
-        React.createElement("p", null, String(this.state.error)),
-        React.createElement("button", {onClick:()=>this.setState({hasError:false}),className:"btn btn-primary",style:{marginTop:20,width:"auto"}}, "Recharger")
+      const ctx = this.props.name ? ` (${this.props.name})` : "";
+      const msg = this.state.error ? String(this.state.error) : "Erreur inconnue";
+      return React.createElement("div", {style:{padding:32,textAlign:"center",background:"var(--surface)",borderRadius:16,border:"1px solid var(--danger)",margin:16}},
+        React.createElement("div", {style:{fontSize:36,marginBottom:12}}, "\u26A0\uFE0F"),
+        React.createElement("h3", {style:{color:"var(--danger)",marginBottom:8,fontSize:16}}, "Erreur" + ctx),
+        React.createElement("p", {style:{color:"var(--text-secondary)",fontSize:13,marginBottom:4,fontFamily:"monospace",background:"var(--bg-overlay)",padding:"8px 12px",borderRadius:8,maxWidth:480,margin:"0 auto 16px",overflowX:"auto",textAlign:"left"}}, msg),
+        React.createElement("div", {style:{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}},
+          React.createElement("button", {onClick:()=>this.setState({hasError:false,error:null,info:null}),className:"btn btn-primary",style:{fontSize:13}}, "\u{1F504} Recharger"),
+          React.createElement("button", {onClick:()=>window.location.reload(),className:"btn",style:{fontSize:13}}, "Reload page")
+        )
       );
     }
     return this.props.children;
@@ -5241,7 +5274,8 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const [dashPlatformAccounts, setDashPlatformAccounts] = useState([]);
   useEffect(() => {
     sb.from("platform_accounts").select("id,platform,account_name,status").order("platform")
-      .then(({ data }) => setDashPlatformAccounts(data || []));
+      .then(({ data, error }) => { if (error) { console.warn("[SB_ERR] platform_accounts:", error.message||error); } setDashPlatformAccounts(data || []); })
+      .catch(e => { console.warn("[SB_ERR] platform_accounts (catch):", e.message||e); });
   }, []);
 
   const botStatusList = useMemo(() => {
@@ -7250,35 +7284,44 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   };
   const fetchActivityFeed = React.useCallback(async () => {
     try {
+      // ── DIAGNOSTIC: SB_FROM log so 404s appear clearly in Network + Console ──
+      console.info("[SB_FROM] spender_events", { select:"id,tg_user_id,event_type,summary,created_at", order:"created_at desc", limit:100 });
       const { data: evData, error: evErr } = await sb.from("spender_events")
         .select("id,tg_user_id,event_type,summary,created_at")
         .order("created_at", { ascending: false }).limit(100);
-      if (!evErr && evData && evData.length > 0) {
+      if (evErr) {
+        console.error("[SB_ERR] spender_events", evErr.code || "", evErr.message || evErr);
+        throw evErr; // falls through to fallback below
+      }
+      if (evData && evData.length > 0) {
         // Build spender info map by tg_user_id
-        const tgIds = [...new Set(evData.map(ev => ev.tg_user_id).filter(Boolean))];
+        const tgIds = [...new Set(safeArr(evData).map(ev => ev.tg_user_id).filter(Boolean))];
         let spMap = {};
         if (tgIds.length > 0) {
           try {
+            console.info("[SB_FROM] spenders (enrich events)", { in_tg_user_ids: tgIds.length });
             const { data: spData } = await sb.from("spenders")
-              .select("tg_user_id,username,display_name,meta,handle,name")
+              .select("id,tg_user_id,username,display_name,meta,handle,name")
               .in("tg_user_id", tgIds);
-            if (spData) spData.forEach(sp => { spMap[sp.tg_user_id] = sp; });
-          } catch (_) { /* spenders join failed, continue without labels */ }
+            if (spData) spData.forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
+          } catch (e) { console.warn("[SB_ERR] spenders (enrich events)", e.message||e); }
         }
         // Deduplicate: keep first occurrence per (tg_user_id|event_type|summary|2-min-bucket)
         const seen = new Set();
         const deduped = [];
-        for (const ev of evData) {
+        for (const ev of safeArr(evData)) {
           const bucket = ev.created_at ? Math.floor(new Date(ev.created_at).getTime() / 120000) : 0;
           const key = `${ev.tg_user_id}|${ev.event_type}|${ev.summary}|${bucket}`;
           if (!seen.has(key)) { seen.add(key); deduped.push(ev); }
         }
         setActivityFeed(deduped.map(ev => {
-          const sp = ev.tg_user_id ? spMap[ev.tg_user_id] : null;
+          const sp = ev.tg_user_id ? spMap[String(ev.tg_user_id)] : null;
           // Use global helper to avoid "@?" and null crashes
           const label = sp ? getSpenderDisplayName(sp) : (ev.tg_user_id ? "#" + ev.tg_user_id : "?");
           return {
             id: ev.id,
+            // store BOTH identifiers for click routing (E)
+            spender_id: sp ? sp.id : null,
             tg_user_id: ev.tg_user_id,
             label,
             message: ev.summary || ev.event_type || "",
@@ -7288,21 +7331,25 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         }));
         return;
       }
-    } catch (_) { /* spender_events table may not exist */ }
+    } catch (e) { console.warn("[SB_ERR] spender_events — falling back to spenders table:", e.message||e); }
     // Fallback: synthetic feed from spenders table
     try {
-      const { data: fbData } = await sb.from("spenders")
+      console.info("[SB_FROM] spenders (activity-feed fallback)", { select:"id,tg_user_id,...", order:"updated_at desc", limit:30 });
+      const { data: fbData, error: fbErr } = await sb.from("spenders")
         .select("id,tg_user_id,username,display_name,meta,handle,name,created_at,updated_at,total_spent,status")
         .order("updated_at", { ascending: false }).limit(30);
+      if (fbErr) { console.error("[SB_ERR] spenders (activity-feed fallback)", fbErr.code||"", fbErr.message||fbErr); }
       if (fbData && fbData.length > 0) {
         const now = Date.now();
         const h24 = 24 * 60 * 60 * 1000;
-        setActivityFeed(fbData.map(sp => {
+        setActivityFeed(safeArr(fbData).map(sp => {
           // Use global helper for consistent null-safe labelling (no "@?")
           const label = getSpenderDisplayName(sp);
           const isNew = sp.created_at && (now - new Date(sp.created_at).getTime()) < h24;
           return {
             id: sp.id,
+            // store BOTH identifiers for click routing (E)
+            spender_id: sp.id,
             tg_user_id: sp.tg_user_id,
             label,
             message: isNew ? "nouveau spender" : "profil mis à jour",
@@ -7312,7 +7359,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           };
         }));
       }
-    } catch (_) { /* fallback failed */ }
+    } catch (e) { console.warn("[SB_ERR] spenders (activity-feed fallback):", e.message||e); }
   }, []);
 
   // Initial fetch on mount
@@ -7344,9 +7391,22 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
 
   // ── Scroll + highlight + open modal from activity feed click ──
   const handleActivityClick = React.useCallback((feedItem) => {
-    // 1) Find spender: prefer tg_user_id, fallback to handle
+    // ── CLICK GUARD (D) — never crash on null/undefined item ──
+    if (!feedItem || typeof feedItem !== "object") {
+      console.warn("[CLICK_IGNORED] handleActivityClick: missing feedItem");
+      return;
+    }
+    // 1) Find spender: prefer spender_id (UUID), then tg_user_id, fallback to handle (E)
     let sp = null;
-    if (feedItem.tg_user_id) {
+    // 1a) Lookup by DB UUID first (most reliable)
+    if (feedItem.spender_id) {
+      sp = spenders.find(s => s.dbId === feedItem.spender_id || s.id === feedItem.spender_id);
+      if (!sp) {
+        const dbSp = safeArr(dbSpenders).find(d => d.id === feedItem.spender_id);
+        if (dbSp) sp = spenders.find(s => (s.dbId||s.id) === dbSp.id);
+      }
+    }
+    if (!sp && feedItem.tg_user_id) {
       sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === String(feedItem.tg_user_id));
       // If not in spenders array, try dbSpenders and build synthetic entry
       if (!sp) {
@@ -7446,6 +7506,38 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     setSelected(vm); setSpModalTab("profil"); setSpEditMode(false);
     setSpForm({langue: vm.langue || "FR", timezone: vm.timezone || "Europe/Zurich", budget_range: vm.budget_range || "", first_name: vm.first_name !== "\u2014" ? vm.first_name : (vm.contactInfo?.prenom || ""), age: vm.age || "", city: vm.city || "", country: vm.country || "", job: vm.job || (vm.contactInfo?.metier || ""), telegram_username: vm.telegram_username || vm.telegramId || "", whatsapp_phone: vm.whatsapp_phone || "", relationship_status: vm.relationship_status || "", preferences: vm.preferences || "", personality_notes: vm.personality_notes || "", chatter_notes: vm.dbNotes || "", favorite_content: vm.favorite_content || "", best_time: vm.best_time || "", classification: vm.classification || "new", risk_level: vm.risk_level || "safe", source: vm.source || "", tags: vm.dbTags || [], status: vm.dbStatus || "active"});
   };
+  // ── openSpenderById / openSpenderByTgUserId (E) — safe lookup before open ──
+  const openSpenderById = React.useCallback((id) => {
+    if (!id) { console.warn("[CLICK_IGNORED] openSpenderById: missing id"); return; }
+    // 1) try computed list first (has enriched stats)
+    const sp = spenders.find(s => s.dbId === id || s.id === id)
+      || safeArr(dbSpenders).find(d => d.id === id);
+    if (sp) { openSpenderModal(sp); return; }
+    // 2) fetch from DB directly
+    console.info("[SB_FROM] spenders (openById)", id);
+    sb.from("spenders").select("*").eq("id", id).maybeSingle()
+      .then(({ data, error }) => {
+        if (error) { console.error("[SB_ERR] spenders (openById):", error.message||error); addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
+        if (!data) { addToast(fr?"Spender introuvable":"Spender not found","warning"); return; }
+        openSpenderModal(data);
+      }).catch(e => { console.error("[SB_ERR] spenders (openById catch):", e.message||e); addToast(fr?"Erreur chargement spender":"Spender load error","error"); });
+  }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
+
+  const openSpenderByTgUserId = React.useCallback((tgId) => {
+    if (!tgId) { console.warn("[CLICK_IGNORED] openSpenderByTgUserId: missing tgId"); return; }
+    // 1) try computed list first
+    const sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === String(tgId))
+      || safeArr(dbSpenders).find(d => d.tg_user_id && String(d.tg_user_id) === String(tgId));
+    if (sp) { openSpenderModal(sp); return; }
+    // 2) fetch from DB directly
+    console.info("[SB_FROM] spenders (openByTgUserId)", tgId);
+    sb.from("spenders").select("*").eq("tg_user_id", String(tgId)).maybeSingle()
+      .then(({ data, error }) => {
+        if (error) { console.error("[SB_ERR] spenders (openByTgUserId):", error.message||error); addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
+        if (!data) { addToast(`${fr?"Spender introuvable":"Spender not found"} (tg_user_id=${tgId})`,"warning"); return; }
+        openSpenderModal(data);
+      }).catch(e => { console.error("[SB_ERR] spenders (openByTgUserId catch):", e.message||e); });
+  }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
   const handleSaveProfile = async () => {
     if (!selected?.dbId) { addToast(fr ? "Spender sans ID DB" : "Spender has no DB ID", "error"); return; }
     setSpSavingProfile(true);
@@ -15523,12 +15615,13 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
   useEffect(() => {
     (async () => {
       try {
-        const { data } = await sb.from("todos").select("*").order("created_at", { ascending: false }).limit(50);
+        const { data, error } = await sb.from("todos").select("*").order("created_at", { ascending: false }).limit(50);
+        if (error) { console.warn("[SB_ERR] todos:", error.message||error); return; }
         if (data && user) {
           const mine = data.filter(t => t.created_by === user.id);
           setTodos(mine);
         }
-      } catch (e) { /* table may not exist */ }
+      } catch (e) { console.warn("[SB_ERR] todos (catch):", e.message||e); }
     })();
   }, [user?.id]);
 
@@ -25417,7 +25510,9 @@ const PushPageV1 = ({ user, lang, models, spenders, botStats, onRefresh }) => {
 
   useEffect(() => {
     fetchCampaigns();
-    sb.from("platform_accounts").select("platform,status").then(({ data }) => setPlatformAccounts(data || []));
+    sb.from("platform_accounts").select("platform,status")
+      .then(({ data, error }) => { if (error) { console.warn("[SB_ERR] platform_accounts:", error.message||error); } setPlatformAccounts(data || []); })
+      .catch(e => { console.warn("[SB_ERR] platform_accounts (catch):", e.message||e); setPlatformAccounts([]); });
   }, []);
 
   const fetchCampaigns = async () => {
@@ -26524,7 +26619,7 @@ const App = () => {
   const renderGerantContent = () => {
     switch(tab) {
       case "spenders":
-        return <SpendersTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} />;
+        return <ErrorBoundary name="SpenderPage"><SpendersTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} /></ErrorBoundary>;
       case "dashboard":
         return <DashboardRedesign user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} botStats={botStats} alerts={alerts} navigateTo={navigateTo} navigateToSpender={navigateToSpender} />;
       case "business":
@@ -26996,7 +27091,7 @@ const App = () => {
             </div>
           )}
           {/* ── Chatter-only pages — UNCHANGED ── */}
-          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
+          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ErrorBoundary name="ChatterPage"><ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} /></ErrorBoundary>}
           {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} profiles={profiles} onRefresh={onRefresh} />}
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} onRefresh={onRefresh} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
