@@ -20793,17 +20793,26 @@ const BroadcastsTab = ({ user, lang, spenders, txs, models, broadcasts, onRefres
 // BOTS MANAGEMENT PAGE (standalone /bots page)
 // B1 UI shell + B2 data wiring (bot_status)
 // =============================================
+const BOT_AUTOFILL = { id: "autofill", key: "telegram_autofill", name: "Bot Autofill (Telegram Autofill)", icon: "\u{270F}\uFE0F", desc: "Ingestion auto messages TG, créa spenders" };
 const BOT_ORDER = [
   { id: "tg", key: "tg_bot", name: "Bot TG", icon: "\u{2708}\uFE0F", desc: "Telegram conversations, screenshots, escalades" },
   { id: "chatting", key: "chatting_bot", name: "Chatting Bot", icon: "\u{1F4AC}", desc: "Messages, notifications, relances" },
   { id: "scan", key: "scan_checker", name: "Scan Checker", icon: "\u{1F50D}", desc: "Vérification captures, détection fake" },
   { id: "cam", key: "cam_bot", name: "Bot Cam", icon: "\u{1F3A5}", desc: "Appels vidéo automatiques, delivery vidéo" }
 ];
-const BotsManagementPage = ({ lang }) => {
+const BotsManagementPage = ({ lang, user }) => {
   const fr = lang === "fr";
+  const addToast = useToast();
   const [statusRows, setStatusRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [autofillModalOpen, setAutofillModalOpen] = useState(false);
+  const [autofillRun, setAutofillRun] = useState(null);
+  const [autofillMetrics, setAutofillMetrics] = useState(null);
+  const [autofillEvents, setAutofillEvents] = useState([]);
+  const [autofillLastCmd, setAutofillLastCmd] = useState(null);
+  const [autofillEventsFilter, setAutofillEventsFilter] = useState("all");
+  const [autofillCmdLoading, setAutofillCmdLoading] = useState(null);
   const [botTabs, setBotTabs] = useState({ tg: "stats", chatting: "stats", scan: "stats", cam: "stats" });
   const setBotTab = (id, tab) => setBotTabs(prev => ({ ...prev, [id]: tab }));
   const [botLogs, setBotLogs] = useState({ tg: [], chatting: [], scan: [], cam: [] });
@@ -20864,14 +20873,54 @@ const BotsManagementPage = ({ lang }) => {
     setLoading(false);
   }, []);
 
+  const fetchAutofill = useCallback(async () => {
+    if (!window.sb) return;
+    try {
+      const [runRes, metricsRes, eventsRes, cmdRes] = await Promise.all([
+        window.sb.from("bot_runs").select("*").eq("bot_name", "telegram_autofill").maybeSingle(),
+        window.sb.from("bot_daily_metrics").select("*").eq("bot_name", "telegram_autofill").eq("day", new Date().toISOString().slice(0, 10)).maybeSingle(),
+        window.sb.from("bot_events").select("id,bot_name,level,event_type,message,created_at").eq("bot_name", "telegram_autofill").order("created_at", { ascending: false }).limit(50),
+        window.sb.from("bot_commands").select("id,command,status,created_at").eq("bot_name", "telegram_autofill").order("created_at", { ascending: false }).limit(1).maybeSingle()
+      ]);
+      if (runRes.data) setAutofillRun(runRes.data);
+      else setAutofillRun(null);
+      if (metricsRes.data) setAutofillMetrics(metricsRes.data);
+      else setAutofillMetrics(null);
+      setAutofillEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
+      if (cmdRes.data) setAutofillLastCmd(cmdRes.data);
+      else setAutofillLastCmd(null);
+    } catch (_) {}
+  }, []);
+
+  const sendBotCommand = useCallback(async (cmd) => {
+    if (!window.sb) return;
+    setAutofillCmdLoading(cmd);
+    try {
+      const row = { bot_name: "telegram_autofill", command: cmd, status: "pending" };
+      if (user && user.id) row.requested_by = user.id;
+      const { error: err } = await window.sb.from("bot_commands").insert(row);
+      if (err) { addToast("Erreur: " + (err.message || "Commande non envoyée"), "error"); setAutofillCmdLoading(null); return; }
+      addToast(fr ? "Commande envoyée" : "Command sent", "success");
+      fetchAutofill();
+    } catch (e) { addToast("Erreur: " + (e && e.message), "error"); }
+    setAutofillCmdLoading(null);
+  }, [addToast, fr, fetchAutofill, user]);
+
   useEffect(() => { fetchStatus(); }, [fetchStatus]);
   useEffect(() => { const iv = setInterval(fetchStatus, 30000); return () => clearInterval(iv); }, [fetchStatus]);
+  useEffect(() => { fetchAutofill(); const iv = setInterval(fetchAutofill, 5000); return () => clearInterval(iv); }, [fetchAutofill]);
   useEffect(() => {
     if (!selectedBot) return;
     const handleEsc = e => { if (e.key === "Escape") setSelectedBot(null); };
     window.addEventListener("keydown", handleEsc);
     return () => window.removeEventListener("keydown", handleEsc);
   }, [selectedBot]);
+  useEffect(() => {
+    if (!autofillModalOpen) return;
+    const h = e => { if (e.key === "Escape") setAutofillModalOpen(false); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [autofillModalOpen]);
 
   const fetchSessions = useCallback(async () => {
     if (!window.sb) { setSessionsError("Supabase non connecté"); setSessionsLoading(false); return; }
@@ -21083,7 +21132,7 @@ const BotsManagementPage = ({ lang }) => {
           <div style={{ fontSize: 18, fontWeight: 800, color: "var(--text-primary)" }}>{"\u{1F916}"} {fr ? "Bots" : "Bots"}</div>
           <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 4 }}>{fr ? "Contrôle et monitoring" : "Control and monitoring"}</div>
         </div>
-        <button onClick={() => { setLoading(true); fetchStatus(); }} disabled={loading} style={{ padding: "7px 13px", borderRadius: 9, border: "1px solid var(--accent)", background: "var(--accent-muted)", color: "var(--accent)", fontSize: 12, fontWeight: 600, cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1 }}>{"\u{1F504}"} {loading ? "…" : (fr ? "Rafraîchir" : "Refresh")}</button>
+        <button onClick={() => { setLoading(true); fetchStatus(); fetchAutofill(); }} disabled={loading} style={{ padding: "7px 13px", borderRadius: 9, border: "1px solid var(--accent)", background: "var(--accent-muted)", color: "var(--accent)", fontSize: 12, fontWeight: 600, cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1 }}>{"\u{1F504}"} {loading ? "…" : (fr ? "Rafraîchir" : "Refresh")}</button>
       </div>
 
       {error && (
@@ -21101,6 +21150,55 @@ const BotsManagementPage = ({ lang }) => {
       {/* Section Cartes bots (en haut, style Bots Control) */}
       <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.5px" }}>{fr ? "Statut des bots" : "Bot status"}</div>
       <div style={{ display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr", gap: 16, marginBottom: 28 }}>
+        {/* Carte Bot Autofill — première position */}
+        {(() => {
+          const r = autofillRun;
+          const m = autofillMetrics;
+          const st = (r && r.status) || "offline";
+          const isOnline = st === "online";
+          const isPaused = st === "paused";
+          const statusConf = isPaused ? { label: "PAUSED", color: "var(--warning)", bg: "var(--warning-muted)" } : isOnline ? { label: "ONLINE", color: "var(--success)", bg: "var(--success-muted)" } : { label: "OFFLINE", color: "var(--danger)", bg: "var(--danger-muted)" };
+          const uptimeVal = (r && r.meta && r.meta.uptime_pct != null) ? (Number(r.meta.uptime_pct).toFixed(1) + "%") : "—";
+          const msgsVal = m && m.msgs_ingested != null ? (m.msgs_ingested >= 1000 ? (m.msgs_ingested / 1000).toFixed(1) + "k" : String(m.msgs_ingested)) : "—";
+          const errVal = m && m.errors_count != null ? m.errors_count : "—";
+          const uptimeColor = (r && r.meta && r.meta.uptime_pct != null) ? (Number(r.meta.uptime_pct) >= 95 ? "var(--success)" : Number(r.meta.uptime_pct) >= 80 ? "var(--warning)" : "var(--danger)") : "var(--text-tertiary)";
+          const actionsDisabled = !isOnline && !isPaused;
+          return (
+            <div key="autofill" onClick={() => setAutofillModalOpen(true)} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 16, transition: "all 0.2s", cursor: "pointer" }} onMouseOver={e => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.borderColor = "var(--accent)"; e.currentTarget.style.boxShadow = "0 8px 24px rgba(0,0,0,0.2)"; }} onMouseOut={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.boxShadow = ""; }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 24 }}>{BOT_AUTOFILL.icon || "\u{1F916}"}</span>
+                  <div>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>{BOT_AUTOFILL.name}</div>
+                    <div style={{ fontSize: 10, color: "var(--muted2)" }}>{BOT_AUTOFILL.desc}</div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 20, background: statusConf.bg, fontSize: 10, fontWeight: 800, color: statusConf.color, letterSpacing: 0.5 }}>
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: statusConf.color, animation: isOnline && !isPaused ? "pulse 2s infinite" : "none" }} />
+                  {statusConf.label}
+                </div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
+                {[
+                  { label: fr ? "Uptime" : "Uptime", value: uptimeVal, color: uptimeColor },
+                  { label: fr ? "Msgs/jour" : "Msgs/day", value: msgsVal, color: "var(--text)" },
+                  { label: fr ? "Erreurs" : "Errors", value: errVal, color: (errVal !== "—" && Number(errVal) > 0) ? "var(--danger)" : "var(--muted2)" },
+                ].map(k => (
+                  <div key={k.label} style={{ background: "var(--surface2)", borderRadius: 10, padding: "8px 10px", textAlign: "center" }}>
+                    <div style={{ fontSize: 9, color: "var(--muted)", textTransform: "uppercase", fontWeight: 600, marginBottom: 3 }}>{k.label}</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: k.color }}>{k.value}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={btnRow}>
+                <button onClick={e => { e.stopPropagation(); if (!actionsDisabled) sendBotCommand("connect"); }} disabled={!actionsDisabled} style={{ ...btnStyle, opacity: actionsDisabled ? 0.5 : 1 }}>Connecter</button>
+                <button onClick={e => { e.stopPropagation(); if (!actionsDisabled) sendBotCommand("pause"); }} disabled={actionsDisabled} style={{ ...btnStyle, opacity: actionsDisabled ? 0.5 : 1 }}>Pause</button>
+                <button onClick={e => { e.stopPropagation(); if (!actionsDisabled) sendBotCommand("resume"); }} disabled={actionsDisabled} style={{ ...btnStyle, opacity: actionsDisabled ? 0.5 : 1 }}>Resume</button>
+                <button onClick={e => { e.stopPropagation(); if (!actionsDisabled) sendBotCommand("restart"); }} disabled={actionsDisabled} style={{ ...btnStyle, opacity: actionsDisabled ? 0.5 : 1 }}>Redémarrer</button>
+              </div>
+            </div>
+          );
+        })()}
         {BOT_ORDER.map(bot => {
           const row = byKey[bot.key];
           const isOnline = row && row.is_online === true;
@@ -21146,6 +21244,93 @@ const BotsManagementPage = ({ lang }) => {
           );
         })}
       </div>
+
+      {/* Modal Bot Autofill — Monitoring */}
+      {autofillModalOpen && (
+        <div onClick={() => setAutofillModalOpen(false)} style={{ position: "fixed", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.6)", zIndex: 9999 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "var(--card-bg)", borderRadius: 16, padding: 24, width: "min(720px, 95vw)", maxHeight: "90vh", overflowY: "auto", boxShadow: "0 20px 60px rgba(0,0,0,0.4)", border: "1px solid var(--card-border)" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 28 }}>{BOT_AUTOFILL.icon}</span>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800, color: "var(--text-primary)" }}>Bot Autofill — Monitoring</div>
+                  <div style={{ fontSize: 11, color: "var(--muted2)" }}>
+                    {autofillRun && autofillRun.last_heartbeat_at ? (() => { const sec = Math.floor((Date.now() - new Date(autofillRun.last_heartbeat_at).getTime()) / 1000); return sec < 60 ? (fr ? "il y a " + sec + "s" : sec + "s ago") : (fr ? "il y a " + Math.floor(sec / 60) + " min" : Math.floor(sec / 60) + " min ago"); })() : "—"}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {(() => { const st = (autofillRun && autofillRun.status) || "offline"; const isOn = st === "online" || st === "paused"; const sc = st === "paused" ? { color: "var(--warning)", bg: "var(--warning-muted)", label: "PAUSED" } : st === "online" ? { color: "var(--success)", bg: "var(--success-muted)", label: "ONLINE" } : { color: "var(--danger)", bg: "var(--danger-muted)", label: "OFFLINE" }; return (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 20, background: sc.bg, fontSize: 10, fontWeight: 800, color: sc.color, letterSpacing: 0.5 }}>
+                    <span style={{ width: 7, height: 7, borderRadius: "50%", background: sc.color }} />
+                    {sc.label}
+                  </div>
+                ); })()}
+                <button onClick={() => fetchAutofill()} style={btnStyle}>{"\u{1F504}"} {fr ? "Rafraîchir" : "Refresh"}</button>
+                <button onClick={() => { sendBotCommand("connect"); }} disabled={(autofillRun && autofillRun.status) === "online"} style={{ ...btnStyle, opacity: (autofillRun && autofillRun.status) === "online" ? 0.5 : 1 }}>Connecter</button>
+                <button onClick={() => sendBotCommand("pause")} disabled={!(autofillRun && (autofillRun.status === "online" || autofillRun.status === "degraded"))} style={btnStyle}>Pause</button>
+                <button onClick={() => sendBotCommand("resume")} disabled={!(autofillRun && autofillRun.status === "paused")} style={btnStyle}>Resume</button>
+                <button onClick={() => sendBotCommand("restart")} disabled={!(autofillRun && (autofillRun.status === "online" || autofillRun.status === "paused" || autofillRun.status === "degraded"))} style={btnStyle}>Restart</button>
+                <button onClick={() => setAutofillModalOpen(false)} style={{ ...btnStyle, borderColor: "var(--danger)", color: "var(--danger)" }}>{"\u00D7"}</button>
+              </div>
+            </div>
+            {autofillLastCmd && (
+              <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginBottom: 12 }}>
+                {fr ? "Dernière commande" : "Last command"}: {autofillLastCmd.command} — {autofillLastCmd.status}
+              </div>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, marginBottom: 20 }}>
+              {[
+                { label: fr ? "Msgs ingérés" : "Msgs ingested", value: autofillMetrics ? autofillMetrics.msgs_ingested : "—" },
+                { label: fr ? "Spenders créés" : "Spenders created", value: autofillMetrics ? autofillMetrics.spenders_created : "—" },
+                { label: fr ? "Spenders mis à jour" : "Spenders updated", value: autofillMetrics ? autofillMetrics.spenders_updated : "—" },
+                { label: fr ? "Erreurs" : "Errors", value: autofillMetrics ? autofillMetrics.errors_count : "—" },
+                { label: fr ? "Enrich pending" : "Enrich pending", value: autofillMetrics ? autofillMetrics.enrich_pending : "—" },
+                { label: fr ? "Enrich done" : "Enrich done", value: autofillMetrics ? autofillMetrics.enrich_done : "—" },
+              ].map(k => (
+                <div key={k.label} style={{ background: "var(--bg-overlay)", borderRadius: 10, padding: "10px 12px", textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: "var(--muted)", textTransform: "uppercase", fontWeight: 600, marginBottom: 3 }}>{k.label}</div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)" }}>{k.value}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)" }}>{fr ? "Live events" : "Live events"}</span>
+              {["all","info","warn","error"].map(lvl => (
+                <button key={lvl} onClick={() => setAutofillEventsFilter(lvl)} style={{ ...btnStyle, padding: "4px 8px", fontSize: 10, background: autofillEventsFilter === lvl ? "var(--accent-muted)" : "var(--bg-overlay)", color: autofillEventsFilter === lvl ? "var(--accent)" : "var(--text-tertiary)" }}>{lvl}</button>
+              ))}
+            </div>
+            <div style={{ maxHeight: 220, overflowY: "auto", border: "1px solid var(--border-subtle)", borderRadius: 10 }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                <thead><tr style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+                  <th style={{ padding: "8px 10px", textAlign: "left", color: "var(--text-tertiary)" }}>Time</th>
+                  <th style={{ padding: "8px 10px", textAlign: "left", color: "var(--text-tertiary)" }}>Level</th>
+                  <th style={{ padding: "8px 10px", textAlign: "left", color: "var(--text-tertiary)" }}>Type</th>
+                  <th style={{ padding: "8px 10px", textAlign: "left", color: "var(--text-tertiary)" }}>Message</th>
+                </tr></thead>
+                <tbody>
+                  {(autofillEventsFilter === "all" ? autofillEvents : autofillEvents.filter(e => e.level === autofillEventsFilter)).map(ev => (
+                    <tr key={ev.id} style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+                      <td style={{ padding: "6px 10px", color: "var(--text-tertiary)", whiteSpace: "nowrap" }}>{ev.created_at ? new Date(ev.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—"}</td>
+                      <td style={{ padding: "6px 10px", color: ev.level === "error" ? "var(--danger)" : ev.level === "warn" ? "var(--warning)" : "var(--text-secondary)" }}>{ev.level}</td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-secondary)" }}>{ev.event_type || "—"}</td>
+                      <td style={{ padding: "6px 10px", color: "var(--text-primary)", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.message || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {(autofillRun && (autofillRun.started_at || autofillRun.version)) && (
+              <div style={{ fontSize: 10, color: "var(--text-quaternary)", marginTop: 12 }}>
+                {autofillRun.started_at ? "started: " + fmtDate(autofillRun.started_at) : ""}
+                {autofillRun.started_at && autofillRun.version ? " · " : ""}
+                {autofillRun.version ? "v" + autofillRun.version : ""}
+                {autofillRun.meta && autofillRun.meta.last_success_at ? " · last_success: " + fmtDate(autofillRun.meta.last_success_at) : ""}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── SESSIONS TELEGRAM ── */}
       <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 12 }}>
@@ -25799,7 +25984,7 @@ const App = () => {
           <PushPageV1 user={user} lang={lang} models={models} spenders={spenders} botStats={botStats} onRefresh={onRefresh} />
         </>);
       case "bots":
-        return <BotsManagementPage lang={lang} />;
+        return <BotsManagementPage lang={lang} user={user} />;
       case "ia-insights":
         return <IAInsightsPage user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} lang={lang} onNavigate={navigateTo} />;
       case "admin":
