@@ -1,9 +1,10 @@
 // ─────────────────────────────────────────────
 // manager-notifier — Railway entry point
-// HTTP /health  +  manager_alerts → Telegram
+// HTTP /health  +  manager_alerts → Telegram  +  enrich poller
 // ─────────────────────────────────────────────
 import http from 'node:http';
 import { startPoller, metrics } from './poller.js';
+import { startEnrichPoller, enrichMetrics } from './enrich.js';
 
 // ── Env validation ───────────────────────────
 const REQUIRED_VARS = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'TELEGRAM_BOT_TOKEN'] as const;
@@ -23,10 +24,18 @@ const server = http.createServer((req, res) => {
     const body = JSON.stringify({
       status: 'ok',
       uptimeSeconds: Math.floor((Date.now() - START_TIME) / 1000),
-      sentCount: metrics.sentCount,
-      errorCount: metrics.errorCount,
-      lastPollAt: metrics.lastPollAt,
-      pollerRunning: metrics.running,
+      alerts: {
+        sentCount: metrics.sentCount,
+        errorCount: metrics.errorCount,
+        lastPollAt: metrics.lastPollAt,
+        running: metrics.running,
+      },
+      enrich: {
+        processed: enrichMetrics.processed,
+        errors: enrichMetrics.errors,
+        lastPollAt: enrichMetrics.lastPollAt,
+        running: enrichMetrics.running,
+      },
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(body);
@@ -40,9 +49,14 @@ server.listen(PORT, () => {
   console.log(`[HEALTH] HTTP server listening on :${PORT} — GET /health`);
 });
 
-// ── Start poller ──────────────────────────────
+// ── Start pollers ──────────────────────────────
 startPoller().catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);
-  console.error('[FATAL] Poller crashed:', msg);
+  console.error('[FATAL] Alert poller crashed:', msg);
   process.exit(1);
+});
+
+startEnrichPoller().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error('[WARN] Enrich poller failed to start:', msg);
 });
