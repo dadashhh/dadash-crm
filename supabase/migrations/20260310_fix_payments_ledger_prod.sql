@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS payment_events (
   created_at timestamptz DEFAULT now()
 );
 
--- Colonnes manquantes si table existait avant
+-- Colonnes manquantes si table existait avant (payment_system.sql a kind NOT NULL)
+ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS kind text DEFAULT 'salary';
+ALTER TABLE payment_events ALTER COLUMN kind SET DEFAULT 'salary';
+UPDATE payment_events SET kind = 'salary' WHERE kind IS NULL;
 ALTER TABLE payment_events ADD COLUMN IF NOT EXISTS note text;
 DO $$
 BEGIN

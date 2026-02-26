@@ -21,9 +21,9 @@ BEGIN
     RETURN;
   END IF;
 
-  -- 2) Créer payment_event pending
-  INSERT INTO payment_events (from_user_id, to_user_id, amount, currency, title, note, status, created_by)
-  VALUES (v_gerant_id, v_chatter_id, 50.00, 'CHF', 'Test paiement', 'Test migration', 'pending', v_gerant_id)
+  -- 2) Créer payment_event pending (kind requis si colonne existe)
+  INSERT INTO payment_events (from_user_id, to_user_id, amount, currency, kind, title, note, status, created_by)
+  VALUES (v_gerant_id, v_chatter_id, 50.00, 'CHF', 'salary', 'Test paiement', 'Test migration', 'pending', v_gerant_id)
   RETURNING id INTO v_pe_id;
 
   RAISE NOTICE 'Payment event créé: %', v_pe_id;
