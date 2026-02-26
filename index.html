@@ -760,6 +760,72 @@
       border-color: #8B5CF6 !important;
       box-shadow: 0 4px 20px rgba(139,92,246,0.15);
     }
+    .spender-card-glow {
+      border-color: rgba(139,92,246,0.45) !important;
+      box-shadow: 0 0 12px 2px rgba(139,92,246,0.10), 0 2px 8px rgba(139,92,246,0.08);
+    }
+    .spender-card-highlight {
+      border-color: #8B5CF6 !important;
+      box-shadow: 0 0 20px 4px rgba(139,92,246,0.30), 0 4px 24px rgba(139,92,246,0.18) !important;
+      transition: box-shadow 0.3s, border-color 0.3s !important;
+    }
+    .spender-badge-new {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: rgba(16,185,129,0.18);
+      color: #10b981;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .spender-badge-updated {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: rgba(139,92,246,0.18);
+      color: #a78bfa;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .spender-relative-time {
+      font-size: 9px;
+      color: var(--text-quaternary);
+      font-weight: 500;
+    }
+    .activity-feed-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px 8px;
+      margin-bottom: 16px;
+    }
+    .activity-feed-list {
+      max-height: 290px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(139,92,246,0.2) transparent;
+    }
+    .activity-feed-list::-webkit-scrollbar { width: 4px; }
+    .activity-feed-list::-webkit-scrollbar-track { background: transparent; }
+    .activity-feed-list::-webkit-scrollbar-thumb { background: rgba(139,92,246,0.2); border-radius: 4px; }
+    .activity-feed-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.15s;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    .activity-feed-item:hover {
+      background: rgba(139,92,246,0.06);
+    }
+    .activity-feed-item:last-child { border-bottom: none; }
     .spender-top {
       display: flex;
       justify-content: space-between;
@@ -2026,6 +2092,23 @@ const sb = window.sb;
 const EXCHANGE_RATE_EUR_CHF = 0.94;
 const PAGE_SIZE = 50;
 const DEBOUNCE_DELAY = 300;
+
+// ═══ formatRelativeTime — returns "il y a X min/h/j" from a timestamp ═══
+const formatRelativeTime = (ts) => {
+  if (!ts) return "";
+  const diff = Date.now() - new Date(ts).getTime();
+  if (diff < 0) return "à l'instant";
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return "à l'instant";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `il y a ${min} min`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `il y a ${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `il y a ${days}j`;
+  const months = Math.floor(days / 30);
+  return `il y a ${months} mois`;
+};
 
 // ═══ PAYMENT METHODS (Twint #1 en Suisse) ═══
 const PAYMENT_METHODS = ["Twint", "Revolut", "Virement bancaire", "PayPal", "Cash", "Crypto", "Autre"];
@@ -6881,6 +6964,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [filterStatus, setFilterStatus] = useState("");
   const [spCardFilter, setSpCardFilter] = useState(null);
   const [spChartMetric, setSpChartMetric] = useState("nouveaux");
+  const [highlightSpenderId, setHighlightSpenderId] = useState(null);
+  const [activityFeed, setActivityFeed] = useState([]);
+  const activityPollingRef = React.useRef(null);
 
   // Platform presence lookup: handle → Set<platform>
   const [spenderPlatforms, setSpenderPlatforms] = useState({});
@@ -6895,6 +6981,75 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       setSpenderPlatforms(map);
     });
   }, []);
+
+  // ── Activity feed: fetch from spender_events or fallback from spenders ──
+  const fetchActivityFeed = React.useCallback(async () => {
+    try {
+      const { data: evData, error: evErr } = await sb.from("spender_events")
+        .select("id,spender_id,spender_tg_user_id,spender_handle,event_type,message,created_at")
+        .order("created_at", { ascending: false }).limit(20);
+      if (!evErr && evData && evData.length > 0) {
+        setActivityFeed(evData.map(ev => ({
+          id: ev.id,
+          spenderId: ev.spender_id,
+          handle: ev.spender_handle || "",
+          message: ev.message || ev.event_type || "",
+          eventType: ev.event_type,
+          ts: ev.created_at,
+        })));
+        return;
+      }
+    } catch (_) { /* spender_events table may not exist — fallback */ }
+    try {
+      const { data: fbData } = await sb.from("spenders")
+        .select("id,handle,name,created_at,updated_at,total_spent,status")
+        .order("updated_at", { ascending: false }).limit(20);
+      if (fbData && fbData.length > 0) {
+        const now = Date.now();
+        const h24 = 24 * 60 * 60 * 1000;
+        setActivityFeed(fbData.map(sp => {
+          const handle = sp.handle || sp.name || "?";
+          const isNew = sp.created_at && (now - new Date(sp.created_at).getTime()) < h24;
+          const msg = isNew ? `@${handle} — nouveau spender` : `@${handle} — profil mis à jour`;
+          return {
+            id: sp.id,
+            spenderId: sp.id,
+            handle: handle,
+            message: msg,
+            eventType: isNew ? "spender_created" : "spender_updated",
+            ts: isNew ? sp.created_at : sp.updated_at,
+          };
+        }));
+      }
+    } catch (_) { /* fallback failed silently */ }
+  }, []);
+
+  useEffect(() => {
+    fetchActivityFeed();
+    activityPollingRef.current = setInterval(fetchActivityFeed, 5000);
+    return () => { if (activityPollingRef.current) clearInterval(activityPollingRef.current); };
+  }, [fetchActivityFeed]);
+
+  // Re-fetch feed when parent refreshes spender data
+  const _dbSpendersRef = React.useRef(dbSpenders);
+  useEffect(() => {
+    if (_dbSpendersRef.current !== dbSpenders) { _dbSpendersRef.current = dbSpenders; fetchActivityFeed(); }
+  }, [dbSpenders, fetchActivityFeed]);
+
+  // ── Scroll + highlight handler from activity feed ──
+  const handleActivityClick = React.useCallback((feedItem) => {
+    const spenderId = feedItem.spenderId;
+    const handleName = (feedItem.handle || "").replace(/^@/, "");
+    const sp = spenders.find(s => s.dbId === spenderId || s.name === handleName);
+    if (!sp) return;
+    const cardId = `spender-card-${sp.dbId || sp.name}`;
+    const el = document.getElementById(cardId);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    setHighlightSpenderId(sp.dbId || sp.name);
+    setTimeout(() => setHighlightSpenderId(null), 2000);
+  }, [spenders]);
 
   const handleSpStatus = async (txId, newStatus) => {
     if (processingTxId) return;
@@ -7017,6 +7172,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         relationship_status: dbSp.relationship_status || null,
         risk_level: dbSp.risk_level || "safe",
         telegram_username: dbSp.telegram_username || null,
+        created_at: dbSp.created_at || null,
+        updated_at: dbSp.updated_at || null,
         txs: [], byModel: {}, byChatter: {}, byProvider: {},
       };
     });
@@ -7200,6 +7357,35 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         </div>
       )}
 
+      {/* ── ACTIVITY FEED — Dernières activités (live) ── */}
+      <div className="activity-feed-card">
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:14}}>{"⚡"}</span>
+            <span style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{fr?"Dernières activités":"Recent activity"}</span>
+            <span style={{fontSize:10,color:"var(--text-quaternary)",fontWeight:500}}>live</span>
+          </div>
+          <button onClick={fetchActivityFeed} style={{padding:"3px 10px",borderRadius:7,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text-tertiary)",fontSize:11,fontWeight:600,cursor:"pointer"}}>{"↻"}</button>
+        </div>
+        <div className="activity-feed-list">
+          {activityFeed.length === 0 && (
+            <div style={{padding:24,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucune activité récente":"No recent activity"}</div>
+          )}
+          {activityFeed.map((item, idx) => {
+            const evIcon = item.eventType === "spender_created" ? "🟢" : item.eventType === "status_changed" ? "🔄" : item.eventType === "tx_created" ? "💰" : item.eventType === "handle_set" ? "🏷️" : "✏️";
+            return (
+              <div key={item.id || idx} className="activity-feed-item" onClick={() => handleActivityClick(item)}>
+                <span style={{fontSize:14,flexShrink:0}}>{evIcon}</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:12,fontWeight:600,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.message}</div>
+                </div>
+                <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts)}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
       {/* ── Toolbar recherche + filtres (aligné Dashboard) ── */}
       <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"16px 20px",marginBottom:18}}>
         <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center"}}>
@@ -7284,12 +7470,26 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             const _avatarColors = ["#8b5cf6","#10b981","#f59e0b","#3b82f6","#ef4444","#06b6d4","#ec4899","#f97316"];
             const _avatarHash = (s.name||"").split("").reduce((h,c)=>(h*31+c.charCodeAt(0))&0xffff,0);
             const _avatarColor = _avatarColors[_avatarHash % _avatarColors.length];
+            const _h24 = 24 * 60 * 60 * 1000;
+            const _isNew = s.created_at && (Date.now() - new Date(s.created_at).getTime()) < _h24;
+            const _isUpdated = !_isNew && s.updated_at && (Date.now() - new Date(s.updated_at).getTime()) < _h24;
+            const _hasGlow = _isNew || _isUpdated;
+            const _cardKey = s.dbId || s.name;
+            const _isHighlighted = highlightSpenderId === _cardKey;
+            const _relTime = _isNew ? formatRelativeTime(s.created_at) : _isUpdated ? formatRelativeTime(s.updated_at) : "";
             return (
-            <div key={s.name} className="spender-card" onClick={()=>openSpenderModal(s)}
-              style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,cursor:"pointer",transition:"all 0.18s"}}
+            <div key={s.name} id={`spender-card-${_cardKey}`} className={`spender-card${_hasGlow?" spender-card-glow":""}${_isHighlighted?" spender-card-highlight":""}`} onClick={()=>openSpenderModal(s)}
+              style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,cursor:"pointer",transition:"all 0.18s",position:"relative"}}
               onMouseEnter={e=>{e.currentTarget.style.borderColor="var(--accent)";e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 8px 24px rgba(139,92,246,0.12)";}}
-              onMouseLeave={e=>{e.currentTarget.style.borderColor="var(--border)";e.currentTarget.style.transform="";e.currentTarget.style.boxShadow="";}}
+              onMouseLeave={e=>{e.currentTarget.style.borderColor=_hasGlow?"rgba(139,92,246,0.45)":"var(--border)";e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=_hasGlow?"0 0 12px 2px rgba(139,92,246,0.10)":"";}}
             >
+              {/* ── NEW / UPDATED badge (top-right) ── */}
+              {(_isNew || _isUpdated) && (
+                <div style={{position:"absolute",top:10,right:10,display:"flex",alignItems:"center",gap:5}}>
+                  <span className={_isNew ? "spender-badge-new" : "spender-badge-updated"}>{_isNew ? "NEW" : "UPDATED"}</span>
+                  {_relTime && <span className="spender-relative-time">{_relTime}</span>}
+                </div>
+              )}
               {/* ── HEADER: Avatar + Name + Flag ── */}
               <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
                 <div style={{width:44,height:44,borderRadius:"50%",background:_avatarColor+"22",border:`2px solid ${_avatarColor}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:_avatarColor,flexShrink:0}}>
