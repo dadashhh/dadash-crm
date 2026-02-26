@@ -2478,7 +2478,7 @@ const ROLE_ACCESS = {
   gerant: ["dashboard","spenders","business","equipe","messagerie","compta","automation","bots","ia-insights","admin"],
   admin: ["admin"],
   ceo: ["admin"],
-  modele: ["model_checklist","model_content","model_tasks","model_payments","model_notif"],
+  modele: ["model_checklist","model_content","model_tasks","model_payments","model_compta","model_notif"],
   chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition","chatter_scan","chatter_notif"],
   provider: ["provider_dashboard","transactions","provider_compta","provider_notif"]
 };
@@ -2494,7 +2494,7 @@ const TAB_TO_FEATURE = {
   model_checklist:"modeles", model_content:"modeles",
   model_tasks:"modeles", model_payments:"modeles", model_dashboard:"modeles",
   model_notif:"compta",
-  transactions:"transactions", provider_compta:"compta", provider_notif:"compta",
+  transactions:"transactions", provider_compta:"compta", provider_notif:"compta", model_compta:"compta",
 };
 // canSeeWithPerms — checks user-specific perms first, then role defaults, then ROLE_ACCESS
 const canSeeWithPerms = (role, tabId, myPerms) => {
@@ -19036,6 +19036,341 @@ const PaymentEventsSection = ({user, lang, paymentEvents, profiles, onRefresh, o
   );
 };
 
+// =============================================
+// RECEIVER COMPTA TAB — Espace paiements internes
+// Visible: chatter / provider / modele
+// Blocs: KPIs · Solde · Paiements reçus · Ledger · Notifs
+// Realtime via parent props + polling fallback 12s
+// =============================================
+const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntries: propLedger, notifications: propNotifs, profiles, onMarkRead, onMarkAllRead}) => {
+  const fr = lang === "fr";
+  const [payments, setPayments] = React.useState([]);
+  const [ledger, setLedger] = React.useState([]);
+  const [balance, setBalance] = React.useState({});
+  const [notifs, setNotifs] = React.useState([]);
+  const [unread, setUnread] = React.useState(0);
+  const [section, setSection] = React.useState("overview");
+
+  // ── Sync from parent props (realtime flows through) ──
+  React.useEffect(() => {
+    const p = (propPayments||[]).filter(e=>e.to_user_id===user.id).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+    setPayments(p);
+  }, [propPayments, user.id]);
+
+  React.useEffect(() => {
+    const l = (propLedger||[]).filter(e=>e.owner_user_id===user.id).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+    setLedger(l);
+    const bal = {};
+    l.forEach(e => { const c = e.currency||"EUR"; bal[c] = (bal[c]||0) + (Number(e.amount)||0); });
+    setBalance(bal);
+  }, [propLedger, user.id]);
+
+  React.useEffect(() => {
+    const n = (propNotifs||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+    setNotifs(n);
+    setUnread(n.filter(x=>!x.read).length);
+  }, [propNotifs]);
+
+  // ── Polling fallback 12s ──
+  const doFetch = React.useCallback(async () => {
+    if (!window.sb || !window.__sbReady) return;
+    try {
+      const [pe, le, no] = await Promise.all([
+        window.sb.from("payment_events").select("*").eq("to_user_id", user.id).order("created_at",{ascending:false}).limit(200),
+        window.sb.from("ledger_entries").select("*").eq("owner_user_id", user.id).order("created_at",{ascending:false}).limit(500),
+        window.sb.from("notifications").select("*").eq("user_id", user.id).order("created_at",{ascending:false}).limit(200),
+      ]);
+      if (!pe.error) setPayments((pe.data||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)));
+      if (!le.error) {
+        const l = (le.data||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+        setLedger(l);
+        const bal = {};
+        l.forEach(e => { const c = e.currency||"EUR"; bal[c] = (bal[c]||0) + (Number(e.amount)||0); });
+        setBalance(bal);
+      }
+      if (!no.error) {
+        const n = (no.data||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+        setNotifs(n);
+        setUnread(n.filter(x=>!x.read).length);
+      }
+    } catch(_) {}
+  }, [user.id]);
+
+  React.useEffect(() => {
+    doFetch();
+    const t = setInterval(doFetch, 12000);
+    return () => clearInterval(t);
+  }, [doFetch]);
+
+  // ── KPIs ──
+  const pendingByCurr = React.useMemo(() => {
+    const acc = {};
+    payments.filter(p=>p.status==="pending").forEach(p => { const c=p.currency||"EUR"; acc[c]=(acc[c]||0)+(Number(p.amount)||0); });
+    return acc;
+  }, [payments]);
+
+  const paid30ByCurr = React.useMemo(() => {
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-30);
+    const acc = {};
+    payments.filter(p=>p.status==="paid"&&new Date(p.created_at)>=cutoff).forEach(p => { const c=p.currency||"EUR"; acc[c]=(acc[c]||0)+(Number(p.amount)||0); });
+    return acc;
+  }, [payments]);
+
+  const pendingCount = React.useMemo(() => payments.filter(p=>p.status==="pending").length, [payments]);
+  const paid30Count = React.useMemo(() => {
+    const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-30);
+    return payments.filter(p=>p.status==="paid"&&new Date(p.created_at)>=cutoff).length;
+  }, [payments]);
+
+  // ── Helpers ──
+  const getProfile = id => (profiles||[]).find(p=>p.id===id);
+  const fmtCurr = (amount, currency) => {
+    const sym = {EUR:"€",USD:"$",GBP:"£",CHF:"Fr"};
+    const n = Number(amount)||0;
+    return n.toLocaleString("fr-CH",{minimumFractionDigits:2,maximumFractionDigits:2}) + " " + (sym[currency]||currency||"€");
+  };
+  const badgeStatus = (status) => {
+    const cfg = status==="paid"
+      ? {bg:"rgba(34,211,161,0.15)",color:"#22d3a1",border:"rgba(34,211,161,0.3)"}
+      : status==="pending"
+      ? {bg:"rgba(245,158,11,0.15)",color:"#f59e0b",border:"rgba(245,158,11,0.3)"}
+      : {bg:"rgba(107,114,128,0.15)",color:"#6b7280",border:"rgba(107,114,128,0.3)"};
+    return {display:"inline-block",padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:700,background:cfg.bg,color:cfg.color,border:`1px solid ${cfg.border}`};
+  };
+  const navBtn = (id, label, icon, badge) => (
+    <button key={id} onClick={()=>setSection(id)} style={{
+      padding:"8px 14px",borderRadius:10,cursor:"pointer",fontFamily:"'Inter',sans-serif",fontSize:13,fontWeight:600,flexShrink:0,
+      border:`1px solid ${section===id?"var(--accent)":"var(--border-subtle)"}`,
+      background:section===id?"var(--accent-muted)":"var(--bg-raised)",
+      color:section===id?"var(--accent)":"var(--text-secondary)",transition:"all 0.15s",
+    }}>
+      {icon} {label}{badge>0&&<span style={{marginLeft:5,background:"#EF4444",color:"#fff",borderRadius:8,padding:"1px 6px",fontSize:10,fontWeight:700}}>{badge}</span>}
+    </button>
+  );
+
+  // ── KPI card ──
+  const kpiCard = (label, byCurr, count, colorClass, icon) => (
+    <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:14,padding:"16px 18px"}}>
+      <div style={{fontSize:11,fontWeight:600,color:colorClass,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>{icon} {label}</div>
+      {Object.keys(byCurr).length===0
+        ? <div style={{fontSize:18,fontWeight:800,color:"var(--text-tertiary)"}}>—</div>
+        : Object.entries(byCurr).map(([c,v]) => <div key={c} style={{fontSize:18,fontWeight:800,color:colorClass}}>{fmtCurr(v,c)}</div>)
+      }
+      <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:3}}>{count} {fr?"paiement(s)":"payment(s)"}</div>
+    </div>
+  );
+
+  const COL_HEAD = {padding:"8px 10px",textAlign:"left",color:"var(--text-tertiary)",fontWeight:600,fontSize:11,whiteSpace:"nowrap",borderBottom:"1px solid var(--border-subtle)"};
+  const COL_CELL = {padding:"10px 10px",borderBottom:"1px solid var(--border-subtle)",fontSize:12};
+
+  return (
+    <div style={{padding:"0 0 32px"}}>
+      {/* ── Title ── */}
+      <div style={{marginBottom:20}}>
+        <h2 style={{fontSize:22,fontWeight:800,color:"var(--text-primary)",fontFamily:"'DM Sans',sans-serif",margin:0}}>
+          🏦 {fr?"Espace Comptabilité":"My Accounting"}
+        </h2>
+        <p style={{fontSize:12,color:"var(--text-tertiary)",marginTop:4,fontFamily:"'Inter',sans-serif"}}>
+          {fr?"Paiements internes, solde et notifications — actualisé en temps réel":"Internal payments, balance & notifications — live"}
+        </p>
+      </div>
+
+      {/* ── KPIs ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(155px,1fr))",gap:12,marginBottom:24}}>
+        {kpiCard(fr?"En attente":"Pending", pendingByCurr, pendingCount, "#f59e0b", "⏳")}
+        {kpiCard(fr?"Payé (30j)":"Paid (30d)", paid30ByCurr, paid30Count, "#22d3a1", "✅")}
+        {Object.keys(balance).length===0
+          ? <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:14,padding:"16px 18px"}}>
+              <div style={{fontSize:11,fontWeight:600,color:"var(--accent)",textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>📊 {fr?"Solde":"Balance"}</div>
+              <div style={{fontSize:18,fontWeight:800,color:"var(--text-tertiary)"}}>—</div>
+            </div>
+          : Object.entries(balance).map(([c,v]) => (
+              <div key={c} style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:14,padding:"16px 18px"}}>
+                <div style={{fontSize:11,fontWeight:600,color:"var(--accent)",textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>📊 Solde {c}</div>
+                <div style={{fontSize:18,fontWeight:800,color:v>=0?"var(--accent)":"#EF4444"}}>{fmtCurr(v,c)}</div>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:3}}>{ledger.filter(e=>e.currency===c).length} {fr?"écritures":"entries"}</div>
+              </div>
+            ))
+        }
+      </div>
+
+      {/* ── Section nav ── */}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:2}}>
+        {navBtn("overview",  fr?"Vue d'ensemble":"Overview",  "📋", 0)}
+        {navBtn("payments",  fr?"Paiements reçus":"Payments", "💸", 0)}
+        {navBtn("ledger",    fr?"Historique Ledger":"Ledger", "📖", 0)}
+        {navBtn("notifs",    fr?"Notifications":"Notifs",     "🔔", unread)}
+      </div>
+
+      {/* ── Overview ── */}
+      {section==="overview" && (
+        <div style={{display:"grid",gap:20}}>
+          {/* Solde actuel */}
+          <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+            <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",marginBottom:14,fontFamily:"'DM Sans',sans-serif"}}>
+              💰 {fr?"Solde actuel":"Current Balance"}
+            </h3>
+            {Object.keys(balance).length===0
+              ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"20px 0",textAlign:"center"}}>{fr?"Aucune écriture comptable":"No ledger entries yet"}</div>
+              : <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(120px,1fr))",gap:10}}>
+                  {Object.entries(balance).map(([c,v]) => (
+                    <div key={c} style={{background:"var(--bg-overlay)",borderRadius:10,padding:"12px 14px",textAlign:"center"}}>
+                      <div style={{fontSize:11,color:"var(--text-tertiary)",marginBottom:4}}>{c}</div>
+                      <div style={{fontSize:20,fontWeight:800,color:v>=0?"var(--accent)":"#EF4444"}}>{fmtCurr(v,c)}</div>
+                    </div>
+                  ))}
+                </div>
+            }
+          </div>
+          {/* Derniers paiements */}
+          <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+              <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",fontFamily:"'DM Sans',sans-serif"}}>💸 {fr?"Derniers paiements":"Recent payments"}</h3>
+              {payments.length>5&&<button onClick={()=>setSection("payments")} style={{fontSize:11,color:"var(--accent)",fontWeight:600,background:"none",border:"none",cursor:"pointer",fontFamily:"'Inter',sans-serif"}}>{fr?"Voir tout →":"See all →"}</button>}
+            </div>
+            {payments.length===0
+              ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"20px 0",textAlign:"center"}}>{fr?"Aucun paiement reçu":"No payments received yet"}</div>
+              : payments.slice(0,5).map(p => {
+                  const from = getProfile(p.from_user_id);
+                  return (
+                    <div key={p.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid var(--border-subtle)"}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:13,fontWeight:600,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.title||fr?"Paiement":"Payment"}</div>
+                        <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>{formatDateSafe(p.created_at)} · {displayUserName(from)||"—"}</div>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0,marginLeft:12}}>
+                        <div style={{fontSize:13,fontWeight:700,color:"var(--text-primary)"}}>{fmtCurr(p.amount,p.currency)}</div>
+                        <span style={badgeStatus(p.status)}>{p.status}</span>
+                      </div>
+                    </div>
+                  );
+                })
+            }
+          </div>
+        </div>
+      )}
+
+      {/* ── Paiements reçus ── */}
+      {section==="payments" && (
+        <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+          <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",marginBottom:14,fontFamily:"'DM Sans',sans-serif"}}>
+            💸 {fr?"Paiements reçus":"Payments received"} <span style={{fontWeight:400,color:"var(--text-tertiary)",fontSize:12}}>({payments.length})</span>
+          </h3>
+          {payments.length===0
+            ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"32px 0",textAlign:"center"}}>{fr?"Aucun paiement reçu":"No payments received yet"}</div>
+            : <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr>
+                      {[fr?"Date":"Date", fr?"De":"From", fr?"Titre":"Title", fr?"Montant":"Amount", "Statut"].map(h=>(
+                        <th key={h} style={COL_HEAD}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payments.map(p => {
+                      const from = getProfile(p.from_user_id);
+                      return (
+                        <tr key={p.id} style={{background:"transparent"}}>
+                          <td style={{...COL_CELL,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{formatDateSafe(p.created_at)}</td>
+                          <td style={{...COL_CELL,color:"var(--text-primary)",fontWeight:500}}>{displayUserName(from)||p.from_user_id?.slice(0,8)||"—"}</td>
+                          <td style={{...COL_CELL,color:"var(--text-primary)",maxWidth:200}}><div style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.title||"—"}</div></td>
+                          <td style={{...COL_CELL,fontWeight:700,color:"var(--text-primary)",whiteSpace:"nowrap"}}>{fmtCurr(p.amount,p.currency)}</td>
+                          <td style={COL_CELL}><span style={badgeStatus(p.status)}>{p.status}</span></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+          }
+        </div>
+      )}
+
+      {/* ── Historique Ledger ── */}
+      {section==="ledger" && (
+        <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+          <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",marginBottom:14,fontFamily:"'DM Sans',sans-serif"}}>
+            📖 {fr?"Historique Ledger":"Ledger History"} <span style={{fontWeight:400,color:"var(--text-tertiary)",fontSize:12}}>({ledger.length})</span>
+          </h3>
+          {ledger.length===0
+            ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"32px 0",textAlign:"center"}}>{fr?"Aucune écriture":"No ledger entries yet"}</div>
+            : <div style={{overflowX:"auto"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr>
+                      {["Date","Type","Montant","Devise","Titre","Note"].map(h=>(
+                        <th key={h} style={COL_HEAD}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ledger.map(e => {
+                      const isCredit = e.entry_type==="credit";
+                      return (
+                        <tr key={e.id}>
+                          <td style={{...COL_CELL,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{formatDateSafe(e.created_at)}</td>
+                          <td style={COL_CELL}>
+                            <span style={{display:"inline-block",padding:"2px 7px",borderRadius:5,fontSize:10,fontWeight:700,
+                              background:isCredit?"rgba(34,211,161,0.15)":"rgba(239,68,68,0.15)",
+                              color:isCredit?"#22d3a1":"#ef4444",
+                              border:`1px solid ${isCredit?"rgba(34,211,161,0.3)":"rgba(239,68,68,0.3)"}`
+                            }}>{e.entry_type||"—"}</span>
+                          </td>
+                          <td style={{...COL_CELL,fontWeight:700,color:isCredit?"#22d3a1":"#ef4444",whiteSpace:"nowrap"}}>
+                            {isCredit?"+":"−"}{fmtCurr(Math.abs(Number(e.amount)||0),e.currency)}
+                          </td>
+                          <td style={{...COL_CELL,color:"var(--text-tertiary)"}}>{e.currency||"—"}</td>
+                          <td style={{...COL_CELL,color:"var(--text-primary)",maxWidth:200}}><div style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title||e.description||"—"}</div></td>
+                          <td style={{...COL_CELL,color:"var(--text-tertiary)",maxWidth:150}}><div style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.note||e.notes||"—"}</div></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+          }
+        </div>
+      )}
+
+      {/* ── Notifications ── */}
+      {section==="notifs" && (
+        <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14,flexWrap:"wrap",gap:8}}>
+            <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",fontFamily:"'DM Sans',sans-serif",margin:0}}>
+              🔔 {fr?"Notifications":"Notifications"}
+              {unread>0&&<span style={{marginLeft:6,background:"#EF4444",color:"#fff",borderRadius:8,padding:"1px 7px",fontSize:11,fontWeight:700}}>{unread}</span>}
+            </h3>
+            {unread>0&&<button onClick={onMarkAllRead} style={{fontSize:11,color:"var(--accent)",fontWeight:600,background:"var(--accent-muted)",border:"none",borderRadius:8,padding:"5px 12px",cursor:"pointer",fontFamily:"'Inter',sans-serif"}}>
+              {fr?"✓ Tout marquer lu":"✓ Mark all read"}
+            </button>}
+          </div>
+          {notifs.length===0
+            ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"32px 0",textAlign:"center"}}>{fr?"Aucune notification":"No notifications yet"}</div>
+            : notifs.map(n => {
+                const ico = n.type&&(n.type.includes("payment")||n.type.includes("ledger"))?"💸":n.type&&n.type.includes("tx")?"💰":"🔔";
+                return (
+                  <div key={n.id} onClick={()=>!n.read&&onMarkRead&&onMarkRead(n.id)}
+                    style={{display:"flex",gap:12,alignItems:"flex-start",padding:"12px 0",borderBottom:"1px solid var(--border-subtle)",cursor:n.read?"default":"pointer",opacity:n.read?0.65:1,transition:"opacity 0.2s"}}>
+                    <span style={{fontSize:20,flexShrink:0,marginTop:2}}>{ico}</span>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                        <div style={{fontWeight:n.read?500:700,fontSize:13,color:"var(--text-primary)",lineHeight:1.4}}>{n.title||"Notification"}</div>
+                        <div style={{fontSize:10,color:"var(--text-tertiary)",whiteSpace:"nowrap",flexShrink:0}}>{formatDateSafe(n.created_at)}</div>
+                      </div>
+                      {n.message&&<div style={{fontSize:12,color:"var(--text-secondary)",marginTop:3,lineHeight:1.5}}>{n.message}</div>}
+                      {!n.read&&<div style={{marginTop:4,fontSize:10,color:"var(--accent)",fontWeight:600}}>● {fr?"Non lu — cliquer pour marquer lu":"Unread — click to mark as read"}</div>}
+                    </div>
+                  </div>
+                );
+              })
+          }
+        </div>
+      )}
+    </div>
+  );
+};
+
 /* InternalNotificationsTab — notification list for non-gérant users */
 const InternalNotificationsTab = ({user, lang, notifications, unreadCount, onMarkRead, onMarkAllRead}) => {
   const fr = lang === "fr";
@@ -27154,6 +27489,7 @@ const App = () => {
     {id:"model_content",icon:"\u{1F4DD}",label:t(lang,"my_content"),show:isModele},
     {id:"model_tasks",icon:"\u{1F4CB}",label:t(lang,"my_tasks"),show:isModele},
     {id:"model_payments",icon:"\u{1F4B0}",label:t(lang,"my_payments"),show:isModele},
+    {id:"model_compta",icon:"\u{1F4C4}",label:t(lang,"compta"),show:isModele},
     {id:"model_dashboard",icon:"\u{1F469}‍\u{1F4BC}",label:t(lang,"my_space"),show:isModele},
     {id:"chatter_dashboard",icon:"\u{1F4CA}",label:t(lang,"dashboard"),show:user.role==="chatter"},
     {id:"chatter_transactions",icon:"\u{1F4B0}",label:t(lang,"transactions"),show:user.role==="chatter"},
@@ -27689,7 +28025,7 @@ const App = () => {
           {tab==="chatter_compta"&&user.role==="chatter"&&(<>
             <ChatterComptaTab user={user} lang={lang} payslips={payslips} payouts={payouts} txs={txSummary} models={models} />
             <div style={{marginTop:24}}>
-              <LedgerTab user={user} lang={lang} ledgerEntries={(ledgerEntries||[]).filter(e=>e.owner_user_id===user.id)} profiles={profiles} isGerant={false} />
+              <ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} />
             </div>
           </>)}
           {tab==="chatter_notif"&&user.role==="chatter"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
@@ -27701,11 +28037,12 @@ const App = () => {
           {tab==="provider_compta"&&user.role==="provider"&&(<>
             <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
             <div style={{marginTop:24}}>
-              <LedgerTab user={user} lang={lang} ledgerEntries={(ledgerEntries||[]).filter(e=>e.owner_user_id===user.id)} profiles={profiles} isGerant={false} />
+              <ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} />
             </div>
           </>)}
           {tab==="provider_notif"&&user.role==="provider"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
           {tab==="model_notif"&&user.role==="modele"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
+          {tab==="model_compta"&&user.role==="modele"&&<ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
           </>)}
         </div>
       </div>
