@@ -5198,6 +5198,7 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
   const cs = currencySymbol;
+  const [dashPeriod, setDashPeriod] = useState("7d");
 
   // ── Computed data from state (ZERO fetch) ──
   const allTxs = txs || [];
@@ -5280,32 +5281,35 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
   // ═══════════════════════════════════════════════════
   const kpiData = useMemo(() => {
     const now = Date.now();
-    const d7 = 7 * 86400000;
-    const current = allTxs.filter(tx => (now - new Date(tx.date).getTime()) < d7);
-    const previous = allTxs.filter(tx => {
+    const periodMs = dashPeriod === "all" ? Infinity : dashPeriod === "90d" ? 90*86400000 : dashPeriod === "30d" ? 30*86400000 : 7*86400000;
+    const validTxsAll = allTxs.filter(tx => tx.status === "validated" || tx.status === "confirmee" || tx.status === "payee");
+    const current = periodMs === Infinity ? validTxsAll : validTxsAll.filter(tx => (now - new Date(tx.date).getTime()) < periodMs);
+    const previous = periodMs === Infinity ? [] : validTxsAll.filter(tx => {
       const age = now - new Date(tx.date).getTime();
-      return age >= d7 && age < d7 * 2;
+      return age >= periodMs && age < periodMs * 2;
     });
     const caBrut = current.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
     const prevBrut = previous.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
-    const caNet = current.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
-    const prevNet = previous.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
+    const caNet = current.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+    const prevNet = previous.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
     const nbTx = current.length;
     const prevNbTx = previous.length;
     const marge = caBrut > 0 ? ((caNet / caBrut) * 100) : 0;
     const prevMarge = prevBrut > 0 ? ((prevNet / prevBrut) * 100) : 0;
     const variation = (curr, prev) => prev > 0 ? (((curr - prev) / prev) * 100) : (curr > 0 ? 100 : 0);
-    // Sparkline data (last 7 days)
+    const sparkDays = dashPeriod === "all" || dashPeriod === "90d" ? 14 : 7;
     const spark = [];
-    for (let i = 6; i >= 0; i--) {
+    for (let i = sparkDays - 1; i >= 0; i--) {
       const dayStart = now - (i + 1) * 86400000;
       const dayEnd = now - i * 86400000;
-      const dayCA = allTxs.filter(tx => {
+      const dayCA = validTxsAll.filter(tx => {
         const t = new Date(tx.date).getTime();
         return t >= dayStart && t < dayEnd;
       }).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
       spark.push(dayCA);
     }
+    const totalAllTime = validTxsAll.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+    const totalAllTimeTx = validTxsAll.length;
     return {
       caBrut, caNet, nbTx, marge,
       varBrut: variation(caBrut, prevBrut),
@@ -5313,8 +5317,11 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
       varTx: variation(nbTx, prevNbTx),
       varMarge: marge - prevMarge,
       spark,
+      totalAllTime,
+      totalAllTimeTx,
+      pendingCount: allTxs.filter(tx => tx.status === "pending").length,
     };
-  }, [allTxs, convertAmount]);
+  }, [allTxs, convertAmount, dashPeriod]);
 
   // ═══════════════════════════════════════════════════
   // 3. BREAKDOWN PAR LANGUE
@@ -5449,8 +5456,42 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
         onClick: a.action,
       })),
 
+      // ═══════ PERIOD SELECTOR ═══════
+      React.createElement("div", {style:{display:"flex",alignItems:"center",gap:8,marginBottom:14,flexWrap:"wrap"}},
+        [
+          {id:"7d",label:"7j"},{id:"30d",label:"30j"},{id:"90d",label:"90j"},{id:"all",label:fr?"Tout":"All"}
+        ].map(p => React.createElement("button",{key:p.id,onClick:()=>setDashPeriod(p.id),style:{padding:"5px 14px",borderRadius:8,border:`1px solid ${dashPeriod===p.id?"var(--accent)":"var(--border-subtle)"}`,background:dashPeriod===p.id?"var(--accent-muted)":"transparent",color:dashPeriod===p.id?"var(--accent)":"var(--text-secondary)",fontSize:12,fontWeight:700,cursor:"pointer",transition:"all 0.2s"}},p.label)),
+        React.createElement("span",{style:{fontSize:11,color:"var(--text-quaternary)",marginLeft:8}},
+          fr ? `${kpiData.nbTx} TX validées` : `${kpiData.nbTx} validated TX`
+        ),
+      ),
+
+      // ═══════ EMPTY STATE GUARD ═══════
+      kpiData.caBrut === 0 && kpiData.nbTx === 0 && React.createElement("div", {style:{background:"var(--card-bg)",border:"1px solid var(--border-accent)",borderRadius:12,padding:"20px 24px",marginBottom:20}},
+        React.createElement("div", {style:{fontSize:14,fontWeight:700,color:"var(--warning)",marginBottom:8}},
+          fr ? "Aucune donnée pour cette période" : "No data for this period"
+        ),
+        React.createElement("div", {style:{fontSize:12,color:"var(--text-secondary)",lineHeight:1.6}},
+          kpiData.totalAllTime > 0
+            ? (fr
+              ? `Il y a ${kpiData.totalAllTimeTx} TX validées au total (${kpiData.totalAllTime.toLocaleString("fr-FR",{maximumFractionDigits:0})} ${cs}). Essayez une période plus large.`
+              : `There are ${kpiData.totalAllTimeTx} validated TX total (${kpiData.totalAllTime.toLocaleString("fr-FR",{maximumFractionDigits:0})} ${cs}). Try a wider period.`)
+            : kpiData.pendingCount > 0
+              ? (fr
+                ? `${kpiData.pendingCount} TX en attente de validation. Les KPIs ne comptent que les TX validées.`
+                : `${kpiData.pendingCount} TX pending validation. KPIs only count validated TX.`)
+              : (fr
+                ? "Aucune transaction trouvée. Vérifiez les données ou les policies RLS."
+                : "No transactions found. Check data or RLS policies.")
+        ),
+        kpiData.totalAllTime > 0 && dashPeriod !== "all" && React.createElement("button", {
+          onClick: () => setDashPeriod("all"),
+          style:{marginTop:10,padding:"6px 14px",borderRadius:8,border:"1px solid var(--accent)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:12,fontWeight:700,cursor:"pointer"}
+        }, fr ? "Voir toutes les périodes" : "View all periods"),
+      ),
+
       // ═══════ SECTION 2: KPIs CARDS ═══════
-      React.createElement("div", {style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}},
+      React.createElement("div", {style:{display:"grid",gridTemplateColumns:_isMobile?"repeat(2,1fr)":"repeat(4,1fr)",gap:12,marginBottom:20}},
         // CA Brut
         React.createElement("div", {style:{...cardStyle,marginBottom:0,display:"flex",flexDirection:"column",gap:6}},
           React.createElement("div", {style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
