@@ -11,7 +11,7 @@
 CREATE TABLE IF NOT EXISTS public.spender_enrich_queue (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id uuid NOT NULL REFERENCES tg_conversations(id),
-  tg_user_id text NOT NULL,
+  tg_user_id bigint NOT NULL,
   spender_id uuid,
   status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'done', 'failed')),
   attempts int NOT NULL DEFAULT 0,
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS public.spender_enrich_queue (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS tg_user_id text;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS tg_user_id bigint;
 ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS spender_id uuid;
 ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS status text DEFAULT 'queued';
 ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS attempts int DEFAULT 0;
@@ -54,7 +54,7 @@ SET search_path = public
 AS $$
 BEGIN
   INSERT INTO spender_enrich_queue (conversation_id, tg_user_id, spender_id)
-  VALUES (NEW.id, NEW.tg_chat_id, NEW.spender_id)
+  VALUES (NEW.id, NEW.tg_chat_id::bigint, NEW.spender_id)
   ON CONFLICT DO NOTHING;
   RETURN NEW;
 END;
@@ -79,7 +79,7 @@ BEGIN
   IF v_conv IS NULL THEN RETURN NEW; END IF;
 
   INSERT INTO spender_enrich_queue (conversation_id, tg_user_id, spender_id, status)
-  VALUES (v_conv.id, v_conv.tg_chat_id, v_conv.spender_id, 'queued')
+  VALUES (v_conv.id, v_conv.tg_chat_id::bigint, v_conv.spender_id, 'queued')
   ON CONFLICT (conversation_id)
     WHERE status IN ('done', 'failed')
   DO UPDATE SET status = 'queued', attempts = 0, last_error = NULL, updated_at = now();

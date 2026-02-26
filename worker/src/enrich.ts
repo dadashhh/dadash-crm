@@ -28,7 +28,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 interface QueueRow {
   id: string;
   conversation_id: string;
-  tg_user_id: string;
+  tg_user_id: string | number;
   spender_id: string | null;
   status: string;
   attempts: number;
@@ -173,7 +173,7 @@ async function processOne(row: QueueRow): Promise<void> {
     if (conv?.spender_id) {
       spenderId = conv.spender_id;
     } else {
-      const handle = row.tg_user_id;
+      const handle = String(row.tg_user_id);
       const { data: existing } = await db
         .from('spenders')
         .select('id')
