@@ -2212,6 +2212,106 @@ const SUPABASE_URL = window.SUPABASE_URL;
 const SUPABASE_ANON_KEY = window.SUPABASE_ANON_KEY;
 const sb = window.sb;
 
+// =============================================
+// SYNC TG → SPENDERS  (POST /internal/sync-carla-telegram equivalent)
+// Parcourt toutes les tg_conversations et associe/crée les spenders.
+// Règles:
+//   • Ne jamais écraser un tg_user_id existant différent
+//   • Ne jamais modifier les transactions
+//   • Visible + exécutable uniquement par le gerant
+// =============================================
+const syncSpendersFromTelegram = async () => {
+  // ─ 1. Récupérer toutes les conversations ─
+  const { data: convs, error: convErr } = await sb
+    .from("tg_conversations")
+    .select("id,tg_chat_id,tg_peer_id,tg_user_id,username,tg_username,display_name,spender_id");
+  if (convErr) throw new Error("tg_conversations: " + convErr.message);
+
+  let total = 0, created = 0, updated = 0;
+
+  for (const conv of convs || []) {
+    // tg_chat_id pour un DM Telegram = user_id numérique de l'interlocuteur
+    const tg_user_id = String(
+      conv.tg_user_id || conv.tg_peer_id || conv.tg_chat_id || ""
+    ).trim();
+    if (!tg_user_id || tg_user_id === "0") continue;
+    total++;
+
+    const rawUsername = conv.tg_username || conv.username || null;
+    const username = rawUsername ? rawUsername.replace(/^@/, "") : null;
+    const display_name = conv.display_name || null;
+
+    const telegramMeta = {
+      user_id: tg_user_id,
+      username,
+      display: username ? "@" + username : tg_user_id,
+      input_value: username ? "@" + username : tg_user_id,
+      source: "telegram_dm",
+    };
+
+    // ─ 2a. Match par tg_user_id ─
+    const { data: byId } = await sb
+      .from("spenders")
+      .select("id,tg_user_id,telegram_username,handle,meta")
+      .eq("tg_user_id", tg_user_id)
+      .maybeSingle();
+
+    if (byId) {
+      const metaUp = {
+        ...(byId.meta || {}),
+        profile: { ...((byId.meta || {}).profile || {}), telegram: telegramMeta },
+      };
+      const up = { meta: metaUp, updated_at: new Date().toISOString() };
+      if (!byId.telegram_username && username) up.telegram_username = username;
+      await sb.from("spenders").update(up).eq("id", byId.id);
+      updated++;
+      continue;
+    }
+
+    // ─ 2b. Match par username (case insensitive) ─
+    if (username) {
+      const { data: byUn } = await sb
+        .from("spenders")
+        .select("id,tg_user_id,handle,meta")
+        .ilike("telegram_username", username)
+        .maybeSingle();
+      if (byUn && !byUn.tg_user_id) {
+        // Ne jamais écraser un tg_user_id existant différent
+        const metaUp = {
+          ...(byUn.meta || {}),
+          profile: { ...((byUn.meta || {}).profile || {}), telegram: telegramMeta },
+        };
+        await sb.from("spenders").update({
+          tg_user_id,
+          meta: metaUp,
+          updated_at: new Date().toISOString(),
+        }).eq("id", byUn.id);
+        updated++;
+        continue;
+      }
+    }
+
+    // ─ 2c. Créer nouveau spender ─
+    const handle = username || ("tg_" + tg_user_id);
+    await sb.from("spenders").insert({
+      handle,
+      name: display_name || handle,
+      tg_user_id,
+      telegram_username: username || null,
+      status: "active",
+      source: "telegram_sync",
+      meta: { profile: { telegram: telegramMeta } },
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    created++;
+  }
+
+  const log = `SYNC_TG_DONE total=${total} created=${created} updated=${updated}`;
+  console.log("[DADASH]", log);
+  return { total, created, updated, log };
+};
+
 // ═══ CONSTANTS ═══
 const EXCHANGE_RATE_EUR_CHF = 0.94;
 const PAGE_SIZE = 50;
@@ -7001,9 +7101,10 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                     {user.role==="gerant"&&<td style={{fontSize:12,whiteSpace:"nowrap",fontFamily:"monospace",color:"var(--text-secondary)"}}>
                       {(()=>{
                         const dbSp=(dbSpenders||[]).find(s=>(s.handle||s.name)===tx.spender_handle);
-                        const numId=tx.telegram_id||dbSp?.telegram_id;
+                        // tg_user_id est la source de vérité, telegram_id est le fallback legacy
+                        const numId=tx.telegram_id||dbSp?.tg_user_id||dbSp?.telegram_id;
                         const usrName=dbSp?.telegram_username;
-                        if(numId) return numId;
+                        if(numId) return <span title={usrName?`@${usrName}`:undefined}>{numId}</span>;
                         if(usrName) return <span style={{fontStyle:"italic",color:"var(--text-tertiary)"}}>{usrName}</span>;
                         return "—";
                       })()}
@@ -7082,6 +7183,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [showActivityDrawer, setShowActivityDrawer] = useState(false);
   const [recentFilter, setRecentFilter] = useState(null);
   const [sortRecents, setSortRecents] = useState(false);
+  const [syncingTg, setSyncingTg] = useState(false);
   const activityPollingRef = React.useRef(null);
   const highlightTimerRef = React.useRef(null);
   const debouncedSearch = useDebounce(search, 300);
@@ -7639,7 +7741,17 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           <button className={`micro-filter-chip${recentFilter==="new"?" active-green":""}`} onClick={()=>setRecentFilter(p=>p==="new"?null:"new")}>{"🟢"} NEW</button>
           <button className={`micro-filter-chip${recentFilter==="updated"?" active":""}`} onClick={()=>setRecentFilter(p=>p==="updated"?null:"updated")}>{"✏️"} UPDATED</button>
           {recentFilter && <button className="micro-filter-chip" onClick={()=>setRecentFilter(null)} style={{borderColor:"var(--text-tertiary)"}}>TOUT</button>}
-          <button onClick={()=>setShowNewSpender(true)} style={{marginLeft:"auto",padding:"7px 13px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>{"➕"} {fr?"Nouveau":"New"}</button>
+          {user.role==="gerant"&&<button onClick={async()=>{
+            if(syncingTg) return;
+            setSyncingTg(true);
+            try {
+              const {total,created,updated} = await syncSpendersFromTelegram();
+              addToast(`🔄 Sync TG: ${total} convs — ${created} créé(s) — ${updated} mis à jour`,"success");
+              await onRefresh();
+            } catch(e){ addToast("Sync TG erreur: "+e.message,"error"); }
+            finally{ setSyncingTg(false); }
+          }} disabled={syncingTg} title="Synchroniser les conversations Telegram → fiches Spenders" style={{marginLeft:"auto",padding:"7px 13px",borderRadius:9,border:"1px solid rgba(139,92,246,0.4)",background:"rgba(139,92,246,0.1)",color:"var(--accent)",fontSize:13,fontWeight:600,cursor:syncingTg?"wait":"pointer",opacity:syncingTg?0.7:1,transition:"all 0.15s"}}>{syncingTg?"⏳ Sync…":"🔄 Sync TG"}</button>}
+          <button onClick={()=>setShowNewSpender(true)} style={{marginLeft:user.role==="gerant"?8:"auto",padding:"7px 13px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>{"➕"} {fr?"Nouveau":"New"}</button>
         </div>
       </div>
 
