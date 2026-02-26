@@ -7057,40 +7057,77 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     });
   }, []);
 
-  // ── Activity feed: fetch from spender_events or fallback from spenders ──
+  // ── Activity feed: fetch from spender_events enriched with spenders ──
+  const _spenderLabel = (sp, tg_user_id) => {
+    if (!sp) return tg_user_id ? "#" + tg_user_id : "?";
+    if (sp.username) return "@" + sp.username.replace(/^@/, "");
+    if (sp.display_name) return sp.display_name;
+    const tg = sp.meta?.profile?.telegram;
+    if (tg?.display) return tg.display;
+    if (tg?.input_value) return tg.input_value;
+    const h = sp.handle || sp.name;
+    if (h) return "@" + h;
+    return tg_user_id ? "#" + tg_user_id : "?";
+  };
   const fetchActivityFeed = React.useCallback(async () => {
     try {
       const { data: evData, error: evErr } = await sb.from("spender_events")
-        .select("id,spender_id,spender_tg_user_id,spender_handle,event_type,message,created_at")
+        .select("id,tg_user_id,event_type,summary,created_at")
         .order("created_at", { ascending: false }).limit(100);
       if (!evErr && evData && evData.length > 0) {
-        setActivityFeed(evData.map(ev => ({
-          id: ev.id,
-          spenderId: ev.spender_id,
-          handle: ev.spender_handle || "",
-          message: ev.message || ev.event_type || "",
-          eventType: ev.event_type,
-          ts: ev.created_at,
-        })));
+        // Build spender info map by tg_user_id
+        const tgIds = [...new Set(evData.map(ev => ev.tg_user_id).filter(Boolean))];
+        let spMap = {};
+        if (tgIds.length > 0) {
+          try {
+            const { data: spData } = await sb.from("spenders")
+              .select("tg_user_id,username,display_name,meta,handle,name")
+              .in("tg_user_id", tgIds);
+            if (spData) spData.forEach(sp => { spMap[sp.tg_user_id] = sp; });
+          } catch (_) { /* spenders join failed, continue without labels */ }
+        }
+        // Deduplicate: keep first occurrence per (tg_user_id|event_type|summary|2-min-bucket)
+        const seen = new Set();
+        const deduped = [];
+        for (const ev of evData) {
+          const bucket = ev.created_at ? Math.floor(new Date(ev.created_at).getTime() / 120000) : 0;
+          const key = `${ev.tg_user_id}|${ev.event_type}|${ev.summary}|${bucket}`;
+          if (!seen.has(key)) { seen.add(key); deduped.push(ev); }
+        }
+        setActivityFeed(deduped.map(ev => {
+          const sp = ev.tg_user_id ? spMap[ev.tg_user_id] : null;
+          const label = _spenderLabel(sp, ev.tg_user_id);
+          return {
+            id: ev.id,
+            tg_user_id: ev.tg_user_id,
+            label,
+            message: ev.summary || ev.event_type || "",
+            eventType: ev.event_type,
+            ts: ev.created_at,
+          };
+        }));
         return;
       }
     } catch (_) { /* spender_events table may not exist */ }
+    // Fallback: synthetic feed from spenders table
     try {
       const { data: fbData } = await sb.from("spenders")
-        .select("id,handle,name,created_at,updated_at,total_spent,status")
+        .select("id,tg_user_id,username,display_name,meta,handle,name,created_at,updated_at,total_spent,status")
         .order("updated_at", { ascending: false }).limit(30);
       if (fbData && fbData.length > 0) {
         const now = Date.now();
         const h24 = 24 * 60 * 60 * 1000;
         setActivityFeed(fbData.map(sp => {
-          const handle = sp.handle || sp.name || "?";
+          const label = _spenderLabel(sp, sp.tg_user_id);
           const isNew = sp.created_at && (now - new Date(sp.created_at).getTime()) < h24;
-          const msg = isNew ? `@${handle} — nouveau spender` : `@${handle} — profil mis à jour`;
           return {
-            id: sp.id, spenderId: sp.id, handle,
-            message: msg,
+            id: sp.id,
+            tg_user_id: sp.tg_user_id,
+            label,
+            message: isNew ? "nouveau spender" : "profil mis à jour",
             eventType: isNew ? "spender_created" : "spender_updated",
             ts: isNew ? sp.created_at : sp.updated_at,
+            spenderHandle: sp.handle || sp.name,
           };
         }));
       }
@@ -7124,13 +7161,53 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     return activityFeed.filter(a => a.ts && new Date(a.ts) >= todayStart).length;
   }, [activityFeed]);
 
-  // ── Scroll + highlight handler from activity feed ──
+  // ── Scroll + highlight + open modal from activity feed click ──
   const handleActivityClick = React.useCallback((feedItem) => {
-    const spenderId = feedItem.spenderId;
-    const handleName = (feedItem.handle || "").replace(/^@/, "");
-    const sp = spenders.find(s => s.dbId === spenderId || s.name === handleName);
+    // 1) Find spender: prefer tg_user_id, fallback to handle
+    let sp = null;
+    if (feedItem.tg_user_id) {
+      sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === String(feedItem.tg_user_id));
+      // If not in spenders array, try dbSpenders and build synthetic entry
+      if (!sp) {
+        const dbSp = (dbSpenders || []).find(d => d.tg_user_id && String(d.tg_user_id) === String(feedItem.tg_user_id));
+        if (dbSp) {
+          const h = dbSp.handle || dbSp.name;
+          sp = spenders.find(s => h && s.name === h);
+          if (!sp && dbSp) {
+            // Build minimal compatible object (0-valued stats prevent crash)
+            sp = {
+              name: h || String(feedItem.tg_user_id),
+              dbId: dbSp.id, tg_user_id: dbSp.tg_user_id,
+              telegramId: dbSp.telegram_id || null, whatsapp_phone: dbSp.whatsapp_phone || null,
+              first_name: dbSp.first_name || null, age: dbSp.age || null,
+              city: dbSp.city || null, country: dbSp.country || null, job: dbSp.job || null,
+              langue: dbSp.langue || null, timezone: dbSp.timezone || "Europe/Zurich",
+              budget_range: dbSp.budget_range || null, classification: dbSp.classification || "new",
+              source: dbSp.source || null, dbTags: Array.isArray(dbSp.tags) ? dbSp.tags : [],
+              dbStatus: dbSp.status || "active", dbNotes: dbSp.notes || "",
+              risk_level: dbSp.risk_level || "safe", telegram_username: dbSp.telegram_username || null,
+              created_at: dbSp.created_at || null, updated_at: dbSp.updated_at || null,
+              preferences: dbSp.preferences || null, personality_notes: dbSp.personality_notes || null,
+              favorite_content: dbSp.favorite_content || null, best_time: dbSp.best_time || null,
+              relationship_status: dbSp.relationship_status || null,
+              totalSpentDb: Number(dbSp.total_spent) || 0, contactInfo: {},
+              ltv: 0, aov: 0, cnt: 0, validCA: 0, pendingCA: 0,
+              segment: getSpenderSegment(0),
+              txs: [], byModel: {}, byChatter: {}, byProvider: {},
+            };
+          }
+        }
+      }
+    }
+    if (!sp && feedItem.spenderHandle) {
+      const h = feedItem.spenderHandle.replace(/^@/, "");
+      sp = spenders.find(s => s.name.toLowerCase() === h.toLowerCase());
+    }
     if (!sp) return;
+    // 2) Close drawer and open modal
     setShowActivityDrawer(false);
+    openSpenderModal(sp);
+    // 3) Scroll + highlight the card in the list
     const cardKey = sp.dbId || sp.name;
     setTimeout(() => {
       const el = document.getElementById(`spender-card-${cardKey}`);
@@ -7138,8 +7215,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
       setHighlightSpenderId(cardKey);
       highlightTimerRef.current = setTimeout(() => setHighlightSpenderId(null), 2000);
-    }, 250);
-  }, [spenders]);
+    }, 300);
+  }, [spenders, dbSpenders, openSpenderModal]);
 
   const handleSpStatus = async (txId, newStatus) => {
     if (processingTxId) return;
@@ -7236,6 +7313,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       map[h] = {
         name: h,
         dbId: dbSp.id,
+        tg_user_id: dbSp.tg_user_id || null,
         telegramId: dbSp.telegram_id || null,
         whatsapp_phone: dbSp.whatsapp_phone || null,
         age: dbSp.age || null,
@@ -7971,7 +8049,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 <div key={item.id || idx} className="activity-drawer-item" onClick={() => handleActivityClick(item)}>
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:12,fontWeight:600,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.message}</div>
+                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label}</div>
+                    {item.message && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.message}</div>}
                   </div>
                   <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts)}</span>
                 </div>
