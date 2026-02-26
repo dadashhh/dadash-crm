@@ -2478,9 +2478,9 @@ const ROLE_ACCESS = {
   gerant: ["dashboard","spenders","business","equipe","messagerie","compta","automation","bots","ia-insights","admin"],
   admin: ["admin"],
   ceo: ["admin"],
-  modele: ["model_checklist","model_content","model_tasks","model_payments"],
-  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition","chatter_scan"],
-  provider: ["provider_dashboard","transactions","provider_compta"]
+  modele: ["model_checklist","model_content","model_tasks","model_payments","model_notif"],
+  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_messagerie","chatter_compta","chatter_competition","chatter_scan","chatter_notif"],
+  provider: ["provider_dashboard","transactions","provider_compta","provider_notif"]
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
 const getRoleTabs = (role) => ROLE_ACCESS[role] || [];
@@ -2489,10 +2489,12 @@ const TAB_TO_FEATURE = {
   chatter_dashboard:"dashboard", chatter_transactions:"transactions",
   chatter_spenders:"spenders", chatter_messagerie:"messagerie",
   chatter_compta:"compta", chatter_competition:"dashboard",
-  chatter_scan:"automation", whatsapp:"messagerie",
+  chatter_scan:"automation", chatter_notif:"compta",
+  whatsapp:"messagerie",
   model_checklist:"modeles", model_content:"modeles",
   model_tasks:"modeles", model_payments:"modeles", model_dashboard:"modeles",
-  transactions:"transactions", provider_compta:"compta",
+  model_notif:"compta",
+  transactions:"transactions", provider_compta:"compta", provider_notif:"compta",
 };
 // canSeeWithPerms — checks user-specific perms first, then role defaults, then ROLE_ACCESS
 const canSeeWithPerms = (role, tabId, myPerms) => {
@@ -2622,6 +2624,8 @@ const PAGE_TABS = {
     { id: "reversements", label: "Reversements", icon: "\u{1F504}" },
     { id: "factures", label: "Factures", icon: "\u{1F4C4}" },
     { id: "resultats_dadash", label: "Résultats DADASH", icon: "\u{1F4B0}" },
+    { id: "paiements_internes", label: "Paiements Internes", icon: "\u{1F4B8}" },
+    { id: "ledger_interne", label: "Ledger", icon: "\u{1F4D2}" },
   ],
   automation: [
     { id: "push",   label: "💬 Push",   icon: "" },
@@ -2639,12 +2643,13 @@ const PAGE_TABS = {
 const ADMIN_NAV = [{ id: "admin", icon: "\u{1F511}", label: "Admin" }];
 
 const FAB_ACTIONS_GERANT = [
-  { id: "create_tx",       label: "Créer Transaction",  icon: "\u{1F4B0}", color: "#10B981" },
-  { id: "create_spender",  label: "Nouveau Spender",    icon: "\u{1F464}", color: "#3B82F6" },
-  { id: "verify_screen",   label: "Vérifier Screen",    icon: "\u{1F4F8}", color: "#F59E0B" },
-  { id: "create_push",     label: "Nouveau Push",       icon: "\u{1F4AC}", color: "#8B5CF6" },
-  { id: "create_todo",     label: "Créer une Todo",     icon: "✅",         color: "#10B981" },
-  { id: "create_depense",  label: "Créer une Dépense",  icon: "\u{1F4B8}", color: "#EF4444" },
+  { id: "create_tx",       label: "Créer Transaction",   icon: "\u{1F4B0}", color: "#10B981" },
+  { id: "create_spender",  label: "Nouveau Spender",     icon: "\u{1F464}", color: "#3B82F6" },
+  { id: "verify_screen",   label: "Vérifier Screen",     icon: "\u{1F4F8}", color: "#F59E0B" },
+  { id: "create_push",     label: "Nouveau Push",        icon: "\u{1F4AC}", color: "#8B5CF6" },
+  { id: "create_todo",     label: "Créer une Todo",      icon: "✅",         color: "#10B981" },
+  { id: "create_depense",  label: "Créer une Dépense",   icon: "\u{1F4B8}", color: "#EF4444" },
+  { id: "create_payment",  label: "Paiement Interne",    icon: "\u{1F4B8}", color: "#6366F1" },
 ];
 const FAB_ACTIONS_CHATTER = [
   { id: "create_tx", label: "Créer Transaction", icon: "\u{1F4B0}", color: "#10B981" },
@@ -18742,6 +18747,340 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
 };
 
 // =============================================
+// PAYMENT SYSTEM — INTERNAL PAYMENTS (PaymentEventsSection, LedgerTab, CreatePaymentModal, InternalNotificationsTab)
+// =============================================
+
+/* LedgerTab — shows ledger_entries for a user with date filters */
+const LedgerTab = ({user, lang, ledgerEntries, profiles, isGerant}) => {
+  const fr = lang === "fr";
+  const [dateFrom, setDateFrom] = useState(() => { const d=new Date(); d.setDate(1); return d.toISOString().split("T")[0]; });
+  const [dateTo, setDateTo] = useState(() => new Date().toISOString().split("T")[0]);
+  const [filterUserId, setFilterUserId] = useState("");
+
+  const filtered = useMemo(() => {
+    let list = (ledgerEntries || []);
+    if (dateFrom) list = list.filter(e => (e.created_at||"").slice(0,10) >= dateFrom);
+    if (dateTo) list = list.filter(e => (e.created_at||"").slice(0,10) <= dateTo);
+    if (isGerant && filterUserId) list = list.filter(e => e.owner_user_id === filterUserId);
+    return list.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+  }, [ledgerEntries, dateFrom, dateTo, filterUserId, isGerant]);
+
+  const credits = filtered.filter(e=>Number(e.amount)>0).reduce((s,e)=>s+Number(e.amount),0);
+  const debits  = filtered.filter(e=>Number(e.amount)<0).reduce((s,e)=>s+Number(e.amount),0);
+  const total   = credits + debits;
+
+  const uniqueUsers = useMemo(() => {
+    if (!isGerant || !profiles) return [];
+    const ids = new Set((ledgerEntries||[]).map(e=>e.owner_user_id));
+    return (profiles||[]).filter(p=>ids.has(p.id));
+  }, [ledgerEntries, profiles, isGerant]);
+
+  return (
+    <div>
+      <div className="ui-section-header">
+        <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4D2}"} {fr?"Ledger Interne":"Internal Ledger"}</h2>
+        <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr?"Mouvements comptables internes (paiements manager↔équipe)":"Internal accounting movements (manager↔team payments)"}</p>
+      </div>
+      {/* Filters */}
+      <div className="ui-panel" style={{marginBottom:16,display:"flex",flexWrap:"wrap",gap:12,alignItems:"flex-end"}}>
+        <div>
+          <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:3}}>{fr?"Du":"From"}</label>
+          <input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{...UI.input,width:140}} />
+        </div>
+        <div>
+          <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:3}}>{fr?"Au":"To"}</label>
+          <input type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)} style={{...UI.input,width:140}} />
+        </div>
+        {isGerant && uniqueUsers.length > 0 && (
+          <div>
+            <label style={{fontSize:11,color:"var(--text-tertiary)",display:"block",marginBottom:3}}>{fr?"Utilisateur":"User"}</label>
+            <select value={filterUserId} onChange={e=>setFilterUserId(e.target.value)} style={{...UI.input,width:170}}>
+              <option value="">{fr?"Tous":"All"}</option>
+              {uniqueUsers.map(u=><option key={u.id} value={u.id}>{displayUserName(u)} ({u.role})</option>)}
+            </select>
+          </div>
+        )}
+        <button onClick={()=>{setDateFrom(new Date(new Date().getFullYear(),new Date().getMonth(),1).toISOString().split("T")[0]);setDateTo(new Date().toISOString().split("T")[0]);setFilterUserId("");}} style={{...UI.btnSecondary,alignSelf:"flex-end"}}>{fr?"Réinitialiser":"Reset"}</button>
+      </div>
+      {/* KPIs */}
+      <div style={{display:"flex",gap:12,flexWrap:"wrap",marginBottom:16}}>
+        {[
+          {label:fr?"Entrées":"Credits",val:"+"+credits.toLocaleString("fr-FR",{maximumFractionDigits:2}),color:"var(--success)"},
+          {label:fr?"Sorties":"Debits",val:debits.toLocaleString("fr-FR",{maximumFractionDigits:2}),color:"var(--danger)"},
+          {label:fr?"Solde période":"Period balance",val:(total>=0?"+":"")+total.toLocaleString("fr-FR",{maximumFractionDigits:2}),color:total>=0?"var(--success)":"var(--danger)"},
+          {label:fr?"Lignes":"Rows",val:filtered.length,color:"var(--text-primary)"},
+        ].map(k=>(
+          <div key={k.label} className="ui-panel" style={{padding:"10px 16px",minWidth:130,flex:"1 1 130px"}}>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{k.label}</div>
+            <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.val}</div>
+          </div>
+        ))}
+      </div>
+      {/* Table */}
+      <div className="ui-panel">
+        <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+          <table className="table" style={{fontSize:12,minWidth:_isMobile?500:undefined}}>
+            <thead><tr>
+              <th>{fr?"Date":"Date"}</th>
+              {isGerant && <th>{fr?"Utilisateur":"User"}</th>}
+              <th>{fr?"Contrepartie":"Counterparty"}</th>
+              <th>{fr?"Type":"Type"}</th>
+              <th>{fr?"Titre":"Title"}</th>
+              <th style={{textAlign:"right"}}>{fr?"Montant":"Amount"}</th>
+              <th>{fr?"Note":"Note"}</th>
+            </tr></thead>
+            <tbody>
+              {filtered.map(e=>{
+                const isPos = Number(e.amount) >= 0;
+                const ownerProfile = isGerant && profiles ? profiles.find(p=>p.id===e.owner_user_id) : null;
+                const cpProfile = profiles ? profiles.find(p=>p.id===e.counterparty_user_id) : null;
+                return (
+                  <tr key={e.id}>
+                    <td style={{whiteSpace:"nowrap"}}>{formatDateSafe(e.created_at)}</td>
+                    {isGerant && <td>{ownerProfile ? displayUserName(ownerProfile) : (e.owner_user_id||"").slice(0,8)+"…"}</td>}
+                    <td>{cpProfile ? displayUserName(cpProfile) : (e.counterparty_user_id ? (e.counterparty_user_id||"").slice(0,8)+"…" : "—")}</td>
+                    <td><span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:isPos?"var(--success-bg)":"var(--danger-bg)",color:isPos?"var(--success)":"var(--danger)"}}>{e.entry_type||"—"}</span></td>
+                    <td style={{maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title||"—"}</td>
+                    <td style={{textAlign:"right",fontWeight:700,color:isPos?"var(--success)":"var(--danger)"}}>{isPos?"+":""}{Number(e.amount||0).toLocaleString("fr-FR",{maximumFractionDigits:2})} {e.currency||"EUR"}</td>
+                    <td style={{maxWidth:110,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:"var(--text-tertiary)"}}>{e.note||"—"}</td>
+                  </tr>
+                );
+              })}
+              {filtered.length===0&&<tr><td colSpan={isGerant?7:6} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr?"Aucun mouvement sur cette période":"No movements for this period"}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* CreatePaymentModal — modal to create a payment_event (status: pending) */
+const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [form, setForm] = useState({from_user_id:user.id,to_user_id:"",amount:"",currency:"EUR",kind:"salary",title:"",note:""});
+  const [saving, setSaving] = useState(false);
+  const set = (k,v) => setForm(prev=>({...prev,[k]:v}));
+  const inpStyle = {...UI.input,marginBottom:0};
+  const allUsers = (profiles||[]).filter(p=>p.id&&p.role&&!["admin","ceo"].includes(p.role));
+
+  const handleCreate = async () => {
+    if (!form.from_user_id) return addToast(fr?"Payeur requis":"Payer required","error");
+    if (!form.to_user_id) return addToast(fr?"Receveur requis":"Receiver required","error");
+    if (!form.amount||isNaN(Number(form.amount))||Number(form.amount)<=0) return addToast(fr?"Montant invalide":"Invalid amount","error");
+    if (form.from_user_id===form.to_user_id) return addToast(fr?"Payeur et receveur identiques":"Payer = Receiver","error");
+    setSaving(true);
+    const {error} = await sb.from("payment_events").insert({
+      created_by:user.id,
+      from_user_id:form.from_user_id,
+      to_user_id:form.to_user_id,
+      amount:Number(form.amount),
+      currency:form.currency||"EUR",
+      kind:form.kind||"salary",
+      title:form.title.trim()||form.kind,
+      note:form.note.trim()||null,
+      status:"pending"
+    });
+    setSaving(false);
+    if (error) return addToast("Erreur: "+error.message,"error");
+    addToast("\u{1F4B8} Paiement créé — marquer payé pour écrire la compta","success");
+    onSaved();
+  };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{background:"var(--bg-modal)",border:"1px solid var(--border-strong)",borderRadius:16,padding:24,width:"100%",maxWidth:480,maxHeight:"90vh",overflowY:"auto",boxShadow:"var(--shadow-lg)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <h3 style={{fontSize:16,fontWeight:800,color:"var(--text-primary)",margin:0}}>{"\u{1F4B8}"} {fr?"Créer un paiement interne":"Create internal payment"}</h3>
+          <button onClick={onClose} style={{background:"none",border:"none",color:"var(--text-tertiary)",fontSize:20,cursor:"pointer",padding:"2px 6px",borderRadius:6}}>×</button>
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Type de paiement":"Payment kind"}</label>
+            <select value={form.kind} onChange={e=>set("kind",e.target.value)} style={inpStyle}>
+              <option value="salary">{fr?"Salaire":"Salary"}</option>
+              <option value="bonus">{fr?"Prime / Bonus":"Bonus"}</option>
+              <option value="adjustment">{fr?"Ajustement":"Adjustment"}</option>
+              <option value="provider_payment">{fr?"Paiement Provider":"Provider payment"}</option>
+            </select>
+          </div>
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Payeur (from_user_id)":"Payer (from_user_id)"}</label>
+            <select value={form.from_user_id} onChange={e=>set("from_user_id",e.target.value)} style={inpStyle}>
+              <option value="">— {fr?"Choisir":"Select"} —</option>
+              {allUsers.map(u=><option key={u.id} value={u.id}>{displayUserName(u)} ({u.role})</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Receveur (to_user_id)":"Receiver (to_user_id)"}</label>
+            <select value={form.to_user_id} onChange={e=>set("to_user_id",e.target.value)} style={inpStyle}>
+              <option value="">— {fr?"Choisir":"Select"} —</option>
+              {allUsers.filter(u=>u.id!==form.from_user_id).map(u=><option key={u.id} value={u.id}>{displayUserName(u)} ({u.role})</option>)}
+            </select>
+          </div>
+          <div style={{display:"flex",gap:10}}>
+            <div style={{flex:1}}>
+              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Montant":"Amount"}</label>
+              <input type="number" min="0.01" step="0.01" value={form.amount} onChange={e=>set("amount",e.target.value)} style={inpStyle} placeholder="0.00" />
+            </div>
+            <div style={{width:90}}>
+              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Devise":"Currency"}</label>
+              <select value={form.currency} onChange={e=>set("currency",e.target.value)} style={inpStyle}>
+                <option value="EUR">EUR</option>
+                <option value="CHF">CHF</option>
+                <option value="USD">USD</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>Titre</label>
+            <input type="text" value={form.title} onChange={e=>set("title",e.target.value)} style={inpStyle} placeholder={fr?"Ex: Salaire Janvier 2026":"E.g. January 2026 salary"} />
+          </div>
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Note (optionnel)":"Note (optional)"}</label>
+            <textarea value={form.note} onChange={e=>set("note",e.target.value)} style={{...inpStyle,height:58,resize:"vertical"}} placeholder={fr?"Note interne...":"Internal note..."} />
+          </div>
+          <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:4}}>
+            <button onClick={onClose} style={UI.btnSecondary}>{fr?"Annuler":"Cancel"}</button>
+            <button onClick={handleCreate} disabled={saving} style={{...UI.btnPrimary,opacity:saving?0.6:1}}>
+              {saving?"...":(fr?"Créer (en attente)":"Create (pending)")}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* PaymentEventsSection — gérant view of payment_events + mark-paid action */
+const PaymentEventsSection = ({user, lang, paymentEvents, profiles, onRefresh, onCreatePayment, afterMutationRefresh}) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [marking, setMarking] = useState(null);
+
+  const handleMarkPaid = async (evt) => {
+    setMarking(evt.id);
+    const {error} = await sb.from("payment_events").update({status:"paid"}).eq("id",evt.id);
+    setMarking(null);
+    if (error) { addToast("Erreur: "+error.message,"error"); return; }
+    addToast("\u2705 Paiement marqué payé — ledger + notifs écrits automatiquement","success");
+    if (afterMutationRefresh) afterMutationRefresh(); else if (onRefresh) onRefresh();
+  };
+
+  const getUserName = (id) => {
+    if (!id||!profiles) return id?(id||"").slice(0,8)+"…":"—";
+    const p = profiles.find(x=>x.id===id);
+    return p ? displayUserName(p) : (id||"").slice(0,8)+"…";
+  };
+
+  const statusBadge = (s) => {
+    const map = {paid:["var(--success-bg)","var(--success)"],pending:["var(--warning-bg)","var(--warning)"],cancelled:["var(--danger-bg)","var(--danger)"]};
+    const [bg,col] = map[s]||["var(--accent-muted)","var(--accent)"];
+    return <span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:bg,color:col}}>{s||"pending"}</span>;
+  };
+
+  const sorted = useMemo(()=>[...(paymentEvents||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)),[paymentEvents]);
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4B8}"} {fr?"Paiements Internes":"Internal Payments"}</h2>
+          <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr?"Manager \u2194 Chatter \u2194 Modèle \u2194 Provider":"Manager \u2194 Chatter \u2194 Model \u2194 Provider"}</p>
+        </div>
+        <button onClick={onCreatePayment} style={{...UI.btnPrimary,display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:16,lineHeight:1}}>+</span>
+          <span>{fr?"Créer paiement":"Create payment"}</span>
+        </button>
+      </div>
+      <div className="ui-panel">
+        <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+          <table className="table" style={{fontSize:12,minWidth:_isMobile?620:undefined}}>
+            <thead><tr>
+              <th>{fr?"Date":"Date"}</th>
+              <th>{fr?"Type":"Kind"}</th>
+              <th>{fr?"Payeur":"From"}</th>
+              <th>{fr?"Receveur":"To"}</th>
+              <th style={{textAlign:"right"}}>{fr?"Montant":"Amount"}</th>
+              <th>{fr?"Titre":"Title"}</th>
+              <th>{fr?"Statut":"Status"}</th>
+              <th style={{textAlign:"center"}}>{fr?"Action":"Action"}</th>
+            </tr></thead>
+            <tbody>
+              {sorted.map(evt=>(
+                <tr key={evt.id}>
+                  <td style={{whiteSpace:"nowrap"}}>{formatDateSafe(evt.created_at)}</td>
+                  <td><span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:"var(--accent-muted)",color:"var(--accent)"}}>{evt.kind||"—"}</span></td>
+                  <td>{getUserName(evt.from_user_id)}</td>
+                  <td>{getUserName(evt.to_user_id)}</td>
+                  <td style={{textAlign:"right",fontWeight:700}}>{Number(evt.amount||0).toLocaleString("fr-FR",{maximumFractionDigits:2})} {evt.currency||"EUR"}</td>
+                  <td style={{maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{evt.title||"—"}</td>
+                  <td>{statusBadge(evt.status)}</td>
+                  <td style={{textAlign:"center"}}>
+                    {evt.status==="pending"
+                      ? <button onClick={()=>handleMarkPaid(evt)} disabled={marking===evt.id} style={{padding:"4px 12px",borderRadius:8,background:"var(--success)",color:"#fff",border:"none",fontSize:11,fontWeight:700,cursor:"pointer",opacity:marking===evt.id?0.6:1,whiteSpace:"nowrap"}}>
+                          {marking===evt.id?"...":(fr?"\u2713 Marquer payé":"\u2713 Mark paid")}
+                        </button>
+                      : <span style={{color:"var(--text-tertiary)",fontSize:11}}>—</span>
+                    }
+                  </td>
+                </tr>
+              ))}
+              {sorted.length===0&&<tr><td colSpan={8} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr?"Aucun paiement interne — créez-en un avec le bouton ci-dessus":"No internal payments — create one with the button above"}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* InternalNotificationsTab — notification list for non-gérant users */
+const InternalNotificationsTab = ({user, lang, notifications, unreadCount, onMarkRead, onMarkAllRead}) => {
+  const fr = lang === "fr";
+  const sorted = useMemo(()=>[...(notifications||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)),[notifications]);
+  const typeIcon = (type) => {
+    if (!type) return "\u{1F514}";
+    if (type.includes("payment")||type.includes("ledger")||type.includes("salary")||type.includes("bonus")) return "\u{1F4B8}";
+    if (type.includes("tx")) return "\u{1F4B0}";
+    if (type.includes("scan")) return "\u{1F4F8}";
+    if (type.includes("broadcast")) return "\u{1F4E2}";
+    if (type.includes("message")) return "\u{1F4AC}";
+    return "\u{1F514}";
+  };
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div>
+          <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F514}"} {fr?"Mes Notifications":"My Notifications"}</h2>
+          <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>
+            {unreadCount>0?`${unreadCount} ${fr?"non lue(s)":"unread"}`:(fr?"Tout lu \u2713":"All read \u2713")}
+          </p>
+        </div>
+        {unreadCount>0&&<button onClick={onMarkAllRead} style={UI.btnSecondary}>{fr?"\u2713 Tout marquer lu":"\u2713 Mark all read"}</button>}
+      </div>
+      <div className="ui-panel">
+        {sorted.length===0&&<div style={{textAlign:"center",color:"var(--text-tertiary)",padding:48,fontSize:13}}>{fr?"Aucune notification":"No notifications yet"}</div>}
+        {sorted.map(n=>(
+          <div key={n.id} onClick={()=>!n.read&&onMarkRead&&onMarkRead(n.id)} style={{display:"flex",gap:12,alignItems:"flex-start",padding:"12px 0",borderBottom:"1px solid var(--border-subtle)",cursor:n.read?"default":"pointer",opacity:n.read?0.6:1,transition:"opacity 0.2s"}}>
+            <span style={{fontSize:22,flexShrink:0,marginTop:1}}>{typeIcon(n.type)}</span>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                <div style={{fontWeight:n.read?500:700,fontSize:13,color:"var(--text-primary)",lineHeight:1.4}}>{n.title||"Notification"}</div>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",whiteSpace:"nowrap",flexShrink:0}}>{formatDateSafe(n.created_at)}</div>
+              </div>
+              {n.message&&<div style={{fontSize:12,color:"var(--text-secondary)",marginTop:3,lineHeight:1.5}}>{n.message}</div>}
+              {!n.read&&<div style={{marginTop:4,fontSize:10,color:"var(--accent)",fontWeight:600}}>{"\u25CF"} {fr?"Non lu — cliquer pour marquer lu":"Unread — click to mark as read"}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
 // CHATTER ROLE — COMPETITION + GAMIFICATION (EC8)
 // =============================================
 const CHATTER_LEVELS = [
@@ -26144,6 +26483,10 @@ const App = () => {
   const [screenshotChecks, setScreenshotChecks] = useState([]);
   const [broadcasts, setBroadcasts] = useState([]);
   const [escalationCount, setEscalationCount] = useState(0);
+  // ── PAYMENT SYSTEM STATE ──
+  const [paymentEvents, setPaymentEvents] = useState([]);
+  const [ledgerEntries, setLedgerEntries] = useState([]);
+  const [showPaymentModal, setShowPaymentModal] = useState(false);
   // ── SERVER PAGINATION STATE ──
   const [txSummary, setTxSummary] = useState([]);
   const [txTotal, setTxTotal] = useState(0);
@@ -26260,12 +26603,12 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
     try {
       /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR] = await Promise.race([Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
         safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
         safe(sb.from("spenders").select("*"), "spenders"),
         safe(sb.from("profiles").select("*"), "profiles"),
@@ -26294,6 +26637,10 @@ const App = () => {
         /* CHRISTINE FIX — product_tag_id may not exist, use select(*) as fallback */
         safe(sb.from("transactions").select("*").order("date",{ascending:false}), "tx_summary"),
         safe(sb.from("expense_categories").select("code,label").eq("is_active",true).order("sort_order",{ascending:true}), "expense_categories"),
+        /* PAYMENT SYSTEM — payment_events (gérant voit tout, autres voient from/to/created_by via RLS) */
+        safe(sb.from("payment_events").select("*").order("created_at",{ascending:false}).limit(200), "payment_events"),
+        /* PAYMENT SYSTEM — ledger_entries (RLS: owner_user_id = auth.uid() pour non-gérant) */
+        safe(sb.from("ledger_entries").select("*").order("created_at",{ascending:false}).limit(500), "ledger_entries"),
       ]), _dataTimeout]);
     } catch(e) { /* DB FIX — loadData timeout or critical failure */ console.error("[DADASH] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
     // Discard results if a newer loadData call was started while we were awaiting
@@ -26387,6 +26734,9 @@ const App = () => {
     setClTotal(chLogR.count||(chLogR.data||[]).length||0);
     (()=>{ let scData=(scR&&scR.data)||[]; if(currentUser&&currentUser.role==="chatter"){ scData=scData.filter(sc=>(sc.checked_by||sc.checker_id||sc.chatter_id)===currentUser.id); } setScreenshotChecks(scData); window.__screenshotChecks=scData; setScTotal(scData.length); })();
     setBroadcasts((bcR&&bcR.data)||[]);
+    // PAYMENT SYSTEM — set payment_events and ledger_entries
+    setPaymentEvents((peR&&peR.data)||[]);
+    setLedgerEntries((leR&&leR.data)||[]);
     // Load escalation count for messagerie badge
     if (currentUser && currentUser.role === "gerant") {
       try {
@@ -26458,6 +26808,13 @@ const App = () => {
     if (type === "spender" || type === "escalade") {
       if (user && user.role === "chatter") { return { mode: "setTab", tab: "chatter_spenders" }; }
       return { mode: "navigateTo", page: "business", sub: "spenders" };
+    }
+    // PAYMENT SYSTEM — payment/ledger/salary/bonus notifications navigate to the appropriate compta section
+    if (type === "payment" || type === "ledger" || type === "salary" || type === "bonus" || type === "adjustment") {
+      if (user && user.role === "chatter") { return { mode: "setTab", tab: "chatter_notif" }; }
+      if (user && user.role === "provider") { return { mode: "setTab", tab: "provider_notif" }; }
+      if (user && user.role === "modele") { return { mode: "setTab", tab: "model_notif" }; }
+      return { mode: "navigateTo", page: "compta", sub: "paiements_internes" };
     }
     return null;
   };
@@ -26547,7 +26904,8 @@ const App = () => {
   useEffect(() => {
     const handler = (e) => {
       if (e.key === "Escape") {
-        if (mobileMenuOpen) setMobileMenuOpen(false);
+        if (showPaymentModal) setShowPaymentModal(false);
+        else if (mobileMenuOpen) setMobileMenuOpen(false);
         else if (fabSpenderModal) setFabSpenderModal(false);
         else if (fabTodoModal) setFabTodoModal(false);
         else if (fabDepenseModal) setFabDepenseModal(false);
@@ -26556,7 +26914,7 @@ const App = () => {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [fabOpen, fabSpenderModal, fabTodoModal, fabDepenseModal, mobileMenuOpen]);
+  }, [fabOpen, fabSpenderModal, fabTodoModal, fabDepenseModal, mobileMenuOpen, showPaymentModal]);
 
   // ── SUPABASE REALTIME: Notifications + TX + Scans + Broadcasts ──
   useEffect(() => {
@@ -26608,6 +26966,33 @@ const App = () => {
           setUnreadCount(prev => prev + 1);
         }
       })
+      // PAYMENT SYSTEM — realtime: payment_events UPDATE (gérant sees status changes)
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "payment_events" }, (payload) => {
+        if (payload.new) {
+          setPaymentEvents(prev => prev.map(e => e.id===payload.new.id ? payload.new : e));
+          if (payload.new.status === "paid" && payload.old && payload.old.status !== "paid") {
+            // Trigger afterMutationRefresh to pick up new ledger_entries + notifications
+            setTimeout(() => {
+              sb.from("ledger_entries").select("*").order("created_at",{ascending:false}).limit(500)
+                .then(r => { if (!r.error) setLedgerEntries(r.data||[]); });
+              sb.from("notifications").select("*").eq("user_id",user.id).order("created_at",{ascending:false}).limit(PAGE_SIZE)
+                .then(r => { if (!r.error) { setNotifications(r.data||[]); setUnreadCount((r.data||[]).filter(n=>!n.read).length); } });
+            }, 1200); // slight delay to let DB trigger complete
+          }
+        }
+      })
+      // PAYMENT SYSTEM — realtime: payment_events INSERT (gérant sees new payments)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "payment_events" }, (payload) => {
+        if (payload.new) {
+          setPaymentEvents(prev => [payload.new, ...prev].slice(0, 200));
+        }
+      })
+      // PAYMENT SYSTEM — realtime: ledger_entries INSERT (all users see their own)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "ledger_entries" }, (payload) => {
+        if (payload.new && (user.role === "gerant" || payload.new.owner_user_id === user.id)) {
+          setLedgerEntries(prev => [payload.new, ...prev].slice(0, 500));
+        }
+      })
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
@@ -26657,6 +27042,8 @@ const App = () => {
     setBotStats([]);
     setNotifications([]);
     setUnreadCount(0);
+    setPaymentEvents([]);
+    setLedgerEntries([]);
   };
 
   /* DB FIX — global refresh with error handling */
@@ -26670,6 +27057,26 @@ const App = () => {
     }
   };
   const onRefresh = fn_afterMutationOrImportRefresh;
+
+  /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications */
+  const afterMutationRefresh = useCallback(async () => {
+    if (!user) return;
+    try {
+      const [peRes, leRes, nRes] = await Promise.all([
+        sb.from("payment_events").select("*").order("created_at",{ascending:false}).limit(200),
+        sb.from("ledger_entries").select("*").order("created_at",{ascending:false}).limit(500),
+        sb.from("notifications").select("*").eq("user_id",user.id).order("created_at",{ascending:false}).limit(PAGE_SIZE),
+      ]);
+      if (!peRes.error) setPaymentEvents(peRes.data||[]);
+      if (!leRes.error) setLedgerEntries(leRes.data||[]);
+      if (!nRes.error) {
+        setNotifications(nRes.data||[]);
+        setUnreadCount((nRes.data||[]).filter(n=>!n.read).length);
+      }
+    } catch(e) {
+      console.error("[DADASH] afterMutationRefresh failed:", e.message||e);
+    }
+  }, [user?.id]);
 
   // ── ALERT HELPERS ──
   const dismissAlert = async (alertId) => {
@@ -26755,8 +27162,11 @@ const App = () => {
     {id:"chatter_compta",icon:"\u{1F4C4}",label:t(lang,"compta"),show:user.role==="chatter"},
     {id:"chatter_competition",icon:"\u{1F3C6}",label:t(lang,"competition_label"),show:user.role==="chatter"},
     {id:"chatter_scan",icon:"\u{1F50D}",label:t(lang,"verify_screen"),show:user.role==="chatter"},
+    {id:"chatter_notif",icon:"\u{1F514}",label:lang==="fr"?"Notifications":"Notifications",show:user.role==="chatter"},
     {id:"transactions",icon:"\u{1F4B8}",label:"Mes Transactions",show:user.role==="provider"},
     {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:user.role==="provider"},
+    {id:"provider_notif",icon:"\u{1F514}",label:lang==="fr"?"Notifications":"Notifications",show:user.role==="provider"},
+    {id:"model_notif",icon:"\u{1F514}",label:lang==="fr"?"Notifications":"Notifications",show:user.role==="modele"},
     {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:user.role==="chatter"},
   ];
 
@@ -26853,6 +27263,8 @@ const App = () => {
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
           {subTab==="resultats_dadash"&&<ResultatsDadashTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
+          {subTab==="paiements_internes"&&<PaymentEventsSection user={user} lang={lang} paymentEvents={paymentEvents} profiles={profiles} onRefresh={onRefresh} onCreatePayment={()=>setShowPaymentModal(true)} afterMutationRefresh={afterMutationRefresh} />}
+          {subTab==="ledger_interne"&&<LedgerTab user={user} lang={lang} ledgerEntries={ledgerEntries} profiles={profiles} isGerant={true} />}
         </div>);
       case "automation":
         return (<>{renderGerantTabBar("automation")}
@@ -26885,6 +27297,7 @@ const App = () => {
     else if (actionId === "create_push") { navigateTo("automation","push"); }
     else if (actionId === "create_todo") { setFabTodoForm({ title: "" }); setFabTodoModal(true); }
     else if (actionId === "create_depense") { setFabDepenseEditId(null); const defCat=expenseCategories&&expenseCategories.length>0?expenseCategories[0].code:""; setFabDepenseForm({ amount: "", type: "autre", category: defCat, description: "", date: new Date().toISOString().split("T")[0], currency: "EUR", assigned_to_id: "", assigned_to_type: "" }); setFabDepenseModal(true); }
+    else if (actionId === "create_payment") { setShowPaymentModal(true); }
   };
   const handleFabCreateSpender = async () => {
     if (!fabSpForm.handle.trim()) return addToast("Handle requis","error");
@@ -26983,8 +27396,11 @@ const App = () => {
           <div className="sidebar-logo">D</div>
           <div className="sidebar-nav">
             {otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).map(x=>(
-              <button key={x.id} className={`sidebar-btn ${tab===x.id&&!drillDown?"active":""}`} onClick={()=>{closeDrill();setTab(x.id);}} title={x.label}>
+              <button key={x.id} className={`sidebar-btn ${tab===x.id&&!drillDown?"active":""}`} onClick={()=>{closeDrill();setTab(x.id);}} title={x.label} style={{position:"relative"}}>
                 {x.icon}
+                {(x.id==="chatter_notif"||x.id==="provider_notif"||x.id==="model_notif")&&unreadCount>0&&(
+                  <span style={{position:"absolute",top:4,right:4,minWidth:14,height:14,borderRadius:7,background:"#EF4444",color:"#fff",fontSize:9,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 2px"}}>{unreadCount>9?"9+":unreadCount}</span>
+                )}
               </button>
             ))}
           </div>
@@ -27050,6 +27466,7 @@ const App = () => {
                 <button key={x.id} onClick={()=>{closeDrill();setTab(x.id);setMobileMenuOpen(false);}} style={{display:"flex",alignItems:"center",gap:12,width:"100%",padding:"14px 16px",background:tab===x.id?"var(--accent-muted)":"none",border:"none",borderRadius:10,color:tab===x.id?"var(--accent)":"var(--text-secondary)",fontSize:15,fontWeight:tab===x.id?700:500,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",transition:"all 0.15s"}}>
                   <span style={{fontSize:20}}>{typeof x.icon==="string"?x.icon:"\u{1F4CB}"}</span>
                   <span>{x.label}</span>
+                  {(x.id==="chatter_notif"||x.id==="provider_notif"||x.id==="model_notif")&&unreadCount>0&&<span style={{marginLeft:"auto",background:"#EF4444",color:"#fff",fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:10}}>{unreadCount}</span>}
                 </button>
               ))}
             </div>
@@ -27269,13 +27686,26 @@ const App = () => {
             {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
             {messagerieSubTab==="escalades"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} escaladesOnly />}
           </>)}
-          {tab==="chatter_compta"&&user.role==="chatter"&&<ChatterComptaTab user={user} lang={lang} payslips={payslips} payouts={payouts} txs={txSummary} models={models} />}
+          {tab==="chatter_compta"&&user.role==="chatter"&&(<>
+            <ChatterComptaTab user={user} lang={lang} payslips={payslips} payouts={payouts} txs={txSummary} models={models} />
+            <div style={{marginTop:24}}>
+              <LedgerTab user={user} lang={lang} ledgerEntries={(ledgerEntries||[]).filter(e=>e.owner_user_id===user.id)} profiles={profiles} isGerant={false} />
+            </div>
+          </>)}
+          {tab==="chatter_notif"&&user.role==="chatter"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
           {user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
-          {tab==="provider_compta"&&user.role==="provider"&&<ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />}
+          {tab==="provider_compta"&&user.role==="provider"&&(<>
+            <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
+            <div style={{marginTop:24}}>
+              <LedgerTab user={user} lang={lang} ledgerEntries={(ledgerEntries||[]).filter(e=>e.owner_user_id===user.id)} profiles={profiles} isGerant={false} />
+            </div>
+          </>)}
+          {tab==="provider_notif"&&user.role==="provider"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
+          {tab==="model_notif"&&user.role==="modele"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} />}
           </>)}
         </div>
       </div>
@@ -27299,6 +27729,16 @@ const App = () => {
           </div>
         </>);
       })()}
+      {/* ═══ PAYMENT SYSTEM MODAL ═══ */}
+      {showPaymentModal && isGerant && (
+        <CreatePaymentModal
+          user={user}
+          profiles={profiles}
+          lang={lang}
+          onClose={()=>setShowPaymentModal(false)}
+          onSaved={()=>{setShowPaymentModal(false);afterMutationRefresh();navigateTo("compta","paiements_internes");}}
+        />
+      )}
       {/* ═══ FAB MODALS ═══ */}
       {fabSpenderModal && (
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:10000}} onClick={()=>setFabSpenderModal(false)}>
