@@ -68,6 +68,18 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
 
   log.info('INGEST', 'msg_ok', { msg_id: msg.tgMessageId, conv_id: convId });
 
+  // 2b. Insert spender_event new_message (pour Activity feed DADASH)
+  try {
+    await db.rpc('fn_insert_spender_event', {
+      p_tg_user_id: msg.tgUserId,
+      p_event_type: 'new_message',
+      p_idempotency_key: `msg:${msg.tgUserId}:${msg.tgMessageId}`,
+      p_data: { summary: msg.text?.slice(0, 100) || null },
+    });
+  } catch {
+    // Ignore dedup/constraint errors
+  }
+
   // 3. Upsert spender
   try {
     await upsertSpender({
