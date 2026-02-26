@@ -28,7 +28,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 interface QueueRow {
   id: string;
   conversation_id: string;
-  tg_chat_id: string;
+  tg_user_id: string;
   spender_id: string | null;
   status: string;
   attempts: number;
@@ -173,7 +173,7 @@ async function processOne(row: QueueRow): Promise<void> {
     if (conv?.spender_id) {
       spenderId = conv.spender_id;
     } else {
-      const handle = row.tg_chat_id;
+      const handle = row.tg_user_id;
       const { data: existing } = await db
         .from('spenders')
         .select('id')
@@ -243,10 +243,10 @@ async function processOne(row: QueueRow): Promise<void> {
     try {
       await db.from('spender_events').insert({
         spender_id: spenderId,
-        spender_handle: row.tg_chat_id,
+        spender_handle: row.tg_user_id,
         event_type: eventType,
         message: isNewSpender
-          ? `Nouveau spender créé via TG: ${profile.first_name || row.tg_chat_id}`
+          ? `Nouveau spender créé via TG: ${profile.first_name || row.tg_user_id}`
           : `Profil enrichi: ${updatedFields.join(', ')}`,
         meta: { updated_fields: updatedFields, profile },
       });
@@ -261,7 +261,7 @@ async function processOne(row: QueueRow): Promise<void> {
         const details = updatedFields
           .map((f) => `${f}: ${profile[f as keyof ExtractedProfile]}`)
           .join('\n');
-        const text = `${emoji} <b>${title}</b>\nChat: ${row.tg_chat_id}\n${details}`;
+        const text = `${emoji} <b>${title}</b>\nChat: ${row.tg_user_id}\n${details}`;
         await sendMessage(MANAGER_TG_CHAT_ID, text);
         console.log(`[TG] sent ${eventType} notification to manager`);
       } catch (e) {
@@ -275,6 +275,7 @@ async function processOne(row: QueueRow): Promise<void> {
     .update({
       status: 'done',
       spender_id: spenderId,
+      tg_user_id: row.tg_user_id,
       last_message_id: messages[messages.length - 1].id,
       updated_at: new Date().toISOString(),
     })

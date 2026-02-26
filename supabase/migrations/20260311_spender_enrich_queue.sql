@@ -5,12 +5,13 @@
 --
 -- Le worker Railway lock une row (queued→processing), charge les tg_messages,
 -- extrait le profil, upsert spenders.meta.profile, écrit spender_events.
+-- NOTE: la colonne s'appelle tg_user_id (schéma prod existant)
 -- ═══════════════════════════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS public.spender_enrich_queue (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id uuid NOT NULL REFERENCES tg_conversations(id),
-  tg_chat_id text NOT NULL,
+  tg_user_id text NOT NULL,
   spender_id uuid,
   status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'done', 'failed')),
   attempts int NOT NULL DEFAULT 0,
@@ -21,6 +22,16 @@ CREATE TABLE IF NOT EXISTS public.spender_enrich_queue (
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS tg_user_id text;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS spender_id uuid;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS status text DEFAULT 'queued';
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS attempts int DEFAULT 0;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS locked_at timestamptz;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS locked_by text;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS last_message_id text;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS last_error text;
+ALTER TABLE spender_enrich_queue ADD COLUMN IF NOT EXISTS updated_at timestamptz DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_enrich_queue_status ON spender_enrich_queue(status) WHERE status = 'queued';
 CREATE INDEX IF NOT EXISTS idx_enrich_queue_conversation ON spender_enrich_queue(conversation_id);
@@ -35,13 +46,14 @@ CREATE POLICY seq_gerant_all ON spender_enrich_queue FOR ALL USING (
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- Trigger: auto-enqueue quand une nouvelle tg_conversation est créée
+-- tg_conversations.tg_chat_id → spender_enrich_queue.tg_user_id
 -- ─────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.fn_auto_enqueue_enrich()
 RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public
 AS $$
 BEGIN
-  INSERT INTO spender_enrich_queue (conversation_id, tg_chat_id, spender_id)
+  INSERT INTO spender_enrich_queue (conversation_id, tg_user_id, spender_id)
   VALUES (NEW.id, NEW.tg_chat_id, NEW.spender_id)
   ON CONFLICT DO NOTHING;
   RETURN NEW;
@@ -66,7 +78,7 @@ BEGIN
   SELECT id, tg_chat_id, spender_id INTO v_conv FROM tg_conversations WHERE id = NEW.conversation_id;
   IF v_conv IS NULL THEN RETURN NEW; END IF;
 
-  INSERT INTO spender_enrich_queue (conversation_id, tg_chat_id, spender_id, status)
+  INSERT INTO spender_enrich_queue (conversation_id, tg_user_id, spender_id, status)
   VALUES (v_conv.id, v_conv.tg_chat_id, v_conv.spender_id, 'queued')
   ON CONFLICT (conversation_id)
     WHERE status IN ('done', 'failed')
