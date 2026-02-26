@@ -8565,7 +8565,9 @@ const PayesTab = ({user, lang, txs, payouts, paymentEvents, ledgerEntries, paysl
   const payFilteredTxs = dr.filterByDate(txs, "date");
   const chatterPayouts = (payouts || []).filter(p => p.user_id && getPayoutBeneficiaryType(p) === "chatter");
   const modelPayouts = (payouts || []).filter(p => p.model_id && isModelePayout(p));
-  const ledgerCredits = (ledgerEntries || []).filter(le => le.entry_type === "credit" || le.entry_type === "receiver_credit");
+  const isLedgerCredit = (le) => le.entry_type === "credit" || le.entry_type === "receiver_credit";
+  const isLedgerDebit = (le) => le.entry_type === "debit" || le.entry_type === "payer_debit";
+  const ledgerCredits = (ledgerEntries || []).filter(isLedgerCredit);
 
   const now = new Date();
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -8642,13 +8644,17 @@ const PayesTab = ({user, lang, txs, payouts, paymentEvents, ledgerEntries, paysl
     setSaving(true);
     try {
       const bt = beneficiary.type || "chatter";
-      const row = { from_user_id: user.id, to_user_id: beneficiary.id, amount: data.balance, currency: "CHF", kind: "salary", title: "Paiement Compta", note: "Marqué payé depuis Compta", status: "paid", created_by: user.id };
+      const amt = Math.round(data.balance * 100) / 100;
+      if (amt <= 0) { addToast(fr?"Montant invalide":"Invalid amount","error"); setSaving(false); return; }
+      const row = { from_user_id: user.id, to_user_id: beneficiary.id, amount: amt, currency: "CHF", kind: "salary", title: "Paiement Compta", note: "Marqué payé depuis Compta", status: "paid", created_by: user.id };
       const { error } = await sb.from("payment_events").insert(row).select().single();
       if (error) {
         const msg = error.message || "";
-        if (/permission|denied|policy/i.test(msg)) addToast(fr?"Droits insuffisants.":"Insufficient permissions.","error");
-        else if (/check constraint|ledger/i.test(msg)) addToast(fr?"Erreur contrainte ledger.":"Ledger constraint error.","error");
-        else addToast(fr?"Erreur marquer payé: ":"Mark paid error: " + msg, "error");
+        if (/permission|denied|policy/i.test(msg)) addToast(fr?"Droits insuffisants. Vérifiez le rôle gerant.":"Insufficient permissions. Check gerant role.","error");
+        else if (/check constraint.*amount/i.test(msg)) addToast(fr?"Erreur: montant doit être > 0":"Error: amount must be > 0","error");
+        else if (/check constraint|ledger/i.test(msg)) addToast(fr?"Erreur contrainte DB. Exécutez la migration 20260311_fix_payments_ledger_definitive.sql":"DB constraint error. Run migration 20260311_fix_payments_ledger_definitive.sql","error");
+        else if (/null.*note|not-null/i.test(msg)) addToast(fr?"Erreur: champ note requis. Exécutez la migration.":"Error: note field required. Run migration.","error");
+        else addToast((fr?"Erreur marquer payé: ":"Mark paid error: ") + msg, "error");
         if (user.role==="gerant") console.warn("[DADASH Compta] handleMarkPaid failed:", msg, row);
         setSaving(false); return;
       }
@@ -16719,11 +16725,11 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
   const myLedgerEntries = (allLedgerEntries||[]).filter(le=>le.owner_user_id===user.id);
   const myNotifications = (allNotifications||[]).filter(n=>n.user_id===user.id);
 
+  const isDebit = (et) => et === "debit" || et === "payer_debit";
   const balance = useMemo(() => {
     return myLedgerEntries.reduce((s,le)=>{
       const amt = convertAmount(Number(le.amount||0),le.currency||"CHF");
-      const sign = (le.entry_type==="debit"||le.entry_type==="payer_debit") ? -1 : 1;
-      return s + sign * amt;
+      return s + (isDebit(le.entry_type) ? -1 : 1) * amt;
     },0);
   }, [myLedgerEntries, convertAmount]);
 
@@ -16761,7 +16767,7 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
   const bonus = currentPayslip ? Number(currentPayslip.bonus||0) : 0;
   const totalEstime = base + bonus + commissionsThisMonth;
   const totalPayePayouts = myPayouts.filter(p=>p.status==="paid"||p.status==="done"||p.status==="validated").reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"EUR"),0);
-  const totalPayeLedger = myLedgerEntries.filter(le=>le.entry_type==="credit"||le.entry_type==="receiver_credit").reduce((s,le)=>s+convertAmount(Number(le.amount||0),le.currency||"CHF"),0);
+  const totalPayeLedger = myLedgerEntries.filter(le=>!isDebit(le.entry_type)).reduce((s,le)=>s+convertAmount(Number(le.amount||0),le.currency||"CHF"),0);
   const totalPayePayslips = payslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
   const totalPaye = totalPayePayouts + totalPayeLedger + totalPayePayslips;
 
