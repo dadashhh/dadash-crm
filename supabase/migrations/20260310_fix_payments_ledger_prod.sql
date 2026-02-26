@@ -85,6 +85,8 @@ BEGIN
   UPDATE ledger_entries SET note = '' WHERE note IS NULL;
   ALTER TABLE ledger_entries ALTER COLUMN note SET DEFAULT '';
   ALTER TABLE ledger_entries ALTER COLUMN note SET NOT NULL;
+  -- created_by requis si colonne existe (payment_system.sql)
+  ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES profiles(id);
 EXCEPTION WHEN undefined_table THEN NULL;
 END $$;
 
@@ -177,18 +179,20 @@ BEGIN
 
   -- 1. Debit (from_user)
   INSERT INTO ledger_entries (
-    owner_user_id, counterparty_user_id, entry_type, amount, currency, title, note, payment_event_id
+    owner_user_id, counterparty_user_id, entry_type, amount, currency, title, note, payment_event_id, created_by
   ) VALUES (
     NEW.from_user_id, NEW.to_user_id, 'debit', NEW.amount, NEW.currency,
-    COALESCE(NEW.title, 'Paiement sortant'), COALESCE(NEW.note, ''), NEW.id
+    COALESCE(NEW.title, 'Paiement sortant'), COALESCE(NEW.note, ''), NEW.id,
+    COALESCE(NEW.created_by, NEW.from_user_id)
   );
 
   -- 2. Credit (to_user)
   INSERT INTO ledger_entries (
-    owner_user_id, counterparty_user_id, entry_type, amount, currency, title, note, payment_event_id
+    owner_user_id, counterparty_user_id, entry_type, amount, currency, title, note, payment_event_id, created_by
   ) VALUES (
     NEW.to_user_id, NEW.from_user_id, 'credit', NEW.amount, NEW.currency,
-    COALESCE(NEW.title, 'Paiement reçu'), COALESCE(NEW.note, ''), NEW.id
+    COALESCE(NEW.title, 'Paiement reçu'), COALESCE(NEW.note, ''), NEW.id,
+    COALESCE(NEW.created_by, NEW.from_user_id)
   );
 
   -- 3. Notification (si to_user_id dans profiles)
