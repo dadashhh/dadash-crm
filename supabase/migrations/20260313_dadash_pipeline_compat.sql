@@ -7,6 +7,34 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- PHASE 0 — normalize_tg_user_id (au cas où 1er script pas exécuté ou partiel)
+-- ═══════════════════════════════════════════════════════════════════════════════
+CREATE OR REPLACE FUNCTION public.normalize_tg_user_id(input_val TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+  v_clean TEXT;
+BEGIN
+  IF input_val IS NULL OR trim(input_val) = '' THEN
+    RETURN NULL;
+  END IF;
+  v_clean := regexp_replace(trim(input_val), '[^0-9]', '', 'g');
+  IF v_clean = '' THEN
+    RETURN NULL;
+  END IF;
+  RETURN v_clean;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.normalize_tg_user_id(input_val BIGINT)
+RETURNS TEXT
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT CASE WHEN input_val IS NULL THEN NULL ELSE input_val::text END;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- PHASE 1 — fn_upsert_spender_from_tg (TEXT tg_user_id)
 -- ═══════════════════════════════════════════════════════════════════════════════
 CREATE OR REPLACE FUNCTION public.fn_upsert_spender_from_tg(
