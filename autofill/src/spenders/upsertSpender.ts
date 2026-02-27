@@ -50,7 +50,7 @@ export async function upsertSpender(p: UpsertSpenderParams): Promise<UpsertResul
 
   const { data: existing, error: selErr } = await db
     .from('spenders')
-    .select('id, handle, display_name, name, meta')
+    .select('id, handle, display_name, name, meta, first_name')
     .eq('tg_user_id', tgUserId)
     .maybeSingle();
 
@@ -80,6 +80,7 @@ export async function upsertSpender(p: UpsertSpenderParams): Promise<UpsertResul
     if (handle && !existing.handle) updates.handle = handle;
     if (display_name && !existing.display_name) updates.display_name = display_name;
     if (name && (!existing.name || existing.name.startsWith('tg_'))) updates.name = name;
+    if (firstName && !(existing as { first_name?: string }).first_name) updates.first_name = firstName;
 
     await db.from('spenders').update(updates).eq('id', existing.id);
 
@@ -98,6 +99,7 @@ export async function upsertSpender(p: UpsertSpenderParams): Promise<UpsertResul
       handle,
       display_name: display_name || null,
       name,
+      first_name: firstName || null,
       tg_user_id: tgUserId,
       telegram_username: username?.replace(/^@/, '') || null,
       meta: { profile: { telegram: telegramMeta } },

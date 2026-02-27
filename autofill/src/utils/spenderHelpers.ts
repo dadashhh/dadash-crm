@@ -107,3 +107,22 @@ export function structureExtractedProfile(profile: Record<string, unknown>): Rec
   if (profile.interests && Array.isArray(profile.interests)) out.interests = profile.interests;
   return out;
 }
+
+/** Flatten structured profile for fn_apply_spender_enrichment RPC */
+export function flattenForEnrichmentRpc(structured: Record<string, unknown>): Record<string, unknown> {
+  const flat: Record<string, unknown> = {};
+  const identity = structured.identity as Record<string, unknown> | undefined;
+  const location = structured.location as Record<string, unknown> | undefined;
+  const status = structured.status as Record<string, unknown> | undefined;
+  if (identity?.age !== undefined && identity?.age !== null) flat.age = identity.age;
+  if (identity?.first_name) flat.first_name = identity.first_name;
+  if (location?.city) flat.city = location.city;
+  if (location?.country) flat.country = location.country;
+  if (structured.job) flat.job = structured.job;
+  if (structured.language) flat.language = structured.language;
+  if (structured.notes_chatter) flat.notes = structured.notes_chatter;
+  if (status?.relation) flat.relationship_status = status.relation;
+  if (structured.budget_range) flat.budget_range = structured.budget_range;
+  if (structured.whatsapp_phone) flat.whatsapp_phone = structured.whatsapp_phone;
+  return flat;
+}

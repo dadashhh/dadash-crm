@@ -1,8 +1,7 @@
-import { createHash } from 'node:crypto';
 import { db } from '../supabaseClient.js';
 import { log, type LogMeta } from '../logger.js';
 import { extractProfile } from '../profile/extractProfile.js';
-import { deepMergeNoEmpty, diffAddedFields, writeSpenderEvent, structureExtractedProfile } from '../utils/spenderHelpers.js';
+import { structureExtractedProfile, flattenForEnrichmentRpc } from '../utils/spenderHelpers.js';
 
 const POLL_MS = parseInt(process.env.ENRICH_POLL_MS ?? '5000', 10);
 const BATCH_LIMIT = parseInt(process.env.ENRICH_BATCH_LIMIT ?? '1', 10);
@@ -62,11 +61,6 @@ async function completeJob(jobId: string, status: 'done' | 'failed', errMsg?: st
   }
 }
 
-function profileHash(fields: string[], lastMessageId: number | null): string {
-  const input = [...fields.sort(), String(lastMessageId ?? 0)].join(':');
-  return createHash('sha256').update(input).digest('hex').slice(0, 12);
-}
-
 async function processJob(job: QueueRow): Promise<void> {
   const ctx: LogMeta = {
     conv_id: job.conversation_id,
@@ -110,10 +104,10 @@ async function processJob(job: QueueRow): Promise<void> {
     return;
   }
 
-  // C) Load current spender meta
+  // C) Load spender
   const { data: spender, error: spErr } = await db
     .from('spenders')
-    .select('id, meta')
+    .select('id')
     .eq('tg_user_id', job.tg_user_id)
     .maybeSingle();
 
@@ -124,63 +118,33 @@ async function processJob(job: QueueRow): Promise<void> {
     return;
   }
 
-  // D) Deep merge snapshot: spenders.meta.profile (structure identity/location/status)
-  const currentMeta = (spender.meta ?? {}) as Record<string, unknown>;
-  const currentProfile = (currentMeta.profile ?? {}) as Record<string, unknown>;
-  const mergedProfile = deepMergeNoEmpty(currentProfile, structuredProfile);
+  // D) Flatten for RPC (age, city, country, job, language, notes, etc.)
+  const enrichmentJson = flattenForEnrichmentRpc(structuredProfile as Record<string, unknown>);
+  if (Object.keys(enrichmentJson).length === 0) {
+    log.info('ENRICH', 'no_new_fields', ctx);
+    await completeJob(job.id, 'done');
+    metrics.enriched_ok++;
+    return;
+  }
 
-  const newMeta = deepMergeNoEmpty(currentMeta, { profile: mergedProfile });
+  // E) Apply via RPC (merge meta + update columns + insert event)
+  const { data: applyResult, error: applyErr } = await db.rpc('fn_apply_spender_enrichment', {
+    p_spender_id: spender.id,
+    p_tg_user_id: job.tg_user_id,
+    p_enrichment: enrichmentJson,
+  });
 
-  // Detect actually new/changed fields (nested keys flattened for summary)
-  const changedFields = diffAddedFields(currentProfile, mergedProfile);
-
-  // E) Write spender update
-  const topLevelUpdates: Record<string, unknown> = { meta: newMeta };
-  if (profile.age !== undefined && profile.age !== currentProfile.age) topLevelUpdates.age = profile.age;
-  if (profile.city && profile.city !== currentProfile.city) topLevelUpdates.city = profile.city;
-  if (profile.country && profile.country !== currentProfile.country) topLevelUpdates.country = profile.country;
-  if (profile.job && profile.job !== currentProfile.job) topLevelUpdates.job = profile.job;
-
-  const { error: updErr } = await db
-    .from('spenders')
-    .update(topLevelUpdates)
-    .eq('id', spender.id);
-
-  if (updErr) {
-    log.error('ENRICH', 'spender_update_failed', { ...ctx, error: updErr.message });
-    await completeJob(job.id, 'failed', `spender_update: ${updErr.message}`);
+  if (applyErr) {
+    log.error('ENRICH', 'apply_failed', { ...ctx, error: applyErr.message });
+    await completeJob(job.id, 'failed', `apply: ${applyErr.message}`);
     metrics.enriched_fail++;
     return;
   }
 
-  log.info('UPSERT', 'profile_updated', {
-    ...ctx,
-    fields: changedFields.join(',') || updatedFields.join(','),
-  });
+  const added = (applyResult as { added?: string[] })?.added ?? [];
+  log.info('UPSERT', 'profile_updated', { ...ctx, fields: added.join(',') });
 
-  // F) Write spender_event if there are actually changed fields
-  if (changedFields.length > 0) {
-    const idemKey = `spender:${job.tg_user_id}:profile:${profileHash(changedFields, job.last_message_id)}`;
-
-    try {
-      await writeSpenderEvent(db, {
-        tgUserId: job.tg_user_id,
-        eventType: 'profile_updated',
-        idempotencyKey: idemKey,
-        summary: `Profil enrichi: ${changedFields.join(', ')}`,
-        payload: {
-          fields: changedFields,
-          extracted: structuredProfile,
-          last_message_id: job.last_message_id,
-        },
-      });
-      log.info('EVENT', 'profile_updated', { ...ctx, idempotency_key: idemKey });
-    } catch (evErr) {
-      log.warn('EVENT', 'insert_failed', { ...ctx, error: evErr instanceof Error ? evErr.message : String(evErr) });
-    }
-  }
-
-  // G) Complete
+  // F) Complete
   await completeJob(job.id, 'done');
 
   log.info('QUEUE', 'done', {
