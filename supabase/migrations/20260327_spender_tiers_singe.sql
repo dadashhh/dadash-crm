@@ -2,7 +2,7 @@
 -- MIGRATION: Spender Tiers "Singe" — hiérarchie automatique basée sur les TX validées
 -- Date: 2026-03-27
 -- Remplace: whale/vip/regular → timewaster/ouistiti/orang_outan/gorille
--- Safe to re-run: IF NOT EXISTS, CREATE OR REPLACE, DO blocks
+-- Safe to re-run: DROP IF EXISTS CASCADE, CREATE OR REPLACE
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -18,13 +18,16 @@ CREATE INDEX IF NOT EXISTS idx_transactions_spender_status
   ON public.transactions (spender_id, status);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 2. VIEW v_spender_score — agrège total_spent + tx_count_valid depuis transactions
---    Seules les TX status IN ('valid','validated','confirmee') comptent
---    DROP CASCADE nécessaire car v_spenders_ui dépend de v_spender_score
+-- 2. DROP toutes les vues dépendantes (CASCADE) pour pouvoir les recréer
 -- ─────────────────────────────────────────────────────────────────────────────
-DROP VIEW IF EXISTS public.v_spenders_ui;
-DROP VIEW IF EXISTS public.v_spender_score;
+DROP VIEW IF EXISTS public.v_activity_feed CASCADE;
+DROP VIEW IF EXISTS public.v_spenders_ui CASCADE;
+DROP VIEW IF EXISTS public.v_spender_score CASCADE;
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3. VIEW v_spender_score — agrège total_spent + tx_count_valid depuis transactions
+--    Seules les TX status IN ('valid','validated','confirmee') comptent
+-- ─────────────────────────────────────────────────────────────────────────────
 CREATE VIEW public.v_spender_score AS
 SELECT
   s.id AS spender_id,
@@ -61,10 +64,8 @@ LEFT JOIN (
 ) agg ON agg.spender_id = s.id;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 3. UPDATE v_spenders_ui — ajouter colonnes tier depuis v_spender_score
+-- 4. VIEW v_spenders_ui — profil normalisé + colonnes tier
 -- ─────────────────────────────────────────────────────────────────────────────
-DROP VIEW IF EXISTS public.v_spenders_ui;
-
 CREATE VIEW public.v_spenders_ui AS
 SELECT
   s.id,
@@ -178,38 +179,10 @@ WHERE (
   OR s.is_active = true
 );
 
-GRANT SELECT ON public.v_spender_score TO authenticated;
-GRANT SELECT ON public.v_spender_score TO service_role;
-GRANT SELECT ON public.v_spenders_ui TO authenticated;
-GRANT SELECT ON public.v_spenders_ui TO service_role;
-
 -- ─────────────────────────────────────────────────────────────────────────────
--- 4. Remplacer le CHECK constraint pour accepter 'spender_tier_changed'
---    On drop l'ancien puis on recrée en mode NOT VALID (plain SQL, pas DO block)
---    pour ne pas scanner les lignes existantes qui pourraient avoir d'autres types.
+-- 5. VIEW v_activity_feed — recréée avec support spender_tier_changed
 -- ─────────────────────────────────────────────────────────────────────────────
-ALTER TABLE public.spender_events
-  DROP CONSTRAINT IF EXISTS chk_spender_events_event_type;
-
-ALTER TABLE public.spender_events
-  ADD CONSTRAINT chk_spender_events_event_type
-  CHECK (event_type IN (
-    'new_spender',
-    'profile_updated',
-    'new_message',
-    'status_changed',
-    'classification_changed',
-    'spender_created',
-    'tx_created',
-    'handle_set',
-    'spender_tier_changed',
-    'unknown'
-  )) NOT VALID;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- 5. UPDATE v_activity_feed pour supporter spender_tier_changed
--- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW public.v_activity_feed AS
+CREATE VIEW public.v_activity_feed AS
 SELECT
   e.id,
   e.event_type,
@@ -244,8 +217,38 @@ LEFT JOIN public.spenders s
 ORDER BY e.created_at DESC;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 6. RPC fn_refresh_spender_tier — recalcule le tier et insère un event si changé
---    Appeler après ajout/validation de TX
+-- 6. GRANTS sur toutes les vues
+-- ─────────────────────────────────────────────────────────────────────────────
+GRANT SELECT ON public.v_spender_score TO authenticated;
+GRANT SELECT ON public.v_spender_score TO service_role;
+GRANT SELECT ON public.v_spenders_ui TO authenticated;
+GRANT SELECT ON public.v_spenders_ui TO service_role;
+GRANT SELECT ON public.v_activity_feed TO authenticated;
+GRANT SELECT ON public.v_activity_feed TO service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 7. CHECK constraint pour accepter 'spender_tier_changed'
+-- ─────────────────────────────────────────────────────────────────────────────
+ALTER TABLE public.spender_events
+  DROP CONSTRAINT IF EXISTS chk_spender_events_event_type;
+
+ALTER TABLE public.spender_events
+  ADD CONSTRAINT chk_spender_events_event_type
+  CHECK (event_type IN (
+    'new_spender',
+    'profile_updated',
+    'new_message',
+    'status_changed',
+    'classification_changed',
+    'spender_created',
+    'tx_created',
+    'handle_set',
+    'spender_tier_changed',
+    'unknown'
+  )) NOT VALID;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. RPC fn_refresh_spender_tier — recalcule le tier et insère un event si changé
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.fn_refresh_spender_tier(p_spender_id UUID)
 RETURNS JSONB
