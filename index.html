@@ -791,6 +791,9 @@
       letter-spacing: 0.5px;
       text-transform: uppercase;
     }
+    .spender-badge-updated-animated {
+      animation: glowPulse 1.2s ease-in-out infinite;
+    }
     .spender-relative-time {
       font-size: 9px;
       color: var(--text-quaternary);
@@ -7485,14 +7488,54 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     }
   }, [dbSpenders, showActivityDrawer, activityTab, loadActivity]);
 
-  // Realtime: quand spender enrichi, badge UPDATED si fiche ouverte
+  // Realtime: profile_updated → refetch spender, refresh carte, badge UPDATED animé
   const selectedRef = React.useRef(selected);
   selectedRef.current = selected;
+  const onRefreshRef = React.useRef(onRefresh);
+  onRefreshRef.current = onRefresh;
   useEffect(() => {
     window.__onSpenderUpdated = (spenderId) => {
       if (selectedRef.current?.dbId === spenderId) setSpenderJustUpdated(true);
     };
-    return () => { delete window.__onSpenderUpdated; };
+    window.__onProfileUpdated = async ({ spender_id, tg_user_id }) => {
+      const sel = selectedRef.current;
+      const matches = sel && (spender_id && sel.dbId === spender_id) || (tg_user_id && String(sel?.tg_user_id ?? sel?.telegramId ?? "") === String(tg_user_id));
+      if (!matches) { if (onRefreshRef.current) onRefreshRef.current(); return; }
+      try {
+        let row = null;
+        if (spender_id) {
+          const { data } = await sb.from("v_spenders").select("*").eq("id", spender_id).maybeSingle();
+          row = data;
+        } else if (tg_user_id) {
+          const res = await sb.from("v_spenders").select("*").eq("tg_user_id", tg_user_id).limit(1);
+          row = (res.data && res.data[0]) || null;
+        }
+        if (row && selectedRef.current) {
+          const merged = {
+            ...selectedRef.current,
+            dbId: row.id,
+            name: row.handle || row.name || selectedRef.current.name,
+            handle: row.handle || selectedRef.current.handle,
+            first_name: row.first_name ?? selectedRef.current.first_name,
+            langue: row.langue ?? row.language ?? selectedRef.current.langue,
+            timezone: row.timezone ?? selectedRef.current.timezone,
+            country: row.country ?? selectedRef.current.country,
+            budget_range: row.budget_range ?? selectedRef.current.budget_range,
+            relationship_status: row.relationship_status ?? selectedRef.current.relationship_status,
+            dbNotes: row.notes ?? selectedRef.current.dbNotes,
+            meta: row.meta ?? selectedRef.current.meta,
+            age: row.age ?? selectedRef.current.age,
+            city: row.city ?? selectedRef.current.city,
+            job: row.job ?? selectedRef.current.job,
+          };
+          setSelected(spenderVM(merged));
+          setSpenderJustUpdated(true);
+          setTimeout(() => setSpenderJustUpdated(false), 5000);
+        }
+      } catch (e) { console.warn("[REALTIME] profile_updated refetch:", e?.message || e); }
+      if (onRefreshRef.current) onRefreshRef.current();
+    };
+    return () => { delete window.__onSpenderUpdated; delete window.__onProfileUpdated; };
   }, []);
 
   const activityCounts = useMemo(() => ({
@@ -8186,7 +8229,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                   <div style={{display:"flex",alignItems:"center",gap:8}}>
                     <span style={{fontSize:18,fontWeight:800}}>{getSpenderDisplayName(selected)}</span>
                     {selected?.langue && LANG_FLAGS[selected.langue] && <span style={{fontSize:16}}>{LANG_FLAGS[selected.langue]}</span>}
-                    {spenderJustUpdated && <span style={{fontSize:9,padding:"2px 8px",borderRadius:8,background:"var(--success-muted)",color:"var(--success)",fontWeight:700,animation:"pulse 1.5s infinite"}}>UPDATED</span>}
+                    {spenderJustUpdated && <span className="spender-badge-updated-animated" style={{fontSize:9,padding:"2px 8px",borderRadius:8,background:"var(--success-muted)",color:"var(--success)",fontWeight:700}}>UPDATED</span>}
                   </div>
                   <div style={{display:"flex",gap:4,marginTop:3,flexWrap:"wrap"}}>
                     {computeSpenderBadges(selected).map(b=>(
@@ -27555,6 +27598,11 @@ const App = () => {
         if (id && window.__rtSeen.has(id)) return;
         if (id) window.__rtSeen.add(id);
         if (window.__rtSeen.size > 500) window.__rtSeen.clear();
+        const ev = payload.new;
+        const isProfileUpdated = ev && ["profile_updated","enriched","spender_enriched"].includes(ev.event_type);
+        if (isProfileUpdated && window.__onProfileUpdated) {
+          window.__onProfileUpdated({ spender_id: ev.spender_id, tg_user_id: ev.tg_user_id });
+        }
         if (window.__softRefresh) setTimeout(window.__softRefresh, 300);
       })
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "tg_messages" }, (payload) => {
@@ -27568,6 +27616,7 @@ const App = () => {
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "spenders" }, (payload) => {
         if (user.role !== "gerant" && user.role !== "chatter") return;
         const id = payload.new?.id;
+        if (id && window.__onProfileUpdated) window.__onProfileUpdated({ spender_id: id });
         if (id && window.__onSpenderUpdated) window.__onSpenderUpdated(id);
         if (window.__softRefresh) setTimeout(window.__softRefresh, 300);
       })
