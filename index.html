@@ -2268,7 +2268,7 @@ const sb = window.sb;
 // Colonnes: id, created_at, title, subtitle, tg_user_id, spender_id, payload
 // =============================================
 
-// DADASH compat layer — v_activity_feed (colonnes: id, type, tg_user_id, spender_id, title, subtitle, detail, payload, created_at)
+// DADASH canon — v_activity_feed (colonnes: id, event_type, tg_user_id_text, title, subtitle, detail, created_at)
 const ACTIVITY_VIEW_MAP = {
   new_spender: "v_activity_new_spenders",
   enrichment: "v_activity_enrichments",
@@ -2279,25 +2279,27 @@ const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
   const view = ACTIVITY_VIEW_MAP[tab];
   if (!view) return [];
   try {
-    const { data, error } = await sb.from(view)
-      .select("id,created_at,title,subtitle,detail,tg_user_id,spender_id,payload,type")
+    let q = sb.from(view)
+      .select("id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type")
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
+    const { data, error } = await q;
     if (error) throw error;
+    const tgId = (row) => row.tg_user_id_text ?? row.tg_user_id;
     return (data || []).map(row => ({
       id: row.id,
       created_at: row.created_at,
       ts: row.created_at,
-      title: row.title || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
+      title: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
       subtitle: row.subtitle || "",
       detail: row.detail || "",
-      label: row.title || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
-      message: row.detail || row.title || (row.payload && row.payload.text) || "",
-      tg_user_id: row.tg_user_id,
+      label: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
+      message: row.detail || (row.payload && row.payload.text) || "",
+      tg_user_id: tgId(row),
       spender_id: row.spender_id,
       payload: row.payload || {},
       data: row.payload || {},
-      eventType: row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "new_message"),
+      eventType: row.event_type || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message"),
     }));
   } catch (e) {
     console.warn("[ACTIVITY] apiFetchActivityTab", tab, e?.message || e);
@@ -2305,29 +2307,30 @@ const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
   }
 };
 
-// DADASH compat — v_activity_feed uniquement (pas fn_get_activity_feed_unified)
+// DADASH canon — v_activity_feed (All / New / Enrichment / Messages)
 const apiFetchActivity = async ({ tab, limit = 150 }) => {
   try {
     const view = tab && tab !== "all" ? ACTIVITY_VIEW_MAP[tab] : "v_activity_feed";
     const { data, error } = await sb.from(view)
-      .select("id,created_at,title,subtitle,detail,tg_user_id,spender_id,payload,type")
+      .select("id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type")
       .order("created_at", { ascending: false }).limit(limit);
     if (error) throw error;
     console.log("[ACTIVITY] " + view + " n=" + (data?.length || 0));
+    const tgId = (row) => row.tg_user_id_text ?? row.tg_user_id;
     return (data || []).map(row => ({
       id: row.id,
       created_at: row.created_at,
       ts: row.created_at,
-      title: row.title || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
+      title: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
       subtitle: row.subtitle || "",
       detail: row.detail || "",
-      label: row.title || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
-      message: row.detail || row.title || (row.payload && row.payload.text) || "",
-      tg_user_id: row.tg_user_id,
+      label: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
+      message: row.detail || (row.payload && row.payload.text) || "",
+      tg_user_id: tgId(row),
       spender_id: row.spender_id,
       payload: row.payload || {},
       data: row.payload || {},
-      eventType: row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "new_message"),
+      eventType: row.event_type || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message"),
     }));
   } catch (e) {
     console.warn("[ACTIVITY] fallback v_spender_events:", e?.message || e);
@@ -2349,10 +2352,30 @@ const apiFetchActivity = async ({ tab, limit = 150 }) => {
   }
 };
 
+const mapCanonToSpender = (row) => {
+  if (!row) return null;
+  return {
+    ...row,
+    id: row.spender_id ?? row.id,
+    first_name: row.profile_first_name ?? row.first_name,
+    age: row.profile_age ?? row.age,
+    job: row.profile_job ?? row.job,
+    langue: row.profile_language ?? row.langue ?? row.language,
+    relationship_status: row.profile_relationship_status ?? row.relationship_status,
+    notes: row.notes_chatter ?? row.notes,
+    tg_user_id: row.tg_user_id_text ?? row.tg_user_id,
+    handle: row.username ?? row.handle,
+    name: row.display_name ?? row.name ?? row.username,
+  };
+};
 const apiFetchSpenders = async () => {
+  try {
+    const { data, error } = await sb.from("v_spenders_canon").select("*").order("updated_at", { ascending: false }).limit(500);
+    if (!error && data) { console.log("[SPENDERS] v_spenders_canon n=" + data.length); return data.map(mapCanonToSpender); }
+  } catch (e) { console.warn("[SPENDERS] v_spenders_canon fallback:", e?.message || e); }
   const { data, error } = await sb.from("v_spenders").select("*");
   if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
-  console.log("[SPENDERS] loaded n=" + (data?.length || 0));
+  console.log("[SPENDERS] v_spenders n=" + (data?.length || 0));
   return data || [];
 };
 
@@ -2445,7 +2468,7 @@ const getSpenderMetaProfile = (sp) => {
   const p = sp.meta?.profile || {};
   return {
     first_name: prof.first_name || sp.first_name,
-    age: p?.identity?.age ?? p?.age ?? sp.age,
+    age: (p?.identity?.age ?? p?.age) ?? sp.age,
     city: p?.location?.city || p?.city || sp.city,
     country: prof.country || sp.country,
     timezone: prof.timezone || sp.timezone,
@@ -7505,16 +7528,19 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     };
     window.__onProfileUpdated = async ({ spender_id, tg_user_id }) => {
       const sel = selectedRef.current;
-      const matches = sel && (spender_id && sel.dbId === spender_id) || (tg_user_id && String(sel?.tg_user_id ?? sel?.telegramId ?? "") === String(tg_user_id));
+      const matches = (sel && (spender_id && sel.dbId === spender_id)) || (tg_user_id && String((sel?.tg_user_id ?? sel?.telegramId) ?? "") === String(tg_user_id));
       if (!matches) { if (onRefreshRef.current) onRefreshRef.current(); return; }
       try {
         let row = null;
         if (spender_id) {
-          const { data } = await sb.from("v_spenders").select("*").eq("id", spender_id).maybeSingle();
-          row = data;
+          const { data: canonRow } = await sb.from("v_spenders_canon").select("*").eq("spender_id", spender_id).maybeSingle();
+          row = canonRow ? mapCanonToSpender(canonRow) : null;
+          if (!row) { const { data } = await sb.from("v_spenders").select("*").eq("id", spender_id).maybeSingle(); row = data; }
         } else if (tg_user_id) {
-          const res = await sb.from("v_spenders").select("*").eq("tg_user_id", tg_user_id).limit(1);
-          row = (res.data && res.data[0]) || null;
+          const tgNorm = String(tg_user_id).replace(/\D/g, "");
+          const { data: canonRows } = await sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).limit(1);
+          row = (canonRows && canonRows[0]) ? mapCanonToSpender(canonRows[0]) : null;
+          if (!row) { const res = await sb.from("v_spenders").select("*").eq("tg_user_id", tgNorm).limit(1); row = (res.data && res.data[0]) || null; }
         }
         if (row && selectedRef.current) {
           const merged = {
@@ -7687,13 +7713,19 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     const sp = spenders.find(s => s.dbId === id || s.id === id)
       || safeArr(dbSpenders).find(d => d.id === id);
     if (sp) { openSpenderModal(sp); return; }
-    // 2) fetch from DB directly
+    // 2) fetch from DB (v_spenders_canon puis v_spenders fallback)
     console.info("[SB_FROM] spenders (openById)", id);
-    sb.from("v_spenders").select("*").eq("id", id).maybeSingle()
-      .then(({ data, error }) => {
-        if (error) { console.error("[SB_ERR] spenders (openById):", error.message||error); addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
-        if (!data) { addToast(fr?"Spender introuvable":"Spender not found","warning"); return; }
-        openSpenderModal(data);
+    sb.from("v_spenders_canon").select("*").eq("spender_id", id).maybeSingle()
+      .then(({ data: canonData, error: canonErr }) => {
+        if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return null; }
+        return sb.from("v_spenders").select("*").eq("id", id).maybeSingle();
+      })
+      .then((r) => {
+        if (!r) return;
+        const { data, error } = r;
+        if (error) { addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
+        if (data) openSpenderModal(data);
+        else addToast(fr?"Spender introuvable":"Spender not found","warning");
       }).catch(e => { console.error("[SB_ERR] spenders (openById catch):", e.message||e); addToast(fr?"Erreur chargement spender":"Spender load error","error"); });
   }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
 
@@ -7703,13 +7735,20 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     const sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === String(tgId))
       || safeArr(dbSpenders).find(d => d.tg_user_id && String(d.tg_user_id) === String(tgId));
     if (sp) { openSpenderModal(sp); return; }
-    // 2) fetch from DB directly
+    // 2) fetch from DB (v_spenders_canon par tg_user_id_text puis v_spenders fallback)
     console.info("[SB_FROM] spenders (openByTgUserId)", tgId);
-    sb.from("v_spenders").select("*").eq("tg_user_id", String(tgId)).maybeSingle()
-      .then(({ data, error }) => {
-        if (error) { console.error("[SB_ERR] spenders (openByTgUserId):", error.message||error); addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
-        if (!data) { addToast(`${fr?"Spender introuvable":"Spender not found"} (tg_user_id=${tgId})`,"warning"); return; }
-        openSpenderModal(data);
+    const tgNorm = String(tgId).replace(/\D/g, "");
+    sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).maybeSingle()
+      .then(({ data: canonData, error: canonErr }) => {
+        if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return null; }
+        return sb.from("v_spenders").select("*").eq("tg_user_id", tgNorm).limit(1).maybeSingle();
+      })
+      .then((r) => {
+        if (!r) return;
+        const { data, error } = r;
+        if (error) { addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
+        if (data) openSpenderModal(data);
+        else addToast(`${fr?"Spender introuvable":"Spender not found"} (tg_user_id=${tgId})`,"warning");
       }).catch(e => { console.error("[SB_ERR] spenders (openByTgUserId catch):", e.message||e); });
   }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
   const handleSaveProfile = async () => {
@@ -8071,10 +8110,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             setSyncingTg(true);
             try {
               const {total,created,updated} = await apiSyncTG();
-              addToast(`🔄 Sync TG OK: ${total} convs — ${created} créé(s) — ${updated} mis à jour`,"success");
+              addToast(fr ? "Sync TG OK" : "Sync TG OK","success");
               await onRefresh();
-              loadActivity(activityTab, 30, 0, false);
-            } catch(e){ addToast("Sync TG erreur: "+(e?.message||e),"error"); }
+              ["all","new_spender","enrichment","messages"].forEach(t => loadActivity(t, 30, 0, false));
+            } catch(e){ addToast((fr ? "Sync TG erreur: " : "Sync TG error: ")+(e?.message||e),"error"); }
             finally{ setSyncingTg(false); }
           }} disabled={syncingTg} title="Synchroniser les conversations Telegram → fiches Spenders" style={{marginLeft:"auto",padding:"7px 13px",borderRadius:9,border:"1px solid rgba(139,92,246,0.4)",background:"rgba(139,92,246,0.1)",color:"var(--accent)",fontSize:13,fontWeight:600,cursor:syncingTg?"wait":"pointer",opacity:syncingTg?0.7:1,transition:"all 0.15s"}}>{syncingTg?"⏳ Sync…":"🔄 Sync TG"}</button>}
           <button onClick={()=>setShowNewSpender(true)} style={{marginLeft:user.role==="gerant"?8:"auto",padding:"7px 13px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>{"➕"} {fr?"Nouveau":"New"}</button>
@@ -8248,6 +8287,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                       <span key={b.label} style={{fontSize:8,padding:"1px 6px",borderRadius:6,background:b.bg,color:b.color,fontWeight:700}}>{b.icon} {b.label}</span>
                     ))}
                     <span className={`badge badge-${selected.segment}`}>{selected.segment}</span>
+                    {selected.meta?.enrich?.last && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(34,211,161,0.15)",color:"var(--success)",fontWeight:700}}>AUTO</span>}
                     {selected.telegramId && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-telegram-muted)",color:"var(--brand-telegram)",fontWeight:700}}>TG</span>}
                     {selected.whatsapp_phone && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-whatsapp-muted)",color:"var(--brand-whatsapp)",fontWeight:700}}>WA</span>}
                   </div>
@@ -8263,7 +8303,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                       if(error) { addToast(fr?"Erreur: "+error.message:"Error: "+error.message,"error"); return; }
                       addToast(data?.enrich_queued ? (fr?"Enrich mis en file d'attente":"Enrich queued") : (fr?"Rafraîchi":"Refreshed"),"success");
                       await onRefresh();
-                      sb.from("v_spenders").select("*").eq("id",selected.dbId).maybeSingle().then(({data:d})=>{if(d) openSpenderModal({...d,dbId:d.id});});
+                      sb.from("v_spenders_canon").select("*").eq("spender_id",selected.dbId).maybeSingle().then(async({data:cd})=>{if(cd){openSpenderModal(mapCanonToSpender(cd));return;}const{data:d}=await sb.from("v_spenders").select("*").eq("id",selected.dbId).maybeSingle();if(d)openSpenderModal({...d,dbId:d.id});});
                     } catch(e){ addToast("Erreur: "+(e?.message||e),"error"); }
                   }} style={{padding:"5px 10px",borderRadius:10,background:"rgba(0,136,204,0.12)",border:"1px solid rgba(0,136,204,0.3)",color:"#0088cc",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"🔄"} {fr?"Sync TG":"Sync TG"}</button>
                 )}
@@ -8547,10 +8587,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           {/* ── Tab bar: 3 onglets data-driven ── */}
           <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border)",flexShrink:0}}>
             {[
-              {key:"all",         label:fr?"Tout":"All",              icon:"⚡", count:activityCounts.total || activityCounts.all},
-              {key:"new_spender", label:fr?"Nouveaux":"New Spenders", icon:"🟢", count:activityCounts.newSpender},
-              {key:"enrichment",  label:fr?"Enrichis":"Enrichment",   icon:"✏️", count:activityCounts.enrichment},
-              {key:"messages",    label:fr?"Messages":"Messages",     icon:"💬", count:activityCounts.messages},
+              {key:"all",         label:fr?"Tout":"All",                    icon:"⚡", count:activityCounts.total || activityCounts.all},
+              {key:"new_spender", label:fr?"Nouveaux spenders":"New Spenders", icon:"🟢", count:activityCounts.newSpender},
+              {key:"enrichment",  label:fr?"Enrichissements":"Enrichment", icon:"✏️", count:activityCounts.enrichment},
+              {key:"messages",    label:fr?"Messages":"Messages",         icon:"💬", count:activityCounts.messages},
             ].map(t => (
               <button key={t.key} onClick={() => setActivityTab(t.key)} style={{
                 flex:1, padding:"10px 4px 8px", background:activityTab===t.key?"rgba(99,102,241,0.08)":"transparent",
@@ -15261,9 +15301,9 @@ const AdminSettingsTab = ({lang}) => {
             <div><label style={lbS}>Timezone (défaut UTC+1)</label><select style={inS} value={form.timezone||"Europe/Paris"} onChange={e=>setForm({...form,timezone:e.target.value})}>{TIMEZONES.map(tz=><option key={tz} value={tz}>{tz}</option>)}</select></div>
           </div>
           <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr 1fr",gap:14,marginBottom:20}}>
-            <div><label style={lbS}>Commission % défaut</label><input style={inS} type="number" min="0" max="100" step="0.5" value={form.default_comm_pct??10} onChange={e=>setForm({...form,default_comm_pct:Number(e.target.value)})} /></div>
-            <div><label style={lbS}>Seuil WHALE ({form.currency||"CHF"})</label><input style={inS} type="number" min="0" step="50" value={form.whale_threshold??500} onChange={e=>setForm({...form,whale_threshold:Number(e.target.value)})} /></div>
-            <div><label style={lbS}>{fr?"Seuil INACTIF (jours)":"Inactive (days)"}</label><input style={inS} type="number" min="1" step="1" value={form.inactive_days??30} onChange={e=>setForm({...form,inactive_days:Number(e.target.value)})} /></div>
+            <div><label style={lbS}>Commission % défaut</label><input style={inS} type="number" min="0" max="100" step="0.5" value={form.default_comm_pct ?? 10} onChange={e=>setForm({...form,default_comm_pct:Number(e.target.value)})} /></div>
+            <div><label style={lbS}>Seuil WHALE ({form.currency||"CHF"})</label><input style={inS} type="number" min="0" step="50" value={form.whale_threshold ?? 500} onChange={e=>setForm({...form,whale_threshold:Number(e.target.value)})} /></div>
+            <div><label style={lbS}>{fr?"Seuil INACTIF (jours)":"Inactive (days)"}</label><input style={inS} type="number" min="1" step="1" value={form.inactive_days ?? 30} onChange={e=>setForm({...form,inactive_days:Number(e.target.value)})} /></div>
           </div>
           <button onClick={handleSave} disabled={saving} style={{padding:"10px 24px",borderRadius:10,border:"none",background:saving?"var(--surface2)":"#7c3aed",color:saving?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}}>{saving?"...":(fr?"Sauvegarder":"Save")}</button>
         </div>
