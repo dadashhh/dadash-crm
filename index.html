@@ -2268,87 +2268,124 @@ const sb = window.sb;
 // Colonnes: id, created_at, title, subtitle, tg_user_id, spender_id, payload
 // =============================================
 
-// DADASH canon — v_activity_feed (colonnes: id, event_type, tg_user_id_text, title, subtitle, detail, created_at)
+// DADASH canon — v_activity_feed (colonnes v2: id, type, event_type, tg_user_id, tg_user_id_text, spender_id, title, subtitle, detail, created_at, payload)
 const ACTIVITY_VIEW_MAP = {
   new_spender: "v_activity_new_spenders",
   enrichment: "v_activity_enrichments",
   messages: "v_activity_messages",
   all: "v_activity_feed",
 };
+const ACTIVITY_SELECT_COLS = "id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type";
+const ACTIVITY_SELECT_SAFE = "id,created_at,title,subtitle,tg_user_id,spender_id,payload";
+
+const _enrichDetailFromPayload = (payload) => {
+  if (!payload || typeof payload !== "object") return "";
+  const fields = payload.added_fields || payload.fields;
+  if (Array.isArray(fields) && fields.length > 0) return fields.map(f => "+" + f).join(", ");
+  if (payload.patch && typeof payload.patch === "object") {
+    const keys = Object.keys(payload.patch);
+    if (keys.length > 0) return keys.map(k => "+" + k).join(", ");
+  }
+  if (payload.after && typeof payload.after === "object") {
+    const keys = Object.keys(payload.after).filter(k => {
+      const bv = payload.before ? payload.before[k] : undefined;
+      return payload.after[k] != null && payload.after[k] !== bv;
+    });
+    if (keys.length > 0) return keys.map(k => "+" + k).join(", ");
+  }
+  if (payload.summary) return String(payload.summary);
+  return "";
+};
+
+const _mapActivityRow = (row, tab) => {
+  const pl = row.payload || {};
+  const tgRaw = row.tg_user_id_text || row.tg_user_id;
+  const tgStr = tgRaw ? String(tgRaw) : "";
+  const evType = row.event_type || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message");
+  const isMsg = evType === "message" || evType === "new_message" || tab === "messages";
+  const isEnrich = ["profile_updated","enriched","spender_enriched","enrichment","classification_changed","handle_set","status_changed"].includes(evType) || tab === "enrichment";
+
+  const rawTitle = row.title || "";
+  const label = rawTitle || (tgStr ? "tg_" + tgStr : "?");
+
+  let detail = row.detail || "";
+  let msgText = "";
+  if (isMsg) {
+    msgText = (pl.text && String(pl.text).trim()) || detail || "";
+    const dir = pl.direction === "in" ? "📥" : pl.direction === "out" ? "📤" : "";
+    detail = (dir ? dir + " " : "") + (msgText || row.subtitle || "[sans texte]");
+  } else if (isEnrich && !detail) {
+    detail = _enrichDetailFromPayload(pl) || row.subtitle || "Profil mis à jour";
+  } else if (!detail) {
+    detail = row.subtitle || "";
+  }
+
+  return {
+    id: row.id,
+    created_at: row.created_at,
+    ts: row.created_at,
+    title: label,
+    subtitle: row.subtitle || "",
+    detail: detail,
+    label: label,
+    message: msgText || detail,
+    tg_user_id: tgStr,
+    spender_id: row.spender_id,
+    payload: pl,
+    data: pl,
+    eventType: evType,
+  };
+};
+
 const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
   const view = ACTIVITY_VIEW_MAP[tab];
   if (!view) return [];
   try {
-    let q = sb.from(view)
-      .select("id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type")
+    const { data, error } = await sb.from(view)
+      .select(ACTIVITY_SELECT_COLS)
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
-    const { data, error } = await q;
-    if (error) throw error;
-    const tgId = (row) => row.tg_user_id_text ?? row.tg_user_id;
-    return (data || []).map(row => ({
-      id: row.id,
-      created_at: row.created_at,
-      ts: row.created_at,
-      title: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
-      subtitle: row.subtitle || "",
-      detail: row.detail || "",
-      label: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
-      message: row.detail || (row.payload && row.payload.text) || "",
-      tg_user_id: tgId(row),
-      spender_id: row.spender_id,
-      payload: row.payload || {},
-      data: row.payload || {},
-      eventType: row.event_type || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message"),
-    }));
+    if (!error) return (data || []).map(row => _mapActivityRow(row, tab));
+    console.warn("[ACTIVITY] full select failed, trying safe:", error.message);
+    const { data: d2, error: e2 } = await sb.from(view)
+      .select(ACTIVITY_SELECT_SAFE)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (e2) throw e2;
+    return (d2 || []).map(row => _mapActivityRow(row, tab));
   } catch (e) {
     console.warn("[ACTIVITY] apiFetchActivityTab", tab, e?.message || e);
     return [];
   }
 };
 
-// DADASH canon — v_activity_feed (All / New / Enrichment / Messages)
 const apiFetchActivity = async ({ tab, limit = 150 }) => {
   try {
     const view = tab && tab !== "all" ? ACTIVITY_VIEW_MAP[tab] : "v_activity_feed";
     const { data, error } = await sb.from(view)
-      .select("id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type")
+      .select(ACTIVITY_SELECT_COLS)
       .order("created_at", { ascending: false }).limit(limit);
-    if (error) throw error;
-    console.log("[ACTIVITY] " + view + " n=" + (data?.length || 0));
-    const tgId = (row) => row.tg_user_id_text ?? row.tg_user_id;
-    return (data || []).map(row => ({
-      id: row.id,
-      created_at: row.created_at,
-      ts: row.created_at,
-      title: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
-      subtitle: row.subtitle || "",
-      detail: row.detail || "",
-      label: row.title || (tgId(row) ? "tg_" + tgId(row) : "?"),
-      message: row.detail || (row.payload && row.payload.text) || "",
-      tg_user_id: tgId(row),
-      spender_id: row.spender_id,
-      payload: row.payload || {},
-      data: row.payload || {},
-      eventType: row.event_type || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message"),
-    }));
+    if (!error) {
+      console.log("[ACTIVITY] " + view + " n=" + (data?.length || 0));
+      return (data || []).map(row => _mapActivityRow(row, tab));
+    }
+    const { data: d2, error: e2 } = await sb.from(view)
+      .select(ACTIVITY_SELECT_SAFE)
+      .order("created_at", { ascending: false }).limit(limit);
+    if (!e2) return (d2 || []).map(row => _mapActivityRow(row, tab));
+    throw e2;
   } catch (e) {
     console.warn("[ACTIVITY] fallback v_spender_events:", e?.message || e);
     const { data: evData, error } = await sb.from("v_spender_events")
       .select("id,type,spender_id,tg_user_id,payload,created_at,handle,conv_id")
       .order("created_at", { ascending: false }).limit(limit);
     if (error || !evData?.length) return [];
-    return (evData || []).map(ev => ({
-      id: ev.id,
-      tg_user_id: ev.tg_user_id,
-      spender_id: ev.spender_id,
-      conv_id: ev.conv_id,
-      label: ev.handle || (ev.tg_user_id ? "#" + ev.tg_user_id : "?"),
-      message: ev.payload?.summary || ev.type,
-      eventType: ev.type,
-      ts: ev.created_at,
-      data: ev.payload || {},
-    }));
+    return (evData || []).map(ev => _mapActivityRow({
+      id: ev.id, tg_user_id: ev.tg_user_id, spender_id: ev.spender_id,
+      title: ev.handle || (ev.tg_user_id ? "tg_" + ev.tg_user_id : "?"),
+      subtitle: ev.payload?.summary || ev.type, detail: "",
+      payload: ev.payload || {}, type: ev.type, created_at: ev.created_at,
+    }, tab));
   }
 };
 
@@ -8139,9 +8176,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             setSyncingTg(true);
             try {
               const {total,created,updated} = await apiSyncTG();
-              addToast(fr ? "Sync TG OK" : "Sync TG OK","success");
+              const syncMsg = fr
+                ? `Sync TG: ${total} conversations, ${created} spenders synced`
+                : `Sync TG: ${total} conversations, ${created} spenders synced`;
+              addToast(syncMsg, "success");
               await onRefresh();
-              ["all","new_spender","enrichment","messages"].forEach(t => loadActivity(t, 30, 0, false));
+              await Promise.all(["all","new_spender","enrichment","messages"].map(t => loadActivity(t, 30, 0, false)));
             } catch(e){ addToast((fr ? "Sync TG erreur: " : "Sync TG error: ")+(e?.message||e),"error"); }
             finally{ setSyncingTg(false); }
           }} disabled={syncingTg} title="Synchroniser les conversations Telegram → fiches Spenders" style={{marginLeft:"auto",padding:"7px 13px",borderRadius:9,border:"1px solid rgba(139,92,246,0.4)",background:"rgba(139,92,246,0.1)",color:"var(--accent)",fontSize:13,fontWeight:600,cursor:syncingTg?"wait":"pointer",opacity:syncingTg?0.7:1,transition:"all 0.15s"}}>{syncingTg?"⏳ Sync…":"🔄 Sync TG"}</button>}
@@ -8640,19 +8680,18 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               <div style={{padding:40,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucune activité":"No activity"}</div>
             )}
             {filteredActivityFeed.map((item, idx) => {
-              const evIcon = (item.eventType === "new_spender" || item.eventType === "spender_created") ? "🟢"
-                : ["profile_updated","enriched","spender_enriched","enrichment"].includes(item.eventType) ? "✏️"
-                : item.eventType === "classification_changed" ? "🏅"
-                : item.eventType === "status_changed" ? "🔄"
-                : ["new_message","message"].includes(item.eventType) ? "💬"
-                : item.eventType === "tx_created" ? "💰"
-                : item.eventType === "handle_set" ? "🏷️" : "📋";
+              const isMsg = item.eventType === "message" || item.eventType === "new_message";
+              const isEnrich = ["profile_updated","enriched","spender_enriched","enrichment","classification_changed","handle_set","status_changed"].includes(item.eventType);
+              const isNew = item.eventType === "new_spender" || item.eventType === "spender_created";
+              const evIcon = isNew ? "🟢" : isEnrich ? "✏️" : isMsg ? "💬" : item.eventType === "tx_created" ? "💰" : "📋";
+              const detailText = (item.detail || item.message || item.subtitle || "").slice(0, 140);
+              const detailColor = isEnrich ? "var(--success, #22d3a1)" : isMsg ? "var(--text-secondary)" : "var(--text-tertiary)";
               return (
                 <div key={item.id || idx} className="activity-drawer-item" onClick={() => handleActivityClick(item)}>
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label || item.title || (item.tg_user_id ? "tg_"+item.tg_user_id : "?")}</div>
-                    <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.detail || item.message || item.subtitle || "").slice(0, 120)}</div>
+                    <div style={{fontSize:11,color:detailColor,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{detailText}</div>
                   </div>
                   <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts || item.created_at)}</span>
                 </div>
