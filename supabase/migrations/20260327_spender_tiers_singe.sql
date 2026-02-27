@@ -181,35 +181,26 @@ GRANT SELECT ON public.v_spenders_ui TO service_role;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. Remplacer le CHECK constraint pour accepter 'spender_tier_changed'
---    On drop l'ancien et on recrée avec NOT VALID pour ne pas bloquer sur
---    les lignes existantes avec des event_types hors liste.
+--    On drop l'ancien puis on recrée en mode NOT VALID (plain SQL, pas DO block)
+--    pour ne pas scanner les lignes existantes qui pourraient avoir d'autres types.
 -- ─────────────────────────────────────────────────────────────────────────────
-DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1 FROM information_schema.check_constraints
-     WHERE constraint_schema = 'public'
-       AND constraint_name   = 'chk_spender_events_event_type'
-  ) THEN
-    ALTER TABLE public.spender_events
-      DROP CONSTRAINT chk_spender_events_event_type;
-  END IF;
+ALTER TABLE public.spender_events
+  DROP CONSTRAINT IF EXISTS chk_spender_events_event_type;
 
-  ALTER TABLE public.spender_events
-    ADD CONSTRAINT chk_spender_events_event_type
-    CHECK (event_type IN (
-      'new_spender',
-      'profile_updated',
-      'new_message',
-      'status_changed',
-      'classification_changed',
-      'spender_created',
-      'tx_created',
-      'handle_set',
-      'spender_tier_changed',
-      'unknown'
-    )) NOT VALID;
-END $$;
+ALTER TABLE public.spender_events
+  ADD CONSTRAINT chk_spender_events_event_type
+  CHECK (event_type IN (
+    'new_spender',
+    'profile_updated',
+    'new_message',
+    'status_changed',
+    'classification_changed',
+    'spender_created',
+    'tx_created',
+    'handle_set',
+    'spender_tier_changed',
+    'unknown'
+  )) NOT VALID;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 5. UPDATE v_activity_feed pour supporter spender_tier_changed
