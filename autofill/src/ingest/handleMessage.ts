@@ -17,7 +17,7 @@ export interface IncomingMessage {
 /**
  * Full pipeline for one incoming Telegram message:
  *   1) Upsert conversation → get conversation_id
- *   2) Insert message into tg_messages (idempotent)
+ *   2) Upsert message into tg_messages (idempotent via UNIQUE constraint)
  *   3) upsert_spender_and_event (unified: spender + event message)
  *   4) Enqueue enrichment (seulement si tg_user_id connu — évite crash NOT NULL)
  */
@@ -37,11 +37,18 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     return;
   }
 
-  // 2. Insert message (idempotent via partial unique index on conversation_id + tg_message_id)
+  // 2. Upsert message (idempotent via UNIQUE(conversation_id, tg_message_id))
   const tgMsgIdStr = String(msg.tgMessageId);
   const displayName = [msg.firstName, msg.lastName].filter(Boolean).join(' ') || undefined;
 
-  const { error: msgErr } = await db.from('tg_messages').insert({
+  if (!tgMsgIdStr || tgMsgIdStr === 'undefined' || tgMsgIdStr === 'null') {
+    log.error('INGEST', 'msg_skip_no_tg_message_id', { chat_id: chatId });
+    return;
+  }
+
+  log.info('INGEST', 'upsert_tg_message', { tg_message_id: tgMsgIdStr, conv_id: convId });
+
+  const row = {
     conversation_id: convId,
     direction: msg.direction,
     text: msg.text,
@@ -51,21 +58,36 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
       username: msg.username || null,
       display_name: displayName || null,
     },
-  });
+  };
+
+  const { error: msgErr } = await db
+    .from('tg_messages')
+    .upsert(row, { onConflict: 'conversation_id,tg_message_id' });
 
   if (msgErr) {
-    if (msgErr.code === '23505') {
+    // Never retry 400 errors (constraint/schema issues) — skip and continue
+    const code = msgErr.code ?? '';
+    const is400 = msgErr.message?.includes('400') || code === 'PGRST204';
+    if (is400) {
+      log.error('INGEST', 'msg_upsert_400_skip', {
+        tg_message_id: tgMsgIdStr,
+        error: msgErr.message,
+      });
+      // Fall through to spender upsert — don't block the pipeline
+    } else if (code === '23505') {
       log.info('INGEST', 'msg_dedup', { msg_id: msg.tgMessageId, conv_id: convId });
       return;
+    } else {
+      log.error('INGEST', 'msg_upsert_failed', {
+        tg_message_id: tgMsgIdStr,
+        error: msgErr.message,
+        code,
+      });
+      return;
     }
-    log.error('INGEST', 'msg_insert_failed', {
-      msg_id: msg.tgMessageId,
-      error: msgErr.message,
-    });
-    return;
+  } else {
+    log.info('INGEST', 'msg_upsert_ok', { tg_message_id: tgMsgIdStr, conv_id: convId });
   }
-
-  log.info('INGEST', 'msg_ok', { msg_id: msg.tgMessageId, conv_id: convId });
 
   // 3. upsert_spender_and_event (unified: spender + event message)
   try {
