@@ -2490,7 +2490,8 @@ const mapUiToSpender = (row) => {
     notes: row.notes_chatter,
   };
 };
-const apiFetchSpenders = async () => {
+// ═══ PR1 — CENTRALIZED API LAYER (chatter data isolation) ═══
+const _fetchSpendersGlobal = async () => {
   try {
     const { data, error } = await sb.from("v_spenders_ui").select("*").order("updated_at", { ascending: false }).limit(500);
     if (!error && data) { console.log("[SPENDERS] v_spenders_ui n=" + data.length); return data.map(mapUiToSpender); }
@@ -2504,6 +2505,67 @@ const apiFetchSpenders = async () => {
   console.log("[SPENDERS] v_spenders n=" + (data?.length || 0));
   return data || [];
 };
+
+const apiFetchTransactions = async ({ scope, filters } = {}) => {
+  const s = scope || { type: 'global' };
+  console.log("[API_TX] scope=" + s.type);
+  if (s.type === 'chatter') {
+    const modelIds = s._allowedModelIds || [];
+    let q = sb.from("transactions").select("*").order("date", { ascending: false });
+    if (modelIds.length > 0) {
+      q = q.or("chatter_id.eq." + s.chatter_user_id + ",model_id.in.(" + modelIds.join(",") + ")");
+    } else {
+      q = q.eq("chatter_id", s.chatter_user_id);
+    }
+    if (filters?.startISO) q = q.gte("created_at", filters.startISO);
+    if (filters?.endISO) q = q.lte("created_at", filters.endISO);
+    const { data, error, count } = await q;
+    if (error) { console.warn("[API_TX] chatter fetch error:", error.message); return { data: [], count: 0 }; }
+    const rows = assertChatterScope(data || [], s, 'tx');
+    console.log("[API_TX] chatter n=" + rows.length);
+    return { data: rows, count: rows.length };
+  }
+  const full = sb.from("transactions").select("*").order("date", { ascending: false });
+  const paged = sb.from("transactions").select("*", { count: "exact" }).order("date", { ascending: false }).range(0, 99);
+  const [fullR, pagedR] = await Promise.all([full, paged]);
+  return { data: pagedR.data || [], dataSummary: fullR.data || [], count: pagedR.count || 0 };
+};
+
+const apiFetchKpis = ({ scope, txs }) => {
+  const s = scope || { type: 'global' };
+  if (s.type === 'chatter') {
+    console.log("[API_KPI] chatter — computing from " + (txs || []).length + " scoped TX");
+  }
+  const valid = (txs || []).filter(tx => tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee");
+  const pending = (txs || []).filter(tx => tx.status === "pending");
+  const caBrut = valid.reduce((s, tx) => s + Number(tx.amount || 0), 0);
+  const caNet = valid.reduce((s, tx) => s + Number(tx.net_amount || tx.amount || 0), 0);
+  const txCount = valid.length;
+  const txPending = pending.length;
+  const panierMoyen = txCount > 0 ? caBrut / txCount : 0;
+  return { caBrut, caNet, txCount, txPending, panierMoyen };
+};
+
+const apiFetchSpenders = async ({ scope } = {}) => {
+  const s = scope || { type: 'global' };
+  const allSpenders = await _fetchSpendersGlobal();
+  if (s.type === 'chatter') {
+    const modelIds = s._allowedModelIds || [];
+    const chatterTxs = s._chatterTxs || [];
+    const handleSet = new Set(chatterTxs.map(tx => (tx.spender_handle || "").trim()).filter(Boolean));
+    const idSet = new Set(chatterTxs.map(tx => tx.spender_id).filter(Boolean));
+    const filtered = allSpenders.filter(sp => {
+      const h = (sp.handle || sp.name || "").trim();
+      return handleSet.has(h) || (sp.id && idSet.has(sp.id));
+    });
+    const scopeWithHandles = { ...s, _allowedHandles: handleSet, _allowedSpenderIds: idSet };
+    const safe = assertChatterScope(filtered, scopeWithHandles, 'spender');
+    console.log("[API_SPENDERS] chatter filtered n=" + safe.length + " (from " + allSpenders.length + " total)");
+    return safe;
+  }
+  return allSpenders;
+};
+// ═══ END PR1 API LAYER ═══
 
 // Sync TG — v_tg_conversations expose tg_username (compat layer), fn_upsert_spender_from_tg attend TEXT
 const apiSyncTG = async () => {
@@ -2861,6 +2923,40 @@ const getChatterContext = (user, models) => {
     hasAssignments: assignedModelIds.length > 0,
   };
 };
+// ═══ PR1 — CHATTER DATA ISOLATION: getScope + assertChatterScope ═══
+const getScope = (user) => {
+  if (!user) return { type: 'global' };
+  if (['gerant', 'ceo', 'admin'].includes(user.role)) return { type: 'global' };
+  if (user.role === 'chatter') return { type: 'chatter', chatter_user_id: user.id, email: user.email };
+  return { type: 'global' };
+};
+
+const assertChatterScope = (rows, scope, type = 'tx') => {
+  if (!scope || scope.type !== 'chatter') return rows;
+  if (!Array.isArray(rows)) return [];
+  const clean = [];
+  for (const row of rows) {
+    let ok = false;
+    if (type === 'tx') {
+      ok = row.chatter_id === scope.chatter_user_id;
+      if (!ok && scope._allowedModelIds) ok = scope._allowedModelIds.includes(row.model_id);
+    } else if (type === 'spender') {
+      if (scope._allowedSpenderIds) ok = scope._allowedSpenderIds.has(row.id || row.dbId);
+      if (!ok && scope._allowedModelIds && Array.isArray(row.model_ids)) {
+        ok = row.model_ids.some(mid => scope._allowedModelIds.includes(mid));
+      }
+      if (!ok && scope._allowedHandles) ok = scope._allowedHandles.has((row.handle || row.name || "").trim());
+    }
+    if (ok) {
+      clean.push(row);
+    } else {
+      console.error('[CHATTER_SCOPE_VIOLATION]', type, row.id, 'dropped — not in chatter scope');
+    }
+  }
+  return clean;
+};
+// ═══ END PR1 HELPERS ═══
+
 // EC3 — Commission chatter: user.comm_pct si dispo, sinon 10% par défaut
 const DEFAULT_CHATTER_COMM_PCT = 10;
 const getChatterCommissionPct = (user) => {
@@ -16169,11 +16265,10 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
   useEffect(() => {
     (async () => {
       try {
-        const { data, error } = await sb.from("todos").select("*").order("created_at", { ascending: false }).limit(50);
+        const { data, error } = await sb.from("todos").select("*").eq("created_by", user.id).order("created_at", { ascending: false }).limit(50);
         if (error) { console.warn("[SB_ERR] todos:", error.message||error); return; }
-        if (data && user) {
-          const mine = data.filter(t => t.created_by === user.id);
-          setTodos(mine);
+        if (data) {
+          setTodos(data);
         }
       } catch (e) { console.warn("[SB_ERR] todos (catch):", e.message||e); }
     })();
@@ -16656,7 +16751,14 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
 
   const popupsEl = React.createElement(React.Fragment, null, pendingListModal, alertsModal);
 
+  // PR1: "My data only" badge for chatter isolation
+  const scopeBadge = React.createElement("div", { style: { display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 14px", borderRadius: 20, background: "rgba(139,92,246,0.15)", border: "1px solid rgba(139,92,246,0.3)", color: "#c4b5fd", fontSize: 11, fontWeight: 700, marginBottom: 14, letterSpacing: 0.3 } },
+    React.createElement("span", null, "\uD83D\uDD12"),
+    fr ? "Mes données uniquement" : "My data only"
+  );
+
   return React.createElement("div", { style: { padding: _isMobile ? "0 12px" : 0 } },
+    scopeBadge,
     noAssignBanner,
     filterEl,
     kpiCardsEl,
@@ -16796,6 +16898,10 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
 
   return (
     <div style={{padding:"0 12px"}}>
+      {/* PR1: scope badge */}
+      <div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 14px",borderRadius:20,background:"rgba(139,92,246,0.15)",border:"1px solid rgba(139,92,246,0.3)",color:"#c4b5fd",fontSize:11,fontWeight:700,marginBottom:14,letterSpacing:0.3}}>
+        <span>{"\uD83D\uDD12"}</span>{fr ? "Mes données uniquement" : "My data only"}
+      </div>
       <div className="ui-section-header">
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
           <div>
@@ -17227,15 +17333,34 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
     );
   }
 
+  const [refreshingDb, setRefreshingDb] = useState(false);
+  const handleRefreshDb = async () => {
+    setRefreshingDb(true);
+    try {
+      await onRefresh();
+      addToast(fr ? "Données rafraîchies" : "Data refreshed", "success");
+    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); }
+    setRefreshingDb(false);
+  };
+
   return (
     <div style={{padding:"0 12px"}}>
+      <div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 14px",borderRadius:20,background:"rgba(139,92,246,0.15)",border:"1px solid rgba(139,92,246,0.3)",color:"#c4b5fd",fontSize:11,fontWeight:700,marginBottom:14,letterSpacing:0.3}}>
+        <span>{"\uD83D\uDD12"}</span>
+        {fr ? "Mes données uniquement" : "My data only"}
+      </div>
       <div className="ui-section-header">
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
           <div>
             <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F464}"} {t(lang,"spenders")}</h2>
             <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{mySpenders.length} {fr ? "spenders" : "spenders"} — {fr ? "modèles assignés uniquement" : "assigned models only"}</p>
           </div>
-          <button className="ui-btn-primary" onClick={()=>setShowCreate(true)}>{fr ? "+ Nouveau Spender" : "+ New Spender"}</button>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <button onClick={handleRefreshDb} disabled={refreshingDb} style={{padding:"8px 14px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,fontWeight:600,cursor:refreshingDb?"wait":"pointer",opacity:refreshingDb?0.6:1}} title={fr?"Rafraîchir les données depuis la DB":"Refresh data from DB"}>
+              {refreshingDb ? "\u23F3" : "\uD83D\uDD04"} {fr ? "Rafraîchir DB" : "Refresh DB"}
+            </button>
+            <button className="ui-btn-primary" onClick={()=>setShowCreate(true)}>{fr ? "+ Nouveau Spender" : "+ New Spender"}</button>
+          </div>
         </div>
       </div>
       {myModelIds.length === 0 && (
@@ -27443,19 +27568,37 @@ const App = () => {
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
     const thisVersion = ++_loadVersion.current;
+    const scope = getScope(currentUser);
+    const isChatter = scope.type === 'chatter';
+    const assignedModelIds = isChatter ? (Array.isArray(currentUser?.assigned_models) ? currentUser.assigned_models : []).filter(Boolean) : [];
+    if (isChatter) { scope._allowedModelIds = assignedModelIds; }
+    console.log("[DATA] loadData scope=" + scope.type + (isChatter ? " models=" + assignedModelIds.length : ""));
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
     try {
       /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
+
+      // PR1: chatter uses centralized API — no global transaction/spender fetch
+      const txPromise = isChatter
+        ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_chatter")
+        : safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions");
+      const txSumPromise = isChatter
+        ? safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_chatter")
+        : safe(sb.from("transactions").select("*").order("date",{ascending:false}), "tx_summary");
+      // Spenders: deferred for chatter (needs TX first)
+      const spPromise = isChatter
+        ? safe((async () => ({ data: [], error: null }))(), "spenders_chatter_deferred")
+        : safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders");
+
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
-        safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
-        safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders"),
+        txPromise,
+        spPromise,
         safe(sb.from("profiles").select("*"), "profiles"),
         safe(sb.from("models").select("*"), "models"),
-        safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
-        safe(sb.from("expenses").select("*"), "expenses"),
-        safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
+        isChatter ? safe(sb.from("payouts").select("*").eq("user_id", currentUser.id).order("date",{ascending:false}), "payouts") : safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
+        isChatter ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("*"), "expenses"),
+        isChatter ? Promise.resolve({data:[]}) : safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
         safe(sb.from("products").select("*").order("sort_order"), "products"),
         safe(sb.from("product_tags").select("*").order("sort_order"), "product_tags"),
         safe(sb.from("model_prices").select("*"), "model_prices"),
@@ -27474,8 +27617,7 @@ const App = () => {
         safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200), "broadcasts"),
         /* CHRISTINE FIX — payslips.period may not exist, fallback to created_at */
         safe(sb.from("payslips").select("*").order("created_at",{ascending:false}), "payslips"),
-        /* CHRISTINE FIX — product_tag_id may not exist, use select(*) as fallback */
-        safe(sb.from("transactions").select("*").order("date",{ascending:false}), "tx_summary"),
+        txSumPromise,
         safe(sb.from("expense_categories").select("code,label").eq("is_active",true).order("sort_order",{ascending:true}), "expense_categories"),
         /* PAYMENT SYSTEM — payment_events (gérant voit tout, autres voient from/to/created_by via RLS) */
         safe(sb.from("payment_events").select("*").order("created_at",{ascending:false}).limit(200), "payment_events"),
@@ -27484,26 +27626,36 @@ const App = () => {
       ]), _dataTimeout]);
     } catch(e) { console.error("[DATA] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
     if (thisVersion !== _loadVersion.current) return;
+
     let txData = txR.data||[];
-    let txSumData = txSumR.data||[];
+    // PR1: for chatter, txSumData = same as txData (already server-filtered, no global fetch)
+    let txSumData = isChatter ? txData : (txSumR.data||[]);
     console.log("[SPENDERS] loaded n=" + (spR.data||[]).length + " tx_loaded n=" + txData.length);
     let modelData = moR.data||[];
 
+    // PR1: chatter spender fetch (deferred — needs txData to build scope)
+    if (isChatter) {
+      try {
+        scope._chatterTxs = txSumData;
+        const chatterSpenders = await apiFetchSpenders({ scope });
+        spR = { data: chatterSpenders, error: null };
+        console.log("[SPENDERS] chatter hydrated n=" + chatterSpenders.length);
+      } catch (e) { console.warn("[SPENDERS] chatter fetch failed:", e?.message || e); spR = { data: [], error: e }; }
+    }
+
     // Filter data based on user role
     if(currentUser) {
-      if(currentUser.role==="chatter" && currentUser.assigned_models && currentUser.assigned_models.length>0) {
-        // Include TXs where model_id matches OR where chatter_id matches current user
-        // (handles case where safeInsertTx fell back to Level 3+ and model_id is null)
-        txData = txData.filter(tx=>currentUser.assigned_models.includes(tx.model_id) || tx.chatter_id===currentUser.id);
-        txSumData = txSumData.filter(tx=>currentUser.assigned_models.includes(tx.model_id) || tx.chatter_id===currentUser.id);
-        modelData = modelData.filter(m=>currentUser.assigned_models.includes(m.id));
+      if(isChatter) {
+        // PR1: txData is already server-filtered by apiFetchTransactions — defense-in-depth filter
+        txData = txData.filter(tx=>assignedModelIds.includes(tx.model_id) || tx.chatter_id===currentUser.id);
+        txSumData = txSumData.filter(tx=>assignedModelIds.includes(tx.model_id) || tx.chatter_id===currentUser.id);
+        modelData = modelData.filter(m=>assignedModelIds.includes(m.id));
       } else if(currentUser.role==="provider") {
         txData = txData.filter(tx=>tx.provider_id===currentUser.id);
         txSumData = txSumData.filter(tx=>tx.provider_id===currentUser.id);
         const modelIds = new Set(txSumData.map(tx=>tx.model_id));
         modelData = modelData.filter(m=>modelIds.has(m.id));
       } else if(currentUser.role==="modele") {
-        // Modeles see NO transaction data, spender data, or financial info
         txData = [];
         txSumData = [];
         modelData = [];
@@ -27517,24 +27669,18 @@ const App = () => {
     let expenseData = exR.data||[];
     let ppData = ppR.data||[];
     if(currentUser) {
-      if(currentUser.role==="chatter") {
-        // Chatters: only see spenders from their transactions (use txSumData for full coverage)
+      if(isChatter) {
+        // PR1: spenderData already scoped by apiFetchSpenders — defense-in-depth
         const chatterSpenderHandles = new Set(txSumData.map(tx=>tx.spender_handle).filter(Boolean));
-        spenderData = spenderData.filter(s=>chatterSpenderHandles.has(s.handle));
-        // Chatters: own profile + gerants + chatters (for display names) + providers (for TX dropdown)
+        spenderData = spenderData.filter(s=>chatterSpenderHandles.has(s.handle) || chatterSpenderHandles.has(s.name));
         profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter"||p.role==="provider");
-        // Chatters: only see own payouts
         payoutData = payoutData.filter(p=>p.user_id===currentUser.id);
-        // Chatters: no access to expenses or provider payouts
         expenseData = [];
         ppData = [];
       } else if(currentUser.role==="provider") {
-        // Providers: only relevant profiles
         profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
-        // Providers: no payouts/expenses visibility
         payoutData = [];
         expenseData = [];
-        // Providers: only own provider payouts
         ppData = ppData.filter(p=>p.provider_id===currentUser.id||p.declared_by===currentUser.id);
       } else if(currentUser.role==="modele") {
         spenderData = [];
