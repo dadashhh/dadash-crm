@@ -2565,6 +2565,52 @@ const apiFetchSpenders = async ({ scope } = {}) => {
   }
   return allSpenders;
 };
+// ═══ PR2 — SCOPED ACTIVITY + PAYOUT REQUESTS API ═══
+const apiFetchActivityScoped = async ({ scope, tab = "all", limit = 30, offset = 0 }) => {
+  const s = scope || { type: 'global' };
+  if (s.type === 'chatter') {
+    const allowedSpenderIds = s._allowedSpenderIds ? [...s._allowedSpenderIds].filter(Boolean) : [];
+    const allowedTgIds = s._allowedTgIds ? [...s._allowedTgIds].filter(Boolean) : [];
+    if (allowedSpenderIds.length === 0 && allowedTgIds.length === 0) {
+      console.warn("[ACTIVITY_SCOPED] chatter has 0 allowed spenders — returning empty");
+      return [];
+    }
+    const items = await apiFetchActivityTab(tab, limit, offset);
+    const filtered = items.filter(item => {
+      if (item.spender_id && allowedSpenderIds.includes(item.spender_id)) return true;
+      const tg = item.tg_user_id || item.tg_user_id_text;
+      if (tg && allowedTgIds.includes(String(tg))) return true;
+      return false;
+    });
+    console.log("[ACTIVITY_SCOPED] chatter filtered " + filtered.length + "/" + items.length);
+    return filtered;
+  }
+  return apiFetchActivityTab(tab, limit, offset);
+};
+
+const apiFetchPayoutRequests = async (scope) => {
+  const s = scope || { type: 'global' };
+  if (s.type === 'chatter') {
+    const { data, error } = await sb.from("payout_requests").select("*").eq("chatter_user_id", s.chatter_user_id).order("created_at", { ascending: false });
+    if (error) { console.warn("[PAYOUT_REQ] chatter fetch error:", error.message); return []; }
+    return data || [];
+  }
+  const { data, error } = await sb.from("payout_requests").select("*").order("created_at", { ascending: false });
+  if (error) { console.warn("[PAYOUT_REQ] global fetch error:", error.message); return []; }
+  return data || [];
+};
+
+const apiCreatePayoutRequest = async ({ chatter_user_id, amount, currency, period_start, period_end, notes }) => {
+  const { data, error } = await sb.from("payout_requests").insert({
+    chatter_user_id, amount, currency: currency || "CHF",
+    period_start: period_start || null, period_end: period_end || null,
+    notes: notes || null, status: "requested"
+  }).select();
+  if (error) throw new Error(error.message);
+  return data?.[0] || null;
+};
+// ═══ END PR2 API LAYER ═══
+
 // ═══ END PR1 API LAYER ═══
 
 // Sync TG — v_tg_conversations expose tg_username (compat layer), fn_upsert_spender_from_tg attend TEXT
@@ -17133,7 +17179,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
 };
 
 // =============================================
-// CHATTER ROLE — SPENDERS (EC5)
+// CHATTER ROLE — SPENDERS (EC5 + PR2 PARITY)
 // =============================================
 const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
   const addToast = useToast();
@@ -17151,10 +17197,18 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
   const [saving, setSaving] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [createForm, setCreateForm] = useState({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
+  const [sortBy, setSortBy] = useState("ltv");
+  const [filterBadge, setFilterBadge] = useState("");
+  const [filterLangue, setFilterLangue] = useState("");
+
+  // PR2: Activity state
+  const [activityItems, setActivityItems] = useState([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
 
   const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
 
-  const mySpenders = useMemo(() => {
+  const enrichedSpenders = useMemo(() => {
     const handleSet = new Set(myTxs.map(tx => (tx.spender_handle || "").trim()).filter(Boolean));
     const idSet = new Set(myTxs.map(tx => tx.spender_id).filter(Boolean));
     const matchesSp = (sp) => sp && (handleSet.has((sp.handle || sp.name || "").trim()) || (sp.id && idSet.has(sp.id)));
@@ -17173,12 +17227,38 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
       const txsNorm = spTxs.map(t => ({...t, date: t.date || t.created_at}));
       return {...sp, total_spent: total, ltv: total, validCA: total, pendingCA, aov, tx_count: spTxs.length, cnt: spTxs.length, validCount: validTxs.length, pendingCount: pendingTxs.length, last_tx_date: lastTx ? (lastTx.date || lastTx.created_at) : null, lastTxDate: lastTx ? (lastTx.date || lastTx.created_at) : null, txs: txsNorm, modelNamesInScope};
     });
+    return list;
+  }, [spenders, myTxs, myModelIds, models]);
+
+  const mySpenders = useMemo(() => {
+    let list = [...enrichedSpenders];
     if (debouncedSearch.trim()) {
       const q = debouncedSearch.toLowerCase();
       list = list.filter(sp => (sp.handle || "").toLowerCase().includes(q) || (sp.name || "").toLowerCase().includes(q) || (sp.first_name || "").toLowerCase().includes(q));
     }
-    return list.sort((a, b) => b.total_spent - a.total_spent);
-  }, [spenders, myTxs, myModelIds, models, debouncedSearch]);
+    if (filterBadge) list = list.filter(sp => computeSpenderBadges(sp).some(b => b.label === filterBadge));
+    if (filterLangue) list = list.filter(sp => (sp.langue || "").toUpperCase() === filterLangue);
+    if (sortBy === "frequency") list.sort((a, b) => b.cnt - a.cnt);
+    else if (sortBy === "recency") list.sort((a, b) => new Date(b.lastTxDate || 0) - new Date(a.lastTxDate || 0));
+    else if (sortBy === "vip") list.sort((a, b) => computeVIPScore(b) - computeVIPScore(a));
+    else list.sort((a, b) => b.ltv - a.ltv);
+    return list;
+  }, [enrichedSpenders, debouncedSearch, sortBy, filterBadge, filterLangue]);
+
+  const spPag = usePagination(mySpenders);
+
+  // PR2: load scoped activity
+  const loadScopedActivity = useCallback(async () => {
+    setActivityLoading(true);
+    try {
+      const spenderIds = enrichedSpenders.map(s => s.id).filter(Boolean);
+      const tgIds = enrichedSpenders.map(s => String(s.tg_user_id || "")).filter(Boolean);
+      const scope = { type: 'chatter', chatter_user_id: user.id, _allowedSpenderIds: spenderIds, _allowedTgIds: tgIds };
+      const items = await apiFetchActivityScoped({ scope, tab: "all", limit: 50 });
+      setActivityItems(items);
+    } catch (e) { console.warn("[ACTIVITY_CHATTER]", e?.message || e); }
+    setActivityLoading(false);
+  }, [enrichedSpenders, user.id]);
 
   const spenderTxs = useMemo(() => {
     if (!selectedSpender) return [];
@@ -17451,16 +17531,60 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
           return <ExpandableNotifyBar items={expandItems} variant={barVariant} title={barTitle} icon="\u{1F514}" lang={lang} onItemClick={undefined} />;
         })()}
 
+        {/* PR2: Sort + Filter controls */}
+        <div style={{display:"flex",flexWrap:"wrap",gap:8,alignItems:"center",marginBottom:14}}>
+          {[{v:"ltv",l:"LTV"},{v:"vip",l:"VIP"},{v:"frequency",l:fr?"Fréq.":"Freq."},{v:"recency",l:fr?"Récence":"Recency"}].map(o=>(
+            <button key={o.v} onClick={()=>setSortBy(o.v)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${sortBy===o.v?"#8b5cf6":"var(--border)"}`,background:sortBy===o.v?"rgba(139,92,246,0.15)":"var(--surface2)",color:sortBy===o.v?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer"}}>{o.l}</button>
+          ))}
+          <select value={filterBadge} onChange={e=>setFilterBadge(e.target.value)} style={{padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",minWidth:120}}>
+            <option value="">{fr?"Tous badges":"All badges"}</option>
+            <option value="GORILLE">{"\uD83E\uDD8D"} GORILLE</option>
+            <option value="ORANG-OUTAN">{"\uD83E\uDDA7"} ORANG-OUTAN</option>
+            <option value="OUISTITI">{"\uD83D\uDC12"} OUISTITI</option>
+            <option value="TIMEWASTER">{"\uD83D\uDCA9"} TIMEWASTER</option>
+            <option value="ACTIF">{"\uD83D\uDD25"} ACTIF</option>
+            <option value="INACTIF">{"\uD83D\uDCA4"} INACTIF</option>
+          </select>
+          <select value={filterLangue} onChange={e=>setFilterLangue(e.target.value)} style={{padding:"7px 13px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",minWidth:100}}>
+            <option value="">{fr?"Toutes langues":"All languages"}</option>
+            {(SPENDER_LANGUAGES||["FR","EN","DE","IT","ES","AR","PT"]).map(l=><option key={l} value={l}>{(LANG_FLAGS||{})[l]||""} {l}</option>)}
+          </select>
+          <button onClick={()=>{setShowActivity(!showActivity);if(!showActivity)loadScopedActivity();}} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${showActivity?"#8b5cf6":"var(--border)"}`,background:showActivity?"rgba(139,92,246,0.15)":"var(--surface2)",color:showActivity?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",marginLeft:"auto"}}>
+            {"\u26A1"} {fr?"Activité":"Activity"}
+          </button>
+        </div>
+
+        {/* PR2: Scoped Activity Panel */}
+        {showActivity && (
+          <div className="ui-panel" style={{marginBottom:16,maxHeight:300,overflowY:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <div style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{"\u26A1"} {fr?"Activité récente (mes spenders)":"Recent activity (my spenders)"}</div>
+              <button onClick={loadScopedActivity} disabled={activityLoading} style={{padding:"4px 10px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:11,cursor:"pointer"}}>{activityLoading?"\u23F3":"\uD83D\uDD04"}</button>
+            </div>
+            {activityItems.length === 0 && !activityLoading && <div style={{fontSize:12,color:"var(--text-tertiary)",textAlign:"center",padding:20}}>{fr?"Aucune activité récente":"No recent activity"}</div>}
+            {activityItems.map((item,i)=>{
+              const evIcon = (item.eventType==="new_spender"||item.eventType==="spender_created")?"🟢":["profile_updated","enriched","enrichment"].includes(item.eventType)?"✏️":(item.eventType==="message"||item.eventType==="new_message")?"💬":"📋";
+              return <div key={item.id||i} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                <span style={{fontSize:14,flexShrink:0}}>{evIcon}</span>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label||item.title||"?"}</div>
+                  <div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.detail||item.subtitle||"").slice(0,100)}</div>
+                </div>
+                <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts||item.created_at)}</span>
+              </div>;
+            })}
+          </div>
+        )}
+
         {mySpenders.length === 0 && <div className="ui-panel" style={{padding:48,textAlign:"center"}}><div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:4}}>{fr ? "Aucun spender trouvé" : "No spenders found"}</div><div style={{fontSize:13,color:"var(--muted2)"}}>{fr ? "Les spenders apparaissent après des TX sur tes modèles." : "Spenders appear after TX on your models."}</div></div>}
         <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(260px,1fr))",gap:16}}>
-          {mySpenders.map(sp => {
+          {spPag.paginatedData.map(sp => {
             const _vipScore = computeVIPScore(sp);
             const _vipColor = _vipScore >= 70 ? "var(--success)" : _vipScore >= 40 ? "var(--warning)" : "var(--danger)";
             const _lastTxRel = (() => { if (!sp.last_tx_date) return fr?"jamais":"never"; const d=Math.floor((Date.now()-new Date(sp.last_tx_date).getTime())/86400000); if(d===0) return fr?"aujourd'hui":"today"; if(d===1) return fr?"hier":"yesterday"; return `${fr?"il y a ":""}${d}${fr?"j":"d ago"}`; })();
             const _topBadge = computeSpenderBadges(sp)[0];
             return (
             <div key={sp?.id || sp?.handle} className="spender-card" onClick={()=>{ if(!sp?.id && !sp?.handle && !sp?.name) return; openDetail(sp); }} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,cursor:"pointer",transition:"all 0.2s"}} onMouseEnter={e=>{e.currentTarget.style.borderColor="var(--accent)"; e.currentTarget.style.boxShadow="0 4px 12px rgba(0,0,0,0.15)";}} onMouseLeave={e=>{e.currentTarget.style.borderColor="var(--border)"; e.currentTarget.style.boxShadow="";}}>
-              {/* ── HEADER ── */}
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
                 <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0,flex:1}}>
                   <div style={{position:"relative",flexShrink:0}}>
@@ -17474,65 +17598,27 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
                       <span style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{getSpenderDisplayName(sp)}</span>
                       {sp.langue && LANG_FLAGS[sp.langue] && <span title={sp.langue} style={{fontSize:13}}>{LANG_FLAGS[sp.langue]}</span>}
                     </div>
-                    <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>
-                      {sp.tx_count} TX {"·"} {sp.tier_label || sp.tier}
-                    </div>
-                    {sp.modelNamesInScope && sp.modelNamesInScope.length > 0 && (
-                      <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-                        {(sp.modelNamesInScope || []).slice(0,3).join(", ")}{(sp.modelNamesInScope || []).length > 3 ? "…" : ""}
-                      </div>
-                    )}
+                    <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>{sp.tx_count} TX {"·"} {sp.tier_label || sp.tier}</div>
+                    {sp.modelNamesInScope && sp.modelNamesInScope.length > 0 && <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(sp.modelNamesInScope||[]).slice(0,3).join(", ")}{(sp.modelNamesInScope||[]).length>3?"…":""}</div>}
                   </div>
                 </div>
-                <div style={{flexShrink:0}}>
-                  {_topBadge && <span style={{padding:"3px 10px",borderRadius:12,background:_topBadge.bg,color:_topBadge.color,fontSize:10,fontWeight:700}}>{_topBadge.icon} {_topBadge.label}</span>}
-                </div>
+                <div style={{flexShrink:0}}>{_topBadge && <span style={{padding:"3px 10px",borderRadius:12,background:_topBadge.bg,color:_topBadge.color,fontSize:10,fontWeight:700}}>{_topBadge.icon} {_topBadge.label}</span>}</div>
               </div>
-              {/* ── KPI GRID 2×3 ── */}
               <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"LTV Total":"Total LTV"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(sp.total_spent)}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>AOV</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{fmtAmount(sp.aov)}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Validé":"Validated"}</div>
-                  <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(sp.validCA)}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Pending</div>
-                  <div style={{fontSize:16,fontWeight:800,color:sp.pendingCA>0?"var(--warning)":"var(--text-primary)"}}>{fmtAmount(sp.pendingCA)}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Dernière TX":"Last TX"}</div>
-                  <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{_lastTxRel}</div>
-                </div>
-                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                  <div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Fréquence":"Frequency"}</div>
-                  <div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{sp.tx_count} TX</div>
-                </div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"LTV Total":"Total LTV"}</div><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(sp.total_spent)}</div></div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>AOV</div><div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)"}}>{fmtAmount(sp.aov)}</div></div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Validé":"Validated"}</div><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(sp.validCA)}</div></div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>Pending</div><div style={{fontSize:16,fontWeight:800,color:sp.pendingCA>0?"var(--warning)":"var(--text-primary)"}}>{fmtAmount(sp.pendingCA)}</div></div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Dernière TX":"Last TX"}</div><div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{_lastTxRel}</div></div>
+                <div style={{padding:"8px 10px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:9,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.3,marginBottom:4}}>{fr?"Fréquence":"Frequency"}</div><div style={{fontSize:13,fontWeight:700,color:"var(--text-secondary)"}}>{sp.tx_count} TX</div></div>
               </div>
-              {/* ── VIP SCORE BAR ── */}
-              <div style={{marginBottom:8}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-                  <span style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase"}}>VIP Score</span>
-                  <span style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)"}}>{_vipScore}/100</span>
-                </div>
-                <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
-                  <div style={{width:`${_vipScore}%`,height:"100%",borderRadius:3,background:_vipColor,transition:"width 0.3s"}}/>
-                </div>
-              </div>
-              {/* ── COUNTERS ── */}
-              <div style={{display:"flex",gap:14,marginTop:6}}>
-                <span style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{"✅"} {sp.validCount}</span>
-                <span style={{fontSize:11,color:"var(--warning)",fontWeight:600}}>{"⏳"} {sp.pendingCount}</span>
-              </div>
+              <div style={{marginBottom:8}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}><span style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase"}}>VIP Score</span><span style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)"}}>{_vipScore}/100</span></div><div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}><div style={{width:`${_vipScore}%`,height:"100%",borderRadius:3,background:_vipColor,transition:"width 0.3s"}}/></div></div>
+              <div style={{display:"flex",gap:14,marginTop:6}}><span style={{fontSize:11,color:"var(--success)",fontWeight:600}}>{"✅"} {sp.validCount}</span><span style={{fontSize:11,color:"var(--warning)",fontWeight:600}}>{"⏳"} {sp.pendingCount}</span></div>
             </div>
           );})}
         </div>
+        {/* PR2: Pagination */}
+        <PaginationControls pag={spPag} lang={lang}/>
       </>)}
     </div>
   );
@@ -19221,8 +19307,15 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
 const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayouts, txs, models}) => {
   const fr = lang === "fr";
   const { fmtAmount, convertAmount } = useCurrency();
+  const addToast = useToast();
   const ctx = getChatterContext(user, models);
   const myModelIds = ctx.assignedModelIds;
+
+  const [comptaTab, setComptaTab] = useState("resume");
+  const [payoutRequests, setPayoutRequests] = useState([]);
+  const [prLoading, setPrLoading] = useState(false);
+  const [reqForm, setReqForm] = useState({amount:"",currency:"CHF",period_start:"",period_end:"",notes:""});
+  const [submitting, setSubmitting] = useState(false);
 
   const payslips = (allPayslips||[]).filter(p=>p.user_id===user.id);
   const myPayouts = (allPayouts||[]).filter(p=>p.user_id===user.id);
@@ -19231,10 +19324,16 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
     return (txs||[]).filter(tx=>(tx.status==="validated"||tx.status==="confirmee")&&(myModelIds.includes(tx.model_id)||tx.chatter_id===user.id));
   }, [txs, myModelIds, user.id]);
 
+  const allMyTxs = useMemo(() => {
+    return (txs||[]).filter(tx=>myModelIds.includes(tx.model_id)||tx.chatter_id===user.id);
+  }, [txs, myModelIds, user.id]);
+
   const commPct = getChatterCommissionPct(user);
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthLabel = now.toLocaleDateString(fr?"fr-FR":"en-US",{month:"long",year:"numeric"});
+
   const commissionsThisMonth = useMemo(() => {
-    const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     return myTxs.filter(tx=>new Date(tx.date||tx.created_at||0)>=monthStart).reduce((s,tx)=>{
       const amt = Number(tx.amount||0);
       const cur = tx.currency||"EUR";
@@ -19244,9 +19343,8 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
     },0);
   }, [myTxs, commPct, convertAmount]);
 
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  const monthLabel = now.toLocaleDateString(fr?"fr-FR":"en-US",{month:"long",year:"numeric"});
+  const validatedRevenue = useMemo(() => myTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency||"EUR"),0), [myTxs, convertAmount]);
+  const pendingRevenue = useMemo(() => allMyTxs.filter(tx=>tx.status==="pending").reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency||"EUR"),0), [allMyTxs, convertAmount]);
 
   const currentPayslip = payslips.find(p=>{
     const pDate = p.period ? new Date(p.period) : null;
@@ -19259,14 +19357,41 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
   const totalPayePayouts = myPayouts.filter(p=>p.status==="paid"||p.status==="done"||p.status==="validated").reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"EUR"),0);
   const totalPayePayslips = payslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
   const totalPaye = totalPayePayouts + totalPayePayslips;
-
   const sortedPayouts = useMemo(()=>[...myPayouts].sort((a,b)=>new Date(b.date||b.created_at||0)-new Date(a.date||a.created_at||0)),[myPayouts]);
+
+  // PR2: load payout requests
+  useEffect(() => {
+    (async () => {
+      setPrLoading(true);
+      try {
+        const scope = getScope(user);
+        const data = await apiFetchPayoutRequests(scope);
+        setPayoutRequests(data);
+      } catch (e) { console.warn("[PAYOUT_REQ]", e?.message||e); }
+      setPrLoading(false);
+    })();
+  }, [user?.id]);
+
+  const handleSubmitRequest = async () => {
+    const amt = parseFloat(reqForm.amount);
+    if (!amt || amt <= 0) { addToast(fr?"Montant invalide":"Invalid amount","error"); return; }
+    setSubmitting(true);
+    try {
+      const pr = await apiCreatePayoutRequest({ chatter_user_id: user.id, amount: amt, currency: reqForm.currency||"CHF", period_start: reqForm.period_start||null, period_end: reqForm.period_end||null, notes: reqForm.notes||null });
+      setPayoutRequests(prev => [pr, ...prev]);
+      setReqForm({amount:"",currency:"CHF",period_start:"",period_end:"",notes:""});
+      addToast(fr?"Demande envoyée":"Request sent","success");
+    } catch (e) { addToast("Erreur: "+(e?.message||e),"error"); }
+    setSubmitting(false);
+  };
+
+  const tabBtn = (id,label) => <button onClick={()=>setComptaTab(id)} style={{padding:"8px 16px",borderRadius:9,border:`1px solid ${comptaTab===id?"#8b5cf6":"var(--border)"}`,background:comptaTab===id?"rgba(139,92,246,0.15)":"var(--surface)",color:comptaTab===id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer"}}>{label}</button>;
 
   return (
     <div style={{padding:"0 12px"}}>
       <div className="ui-section-header">
         <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4C4}"} {fr ? "Ma Compta" : "My Accounting"}</h2>
-        <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr ? "Fiche de paie & historique des paies" : "Payslip & payout history"}</p>
+        <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr ? "Résumé, factures & demandes de paiement" : "Summary, invoices & payment requests"}</p>
       </div>
 
       {!ctx.hasAssignments && (
@@ -19275,89 +19400,81 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
         </div>
       )}
 
-      <>
-          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr ? "Ma fiche de paie" : "My payslip"} — {monthLabel}</div>
-          <div className="ui-panel" style={{marginBottom:20}}>
-            <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(2,1fr) repeat(2,1fr)",gap:14}}>
-              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Base" : "Base"}</div>
-                <div style={{fontSize:18,fontWeight:800,color:"var(--text-primary)"}}>{base>0 ? fmtAmount(base) : "—"}</div>
-              </div>
-              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Commissions" : "Commissions"}</div>
-                <div style={{fontSize:18,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(commissionsThisMonth)}</div>
-              </div>
-              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Bonus" : "Bonus"}</div>
-                <div style={{fontSize:18,fontWeight:800,color:"var(--text-primary)"}}>{bonus>0 ? fmtAmount(bonus) : "—"}</div>
-              </div>
-              <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}>
-                <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr ? "Total estimé" : "Est. total"}</div>
-                <div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalEstime)}</div>
-              </div>
-            </div>
-            <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-              <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Total payé (toutes périodes)" : "Total paid (all time)"}</span>
-              <span style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalPaye)}</span>
-            </div>
-          </div>
+      <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
+        {tabBtn("resume",fr?"Résumé":"Summary")}
+        {tabBtn("factures",fr?"Factures":"Invoices")}
+        {tabBtn("demande",fr?"Demande paiement":"Payment Request")}
+      </div>
 
-          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr ? "Historique des paies" : "Payout history"}</div>
-          <div className="ui-panel">
-            <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
-              <table className="table" style={{fontSize:12,minWidth:_isMobile?400:undefined}}>
-                <thead><tr>
-                  <th>{fr ? "Date" : "Date"}</th>
-                  <th>{fr ? "Montant" : "Amount"}</th>
-                  <th>{fr ? "Statut" : "Status"}</th>
-                  <th>{fr ? "Méthode" : "Method"}</th>
-                  <th>{fr ? "Notes" : "Notes"}</th>
-                </tr></thead>
-                <tbody>
-                  {sortedPayouts.map(p=>(
-                    <tr key={p.id}>
-                      <td style={{whiteSpace:"nowrap"}}>{fmtDate(p.date||p.created_at)}</td>
-                      <td style={{fontWeight:700}}>{fmtAmount(Number(p.amount||0),p.currency)}</td>
-                      <td><span style={{padding:"2px 8px",borderRadius:10,background:(p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)")+"15",color:p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)",fontSize:10,fontWeight:700}}>{p.status||"—"}</span></td>
-                      <td>{p.method||"—"}</td>
-                      <td style={{maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.notes||"—"}</td>
-                    </tr>
-                  ))}
-                  {sortedPayouts.length===0 && (
-                    <tr><td colSpan={5} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr ? "Aucune paie reçue" : "No payouts received"}</td></tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
+      {comptaTab === "resume" && (<>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr ? "Ma fiche de paie" : "My payslip"} — {monthLabel}</div>
+        <div className="ui-panel" style={{marginBottom:20}}>
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(3,1fr) repeat(2,1fr)",gap:14}}>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"CA Validé":"Validated Rev."}</div><div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{fmtAmount(validatedRevenue)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"CA Pending":"Pending Rev."}</div><div style={{fontSize:18,fontWeight:800,color:"var(--warning)"}}>{fmtAmount(pendingRevenue)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Commissions":"Commissions"}</div><div style={{fontSize:18,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(commissionsThisMonth)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Base + Bonus":"Base + Bonus"}</div><div style={{fontSize:18,fontWeight:800,color:"var(--text-primary)"}}>{fmtAmount(base+bonus)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Total estimé":"Est. Total"}</div><div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalEstime)}</div></div>
           </div>
+          <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Total payé (toutes périodes)" : "Total paid (all time)"}</span>
+            <span style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalPaye)}</span>
+          </div>
+        </div>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr ? "Historique des paies" : "Payout history"}</div>
+        <div className="ui-panel">
+          <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+            <table className="table" style={{fontSize:12,minWidth:_isMobile?400:undefined}}>
+              <thead><tr><th>{fr?"Date":"Date"}</th><th>{fr?"Montant":"Amount"}</th><th>{fr?"Statut":"Status"}</th><th>{fr?"Méthode":"Method"}</th><th>Notes</th></tr></thead>
+              <tbody>
+                {sortedPayouts.map(p=>(<tr key={p.id}><td style={{whiteSpace:"nowrap"}}>{fmtDate(p.date||p.created_at)}</td><td style={{fontWeight:700}}>{fmtAmount(Number(p.amount||0),p.currency)}</td><td><span style={{padding:"2px 8px",borderRadius:10,background:(p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)")+"15",color:p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)",fontSize:10,fontWeight:700}}>{p.status||"—"}</span></td><td>{p.method||"—"}</td><td style={{maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.notes||"—"}</td></tr>))}
+                {sortedPayouts.length===0 && <tr><td colSpan={5} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr?"Aucune paie reçue":"No payouts received"}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        {payslips.length>0 && (<>
+          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12,marginTop:20}}>{"\u{1F4CB}"} {fr?"Fiches de paie":"Payslips"}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {payslips.map(p=>{const isPaid=p.status==="paid";const sc=isPaid?"var(--success)":"var(--warning)";return(<div key={p.id} className="ui-panel" style={{padding:16}}><div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}><div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"✅":"⏳"}</div><div style={{flex:1}}><div style={{fontSize:14,fontWeight:700}}>{p.period||"—"}</div><div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"·"} Bonus: {fmtAmount(p.bonus||0)}</div></div><div style={{textAlign:"right"}}><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div><span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{isPaid?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span></div></div></div>);})}
+          </div>
+        </>)}
+      </>)}
 
-          {payslips.length>0 && (
-            <>
-              <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12,marginTop:20}}>{"\u{1F4CB}"} {fr ? "Fiches de paie" : "Payslips"}</div>
-              <div style={{display:"flex",flexDirection:"column",gap:8}}>
-                {payslips.map(p=>{
-                  const isPaid = p.status==="paid";
-                  const sc = isPaid ? "var(--success)" : "var(--warning)";
-                  return (
-                    <div key={p.id} className="ui-panel" style={{padding:16}}>
-                      <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
-                        <div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"✅":"⏳"}</div>
-                        <div style={{flex:1}}>
-                          <div style={{fontSize:14,fontWeight:700}}>{p.period||"—"}</div>
-                          <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"·"} Bonus: {fmtAmount(p.bonus||0)}</div>
-                        </div>
-                        <div style={{textAlign:"right"}}>
-                          <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div>
-                          <span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{isPaid?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </>
-          )}
-        </>
+      {comptaTab === "factures" && (<>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr?"Mes factures":"My invoices"}</div>
+        <div className="ui-panel" style={{padding:32,textAlign:"center"}}>
+          <div style={{fontSize:40,marginBottom:8}}>{"\u{1F4C4}"}</div>
+          <div style={{fontSize:14,fontWeight:700,color:"var(--text)",marginBottom:6}}>{fr?"Aucune facture":"No invoices yet"}</div>
+          <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr?"Les factures apparaîtront ici quand ton gérant les créera.":"Invoices will appear here when your manager creates them."}</div>
+        </div>
+      </>)}
+
+      {comptaTab === "demande" && (<>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4B8}"} {fr?"Nouvelle demande de paiement":"New payment request"}</div>
+        <div className="ui-panel" style={{marginBottom:20}}>
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:14,marginBottom:14}}>
+            <div><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Montant":"Amount"} *</div><input type="number" className="filter-select" style={{width:"100%"}} value={reqForm.amount} onChange={e=>setReqForm(p=>({...p,amount:e.target.value}))} placeholder="0.00" min="0" step="0.01"/></div>
+            <div><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Devise":"Currency"}</div><select className="filter-select" style={{width:"100%"}} value={reqForm.currency} onChange={e=>setReqForm(p=>({...p,currency:e.target.value}))}><option value="CHF">CHF</option><option value="EUR">EUR</option></select></div>
+            <div><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Début période":"Period start"}</div><input type="date" className="filter-select" style={{width:"100%"}} value={reqForm.period_start} onChange={e=>setReqForm(p=>({...p,period_start:e.target.value}))}/></div>
+            <div><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Fin période":"Period end"}</div><input type="date" className="filter-select" style={{width:"100%"}} value={reqForm.period_end} onChange={e=>setReqForm(p=>({...p,period_end:e.target.value}))}/></div>
+            <div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>Notes</div><textarea className="filter-select" style={{width:"100%",minHeight:60}} value={reqForm.notes} onChange={e=>setReqForm(p=>({...p,notes:e.target.value}))} placeholder={fr?"Notes ou commentaires...":"Notes or comments..."}/></div>
+          </div>
+          <button className="ui-btn-primary" onClick={handleSubmitRequest} disabled={submitting} style={{width:"100%"}}>{submitting?"\u23F3":(fr?"\u{1F4E8} Envoyer la demande":"\u{1F4E8} Send request")}</button>
+        </div>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr?"Mes demandes":"My requests"}</div>
+        <div className="ui-panel">
+          <div className="table-wrap" style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr><th>Date</th><th>{fr?"Montant":"Amount"}</th><th>{fr?"Période":"Period"}</th><th>{fr?"Statut":"Status"}</th><th>Notes</th></tr></thead>
+              <tbody>
+                {payoutRequests.map(pr=>{const sc=pr.status==="paid"?"var(--success)":pr.status==="approved"?"var(--info)":pr.status==="rejected"?"var(--danger)":"var(--warning)";return(<tr key={pr.id}><td style={{whiteSpace:"nowrap"}}>{fmtDate(pr.created_at)}</td><td style={{fontWeight:700}}>{fmtAmount(Number(pr.amount||0))} {pr.currency}</td><td style={{fontSize:11}}>{pr.period_start&&pr.period_end?`${pr.period_start} → ${pr.period_end}`:"—"}</td><td><span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{pr.status}</span></td><td style={{maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{pr.notes||"—"}</td></tr>);})}
+                {payoutRequests.length===0 && <tr><td colSpan={5} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{prLoading?"\u23F3":(fr?"Aucune demande":"No requests yet")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </>)}
     </div>
   );
 };
@@ -25082,6 +25199,73 @@ const MyInvoicesPanel = ({ invoices, lang }) => {
 };
 
 // =============================================
+// =============================================
+// PR2: GERANT — PAYOUT REQUESTS PANEL (minimal listing)
+// =============================================
+const GerantPayoutRequestsPanel = ({user, lang, profiles}) => {
+  const fr = lang === "fr";
+  const { fmtAmount } = useCurrency();
+  const addToast = useToast();
+  const [requests, setRequests] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const data = await apiFetchPayoutRequests({ type: 'global' });
+        setRequests(data);
+      } catch (e) { console.warn("[PR_GERANT]", e?.message || e); }
+      setLoading(false);
+    })();
+  }, []);
+
+  const updateStatus = async (id, newStatus) => {
+    try {
+      const { error } = await sb.from("payout_requests").update({ status: newStatus }).eq("id", id);
+      if (error) { addToast("Erreur: " + error.message, "error"); return; }
+      setRequests(prev => prev.map(r => r.id === id ? { ...r, status: newStatus } : r));
+      addToast(fr ? "Statut mis à jour" : "Status updated", "success");
+    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); }
+  };
+
+  const getName = (uid) => { const p = (profiles || []).find(p => p.id === uid); return p ? (p.name || p.full_name || p.username || uid.slice(0, 8)) : uid?.slice(0, 8) || "?"; };
+
+  return (
+    <div className="ui-panel" style={{marginTop:20}}>
+      <div style={{fontSize:14,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4E8}"} {fr ? "Demandes de paiement (chatters)" : "Payout Requests (chatters)"}</div>
+      <div className="table-wrap" style={{overflowX:"auto"}}>
+        <table className="table" style={{fontSize:12}}>
+          <thead><tr><th>Date</th><th>Chatter</th><th>{fr?"Montant":"Amount"}</th><th>{fr?"Période":"Period"}</th><th>{fr?"Statut":"Status"}</th><th>Notes</th><th>Actions</th></tr></thead>
+          <tbody>
+            {requests.map(pr => {
+              const sc = pr.status === "paid" ? "var(--success)" : pr.status === "approved" ? "var(--info)" : pr.status === "rejected" ? "var(--danger)" : "var(--warning)";
+              return (
+                <tr key={pr.id}>
+                  <td style={{whiteSpace:"nowrap"}}>{fmtDate(pr.created_at)}</td>
+                  <td style={{fontWeight:600}}>{getName(pr.chatter_user_id)}</td>
+                  <td style={{fontWeight:700}}>{fmtAmount(Number(pr.amount || 0))} {pr.currency}</td>
+                  <td style={{fontSize:11}}>{pr.period_start && pr.period_end ? `${pr.period_start} → ${pr.period_end}` : "—"}</td>
+                  <td><span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{pr.status}</span></td>
+                  <td style={{maxWidth:100,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{pr.notes || "—"}</td>
+                  <td>
+                    {pr.status === "requested" && (<div style={{display:"flex",gap:4}}>
+                      <button onClick={() => updateStatus(pr.id, "approved")} style={{padding:"3px 8px",borderRadius:6,border:"1px solid var(--success)",background:"transparent",color:"var(--success)",fontSize:10,cursor:"pointer",fontWeight:600}}>{"\u2705"}</button>
+                      <button onClick={() => updateStatus(pr.id, "rejected")} style={{padding:"3px 8px",borderRadius:6,border:"1px solid var(--danger)",background:"transparent",color:"var(--danger)",fontSize:10,cursor:"pointer",fontWeight:600}}>{"\u274C"}</button>
+                    </div>)}
+                    {pr.status === "approved" && <button onClick={() => updateStatus(pr.id, "paid")} style={{padding:"3px 8px",borderRadius:6,border:"1px solid var(--success)",background:"var(--success)15",color:"var(--success)",fontSize:10,cursor:"pointer",fontWeight:600}}>{fr?"Marquer payé":"Mark paid"}</button>}
+                  </td>
+                </tr>
+              );
+            })}
+            {requests.length === 0 && <tr><td colSpan={7} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{loading ? "\u23F3" : (fr ? "Aucune demande" : "No requests")}</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
 // COMPTA PROVIDERS TAB (Gérant — Compta > Reversements)
 // =============================================
 const ComptaProvidersTab = ({ user, lang, txs, profiles, providerPayouts, providerPaymentMethods, onRefresh }) => {
@@ -28319,7 +28503,7 @@ const App = () => {
             </div>
           </div>
           {subTab==="pnl"&&<ComptaTab user={user} lang={lang} txs={txSummary} expenses={expenses} expenseCategories={expenseCategories} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} onEditExpense={openEditDepense} />}
-          {subTab==="paies"&&<PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} expenses={expenses} />}
+          {subTab==="paies"&&<><PayesTab user={user} lang={lang} txs={txSummary} payouts={payouts} payslips={payslips} profiles={profiles} models={models} onRefresh={onRefresh} invoices={invoices} expenses={expenses} /><GerantPayoutRequestsPanel user={user} lang={lang} profiles={profiles} /></>}
           {subTab==="reversements"&&<ComptaProvidersTab user={user} lang={lang} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
           {subTab==="resultats_dadash"&&<ResultatsDadashTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
