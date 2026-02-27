@@ -1,12 +1,11 @@
 import { db } from '../supabaseClient.js';
 import { log } from '../logger.js';
-import { upsertSpender } from '../spenders/upsertSpender.js';
+import { upsertSpenderAndEvent } from '../spenders/upsertSpenderAndEvent.js';
 import { enqueueEnrich } from '../queue/enqueueEnrich.js';
-import { writeSpenderEvent } from '../utils/spenderHelpers.js';
 
 export interface IncomingMessage {
   chatId: string | number;
-  tgUserId: number;
+  tgUserId: number | string | null;
   tgMessageId: number;
   text: string;
   username?: string;
@@ -19,8 +18,8 @@ export interface IncomingMessage {
  * Full pipeline for one incoming Telegram message:
  *   1) Upsert conversation → get conversation_id
  *   2) Insert message into tg_messages (idempotent)
- *   3) Upsert spender (minimal, immediate)
- *   4) Enqueue enrichment
+ *   3) upsert_spender_and_event (unified: spender + event message)
+ *   4) Enqueue enrichment (seulement si tg_user_id connu — évite crash NOT NULL)
  */
 export async function handleIncomingMessage(msg: IncomingMessage): Promise<void> {
   const chatId = String(msg.chatId);
@@ -40,7 +39,6 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
 
   // 2. Insert message (idempotent via partial unique index on conversation_id + tg_message_id)
   const tgMsgIdStr = String(msg.tgMessageId);
-
   const displayName = [msg.firstName, msg.lastName].filter(Boolean).join(' ') || undefined;
 
   const { error: msgErr } = await db.from('tg_messages').insert({
@@ -49,7 +47,7 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     text: msg.text,
     tg_message_id: tgMsgIdStr,
     meta: {
-      tg_user_id: msg.tgUserId,
+      tg_user_id: msg.tgUserId ?? chatId,
       username: msg.username || null,
       display_name: displayName || null,
     },
@@ -69,46 +67,42 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
 
   log.info('INGEST', 'msg_ok', { msg_id: msg.tgMessageId, conv_id: convId });
 
-  // 2b. Insert spender_event message (pour Activity feed DADASH)
+  // 3. upsert_spender_and_event (unified: spender + event message)
   try {
-    await writeSpenderEvent(db, {
-      tgUserId: msg.tgUserId,
-      eventType: 'message',
-      idempotencyKey: `msg:${msg.tgUserId}:${msg.tgMessageId}`,
-      summary: msg.text?.slice(0, 100) || 'Message reçu',
-      payload: { tg_message_id: msg.tgMessageId },
-    });
-  } catch {
-    // Ignore dedup/constraint errors
-  }
-
-  // 3. Upsert spender
-  try {
-    await upsertSpender({
-      tgUserId: msg.tgUserId,
+    await upsertSpenderAndEvent({
+      tg_user_id: msg.tgUserId,
       username: msg.username,
-      firstName: msg.firstName,
-      lastName: msg.lastName,
-      displayName,
+      display_name: displayName,
+      message: msg.text,
+      direction: msg.direction,
+      conversation_id: convId,
+      tg_message_id: msg.tgMessageId,
     });
   } catch (err) {
     log.error('SPENDER', 'upsert_failed', {
       tg_user_id: msg.tgUserId,
       error: err instanceof Error ? err.message : String(err),
+      chat_id: chatId,
+      msg_id: msg.tgMessageId,
     });
   }
 
-  // 4. Enqueue enrichment
-  try {
-    await enqueueEnrich({
-      conversationId: convId,
-      tgUserId: msg.tgUserId,
-      lastMessageId: msg.tgMessageId,
-    });
-  } catch (err) {
-    log.error('QUEUE', 'enqueue_failed', {
-      conv_id: convId,
-      error: err instanceof Error ? err.message : String(err),
-    });
+  // 4. Enqueue enrichment — seulement si tg_user_id connu (évite crash spender_enrich_queue NOT NULL)
+  const tgNorm = msg.tgUserId != null && String(msg.tgUserId).replace(/\D/g, '').length > 0;
+  if (tgNorm) {
+    try {
+      await enqueueEnrich({
+        conversationId: convId,
+        tgUserId: msg.tgUserId as number | string,
+        lastMessageId: msg.tgMessageId,
+      });
+    } catch (err) {
+      log.error('QUEUE', 'enqueue_failed', {
+        conv_id: convId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  } else {
+    log.info('QUEUE', 'skip_no_tg_user_id', { conv_id: convId, chat_id: chatId });
   }
 }
