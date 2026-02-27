@@ -7,7 +7,8 @@
 -- which causes HTTP 400 "there is no unique or exclusion constraint matching the ON CONFLICT"
 --
 -- Fix: Create a proper non-partial UNIQUE CONSTRAINT on (conversation_id, tg_message_id).
--- Also add a single-column UNIQUE INDEX on tg_message_id for simple on_conflict lookups.
+--
+-- Note: tg_message_id is BIGINT in production (may differ from CREATE TABLE text).
 --
 -- Date: 2026-03-27
 -- Idempotent: safe to re-run
@@ -15,10 +16,11 @@
 
 BEGIN;
 
--- Step 1: Backfill NULL tg_message_id with UUID to avoid constraint violations
--- (rows without tg_message_id get a unique placeholder so the non-partial constraint works)
+-- Step 1: Backfill NULL tg_message_id with negative row-unique value
+-- Uses -(extract epoch) trick to generate unique negative bigints that won't collide
+-- with real Telegram message IDs (always positive).
 UPDATE public.tg_messages
-   SET tg_message_id = 'legacy_' || id::text
+   SET tg_message_id = -1 * abs(('x' || left(md5(id::text), 15))::bit(60)::bigint)
  WHERE tg_message_id IS NULL;
 
 -- Step 2: Set NOT NULL on tg_message_id (safe after backfill)

@@ -38,21 +38,22 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
   }
 
   // 2. Upsert message (idempotent via UNIQUE(conversation_id, tg_message_id))
-  const tgMsgIdStr = String(msg.tgMessageId);
+  // tg_message_id is BIGINT in production — send as number
+  const tgMsgId = Number(msg.tgMessageId);
   const displayName = [msg.firstName, msg.lastName].filter(Boolean).join(' ') || undefined;
 
-  if (!tgMsgIdStr || tgMsgIdStr === 'undefined' || tgMsgIdStr === 'null') {
+  if (!tgMsgId || isNaN(tgMsgId)) {
     log.error('INGEST', 'msg_skip_no_tg_message_id', { chat_id: chatId });
     return;
   }
 
-  log.info('INGEST', 'upsert_tg_message', { tg_message_id: tgMsgIdStr, conv_id: convId });
+  log.info('INGEST', 'upsert_tg_message', { tg_message_id: tgMsgId, conv_id: convId });
 
   const row = {
     conversation_id: convId,
     direction: msg.direction,
     text: msg.text,
-    tg_message_id: tgMsgIdStr,
+    tg_message_id: tgMsgId,
     meta: {
       tg_user_id: msg.tgUserId ?? chatId,
       username: msg.username || null,
@@ -70,23 +71,23 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     const is400 = msgErr.message?.includes('400') || code === 'PGRST204';
     if (is400) {
       log.error('INGEST', 'msg_upsert_400_skip', {
-        tg_message_id: tgMsgIdStr,
+        tg_message_id: tgMsgId,
         error: msgErr.message,
       });
       // Fall through to spender upsert — don't block the pipeline
     } else if (code === '23505') {
-      log.info('INGEST', 'msg_dedup', { msg_id: msg.tgMessageId, conv_id: convId });
+      log.info('INGEST', 'msg_dedup', { msg_id: tgMsgId, conv_id: convId });
       return;
     } else {
       log.error('INGEST', 'msg_upsert_failed', {
-        tg_message_id: tgMsgIdStr,
+        tg_message_id: tgMsgId,
         error: msgErr.message,
         code,
       });
       return;
     }
   } else {
-    log.info('INGEST', 'msg_upsert_ok', { tg_message_id: tgMsgIdStr, conv_id: convId });
+    log.info('INGEST', 'msg_upsert_ok', { tg_message_id: tgMsgId, conv_id: convId });
   }
 
   // 3. upsert_spender_and_event (unified: spender + event message)
