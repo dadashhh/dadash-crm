@@ -2405,7 +2405,22 @@ const mapCanonToSpender = (row) => {
     name: row.display_name ?? row.name ?? row.username,
   };
 };
+const mapUiToSpender = (row) => {
+  if (!row) return null;
+  return {
+    ...row,
+    tg_user_id: row.tg_user_id_text ?? row.tg_user_id,
+    handle: row.username,
+    name: row.display_name ?? row.username,
+    langue: row.language,
+    notes: row.notes_chatter,
+  };
+};
 const apiFetchSpenders = async () => {
+  try {
+    const { data, error } = await sb.from("v_spenders_ui").select("*").order("updated_at", { ascending: false }).limit(500);
+    if (!error && data) { console.log("[SPENDERS] v_spenders_ui n=" + data.length); return data.map(mapUiToSpender); }
+  } catch (e) { console.warn("[SPENDERS] v_spenders_ui fallback:", e?.message || e); }
   try {
     const { data, error } = await sb.from("v_spenders_canon").select("*").order("updated_at", { ascending: false }).limit(500);
     if (!error && data) { console.log("[SPENDERS] v_spenders_canon n=" + data.length); return data.map(mapCanonToSpender); }
@@ -7576,13 +7591,15 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       try {
         let row = null;
         if (spender_id) {
-          const { data: canonRow } = await sb.from("v_spenders_canon").select("*").eq("spender_id", spender_id).maybeSingle();
-          row = canonRow ? mapCanonToSpender(canonRow) : null;
+          const { data: uiRow } = await sb.from("v_spenders_ui").select("*").eq("id", spender_id).maybeSingle();
+          row = uiRow ? mapUiToSpender(uiRow) : null;
+          if (!row) { const { data: canonRow } = await sb.from("v_spenders_canon").select("*").eq("spender_id", spender_id).maybeSingle(); row = canonRow ? mapCanonToSpender(canonRow) : null; }
           if (!row) { const { data } = await sb.from("v_spenders").select("*").eq("id", spender_id).maybeSingle(); row = data; }
         } else if (tg_user_id) {
           const tgNorm = String(tg_user_id).replace(/\D/g, "");
-          const { data: canonRows } = await sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).limit(1);
-          row = (canonRows && canonRows[0]) ? mapCanonToSpender(canonRows[0]) : null;
+          const { data: uiRows } = await sb.from("v_spenders_ui").select("*").eq("tg_user_id_text", tgNorm).limit(1);
+          row = (uiRows && uiRows[0]) ? mapUiToSpender(uiRows[0]) : null;
+          if (!row) { const { data: canonRows } = await sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).limit(1); row = (canonRows && canonRows[0]) ? mapCanonToSpender(canonRows[0]) : null; }
           if (!row) { const res = await sb.from("v_spenders").select("*").eq("tg_user_id", tgNorm).limit(1); row = (res.data && res.data[0]) || null; }
         }
         if (row && selectedRef.current) {
@@ -7779,20 +7796,20 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     const sp = spenders.find(s => s.dbId === id || s.id === id)
       || safeArr(dbSpenders).find(d => d.id === id);
     if (sp) { openSpenderModal(sp); return; }
-    // 2) fetch from DB (v_spenders_canon puis v_spenders fallback)
+    // 2) fetch from DB (v_spenders_ui → v_spenders_canon → v_spenders fallback)
     console.info("[SB_FROM] spenders (openById)", id);
-    sb.from("v_spenders_canon").select("*").eq("spender_id", id).maybeSingle()
-      .then(({ data: canonData, error: canonErr }) => {
-        if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return null; }
-        return sb.from("v_spenders").select("*").eq("id", id).maybeSingle();
-      })
-      .then((r) => {
-        if (!r) return;
-        const { data, error } = r;
+    (async () => {
+      try {
+        const { data: uiData, error: uiErr } = await sb.from("v_spenders_ui").select("*").eq("id", id).maybeSingle();
+        if (!uiErr && uiData) { openSpenderModal(mapUiToSpender(uiData)); return; }
+        const { data: canonData, error: canonErr } = await sb.from("v_spenders_canon").select("*").eq("spender_id", id).maybeSingle();
+        if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return; }
+        const { data, error } = await sb.from("v_spenders").select("*").eq("id", id).maybeSingle();
         if (error) { addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
         if (data) openSpenderModal(data);
         else addToast(fr?"Spender introuvable":"Spender not found","warning");
-      }).catch(e => { console.error("[SB_ERR] spenders (openById catch):", e.message||e); addToast(fr?"Erreur chargement spender":"Spender load error","error"); });
+      } catch (e) { console.error("[SB_ERR] spenders (openById catch):", e.message||e); addToast(fr?"Erreur chargement spender":"Spender load error","error"); }
+    })();
   }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
 
   const openSpenderByTgUserId = React.useCallback(async (tgId) => {
@@ -7803,11 +7820,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     console.info("[SB_FROM] spenders (openByTgUserId)", tgId);
     const tgNorm = String(tgId).replace(/\D/g, "");
     try {
+      const { data: uiData, error: uiErr } = await sb.from("v_spenders_ui").select("*").eq("tg_user_id_text", tgNorm).maybeSingle();
+      if (!uiErr && uiData) { openSpenderModal(mapUiToSpender(uiData)); return; }
       const { data: canonData, error: canonErr } = await sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).maybeSingle();
       if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return; }
       const { data, error } = await sb.from("v_spenders").select("*").eq("tg_user_id", tgNorm).limit(1).maybeSingle();
       if (!error && data) { openSpenderModal(data); return; }
-      // Auto-create via RPC if spender not found
       const { data: spenderId, error: rpcErr } = await sb.rpc("resolve_spender_by_tg_user_id", { p_tg_user_id: tgNorm });
       if (rpcErr) { addToast(fr?"Erreur chargement spender":"Spender load error","error"); console.error("[RPC] resolve_spender_by_tg_user_id:", rpcErr.message); return; }
       if (spenderId) { openSpenderById(spenderId); return; }
@@ -8372,7 +8390,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                       if(error) { addToast(fr?"Erreur: "+error.message:"Error: "+error.message,"error"); return; }
                       addToast(data?.enrich_queued ? (fr?"Enrich mis en file d'attente":"Enrich queued") : (fr?"Rafraîchi":"Refreshed"),"success");
                       await onRefresh();
-                      sb.from("v_spenders_canon").select("*").eq("spender_id",selected.dbId).maybeSingle().then(async({data:cd})=>{if(cd){openSpenderModal(mapCanonToSpender(cd));return;}const{data:d}=await sb.from("v_spenders").select("*").eq("id",selected.dbId).maybeSingle();if(d)openSpenderModal({...d,dbId:d.id});});
+                      sb.from("v_spenders_ui").select("*").eq("id",selected.dbId).maybeSingle().then(async({data:ud})=>{if(ud){openSpenderModal(mapUiToSpender(ud));return;}const{data:cd}=await sb.from("v_spenders_canon").select("*").eq("spender_id",selected.dbId).maybeSingle();if(cd){openSpenderModal(mapCanonToSpender(cd));return;}const{data:d}=await sb.from("v_spenders").select("*").eq("id",selected.dbId).maybeSingle();if(d)openSpenderModal({...d,dbId:d.id});});
                     } catch(e){ addToast("Erreur: "+(e?.message||e),"error"); }
                   }} style={{padding:"5px 10px",borderRadius:10,background:"rgba(0,136,204,0.12)",border:"1px solid rgba(0,136,204,0.3)",color:"#0088cc",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"🔄"} {fr?"Sync TG":"Sync TG"}</button>
                 )}
