@@ -1904,6 +1904,8 @@
     window.__sbReady = false;
     window.__sbError = null;
     window.__appBuild = Date.now();
+    window.__buildId = "4b089a5";
+    window.__buildDate = "2026-02-27";
     try {
       if (!window.supabase || !window.supabase.createClient) {
         throw new Error("Supabase JS library not loaded. Check CDN or network.");
@@ -2008,7 +2010,10 @@ const {useState, useEffect, useMemo, useCallback, useContext, createContext, use
 const _isMobile = window.innerWidth < 768;
 
 const APP_VERSION = "v2.2";
-console.log("[APP] version=" + APP_VERSION + " sw=" + (window.__swActive ? "active" : "pending") + " sb=" + (window.__sbReady ? "ready" : "error"));
+const BUILD_ID = (window.__buildId || "dev") + " " + (window.__buildDate || new Date().toISOString().slice(0,10));
+console.log("[APP] version=" + APP_VERSION + " build=" + BUILD_ID + " sw=" + (window.__swActive ? "active" : "pending") + " sb=" + (window.__sbReady ? "ready" : "error"));
+console.log("[APP_DIAG] supabase_url=" + (window.SUPABASE_URL || "").replace(/^(https:\/\/[a-z]{4}).*(.supabase.co)$/, "$1****$2"));
+console.log("[APP_DIAG] views_kpi=apiFetchKpis(from txs) views_spenders=v_spenders_ui/v_spenders_canon/v_spenders views_activity=v_activity_feed/v_activity_feed_unified/v_spender_events");
 const _isLowPower = _isMobile || (navigator.hardwareConcurrency && navigator.hardwareConcurrency <= 4);
 
 /* UI FOUNDATION — helpers inline réutilisables (Dashboard-style) */
@@ -3010,6 +3015,47 @@ const getChatterCommissionPct = (user) => {
   if (pct != null && !isNaN(Number(pct))) return Number(pct) / 100;
   return DEFAULT_CHATTER_COMM_PCT / 100;
 };
+
+// ═══ PR-A: DEBUG DUMP COMPONENT (chatter scope diagnostic) ═══
+const ChatterDebugDump = React.memo(({user, models, txs, spenders, lang}) => {
+  const [open, setOpen] = useState(false);
+  if (!user) return null;
+  const ctx = getChatterContext(user, models);
+  const scope = getScope(user);
+  const maskedUrl = (window.SUPABASE_URL || "").replace(/^(https:\/\/[a-z]{4}).*(.supabase.co)$/, "$1****$2");
+  const myTxCount = user.role === "chatter" ? (txs||[]).filter(tx => ctx.assignedModelIds.includes(tx.model_id) || tx.chatter_id === user.id).length : (txs||[]).length;
+  const mySpCount = user.role === "chatter" ? (() => {
+    const handleSet = new Set((txs||[]).filter(tx => ctx.assignedModelIds.includes(tx.model_id) || tx.chatter_id === user.id).map(tx => (tx.spender_handle||"").trim()).filter(Boolean));
+    return (spenders||[]).filter(sp => handleSet.has((sp.handle||sp.name||"").trim())).length;
+  })() : (spenders||[]).length;
+  return (
+    <div style={{marginBottom:12}}>
+      <button onClick={()=>setOpen(!open)} style={{padding:"4px 12px",borderRadius:8,border:"1px solid var(--border-subtle)",background:"var(--surface)",color:"var(--text-tertiary)",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"monospace"}}>{open ? "▼" : "▶"} Debug dump ({user.role})</button>
+      {open && (
+        <pre style={{marginTop:8,padding:14,background:"#0a0a14",border:"1px solid var(--border-subtle)",borderRadius:10,fontSize:11,color:"#a5b4fc",overflow:"auto",maxHeight:300,fontFamily:"monospace",whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{JSON.stringify({
+          build: BUILD_ID,
+          user_id: user.id,
+          user_role: user.role,
+          user_email: (user.email||"").replace(/^(.{3}).*(@.*)$/, "$1***$2"),
+          assigned_models: ctx.assignedModelIds,
+          assigned_model_names: ctx.assignedModels.map(m=>m.name||m.id),
+          has_assignments: ctx.hasAssignments,
+          scope_type: scope.type,
+          supabase_url: maskedUrl,
+          sb_ready: !!window.__sbReady,
+          sw_active: !!window.__swActive,
+          queries: {
+            kpi: "apiFetchKpis — computed client-side from txs (scope=" + scope.type + ")",
+            transactions: "apiFetchTransactions — table:transactions, scope=" + scope.type + (scope.type==="chatter" ? " filter:chatter_id.eq."+user.id+" OR model_id.in.("+ctx.assignedModelIds.join(",")+")" : " (global)"),
+            spenders: "apiFetchSpenders — views:v_spenders_ui→v_spenders_canon→v_spenders, scope=" + scope.type,
+            activity: "apiFetchActivityScoped — views:v_activity_feed/v_activity_feed_unified"
+          },
+          data_counts: { txs_in_props: (txs||[]).length, spenders_in_props: (spenders||[]).length, txs_in_scope: myTxCount, spenders_in_scope: mySpCount },
+        }, null, 2)}</pre>
+      )}
+    </div>
+  );
+});
 
 // ═══ GÉRANT NAV REFACTO ═══
 const GERANT_NAV = [
@@ -16339,9 +16385,8 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
   };
 
   const allTxs = useMemo(() => {
-    if (myModelIds.length === 0) return [];
-    return (txs || []).filter(tx => myModelIds.includes(tx.model_id));
-  }, [txs, myModelIds]);
+    return (txs || []).filter(tx => myModelIds.includes(tx.model_id) || tx.chatter_id === user?.id);
+  }, [txs, myModelIds, user?.id]);
   const allModels = models || [];
   const modelOptions = useMemo(() => safeArr(myModels).map(m => ({ id: m.id, name: m.name || "—" })), [myModels]);
 
@@ -16845,7 +16890,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const [txCardFilter, setTxCardFilter] = useState(null);
   const [txChartMetric, setTxChartMetric] = useState("ca");
 
-  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
+  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id) || tx.chatter_id === user?.id), [txs, myModelIds, user?.id]);
 
   const _txCardBase = txCardFilter==="validated"?myTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee"):txCardFilter==="pending"?myTxs.filter(tx=>tx.status==="pending"):myTxs;
 
@@ -16944,9 +16989,9 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
 
   return (
     <div style={{padding:"0 12px"}}>
-      {/* PR1: scope badge */}
+      {/* PR-B: scope badge with counts */}
       <div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 14px",borderRadius:20,background:"rgba(139,92,246,0.15)",border:"1px solid rgba(139,92,246,0.3)",color:"#c4b5fd",fontSize:11,fontWeight:700,marginBottom:14,letterSpacing:0.3}}>
-        <span>{"\uD83D\uDD12"}</span>{fr ? "Mes données uniquement" : "My data only"}
+        <span>{"\uD83D\uDD12"}</span>{fr ? "Mes données uniquement" : "My data only"} <span style={{opacity:0.6}}>({myTxs.length} TX, {myModelIds.length} {fr?"modèles":"models"})</span>
       </div>
       <div className="ui-section-header">
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
@@ -17201,12 +17246,14 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
   const [filterBadge, setFilterBadge] = useState("");
   const [filterLangue, setFilterLangue] = useState("");
 
-  // PR2: Activity state
+  // PR-C: Activity state with tabs like gérant
   const [activityItems, setActivityItems] = useState([]);
   const [activityLoading, setActivityLoading] = useState(false);
   const [showActivity, setShowActivity] = useState(false);
+  const [activityTab, setActivityTab] = useState("all");
+  const activityPollingRef = useRef(null);
 
-  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id)), [txs, myModelIds]);
+  const myTxs = useMemo(() => (txs || []).filter(tx => myModelIds.includes(tx.model_id) || tx.chatter_id === user?.id), [txs, myModelIds, user?.id]);
 
   const enrichedSpenders = useMemo(() => {
     const handleSet = new Set(myTxs.map(tx => (tx.spender_handle || "").trim()).filter(Boolean));
@@ -17247,18 +17294,26 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
 
   const spPag = usePagination(mySpenders);
 
-  // PR2: load scoped activity
-  const loadScopedActivity = useCallback(async () => {
+  // PR-C: load scoped activity with tab support
+  const loadScopedActivity = useCallback(async (tab) => {
+    const _tab = tab || activityTab || "all";
     setActivityLoading(true);
     try {
       const spenderIds = enrichedSpenders.map(s => s.id).filter(Boolean);
       const tgIds = enrichedSpenders.map(s => String(s.tg_user_id || "")).filter(Boolean);
       const scope = { type: 'chatter', chatter_user_id: user.id, _allowedSpenderIds: spenderIds, _allowedTgIds: tgIds };
-      const items = await apiFetchActivityScoped({ scope, tab: "all", limit: 50 });
+      const items = await apiFetchActivityScoped({ scope, tab: _tab, limit: 50 });
       setActivityItems(items);
     } catch (e) { console.warn("[ACTIVITY_CHATTER]", e?.message || e); }
     setActivityLoading(false);
-  }, [enrichedSpenders, user.id]);
+  }, [enrichedSpenders, user.id, activityTab]);
+
+  useEffect(() => {
+    if (!showActivity) { if (activityPollingRef.current) clearInterval(activityPollingRef.current); return; }
+    loadScopedActivity(activityTab);
+    activityPollingRef.current = setInterval(() => loadScopedActivity(activityTab), 15000);
+    return () => { if (activityPollingRef.current) clearInterval(activityPollingRef.current); };
+  }, [showActivity, activityTab]);
 
   const spenderTxs = useMemo(() => {
     if (!selectedSpender) return [];
@@ -17427,7 +17482,7 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
     <div style={{padding:"0 12px"}}>
       <div style={{display:"inline-flex",alignItems:"center",gap:6,padding:"5px 14px",borderRadius:20,background:"rgba(139,92,246,0.15)",border:"1px solid rgba(139,92,246,0.3)",color:"#c4b5fd",fontSize:11,fontWeight:700,marginBottom:14,letterSpacing:0.3}}>
         <span>{"\uD83D\uDD12"}</span>
-        {fr ? "Mes données uniquement" : "My data only"}
+        {fr ? "Mes données uniquement" : "My data only"} <span style={{opacity:0.6}}>({enrichedSpenders.length} spenders, {myModelIds.length} {fr?"modèles":"models"})</span>
       </div>
       <div className="ui-section-header">
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
@@ -17549,30 +17604,38 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, onRefresh}) => {
             <option value="">{fr?"Toutes langues":"All languages"}</option>
             {(SPENDER_LANGUAGES||["FR","EN","DE","IT","ES","AR","PT"]).map(l=><option key={l} value={l}>{(LANG_FLAGS||{})[l]||""} {l}</option>)}
           </select>
-          <button onClick={()=>{setShowActivity(!showActivity);if(!showActivity)loadScopedActivity();}} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${showActivity?"#8b5cf6":"var(--border)"}`,background:showActivity?"rgba(139,92,246,0.15)":"var(--surface2)",color:showActivity?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",marginLeft:"auto"}}>
+          <button onClick={()=>setShowActivity(!showActivity)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${showActivity?"#8b5cf6":"var(--border)"}`,background:showActivity?"rgba(139,92,246,0.15)":"var(--surface2)",color:showActivity?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",marginLeft:"auto"}}>
             {"\u26A1"} {fr?"Activité":"Activity"}
           </button>
         </div>
 
-        {/* PR2: Scoped Activity Panel */}
+        {/* PR-C: Scoped Activity Panel with tabs like gérant */}
         {showActivity && (
-          <div className="ui-panel" style={{marginBottom:16,maxHeight:300,overflowY:"auto"}}>
+          <div className="ui-panel" style={{marginBottom:16}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
               <div style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{"\u26A1"} {fr?"Activité récente (mes spenders)":"Recent activity (my spenders)"}</div>
-              <button onClick={loadScopedActivity} disabled={activityLoading} style={{padding:"4px 10px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:11,cursor:"pointer"}}>{activityLoading?"\u23F3":"\uD83D\uDD04"}</button>
+              <button onClick={()=>loadScopedActivity(activityTab)} disabled={activityLoading} style={{padding:"4px 10px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:11,cursor:"pointer"}}>{activityLoading?"\u23F3":"\uD83D\uDD04"}</button>
             </div>
-            {activityItems.length === 0 && !activityLoading && <div style={{fontSize:12,color:"var(--text-tertiary)",textAlign:"center",padding:20}}>{fr?"Aucune activité récente":"No recent activity"}</div>}
-            {activityItems.map((item,i)=>{
-              const evIcon = (item.eventType==="new_spender"||item.eventType==="spender_created")?"🟢":["profile_updated","enriched","enrichment"].includes(item.eventType)?"✏️":(item.eventType==="message"||item.eventType==="new_message")?"💬":"📋";
-              return <div key={item.id||i} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
-                <span style={{fontSize:14,flexShrink:0}}>{evIcon}</span>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label||item.title||"?"}</div>
-                  <div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.detail||item.subtitle||"").slice(0,100)}</div>
-                </div>
-                <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts||item.created_at)}</span>
-              </div>;
-            })}
+            <div style={{display:"flex",gap:6,marginBottom:10,flexWrap:"wrap"}}>
+              {[{id:"all",label:fr?"Tout":"All",icon:"\u{1F4CB}"},{id:"new_spender",label:fr?"Nouveaux":"New",icon:"\uD83D\uDFE2"},{id:"enrichment",label:fr?"Enrichis":"Enriched",icon:"✏️"},{id:"messages",label:"Messages",icon:"\uD83D\uDCAC"}].map(t=>(
+                <button key={t.id} onClick={()=>setActivityTab(t.id)} style={{padding:"5px 10px",borderRadius:8,border:`1px solid ${activityTab===t.id?"#8b5cf6":"var(--border-subtle)"}`,background:activityTab===t.id?"rgba(139,92,246,0.15)":"transparent",color:activityTab===t.id?"#c4b5fd":"var(--text-tertiary)",fontSize:11,fontWeight:600,cursor:"pointer"}}>{t.icon} {t.label}</button>
+              ))}
+            </div>
+            <div style={{maxHeight:280,overflowY:"auto"}}>
+              {activityItems.length === 0 && !activityLoading && <div style={{fontSize:12,color:"var(--text-tertiary)",textAlign:"center",padding:20}}>{fr?"Aucune activité récente":"No recent activity"}</div>}
+              {activityLoading && activityItems.length === 0 && <div style={{fontSize:12,color:"var(--text-tertiary)",textAlign:"center",padding:20}}>{"\u23F3"} {fr?"Chargement...":"Loading..."}</div>}
+              {activityItems.map((item,i)=>{
+                const evIcon = (item.eventType==="new_spender"||item.eventType==="spender_created")?"\uD83D\uDFE2":["profile_updated","enriched","enrichment"].includes(item.eventType)?"✏️":(item.eventType==="message"||item.eventType==="new_message")?"\uD83D\uDCAC":"\uD83D\uDCCB";
+                return <div key={item.id||i} style={{display:"flex",gap:8,alignItems:"flex-start",padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <span style={{fontSize:14,flexShrink:0}}>{evIcon}</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label||item.title||"?"}</div>
+                    <div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.detail||item.subtitle||"").slice(0,100)}</div>
+                  </div>
+                  <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts||item.created_at)}</span>
+                </div>;
+              })}
+            </div>
           </div>
         )}
 
@@ -19380,7 +19443,14 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
       const pr = await apiCreatePayoutRequest({ chatter_user_id: user.id, amount: amt, currency: reqForm.currency||"CHF", period_start: reqForm.period_start||null, period_end: reqForm.period_end||null, notes: reqForm.notes||null });
       setPayoutRequests(prev => [pr, ...prev]);
       setReqForm({amount:"",currency:"CHF",period_start:"",period_end:"",notes:""});
-      addToast(fr?"Demande envoyée":"Request sent","success");
+      addToast(fr?"Demande envoyée au gérant":"Request sent to manager","success");
+      try {
+        await sb.from("logs").insert({
+          action: "payout_request_created",
+          user_id: user.id,
+          details: JSON.stringify({ amount: amt, currency: reqForm.currency||"CHF", request_id: pr?.id }),
+        });
+      } catch (_) {}
     } catch (e) { addToast("Erreur: "+(e?.message||e),"error"); }
     setSubmitting(false);
   };
@@ -19442,11 +19512,78 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
       </>)}
 
       {comptaTab === "factures" && (<>
-        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr?"Mes factures":"My invoices"}</div>
-        <div className="ui-panel" style={{padding:32,textAlign:"center"}}>
-          <div style={{fontSize:40,marginBottom:8}}>{"\u{1F4C4}"}</div>
-          <div style={{fontSize:14,fontWeight:700,color:"var(--text)",marginBottom:6}}>{fr?"Aucune facture":"No invoices yet"}</div>
-          <div style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr?"Les factures apparaîtront ici quand ton gérant les créera.":"Invoices will appear here when your manager creates them."}</div>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr?"Aperçu facture — ":"Invoice preview — "}{monthLabel}</div>
+        <div className="ui-panel" style={{marginBottom:20}} id="chatter-invoice-preview">
+          <div style={{padding:24,borderBottom:"2px solid var(--accent)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:12}}>
+              <div>
+                <div style={{fontSize:20,fontWeight:900,color:"var(--accent)",marginBottom:4}}>FACTURE</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)"}}>#{new Date().getFullYear()}-{String(new Date().getMonth()+1).padStart(2,"0")}-{(user.id||"").slice(0,6).toUpperCase()}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:12,fontWeight:700}}>{user.name||user.full_name||user.username||"Chatter"}</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{(user.email||"").replace(/^(.{3}).*(@.*)$/, "$1***$2")}</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{fr?"Émise le":"Issued"}: {new Date().toLocaleDateString(fr?"fr-CH":"en-CH")}</div>
+              </div>
+            </div>
+          </div>
+          <div style={{padding:24}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:12}}>{fr?"Détail":"Details"}</div>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{borderBottom:"1px solid var(--border)"}}>
+                  <th style={{textAlign:"left",padding:"8px 4px",color:"var(--text-tertiary)",fontWeight:600}}>{fr?"Description":"Description"}</th>
+                  <th style={{textAlign:"right",padding:"8px 4px",color:"var(--text-tertiary)",fontWeight:600}}>{fr?"Montant":"Amount"}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"10px 4px"}}>{fr?"CA validé (commissions ":"Validated rev. (commissions "}{(commPct*100).toFixed(0)}%)</td>
+                  <td style={{padding:"10px 4px",textAlign:"right",fontWeight:700}}>{fmtAmount(commissionsThisMonth)}</td>
+                </tr>
+                {base > 0 && <tr style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"10px 4px"}}>{fr?"Salaire de base":"Base salary"}</td>
+                  <td style={{padding:"10px 4px",textAlign:"right",fontWeight:700}}>{fmtAmount(base)}</td>
+                </tr>}
+                {bonus > 0 && <tr style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"10px 4px"}}>{fr?"Bonus":"Bonus"}</td>
+                  <td style={{padding:"10px 4px",textAlign:"right",fontWeight:700}}>{fmtAmount(bonus)}</td>
+                </tr>}
+                <tr>
+                  <td style={{padding:"12px 4px",fontWeight:800,fontSize:14}}>{fr?"TOTAL":"TOTAL"}</td>
+                  <td style={{padding:"12px 4px",textAlign:"right",fontWeight:900,fontSize:16,color:"var(--success)"}}>{fmtAmount(totalEstime)}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div style={{marginTop:16,padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.03)",fontSize:11,color:"var(--text-tertiary)"}}>
+              <div><strong>{fr?"Période":"Period"}:</strong> {monthLabel}</div>
+              <div><strong>{fr?"Modèles":"Models"}:</strong> {ctx.assignedModels.map(m=>m.name||m.id).join(", ")||"—"}</div>
+              <div><strong>{fr?"TX validées":"Validated TX"}:</strong> {myTxs.length}</div>
+              <div><strong>{fr?"Taux commission":"Commission rate"}:</strong> {(commPct*100).toFixed(0)}%</div>
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <button className="ui-btn-primary" onClick={()=>{
+            const el = document.getElementById("chatter-invoice-preview");
+            if (!el) return;
+            const win = window.open("","_blank","width=800,height=600");
+            if (!win) { addToast(fr?"Popup bloqué — autorise les popups":"Popup blocked — allow popups","error"); return; }
+            win.document.write("<html><head><title>Facture "+monthLabel+"</title><style>body{font-family:Inter,sans-serif;padding:40px;background:#fff;color:#111}table{width:100%;border-collapse:collapse}th,td{padding:8px 4px;text-align:left}th{border-bottom:1px solid #ddd;color:#666;font-weight:600}tr:not(:last-child){border-bottom:1px solid #eee}.total td{font-weight:900;font-size:16px;color:#10b981;border-top:2px solid #333}@media print{body{padding:20px}}</style></head><body>");
+            win.document.write("<h1 style='color:#6366f1;margin-bottom:4px'>FACTURE</h1>");
+            win.document.write("<p style='color:#666;margin:0 0 20px'>"+new Date().getFullYear()+"-"+String(new Date().getMonth()+1).padStart(2,"0")+"-"+(user.id||"").slice(0,6).toUpperCase()+"</p>");
+            win.document.write("<p><strong>"+(user.name||user.full_name||"Chatter")+"</strong><br/>"+(fr?"Émise le":"Issued")+": "+new Date().toLocaleDateString(fr?"fr-CH":"en-CH")+"</p>");
+            win.document.write("<table><thead><tr><th>"+(fr?"Description":"Description")+"</th><th style='text-align:right'>"+(fr?"Montant":"Amount")+"</th></tr></thead><tbody>");
+            win.document.write("<tr><td>"+(fr?"Commissions ":"Commissions ")+(commPct*100).toFixed(0)+"%</td><td style='text-align:right'>"+fmtAmount(commissionsThisMonth)+"</td></tr>");
+            if(base>0) win.document.write("<tr><td>"+(fr?"Salaire de base":"Base salary")+"</td><td style='text-align:right'>"+fmtAmount(base)+"</td></tr>");
+            if(bonus>0) win.document.write("<tr><td>Bonus</td><td style='text-align:right'>"+fmtAmount(bonus)+"</td></tr>");
+            win.document.write("<tr class='total'><td>TOTAL</td><td style='text-align:right'>"+fmtAmount(totalEstime)+"</td></tr>");
+            win.document.write("</tbody></table>");
+            win.document.write("<hr style='margin:20px 0'/><p style='font-size:11px;color:#888'>"+(fr?"Période":"Period")+": "+monthLabel+" | "+(fr?"Modèles":"Models")+": "+(ctx.assignedModels.map(m=>m.name).join(", ")||"—")+" | TX: "+myTxs.length+"</p>");
+            win.document.write("</body></html>");
+            win.document.close();
+            setTimeout(()=>win.print(), 500);
+          }}>{"\uD83D\uDDA8"} {fr?"Imprimer / PDF":"Print / PDF"}</button>
         </div>
       </>)}
 
@@ -27756,7 +27893,7 @@ const App = () => {
     const isChatter = scope.type === 'chatter';
     const assignedModelIds = isChatter ? (Array.isArray(currentUser?.assigned_models) ? currentUser.assigned_models : []).filter(Boolean) : [];
     if (isChatter) { scope._allowedModelIds = assignedModelIds; }
-    console.log("[DATA] loadData scope=" + scope.type + (isChatter ? " models=" + assignedModelIds.length : ""));
+    console.log("[DATA] loadData scope=" + scope.type + (isChatter ? " models=" + assignedModelIds.length + " ids=[" + assignedModelIds.join(",") + "]" : ""));
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
     try {
@@ -28041,6 +28178,7 @@ const App = () => {
               console.debug("[DADASH EC2] Chatter sans assignation — source: profiles.assigned_models");
             }
             setUser(fullUser);
+            console.log("[APP_DIAG] user_role=" + fullUser.role + " user_id=" + (fullUser.id||"").slice(0,8) + "… assigned_models=" + JSON.stringify(fullUser.assigned_models||[]));
             if(fullUser.role === "provider") setTab("transactions");
             if(fullUser.role === "modele") setTab("model_checklist");
             await loadData(fullUser);
@@ -28632,7 +28770,7 @@ const App = () => {
               <button onClick={()=>cardModal.openCardModal({title:"Test modal carte",data:{demo:true,entityType:"card"}})} title="Test modal carte" style={{fontSize:12,color:"var(--text-quaternary)",background:"none",border:"none",cursor:"pointer",padding:4}}>?</button>
             )}
             {/* CHRISTINE FIX — Version display */}
-            <div style={{fontSize:9,color:"var(--text-quaternary)",marginTop:4,textAlign:"center"}}>{APP_VERSION}</div>
+            <div style={{fontSize:9,color:"var(--text-quaternary)",marginTop:4,textAlign:"center"}}>{APP_VERSION}<br/><span style={{fontFamily:"monospace",fontSize:8}}>{BUILD_ID}</span></div>
           </div>
         </div>
       ) : (
@@ -28651,7 +28789,7 @@ const App = () => {
           <div className="sidebar-footer">
             <button onClick={onRefresh} title={t(lang,"refresh")}>{"\u{1F504}"}</button>
             {/* CHRISTINE FIX — Version display */}
-            <div style={{fontSize:9,color:"var(--text-quaternary)",marginTop:4,textAlign:"center"}}>{APP_VERSION}</div>
+            <div style={{fontSize:9,color:"var(--text-quaternary)",marginTop:4,textAlign:"center"}}>{APP_VERSION}<br/><span style={{fontFamily:"monospace",fontSize:8}}>{BUILD_ID}</span></div>
           </div>
         </div>
       )}
@@ -28746,6 +28884,7 @@ const App = () => {
               <h1 style={{fontSize:18,fontWeight:800,margin:0,background:"var(--grad)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",letterSpacing:-0.5}}>
                 {drillDown?`${drillDown.type}: ${drillDown.id}`:isAdminUser(user)&&tab==="admin"?"⚙️ Admin":isGerant&&gerantPageInfo?<>{gerantPageInfo.icon} {gerantPageInfo.label}</>:otherTabs.find(x=>x.id===tab)?.label||"DADASH"}
               </h1>
+              <span style={{fontSize:9,color:"var(--text-quaternary)",fontFamily:"monospace",marginLeft:8,whiteSpace:"nowrap",opacity:0.7}} title={"Build: " + BUILD_ID}>build: {BUILD_ID}</span>
             </div>
           </div>
           <div className="topbar-right">
@@ -28915,6 +29054,10 @@ const App = () => {
               <span style={{fontSize:18}}>{"\u{1F464}"}</span>
               <span>{lang==="fr"?"Aucun modèle attribué — contacte le gérant pour être assigné.":"No models assigned — contact manager to get assigned."}</span>
             </div>
+          )}
+          {/* ── PR-A: Debug dump button (chatter + gérant) ── */}
+          {(user.role==="chatter"||isGerant)&&["chatter_dashboard","chatter_transactions","chatter_spenders","chatter_compta","dashboard"].includes(tab)&&(
+            <ChatterDebugDump user={user} models={models} txs={txSummary} spenders={spenders} lang={lang} />
           )}
           {/* ── Chatter-only pages — UNCHANGED ── */}
           {tab==="chatter_dashboard"&&user.role==="chatter"&&<ErrorBoundary name="ChatterPage"><ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} /></ErrorBoundary>}
