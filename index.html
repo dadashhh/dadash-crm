@@ -27450,7 +27450,7 @@ const App = () => {
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
         safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
-        safe(sb.from("v_spenders").select("*"), "spenders"),
+        safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders"),
         safe(sb.from("profiles").select("*"), "profiles"),
         safe(sb.from("models").select("*"), "models"),
         safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
@@ -27549,6 +27549,7 @@ const App = () => {
     setTxTotal(txR.count||txData.length||0);
     const dedupedSpenders = Array.from(new Map((spenderData||[]).filter(Boolean).map(s=>[s.id,s])).values());
     setSpenders(dedupedSpenders);
+    console.info("[BOOT] spenders hydrated n=" + dedupedSpenders.length, dedupedSpenders[0] ? { id: dedupedSpenders[0].id, handle: dedupedSpenders[0].handle || dedupedSpenders[0].name, tg: dedupedSpenders[0].tg_user_id } : "empty");
     setProfiles(profileData);
     setModels(modelData);
     const normPayouts = normalizePayouts(payoutData);
@@ -27930,16 +27931,31 @@ const App = () => {
   const onRefresh = fn_afterMutationOrImportRefresh;
   useEffect(() => { window.__softRefresh = fn_afterMutationOrImportRefresh; return () => { delete window.__softRefresh; }; }, [user?.id]);
 
-  /* Pipeline spenders — polling 20s pour mise à jour auto (gerant) */
+  /* Pipeline spenders — boot hydration immédiate + polling 20s pour tous les rôles */
   useEffect(() => {
-    if (!user || user.role !== "gerant") return;
+    if (!user) return;
+    // Hydratation immédiate au boot (v_spenders_ui → v_spenders_canon → v_spenders)
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetchSpenders();
+        if (cancelled) return;
+        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+        setSpenders(deduped);
+        console.info("[SPENDERS] boot hydration n=" + deduped.length);
+      } catch (e) { console.warn("[SPENDERS] boot hydration failed:", e?.message || e); }
+    })();
+    // Polling périodique 20s
     const iv = setInterval(async () => {
-      const data = await apiFetchSpenders();
-      const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
-      setSpenders(deduped);
+      try {
+        const data = await apiFetchSpenders();
+        if (cancelled) return;
+        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+        setSpenders(deduped);
+      } catch (e) { console.warn("[SPENDERS] periodic refresh failed:", e?.message || e); }
     }, 20000);
-    return () => clearInterval(iv);
-  }, [user?.role]);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [user?.id]);
 
   /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications */
   const afterMutationRefresh = useCallback(async () => {
