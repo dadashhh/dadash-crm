@@ -6,9 +6,7 @@
 -- The existing index uq_tg_messages_conv_tg_msg_id has WHERE tg_message_id IS NOT NULL,
 -- which causes HTTP 400 "there is no unique or exclusion constraint matching the ON CONFLICT"
 --
--- Fix: Create a proper non-partial UNIQUE CONSTRAINT on (conversation_id, tg_message_id).
---
--- Note: tg_message_id is BIGINT in production (may differ from CREATE TABLE text).
+-- Note: tg_message_id is BIGINT in production.
 --
 -- Date: 2026-03-27
 -- Idempotent: safe to re-run
@@ -16,12 +14,17 @@
 
 BEGIN;
 
--- Step 1: Backfill NULL tg_message_id with negative row-unique value
--- Uses -(extract epoch) trick to generate unique negative bigints that won't collide
--- with real Telegram message IDs (always positive).
-UPDATE public.tg_messages
-   SET tg_message_id = -1 * abs(('x' || left(md5(id::text), 15))::bit(60)::bigint)
- WHERE tg_message_id IS NULL;
+-- Step 1: Backfill NULL tg_message_id with unique negative bigints.
+-- Real Telegram message IDs are always positive, so negatives never collide.
+WITH to_fix AS (
+  SELECT id, ROW_NUMBER() OVER (ORDER BY created_at) AS rn
+    FROM public.tg_messages
+   WHERE tg_message_id IS NULL
+)
+UPDATE public.tg_messages t
+   SET tg_message_id = -n.rn
+  FROM to_fix n
+ WHERE t.id = n.id;
 
 -- Step 2: Set NOT NULL on tg_message_id (safe after backfill)
 ALTER TABLE public.tg_messages
