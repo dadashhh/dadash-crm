@@ -52,7 +52,7 @@ SELECT
   e.id,
   'new_spender'::text AS type,
   'new_spender'::text AS event_type,
-  e.tg_user_id,
+  (e.tg_user_id)::text AS tg_user_id,
   (e.tg_user_id)::text AS tg_user_id_text,
   COALESCE(e.spender_id, (SELECT id FROM public.spenders WHERE tg_user_id = e.tg_user_id LIMIT 1)) AS spender_id,
   COALESCE(
@@ -75,7 +75,7 @@ SELECT
   e.id,
   'enrichment'::text AS type,
   COALESCE(e.event_type, 'enrichment')::text AS event_type,
-  e.tg_user_id,
+  (e.tg_user_id)::text AS tg_user_id,
   (e.tg_user_id)::text AS tg_user_id_text,
   COALESCE(e.spender_id, (SELECT id FROM public.spenders WHERE tg_user_id = e.tg_user_id LIMIT 1)) AS spender_id,
   COALESCE(
@@ -107,9 +107,7 @@ SELECT
   m.id,
   'message'::text AS type,
   'message'::text AS event_type,
-  CASE WHEN (m.meta->>'tg_user_id') ~ '^\d+$' THEN (m.meta->>'tg_user_id')::BIGINT
-       WHEN c.tg_user_id IS NOT NULL AND (c.tg_user_id::text) ~ '^\d+$' THEN (c.tg_user_id::text)::BIGINT
-       ELSE NULL::BIGINT END AS tg_user_id,
+  COALESCE(m.meta->>'tg_user_id', c.tg_user_id::text, c.tg_chat_id) AS tg_user_id,
   COALESCE(m.meta->>'tg_user_id', c.tg_user_id::text, c.tg_chat_id) AS tg_user_id_text,
   COALESCE(
     c.spender_id,
