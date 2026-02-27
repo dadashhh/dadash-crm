@@ -2269,13 +2269,14 @@ const ACTIVITY_VIEW_MAP = {
   new_spender: "v_activity_new_spenders",
   enrichment: "v_activity_enrichments",
   messages: "v_activity_messages",
+  all: "v_activity_feed",
 };
 const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
   const view = ACTIVITY_VIEW_MAP[tab];
   if (!view) return [];
   try {
     const { data, error } = await sb.from(view)
-      .select("id,created_at,title,subtitle,tg_user_id,spender_id,payload")
+      .select("id,created_at,title,subtitle,detail,tg_user_id,spender_id,payload,type")
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
     if (error) throw error;
@@ -2283,15 +2284,16 @@ const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
       id: row.id,
       created_at: row.created_at,
       ts: row.created_at,
-      title: row.title || "",
-      subtitle: row.subtitle || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
-      label: row.subtitle || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
-      message: row.title || row.payload?.text || "",
+      title: row.title || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
+      subtitle: row.subtitle || "",
+      detail: row.detail || "",
+      label: row.title || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
+      message: row.detail || row.title || row.payload?.text || "",
       tg_user_id: row.tg_user_id,
       spender_id: row.spender_id,
       payload: row.payload || {},
       data: row.payload || {},
-      eventType: tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "new_message",
+      eventType: row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "new_message"),
     }));
   } catch (e) {
     console.warn("[ACTIVITY] apiFetchActivityTab", tab, e?.message || e);
@@ -7409,11 +7411,11 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [spCardFilter, setSpCardFilter] = useState(null);
   const [spChartMetric, setSpChartMetric] = useState("nouveaux");
   const [highlightSpenderId, setHighlightSpenderId] = useState(null);
-  const [activity, setActivity] = useState({ newSpenders: [], enrichments: [], messages: [] });
+  const [activity, setActivity] = useState({ newSpenders: [], enrichments: [], messages: [], all: [] });
   const [showActivityDrawer, setShowActivityDrawer] = useState(false);
   const [activityTab, setActivityTab] = useState("new_spender");
   const [activityLoading, setActivityLoading] = useState(false);
-  const [activityHasMore, setActivityHasMore] = useState({ new_spender: true, enrichment: true, messages: true });
+  const [activityHasMore, setActivityHasMore] = useState({ new_spender: true, enrichment: true, messages: true, all: true });
   const [recentFilter, setRecentFilter] = useState(null);
   const [sortRecents, setSortRecents] = useState(false);
   const [syncingTg, setSyncingTg] = useState(false);
@@ -7436,17 +7438,19 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   }, []);
 
   const dedupeById = (arr) => Array.from(new Map((arr || []).filter(Boolean).map(i => [i.id, i])).values());
+  const MAX_ACTIVITY_ITEMS = 150;
 
   const loadActivity = React.useCallback(async (tab, limit = 30, cursor = 0, append = false) => {
-    if (!["new_spender", "enrichment", "messages"].includes(tab)) return;
+    if (!["new_spender", "enrichment", "messages", "all"].includes(tab)) return;
     setActivityLoading(true);
     try {
       const items = await apiFetchActivityTab(tab, limit, cursor);
-      const key = tab === "new_spender" ? "newSpenders" : tab === "enrichment" ? "enrichments" : "messages";
+      const key = tab === "new_spender" ? "newSpenders" : tab === "enrichment" ? "enrichments" : tab === "messages" ? "messages" : "all";
       setActivity(prev => {
         const existing = prev[key] || [];
         const merged = append ? dedupeById([...existing, ...items]) : dedupeById(items);
-        return { ...prev, [key]: merged };
+        const sorted = merged.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+        return { ...prev, [key]: sorted.slice(0, MAX_ACTIVITY_ITEMS) };
       });
       setActivityHasMore(prev => ({ ...prev, [tab]: items.length >= limit }));
     } catch (e) { console.warn("[ACTIVITY] loadActivity", tab, e?.message || e); }
@@ -7457,9 +7461,13 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     if (!showActivityDrawer) return;
     loadActivity(activityTab, 30, 0, false);
   }, [showActivityDrawer, activityTab]);
+  useEffect(() => {
+    if (!showActivityDrawer) return;
+    ["new_spender", "enrichment", "messages", "all"].forEach(t => loadActivity(t, 25, 0, false));
+  }, [showActivityDrawer]);
 
   useEffect(() => {
-    const interval = 20000;
+    const interval = 10000;
     if (!showActivityDrawer) return;
     const t = setInterval(() => loadActivity(activityTab, 30, 0, false), interval);
     return () => clearInterval(t);
@@ -7477,6 +7485,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     newSpender: activity.newSpenders.length,
     enrichment: activity.enrichments.length,
     messages: activity.messages.length,
+    all: activity.all.length,
     total: activity.newSpenders.length + activity.enrichments.length + activity.messages.length,
   }), [activity]);
 
@@ -7484,11 +7493,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     if (activityTab === "new_spender") return activity.newSpenders;
     if (activityTab === "enrichment") return activity.enrichments;
     if (activityTab === "messages") return activity.messages;
+    if (activityTab === "all") return activity.all.length ? activity.all : [...activity.newSpenders, ...activity.enrichments, ...activity.messages].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     return [...activity.newSpenders, ...activity.enrichments, ...activity.messages].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   }, [activity, activityTab]);
 
   const handleLoadMore = () => {
-    const arr = activityTab === "new_spender" ? activity.newSpenders : activityTab === "enrichment" ? activity.enrichments : activity.messages;
+    const arr = activityTab === "new_spender" ? activity.newSpenders : activityTab === "enrichment" ? activity.enrichments : activityTab === "messages" ? activity.messages : activity.all;
     loadActivity(activityTab, 30, arr.length, true);
   };
 
@@ -8452,6 +8462,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           {/* ── Tab bar: 3 onglets data-driven ── */}
           <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border)",flexShrink:0}}>
             {[
+              {key:"all",         label:fr?"Tout":"All",              icon:"⚡", count:activityCounts.total || activityCounts.all},
               {key:"new_spender", label:fr?"Nouveaux":"New Spenders", icon:"🟢", count:activityCounts.newSpender},
               {key:"enrichment",  label:fr?"Enrichis":"Enrichment",   icon:"✏️", count:activityCounts.enrichment},
               {key:"messages",    label:fr?"Messages":"Messages",     icon:"💬", count:activityCounts.messages},
@@ -8476,7 +8487,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             )}
             {filteredActivityFeed.map((item, idx) => {
               const evIcon = (item.eventType === "new_spender" || item.eventType === "spender_created") ? "🟢"
-                : ["profile_updated","enriched","spender_enriched"].includes(item.eventType) ? "✏️"
+                : ["profile_updated","enriched","spender_enriched","enrichment"].includes(item.eventType) ? "✏️"
                 : item.eventType === "classification_changed" ? "🏅"
                 : item.eventType === "status_changed" ? "🔄"
                 : ["new_message","message"].includes(item.eventType) ? "💬"
@@ -8486,8 +8497,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 <div key={item.id || idx} className="activity-drawer-item" onClick={() => handleActivityClick(item)}>
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label || item.subtitle}</div>
-                    {(item.message || item.title || item.payload?.summary) && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.eventType==="profile_updated"||item.eventType==="enriched"||item.eventType==="spender_enriched") && item.payload?.summary ? "AI enriched: " + item.payload.summary : (item.title || item.message || "").slice(0, 80)}</div>}
+                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label || item.title || (item.tg_user_id ? "tg_"+item.tg_user_id : "?")}</div>
+                    <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.detail || item.message || item.subtitle || "").slice(0, 120)}</div>
                   </div>
                   <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts || item.created_at)}</span>
                 </div>
