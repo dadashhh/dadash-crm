@@ -8011,6 +8011,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           if (!error && spenderId) {
             setShowActivityDrawer(false);
             openSpenderById(spenderId);
+            if (onRefresh) onRefresh();
             return;
           }
           if (error) console.warn("[RPC] resolve_spender_by_tg_user_id:", error.message);
@@ -8033,7 +8034,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       setHighlightSpenderId(cardKey);
       highlightTimerRef.current = setTimeout(() => setHighlightSpenderId(null), 2000);
     }, 300);
-  }, [spenders, dbSpenders, openSpenderModal, openSpenderById, addToast]);
+  }, [spenders, dbSpenders, openSpenderModal, openSpenderById, onRefresh, addToast]);
 
   const handleSpStatus = async (txId, newStatus) => {
     if (processingTxId) return;
@@ -27967,13 +27968,32 @@ const App = () => {
   const onRefresh = fn_afterMutationOrImportRefresh;
   useEffect(() => { window.__softRefresh = fn_afterMutationOrImportRefresh; return () => { delete window.__softRefresh; }; }, [user?.id]);
 
-  /* Pipeline spenders — boot hydration immédiate + polling 20s (gérant/provider only) */
+  /* Pipeline spenders — boot hydration + polling 20s */
   useEffect(() => {
     if (!user) return;
-    // Chatters: loadData already fetches scoped spenders via apiFetchSpenders({scope})
-    // This unscoped hydration+polling would overwrite filtered data — skip entirely
-    if (user.role === "chatter") return;
     let cancelled = false;
+    if (user.role === "chatter") {
+      const scope = getScope(user);
+      scope._allowedModelIds = (user.assigned_models || []).filter(Boolean);
+      if (scope._allowedModelIds.length === 0) return;
+      (async () => {
+        try {
+          const data = await apiFetchSpenders({ scope });
+          if (cancelled) return;
+          const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+          setSpenders(deduped);
+        } catch (e) { console.warn("[SPENDERS] chatter hydration failed:", e?.message || e); }
+      })();
+      const iv = setInterval(async () => {
+        try {
+          const data = await apiFetchSpenders({ scope });
+          if (cancelled) return;
+          const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+          setSpenders(deduped);
+        } catch (e) { console.warn("[SPENDERS] chatter periodic refresh failed:", e?.message || e); }
+      }, 20000);
+      return () => { cancelled = true; clearInterval(iv); };
+    }
     (async () => {
       try {
         const data = await apiFetchSpenders();
