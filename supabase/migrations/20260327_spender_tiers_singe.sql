@@ -20,8 +20,12 @@ CREATE INDEX IF NOT EXISTS idx_transactions_spender_status
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. VIEW v_spender_score — agrège total_spent + tx_count_valid depuis transactions
 --    Seules les TX status IN ('valid','validated','confirmee') comptent
+--    DROP CASCADE nécessaire car v_spenders_ui dépend de v_spender_score
 -- ─────────────────────────────────────────────────────────────────────────────
-CREATE OR REPLACE VIEW public.v_spender_score AS
+DROP VIEW IF EXISTS public.v_spenders_ui;
+DROP VIEW IF EXISTS public.v_spender_score;
+
+CREATE VIEW public.v_spender_score AS
 SELECT
   s.id AS spender_id,
   COALESCE(agg.total_spent, 0)      AS total_spent,
