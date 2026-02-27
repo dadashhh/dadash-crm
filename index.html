@@ -2243,10 +2243,43 @@ const sb = window.sb;
 
 // =============================================
 // DATA ACCESS LAYER — DADASH compat (VIEW/RPC stables, pas de colonnes fragiles)
-// VIEW/RPC attendus: v_activity_feed, fn_get_activity_feed_unified(limit,offset,category)
-// tg_conversations: colonnes safe = id, tg_chat_id, tg_peer_id, tg_user_id, spender_id
-// (tg_username/username/display_name peuvent être absentes — on lit depuis spenders)
+// 3 views data-driven: v_activity_new_spenders, v_activity_enrichments, v_activity_messages
+// Colonnes: id, created_at, title, subtitle, tg_user_id, spender_id, payload
 // =============================================
+const ACTIVITY_VIEW_MAP = {
+  new_spender: "v_activity_new_spenders",
+  enrichment: "v_activity_enrichments",
+  messages: "v_activity_messages",
+};
+const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
+  const view = ACTIVITY_VIEW_MAP[tab];
+  if (!view) return [];
+  try {
+    const { data, error } = await sb.from(view)
+      .select("id,created_at,title,subtitle,tg_user_id,spender_id,payload")
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (error) throw error;
+    return (data || []).map(row => ({
+      id: row.id,
+      created_at: row.created_at,
+      ts: row.created_at,
+      title: row.title || "",
+      subtitle: row.subtitle || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
+      label: row.subtitle || (row.tg_user_id ? "tg_" + row.tg_user_id : "?"),
+      message: row.title || row.payload?.text || "",
+      tg_user_id: row.tg_user_id,
+      spender_id: row.spender_id,
+      payload: row.payload || {},
+      data: row.payload || {},
+      eventType: tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "new_message",
+    }));
+  } catch (e) {
+    console.warn("[ACTIVITY] apiFetchActivityTab", tab, e?.message || e);
+    return [];
+  }
+};
+
 const apiFetchActivity = async ({ tab, limit = 150 }) => {
   try {
     if (tab && tab !== "all") {
@@ -7357,9 +7390,11 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [spCardFilter, setSpCardFilter] = useState(null);
   const [spChartMetric, setSpChartMetric] = useState("nouveaux");
   const [highlightSpenderId, setHighlightSpenderId] = useState(null);
-  const [activityFeed, setActivityFeed] = useState([]);
+  const [activity, setActivity] = useState({ newSpenders: [], enrichments: [], messages: [] });
   const [showActivityDrawer, setShowActivityDrawer] = useState(false);
-  const [activityTab, setActivityTab] = useState("all");
+  const [activityTab, setActivityTab] = useState("new_spender");
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityHasMore, setActivityHasMore] = useState({ new_spender: true, enrichment: true, messages: true });
   const [recentFilter, setRecentFilter] = useState(null);
   const [sortRecents, setSortRecents] = useState(false);
   const [syncingTg, setSyncingTg] = useState(false);
@@ -7381,90 +7416,69 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     });
   }, []);
 
-  // ── Activity feed: apiFetchActivity (v_activity_feed / fn_get_activity_feed_unified) ──
-  const fetchActivityFeed = React.useCallback(async () => {
-    let items = await apiFetchActivity({ tab: null, limit: 150 });
-    const hasMessages = items.some(i => ["new_message","message","tx_created"].includes(i.eventType));
-    if (!hasMessages) {
-      try {
-        const { data: msgData } = await sb.from("tg_messages").select("id,conversation_id,direction,text,created_at,meta").order("created_at", { ascending: false }).limit(50);
-        if (msgData && msgData.length > 0) {
-          const convIds = [...new Set(msgData.map(m => m.conversation_id))];
-          const { data: convs } = await sb.from("tg_conversations").select("id,tg_chat_id,tg_user_id,spender_id").in("id", convIds);
-          const convMap = {}; (convs || []).forEach(c => { convMap[c.id] = c; });
-          const tgIds = [...new Set((msgData || []).map(m => m.meta?.tg_user_id || convMap[m.conversation_id]?.tg_user_id).filter(Boolean))];
-          let spMap = {};
-          if (tgIds.length > 0) {
-            const { data: spData } = await sb.from("spenders").select("id,tg_user_id,handle,name,meta").in("tg_user_id", tgIds);
-            (spData || []).forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
-          }
-          const msgItems = (msgData || []).map(m => {
-            const c = convMap[m.conversation_id];
-            const tgId = m.meta?.tg_user_id || c?.tg_user_id;
-            const sp = tgId ? spMap[String(tgId)] : null;
-            const label = sp ? (sp.handle || sp.name || (sp.meta?.profile?.telegram?.username ? "@" + sp.meta.profile.telegram.username : "tg_" + tgId)) : (tgId ? "#" + tgId : "?");
-            return { id: "msg_" + m.id, tg_user_id: tgId, spender_id: sp?.id || c?.spender_id, label, message: (m.text || "").slice(0, 80) || (m.direction === "in" ? "Message reçu" : "Message envoyé"), eventType: "new_message", ts: m.created_at, data: {} };
-          });
-          items = [...msgItems, ...items];
-          console.log("[ACTIVITY] fallback tg_messages n=" + msgItems.length);
-        }
-      } catch (e) { console.warn("[ACTIVITY] tg_messages fallback error:", e?.message || e); }
-    }
-    setActivityFeed(items);
+  const dedupeById = (arr) => Array.from(new Map((arr || []).filter(Boolean).map(i => [i.id, i])).values());
+
+  const loadActivity = React.useCallback(async (tab, limit = 30, cursor = 0, append = false) => {
+    if (!["new_spender", "enrichment", "messages"].includes(tab)) return;
+    setActivityLoading(true);
+    try {
+      const items = await apiFetchActivityTab(tab, limit, cursor);
+      const key = tab === "new_spender" ? "newSpenders" : tab === "enrichment" ? "enrichments" : "messages";
+      setActivity(prev => {
+        const existing = prev[key] || [];
+        const merged = append ? dedupeById([...existing, ...items]) : dedupeById(items);
+        return { ...prev, [key]: merged };
+      });
+      setActivityHasMore(prev => ({ ...prev, [tab]: items.length >= limit }));
+    } catch (e) { console.warn("[ACTIVITY] loadActivity", tab, e?.message || e); }
+    finally { setActivityLoading(false); }
   }, []);
 
-  // Initial fetch on mount
-  useEffect(() => { fetchActivityFeed(); }, [fetchActivityFeed]);
-
-  // Polling: 10s background, 5s when drawer open
   useEffect(() => {
-    const interval = showActivityDrawer ? 5000 : 10000;
-    if (showActivityDrawer) fetchActivityFeed();
-    activityPollingRef.current = setInterval(() => {
-      fetchActivityFeed().then(() => {
-        if (activityFeed.length > 0) console.log("[SYNC] poll_ok events=" + activityFeed.length);
-      });
-    }, interval);
-    return () => { if (activityPollingRef.current) clearInterval(activityPollingRef.current); };
-  }, [showActivityDrawer, fetchActivityFeed]);
+    if (!showActivityDrawer) return;
+    loadActivity(activityTab, 30, 0, false);
+  }, [showActivityDrawer, activityTab]);
 
-  // Re-fetch feed when parent refreshes spender data
+  useEffect(() => {
+    const interval = 20000;
+    if (!showActivityDrawer) return;
+    const t = setInterval(() => loadActivity(activityTab, 30, 0, false), interval);
+    return () => clearInterval(t);
+  }, [showActivityDrawer, activityTab, loadActivity]);
+
   const _dbSpendersRef = React.useRef(dbSpenders);
   useEffect(() => {
-    if (_dbSpendersRef.current !== dbSpenders) { _dbSpendersRef.current = dbSpenders; fetchActivityFeed(); }
-  }, [dbSpenders, fetchActivityFeed]);
+    if (_dbSpendersRef.current !== dbSpenders && showActivityDrawer) {
+      _dbSpendersRef.current = dbSpenders;
+      loadActivity(activityTab, 30, 0, false);
+    }
+  }, [dbSpenders, showActivityDrawer, activityTab, loadActivity]);
 
-  // Activity counts by category (24h)
-  const activityCounts = useMemo(() => {
-    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
-    const recent = activityFeed.filter(a => a.ts && new Date(a.ts) >= todayStart);
-    return {
-      total: recent.length,
-      newSpender: recent.filter(a => ["new_spender","spender_created"].includes(a.eventType)).length,
-      enrichment: recent.filter(a => ["profile_updated","enriched","spender_enriched","classification_changed","handle_set","status_changed"].includes(a.eventType)).length,
-      messages: recent.filter(a => ["new_message","message","tx_created"].includes(a.eventType)).length,
-    };
-  }, [activityFeed]);
-  const activityTodayCount = activityCounts.total;
+  const activityCounts = useMemo(() => ({
+    newSpender: activity.newSpenders.length,
+    enrichment: activity.enrichments.length,
+    messages: activity.messages.length,
+    total: activity.newSpenders.length + activity.enrichments.length + activity.messages.length,
+  }), [activity]);
 
-  // Filtered feed by tab
   const filteredActivityFeed = useMemo(() => {
-    if (activityTab === "new_spender") return activityFeed.filter(a => ["new_spender","spender_created"].includes(a.eventType));
-    if (activityTab === "enrichment") return activityFeed.filter(a => ["profile_updated","enriched","spender_enriched","classification_changed","handle_set","status_changed"].includes(a.eventType));
-    if (activityTab === "messages") return activityFeed.filter(a => ["new_message","message","tx_created"].includes(a.eventType));
-    return activityFeed;
-  }, [activityFeed, activityTab]);
+    if (activityTab === "new_spender") return activity.newSpenders;
+    if (activityTab === "enrichment") return activity.enrichments;
+    if (activityTab === "messages") return activity.messages;
+    return [...activity.newSpenders, ...activity.enrichments, ...activity.messages].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  }, [activity, activityTab]);
 
-  // ── Scroll + highlight + open modal from activity feed click ──
+  const handleLoadMore = () => {
+    const arr = activityTab === "new_spender" ? activity.newSpenders : activityTab === "enrichment" ? activity.enrichments : activity.messages;
+    loadActivity(activityTab, 30, arr.length, true);
+  };
+
   const handleActivityClick = React.useCallback((feedItem) => {
-    // ── CLICK GUARD (D) — never crash on null/undefined item ──
     if (!feedItem || typeof feedItem !== "object") {
       console.warn("[CLICK_IGNORED] handleActivityClick: missing feedItem");
       return;
     }
-    // 1) Find spender: prefer spender_id (UUID), then tg_user_id, fallback to handle (E)
     let sp = null;
-    // 1a) Lookup by DB UUID first (most reliable)
     if (feedItem.spender_id) {
       sp = spenders.find(s => s.dbId === feedItem.spender_id || s.id === feedItem.spender_id);
       if (!sp) {
@@ -7894,14 +7908,17 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       )}
 
       {/* ── ACTIVITY BAR — compact 1-line + drawer on click ── */}
-      <div className="activity-bar-compact" onClick={() => { setShowActivityDrawer(true); fetchActivityFeed(); }}>
+      <div className="activity-bar-compact" onClick={() => {
+            setShowActivityDrawer(true);
+            ["new_spender", "enrichment", "messages"].forEach(t => loadActivity(t, 30, 0, false));
+          }}>
         <span style={{fontSize:13}}>{"⚡"}</span>
         <span style={{fontSize:12,fontWeight:700,color:"var(--text)"}}>{fr?"Activités":"Activity"}</span>
         <span style={{fontSize:11,color:"var(--text-tertiary)"}}>—</span>
         {activityCounts.newSpender > 0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(34,211,161,0.12)",color:"var(--success)"}}>{"🟢"} {activityCounts.newSpender}</span>}
         {activityCounts.enrichment > 0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(99,102,241,0.12)",color:"var(--accent)"}}>{"✏️"} {activityCounts.enrichment}</span>}
         {activityCounts.messages > 0 && <span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(59,130,246,0.12)",color:"var(--info)"}}>{"💬"} {activityCounts.messages}</span>}
-        {activityTodayCount === 0 && <span style={{fontSize:11,color:"var(--text-quaternary)"}}>{fr?"aucune":"none"}</span>}
+        {activityCounts.total === 0 && <span style={{fontSize:11,color:"var(--text-quaternary)"}}>{fr?"aucune":"none"}</span>}
         <span style={{width:6,height:6,borderRadius:"50%",background:"#10b981",display:"inline-block",animation:"pulse 2s infinite",flexShrink:0}} title="live"/>
         <span style={{marginLeft:"auto",fontSize:11,fontWeight:600,color:"var(--accent)"}}>{fr?"Voir":"View"} →</span>
       </div>
@@ -7954,7 +7971,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               const {total,created,updated} = await apiSyncTG();
               addToast(`🔄 Sync TG OK: ${total} convs — ${created} créé(s) — ${updated} mis à jour`,"success");
               await onRefresh();
-              fetchActivityFeed();
+              loadActivity(activityTab, 30, 0, false);
             } catch(e){ addToast("Sync TG erreur: "+(e?.message||e),"error"); }
             finally{ setSyncingTg(false); }
           }} disabled={syncingTg} title="Synchroniser les conversations Telegram → fiches Spenders" style={{marginLeft:"auto",padding:"7px 13px",borderRadius:9,border:"1px solid rgba(139,92,246,0.4)",background:"rgba(139,92,246,0.1)",color:"var(--accent)",fontSize:13,fontWeight:600,cursor:syncingTg?"wait":"pointer",opacity:syncingTg?0.7:1,transition:"all 0.15s"}}>{syncingTg?"⏳ Sync…":"🔄 Sync TG"}</button>}
@@ -8413,10 +8430,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               <button onClick={() => setShowActivityDrawer(false)} style={{width:30,height:30,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border)",color:"var(--text-tertiary)",fontSize:16,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"✕"}</button>
             </div>
           </div>
-          {/* ── Tab bar: 3 categories ── */}
+          {/* ── Tab bar: 3 onglets data-driven ── */}
           <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border)",flexShrink:0}}>
             {[
-              {key:"all",     label:fr?"Tout":"All",        icon:"⚡", count:activityCounts.total},
               {key:"new_spender", label:fr?"Nouveaux":"New Spenders", icon:"🟢", count:activityCounts.newSpender},
               {key:"enrichment",  label:fr?"Enrichis":"Enrichment",   icon:"✏️", count:activityCounts.enrichment},
               {key:"messages",    label:fr?"Messages":"Messages",     icon:"💬", count:activityCounts.messages},
@@ -8433,8 +8449,11 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             ))}
           </div>
           <div className="activity-drawer-list">
-            {filteredActivityFeed.length === 0 && (
-              <div style={{padding:40,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucune activité":"No activity"}{activityTab !== "all" && <span> ({activityTab})</span>}</div>
+            {activityLoading && filteredActivityFeed.length === 0 && (
+              <div style={{padding:40,textAlign:"center",color:"var(--text-tertiary)",fontSize:12}}>{fr?"Chargement...":"Loading..."}</div>
+            )}
+            {!activityLoading && filteredActivityFeed.length === 0 && (
+              <div style={{padding:40,textAlign:"center",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucune activité":"No activity"}</div>
             )}
             {filteredActivityFeed.map((item, idx) => {
               const evIcon = (item.eventType === "new_spender" || item.eventType === "spender_created") ? "🟢"
@@ -8448,13 +8467,18 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 <div key={item.id || idx} className="activity-drawer-item" onClick={() => handleActivityClick(item)}>
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label}</div>
-                    {(item.message || item.data?.summary) && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.eventType==="profile_updated"||item.eventType==="enriched"||item.eventType==="spender_enriched") && item.data?.summary ? "AI enriched: " + item.data.summary : (item.title ? item.title + " — " : "") + (item.message||"")}</div>}
+                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label || item.subtitle}</div>
+                    {(item.message || item.title || item.payload?.summary) && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.eventType==="profile_updated"||item.eventType==="enriched"||item.eventType==="spender_enriched") && item.payload?.summary ? "AI enriched: " + item.payload.summary : (item.title || item.message || "").slice(0, 80)}</div>}
                   </div>
-                  <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts)}</span>
+                  <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts || item.created_at)}</span>
                 </div>
               );
             })}
+            {!activityLoading && activityHasMore[activityTab] && filteredActivityFeed.length > 0 && (
+              <div style={{padding:12,textAlign:"center"}}>
+                <button onClick={handleLoadMore} style={{fontSize:11,color:"var(--accent)",background:"var(--accent-subtle)",border:"1px solid var(--border)",borderRadius:8,padding:"6px 16px",cursor:"pointer",fontWeight:600}}>{fr?"Charger plus":"Load more"}</button>
+              </div>
+            )}
           </div>
           {/* ── Footer: version + hard refresh ── */}
           <div style={{padding:"8px 16px",borderTop:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
