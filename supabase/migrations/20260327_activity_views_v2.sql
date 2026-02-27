@@ -108,7 +108,7 @@ SELECT
   'message'::text AS type,
   'message'::text AS event_type,
   CASE WHEN (m.meta->>'tg_user_id') ~ '^\d+$' THEN (m.meta->>'tg_user_id')::BIGINT
-       WHEN c.tg_user_id IS NOT NULL THEN c.tg_user_id
+       WHEN c.tg_user_id IS NOT NULL AND (c.tg_user_id::text) ~ '^\d+$' THEN (c.tg_user_id::text)::BIGINT
        ELSE NULL::BIGINT END AS tg_user_id,
   COALESCE(m.meta->>'tg_user_id', c.tg_user_id::text, c.tg_chat_id) AS tg_user_id_text,
   COALESCE(
