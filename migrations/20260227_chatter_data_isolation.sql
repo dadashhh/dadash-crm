@@ -1,17 +1,17 @@
 -- PR1: Chatter Data Isolation
--- Creates v_chatter_models canonical view from profiles.assigned_models JSONB array.
+-- Creates v_chatter_models canonical view from profiles.assigned_models (text[] array).
 -- No new table needed: assignments already live in profiles.assigned_models.
 
 CREATE OR REPLACE VIEW public.v_chatter_models AS
 SELECT
   p.id AS chatter_user_id,
-  j.value::text::uuid AS model_id
+  m.value::uuid AS model_id
 FROM public.profiles p,
-  jsonb_array_elements_text(p.assigned_models) j(value)
+  unnest(p.assigned_models) m(value)
 WHERE p.role = 'chatter'
   AND p.is_active IS NOT FALSE
   AND p.assigned_models IS NOT NULL
-  AND jsonb_array_length(p.assigned_models) > 0;
+  AND array_length(p.assigned_models, 1) > 0;
 
 GRANT SELECT ON public.v_chatter_models TO authenticated, service_role;
 
