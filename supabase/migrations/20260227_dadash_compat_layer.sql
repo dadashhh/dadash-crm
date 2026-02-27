@@ -21,10 +21,10 @@ ALTER TABLE public.tg_conversations ADD COLUMN IF NOT EXISTS tg_first_name TEXT;
 ALTER TABLE public.tg_conversations ADD COLUMN IF NOT EXISTS tg_last_name TEXT;
 ALTER TABLE public.tg_conversations ADD COLUMN IF NOT EXISTS tg_display_name TEXT;
 
--- Backfill: pour les DMs, tg_chat_id = user_id Telegram
+-- Backfill: pour les DMs, tg_chat_id = user_id Telegram (WHERE filtre déjà les numériques)
 UPDATE public.tg_conversations
 SET
-  tg_user_id = CASE WHEN tg_chat_id ~ '^\d+$' THEN tg_chat_id::BIGINT ELSE tg_user_id END,
+  tg_user_id = tg_chat_id::BIGINT,
   tg_peer_id = COALESCE(tg_peer_id, tg_chat_id)
 WHERE tg_user_id IS NULL AND tg_chat_id ~ '^\d+$';
 
@@ -67,8 +67,22 @@ CREATE TRIGGER trg_sync_conv_from_message
   AFTER INSERT ON public.tg_messages
   FOR EACH ROW EXECUTE FUNCTION public.tg_sync_conv_from_message();
 
--- spender_events: colonne spender_id si manquante (pour lien conv/spender)
+-- spender_events: colonnes compat (certaines migrations créent la table sans data/idempotency_key)
 ALTER TABLE public.spender_events ADD COLUMN IF NOT EXISTS spender_id UUID;
+ALTER TABLE public.spender_events ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE public.spender_events ADD COLUMN IF NOT EXISTS data JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- Backfill data depuis meta si existant (schémas legacy)
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'spender_events' AND column_name = 'meta'
+  ) THEN
+    UPDATE public.spender_events
+    SET data = COALESCE(meta, '{}'::jsonb)
+    WHERE data = '{}'::jsonb AND meta IS NOT NULL AND meta <> '{}'::jsonb;
+  END IF;
+END $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- TÂCHE C — Activity feed: étendre event_type pour enriched/spender_enriched
@@ -77,7 +91,17 @@ ALTER TABLE public.spender_events ADD COLUMN IF NOT EXISTS spender_id UUID;
 
 DO $$
 BEGIN
-  -- Supprimer l'ancienne contrainte si elle existe
+  -- 1. Migrer les event_type invalides vers 'unknown' (évite violation de contrainte)
+  UPDATE public.spender_events
+  SET event_type = 'unknown'
+  WHERE event_type IS NULL
+     OR event_type NOT IN (
+       'new_spender', 'profile_updated', 'new_message', 'status_changed',
+       'classification_changed', 'spender_created', 'tx_created', 'handle_set',
+       'enriched', 'spender_enriched', 'message', 'unknown'
+     );
+
+  -- 2. Supprimer l'ancienne contrainte si elle existe
   IF EXISTS (
     SELECT 1 FROM information_schema.check_constraints
      WHERE constraint_schema = 'public'
@@ -85,7 +109,8 @@ BEGIN
   ) THEN
     ALTER TABLE public.spender_events DROP CONSTRAINT chk_spender_events_event_type;
   END IF;
-  -- Recréer avec types étendus
+
+  -- 3. Recréer avec types étendus
   ALTER TABLE public.spender_events
     ADD CONSTRAINT chk_spender_events_event_type
     CHECK (event_type IN (
@@ -99,17 +124,17 @@ END $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- TÂCHE C — VIEW v_activity_feed_unified
--- Source: spender_events + fallback tg_messages pour "message"
--- Catégories: new_spender | enrichment | message
--- handle = spenders.handle OU meta->profile->telegram->>username OU tg_user_id::text
+-- DROP avant CREATE (changement de type tg_user_id text→bigint impossible avec REPLACE)
 -- ─────────────────────────────────────────────────────────────────────────────
 
-CREATE OR REPLACE VIEW public.v_activity_feed_unified AS
+DROP FUNCTION IF EXISTS public.fn_get_activity_feed_unified(INTEGER, INTEGER, TEXT);
+DROP VIEW IF EXISTS public.v_activity_feed_unified;
+CREATE VIEW public.v_activity_feed_unified AS
 WITH events_with_category AS (
   SELECT
     e.id,
     e.event_type,
-    e.tg_user_id,
+    CASE WHEN (e.tg_user_id::text) ~ '^\d+$' THEN (e.tg_user_id::text)::BIGINT ELSE NULL::BIGINT END AS tg_user_id,
     e.spender_id,
     e.data,
     e.created_at,
@@ -157,15 +182,10 @@ enriched AS (
       WHEN 'message' THEN 'Message'
       WHEN 'tx_created' THEN 'Transaction créée'
       ELSE COALESCE(ev.event_type, 'Événement')
-    END AS title,
-  COALESCE(
-    ev.data->>'summary',
-    ev.data->>'message',
-    ev.event_type || ' — ' || COALESCE(s.handle, 'tg_' || ev.tg_user_id::text)
-  ) AS summary
+    END AS title
   FROM events_with_category ev
-  LEFT JOIN public.spenders s ON s.tg_user_id = ev.tg_user_id OR s.id = ev.spender_id
-  LEFT JOIN public.tg_conversations c ON c.tg_user_id = ev.tg_user_id OR c.spender_id = ev.spender_id
+  LEFT JOIN public.spenders s ON s.tg_user_id::text = ev.tg_user_id::text OR s.id = ev.spender_id
+  LEFT JOIN public.tg_conversations c ON c.tg_user_id::text = ev.tg_user_id::text OR c.spender_id = ev.spender_id
 )
 SELECT
   ev.id,
