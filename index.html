@@ -2347,7 +2347,7 @@ const apiFetchSpenders = async () => {
 
 const apiSyncTG = async () => {
   const safeCols = "id,tg_chat_id,tg_peer_id,tg_user_id,spender_id";
-  const { data: convs, error: convErr } = await sb.from("tg_conversations").select(safeCols);
+  const { data: convs, error: convErr } = await sb.from("v_tg_conversations").select(safeCols);
   if (convErr) throw new Error("tg_conversations: " + convErr.message);
   let total = 0, created = 0, updated = 0;
   for (const conv of convs || []) {
@@ -17587,7 +17587,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
     setLoading(true);
     setLoadError(null);
     try {
-      let q = sb.from("tg_conversations").select("*");
+      let q = sb.from("v_tg_conversations").select("*");
       if (u.role === "chatter") {
         const myModelIds = getChatterContext(u, models).assignedModelIds;
         if (escaladesOnly) {
@@ -18283,11 +18283,11 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
     try {
       let col = null;
       for (const c of ASSIGN_COLUMNS) {
-        const { error } = await sb.from("tg_conversations").select("id," + c).limit(1);
+        const { error } = await sb.from("v_tg_conversations").select("id," + c).limit(1);
         if (!error) { col = c; break; }
       }
       setAssignColumn(col);
-      const { data: list, error: listErr } = await sb.from("tg_conversations").select("*").order("last_message_at", { ascending: false }).limit(100);
+      const { data: list, error: listErr } = await sb.from("v_tg_conversations").select("*").order("last_message_at", { ascending: false }).limit(100);
       if (listErr) throw new Error(listErr.message);
       setConvs(list || []);
     } catch (e) {
@@ -22400,20 +22400,33 @@ const BotsManagementPage = ({ lang, user }) => {
   const fetchAutofill = useCallback(async () => {
     if (!window.sb) return;
     try {
-      const [runRes, metricsRes, eventsRes, cmdRes] = await Promise.all([
+      const [metricsRes, eventsRes, runRes, cmdRes] = await Promise.all([
+        window.sb.from("v_bot_autofill_metrics").select("*").limit(1).maybeSingle(),
+        window.sb.from("v_bot_autofill_events").select("id,type,tg_user_id,spender_id,created_at,message,payload"),
         window.sb.from("bot_runs").select("*").eq("bot_name", "telegram_autofill").maybeSingle(),
-        window.sb.from("bot_daily_metrics").select("*").eq("bot_name", "telegram_autofill").eq("day", new Date().toISOString().slice(0, 10)).maybeSingle(),
-        window.sb.from("bot_events").select("id,bot_name,level,event_type,message,created_at").eq("bot_name", "telegram_autofill").order("created_at", { ascending: false }).limit(50),
         window.sb.from("bot_commands").select("id,command,status,created_at").eq("bot_name", "telegram_autofill").order("created_at", { ascending: false }).limit(1).maybeSingle()
       ]);
+      if (metricsRes.data) setAutofillMetrics({ msgs_ingested: metricsRes.data.msgs_24h, spenders_created: metricsRes.data.spenders_created_24h, spenders_updated: metricsRes.data.spenders_updated_24h, enrich_pending: metricsRes.data.enrich_pending, enrich_done: metricsRes.data.enrich_done, errors_count: metricsRes.data.errors_24h });
+      else setAutofillMetrics(null);
+      setAutofillEvents(Array.isArray(eventsRes.data) ? eventsRes.data.map(e => ({ id: e.id, event_type: e.type, message: e.message, created_at: e.created_at, data: e.payload })) : []);
       if (runRes.data) setAutofillRun(runRes.data);
       else setAutofillRun(null);
-      if (metricsRes.data) setAutofillMetrics(metricsRes.data);
-      else setAutofillMetrics(null);
-      setAutofillEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
       if (cmdRes.data) setAutofillLastCmd(cmdRes.data);
       else setAutofillLastCmd(null);
-    } catch (_) {}
+    } catch (_) {
+      try {
+        const [runRes, metricsRes, eventsRes, cmdRes] = await Promise.all([
+          window.sb.from("bot_runs").select("*").eq("bot_name", "telegram_autofill").maybeSingle(),
+          window.sb.from("bot_daily_metrics").select("*").eq("bot_name", "telegram_autofill").eq("day", new Date().toISOString().slice(0, 10)).maybeSingle(),
+          window.sb.from("bot_events").select("id,bot_name,level,event_type,message,created_at").eq("bot_name", "telegram_autofill").order("created_at", { ascending: false }).limit(50),
+          window.sb.from("bot_commands").select("id,command,status,created_at").eq("bot_name", "telegram_autofill").order("created_at", { ascending: false }).limit(1).maybeSingle()
+        ]);
+        if (runRes.data) setAutofillRun(runRes.data); else setAutofillRun(null);
+        if (metricsRes.data) setAutofillMetrics(metricsRes.data); else setAutofillMetrics(null);
+        setAutofillEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
+        if (cmdRes.data) setAutofillLastCmd(cmdRes.data); else setAutofillLastCmd(null);
+      } catch (_) {}
+    }
   }, []);
 
   const sendBotCommand = useCallback(async (cmd) => {
@@ -27565,7 +27578,21 @@ const App = () => {
       </div>
     </div>
   );
-  if(!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
+  const hash = (typeof window !== "undefined" ? window.location.hash.replace(/^#/, "").split("/")[0] : "") || "";
+  const showLoginRoute = hash === "login";
+  if (!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
+  if (showLoginRoute && user) {
+    return (
+      <div className="login-wrap">
+        <div className="login-card" style={{padding: 32, textAlign: "center"}}>
+          <div className="login-logo">D</div>
+          <div className="login-title">DADASH</div>
+          <div style={{fontSize: 14, color: "var(--text-secondary)", marginBottom: 20}}>{lang === "fr" ? "Déjà connecté" : "Already logged in"}</div>
+          <button className="ui-btn-primary" onClick={handleLogout} style={{width: "100%", padding: "12px 24px"}}>{lang === "fr" ? "Se déconnecter" : "Logout"}</button>
+        </div>
+      </div>
+    );
+  }
 
   const isModele = user.role === "modele";
   const isGerant = user.role === "gerant";
