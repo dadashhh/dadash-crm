@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { db } from '../supabaseClient.js';
 import { log, type LogMeta } from '../logger.js';
 import { extractProfile } from '../profile/extractProfile.js';
-import { deepMerge } from '../utils/deepMerge.js';
+import { deepMergeNoEmpty, diffAddedFields, writeSpenderEvent, structureExtractedProfile } from '../utils/spenderHelpers.js';
 
 const POLL_MS = parseInt(process.env.ENRICH_POLL_MS ?? '5000', 10);
 const BATCH_LIMIT = parseInt(process.env.ENRICH_BATCH_LIMIT ?? '1', 10);
@@ -100,7 +100,8 @@ async function processJob(job: QueueRow): Promise<void> {
 
   // B) Extract profile from message texts
   const profile = extractProfile(messages);
-  const updatedFields = Object.keys(profile);
+  const structuredProfile = structureExtractedProfile(profile as Record<string, unknown>);
+  const updatedFields = Object.keys(structuredProfile);
 
   if (updatedFields.length === 0) {
     log.info('ENRICH', 'no_new_fields', ctx);
@@ -123,19 +124,15 @@ async function processJob(job: QueueRow): Promise<void> {
     return;
   }
 
-  // D) Deep merge snapshot: spenders.meta.profile
+  // D) Deep merge snapshot: spenders.meta.profile (structure identity/location/status)
   const currentMeta = (spender.meta ?? {}) as Record<string, unknown>;
   const currentProfile = (currentMeta.profile ?? {}) as Record<string, unknown>;
-  const mergedProfile = deepMerge(currentProfile, profile as Record<string, unknown>);
+  const mergedProfile = deepMergeNoEmpty(currentProfile, structuredProfile);
 
-  const newMeta = deepMerge(currentMeta, { profile: mergedProfile });
+  const newMeta = deepMergeNoEmpty(currentMeta, { profile: mergedProfile });
 
-  // Detect actually new/changed fields
-  const changedFields = updatedFields.filter((f) => {
-    const oldVal = currentProfile[f];
-    const newVal = (profile as Record<string, unknown>)[f];
-    return oldVal !== newVal;
-  });
+  // Detect actually new/changed fields (nested keys flattened for summary)
+  const changedFields = diffAddedFields(currentProfile, mergedProfile);
 
   // E) Write spender update
   const topLevelUpdates: Record<string, unknown> = { meta: newMeta };
@@ -165,22 +162,21 @@ async function processJob(job: QueueRow): Promise<void> {
   if (changedFields.length > 0) {
     const idemKey = `spender:${job.tg_user_id}:profile:${profileHash(changedFields, job.last_message_id)}`;
 
-    const { error: evErr } = await db.rpc('fn_insert_spender_event', {
-      p_tg_user_id: job.tg_user_id,
-      p_event_type: 'profile_updated',
-      p_idempotency_key: idemKey,
-      p_data: {
-        fields: changedFields,
-        extracted: profile,
-        last_message_id: job.last_message_id,
+    try {
+      await writeSpenderEvent(db, {
+        tgUserId: job.tg_user_id,
+        eventType: 'profile_updated',
+        idempotencyKey: idemKey,
         summary: `Profil enrichi: ${changedFields.join(', ')}`,
-      },
-    });
-
-    if (evErr) {
-      log.warn('EVENT', 'insert_failed', { ...ctx, error: evErr.message });
-    } else {
+        payload: {
+          fields: changedFields,
+          extracted: structuredProfile,
+          last_message_id: job.last_message_id,
+        },
+      });
       log.info('EVENT', 'profile_updated', { ...ctx, idempotency_key: idemKey });
+    } catch (evErr) {
+      log.warn('EVENT', 'insert_failed', { ...ctx, error: evErr instanceof Error ? evErr.message : String(evErr) });
     }
   }
 

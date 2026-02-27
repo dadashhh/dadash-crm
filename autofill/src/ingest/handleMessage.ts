@@ -2,6 +2,7 @@ import { db } from '../supabaseClient.js';
 import { log } from '../logger.js';
 import { upsertSpender } from '../spenders/upsertSpender.js';
 import { enqueueEnrich } from '../queue/enqueueEnrich.js';
+import { writeSpenderEvent } from '../utils/spenderHelpers.js';
 
 export interface IncomingMessage {
   chatId: string | number;
@@ -68,13 +69,14 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
 
   log.info('INGEST', 'msg_ok', { msg_id: msg.tgMessageId, conv_id: convId });
 
-  // 2b. Insert spender_event new_message (pour Activity feed DADASH)
+  // 2b. Insert spender_event message (pour Activity feed DADASH)
   try {
-    await db.rpc('fn_insert_spender_event', {
-      p_tg_user_id: msg.tgUserId,
-      p_event_type: 'new_message',
-      p_idempotency_key: `msg:${msg.tgUserId}:${msg.tgMessageId}`,
-      p_data: { summary: msg.text?.slice(0, 100) || null },
+    await writeSpenderEvent(db, {
+      tgUserId: msg.tgUserId,
+      eventType: 'message',
+      idempotencyKey: `msg:${msg.tgUserId}:${msg.tgMessageId}`,
+      summary: msg.text?.slice(0, 100) || 'Message reçu',
+      payload: { tg_message_id: msg.tgMessageId },
     });
   } catch {
     // Ignore dedup/constraint errors
