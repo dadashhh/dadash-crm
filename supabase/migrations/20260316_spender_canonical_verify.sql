@@ -7,13 +7,13 @@
 SELECT column_name, data_type
   FROM information_schema.columns
  WHERE table_schema = 'public' AND table_name = 'v_spenders'
-   AND column_name IN ('id', 'tg_user_id', 'tg_user_id_text', 'first_name', 'age', 'job', 'city', 'country', 'language', 'notes_chatter', 'relationship', 'source', 'profile_updated_at')
+   AND column_name IN ('id', 'tg_user_id', 'first_name', 'age', 'job', 'city', 'country', 'language', 'notes_chatter', 'relationship', 'source', 'profile_updated_at', 'tg_user_id_text')
  ORDER BY ordinal_position;
 
 -- 2. Sample v_spenders (5 lignes)
-SELECT id, tg_user_id, tg_user_id_text, username, handle, first_name, age, city, language, profile_updated_at
+SELECT id, tg_user_id, username, handle, first_name, age, city
   FROM public.v_spenders
- ORDER BY profile_updated_at DESC NULLS LAST
+ ORDER BY last_activity_at DESC NULLS LAST
  LIMIT 5;
 
 -- 3. fn_spender_apply_enrichment existe
