@@ -20,6 +20,21 @@
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 -- ─────────────────────────────────────────────────────────────────────────────
+-- PHASE -1 — DROP views dépendantes AVANT ALTER COLUMN (évite erreur 0A000)
+-- Les views seront recréées par 20260313_dadash_pipeline_compat.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+DROP VIEW IF EXISTS public.v_activity_new_spenders;
+DROP VIEW IF EXISTS public.v_activity_enrichments;
+DROP VIEW IF EXISTS public.v_activity_messages;
+DROP VIEW IF EXISTS public.v_activity_feed;
+DROP VIEW IF EXISTS public.v_spender_enrich_queue;
+DROP VIEW IF EXISTS public.v_spender_enrichments;
+DROP VIEW IF EXISTS public.v_spender_events;
+DROP VIEW IF EXISTS public.v_spenders;
+DROP VIEW IF EXISTS public.v_tg_conversations;
+DROP VIEW IF EXISTS public.v_tg_messages;
+
+-- ─────────────────────────────────────────────────────────────────────────────
 -- PHASE 0 — Colonnes spenders pour merge (is_active, merged_into_id)
 -- ─────────────────────────────────────────────────────────────────────────────
 ALTER TABLE public.spenders ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT true;
