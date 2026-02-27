@@ -2,6 +2,7 @@ import { db } from '../supabaseClient.js';
 import { log, type LogMeta } from '../logger.js';
 import { extractProfile } from '../profile/extractProfile.js';
 import { structureExtractedProfile, flattenForEnrichmentRpc } from '../utils/spenderHelpers.js';
+import { upsertSpenderAndEvent } from '../spenders/upsertSpenderAndEvent.js';
 
 const POLL_MS = parseInt(process.env.ENRICH_POLL_MS ?? '5000', 10);
 const BATCH_LIMIT = parseInt(process.env.ENRICH_BATCH_LIMIT ?? '1', 10);
@@ -30,7 +31,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 interface QueueRow {
   id: string;
   conversation_id: string;
-  tg_user_id: number;
+  tg_user_id: number | string;
   last_message_id: number | null;
   attempts: number;
 }
@@ -104,45 +105,39 @@ async function processJob(job: QueueRow): Promise<void> {
     return;
   }
 
-  // C) Load spender
-  const { data: spender, error: spErr } = await db
-    .from('spenders')
-    .select('id')
-    .eq('tg_user_id', job.tg_user_id)
-    .maybeSingle();
-
-  if (spErr || !spender) {
-    log.error('ENRICH', 'spender_not_found', { ...ctx, error: spErr?.message ?? 'null' });
-    await completeJob(job.id, 'failed', 'spender_not_found');
-    metrics.enriched_fail++;
+  // C) upsert_spender_and_event (unified: meta.profile + meta.enrich.last + spender_events profile_updated)
+  const tgUserIdStr = String(job.tg_user_id).replace(/\D/g, '') || null;
+  if (!tgUserIdStr) {
+    log.warn('ENRICH', 'skip_no_tg_user_id', ctx);
+    await completeJob(job.id, 'done');
+    metrics.enriched_ok++;
     return;
   }
 
-  // D) Flatten for RPC (age, city, country, job, language, notes, etc.)
-  const enrichmentJson = flattenForEnrichmentRpc(structuredProfile as Record<string, unknown>);
-  if (Object.keys(enrichmentJson).length === 0) {
+  const flatProfile = flattenForEnrichmentRpc(structuredProfile as Record<string, unknown>);
+  const enrichFields = Object.keys(flatProfile);
+  if (enrichFields.length === 0) {
     log.info('ENRICH', 'no_new_fields', ctx);
     await completeJob(job.id, 'done');
     metrics.enriched_ok++;
     return;
   }
 
-  // E) Apply via RPC (merge meta + update columns + insert event)
-  const { data: applyResult, error: applyErr } = await db.rpc('fn_apply_spender_enrichment', {
-    p_spender_id: spender.id,
-    p_tg_user_id: job.tg_user_id,
-    p_enrichment: enrichmentJson,
-  });
-
-  if (applyErr) {
-    log.error('ENRICH', 'apply_failed', { ...ctx, error: applyErr.message });
-    await completeJob(job.id, 'failed', `apply: ${applyErr.message}`);
+  try {
+    await upsertSpenderAndEvent({
+      tg_user_id: tgUserIdStr,
+      extracted_fields: flatProfile,
+      enrich_fields_list: enrichFields,
+      enrich_patch: flatProfile,
+    });
+    log.info('EVENT', 'inserted', { type: 'profile_updated', fields: enrichFields.join(',') });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    log.error('ENRICH', 'upsert_failed', { ...ctx, error: errMsg });
+    await completeJob(job.id, 'failed', `upsert: ${errMsg}`);
     metrics.enriched_fail++;
     return;
   }
-
-  const added = (applyResult as { added?: string[] })?.added ?? [];
-  log.info('UPSERT', 'profile_updated', { ...ctx, fields: added.join(',') });
 
   // F) Complete
   await completeJob(job.id, 'done');
