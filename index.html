@@ -2286,27 +2286,27 @@ const apiFetchActivity = async ({ tab, limit = 150 }) => {
       data: ev.data || {},
     }));
   } catch (e) {
-    console.warn("[ACTIVITY] fallback spender_events:", e?.message || e);
-    const { data: evData, error } = await sb.from("spender_events")
-      .select("id,tg_user_id,event_type,data,created_at")
+    console.warn("[ACTIVITY] fallback v_spender_events:", e?.message || e);
+    const { data: evData, error } = await sb.from("v_spender_events")
+      .select("id,type,spender_id,tg_user_id,payload,created_at,handle,conv_id")
       .order("created_at", { ascending: false }).limit(limit);
     if (error || !evData?.length) return [];
-    const tgIds = [...new Set((evData || []).map(ev => ev.tg_user_id).filter(Boolean))];
-    let spMap = {};
-    if (tgIds.length > 0) {
-      const { data: spData } = await sb.from("spenders").select("id,tg_user_id,handle,name,meta").in("tg_user_id", tgIds);
-      (spData || []).forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
-    }
-    return (evData || []).map(ev => {
-      const sp = ev.tg_user_id ? spMap[String(ev.tg_user_id)] : null;
-      const label = sp ? (sp.handle || sp.name || sp.meta?.profile?.telegram?.username ? "@" + (sp.meta?.profile?.telegram?.username || sp.handle || sp.name) : "tg_" + ev.tg_user_id) : (ev.tg_user_id ? "#" + ev.tg_user_id : "?");
-      return { id: ev.id, tg_user_id: ev.tg_user_id, label, message: ev.data?.summary || ev.event_type, eventType: ev.event_type, ts: ev.created_at, data: ev.data || {} };
-    });
+    return (evData || []).map(ev => ({
+      id: ev.id,
+      tg_user_id: ev.tg_user_id,
+      spender_id: ev.spender_id,
+      conv_id: ev.conv_id,
+      label: ev.handle || (ev.tg_user_id ? "#" + ev.tg_user_id : "?"),
+      message: ev.payload?.summary || ev.type,
+      eventType: ev.type,
+      ts: ev.created_at,
+      data: ev.payload || {},
+    }));
   }
 };
 
 const apiFetchSpenders = async () => {
-  const { data, error } = await sb.from("spenders").select("*");
+  const { data, error } = await sb.from("v_spenders").select("*");
   if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
   console.log("[SPENDERS] loaded n=" + (data?.length || 0));
   return data || [];
@@ -2318,26 +2318,22 @@ const apiSyncTG = async () => {
   if (convErr) throw new Error("tg_conversations: " + convErr.message);
   let total = 0, created = 0, updated = 0;
   for (const conv of convs || []) {
-    const tg_user_id = String(conv.tg_user_id || conv.tg_peer_id || conv.tg_chat_id || "").trim();
-    if (!tg_user_id || tg_user_id === "0") continue;
+    const tgId = conv.tg_user_id ?? conv.tg_peer_id ?? conv.tg_chat_id;
+    const tg_user_id = typeof tgId === "number" ? tgId : parseInt(String(tgId || "").replace(/\D/g, ""), 10);
+    if (!tg_user_id || isNaN(tg_user_id)) continue;
     total++;
-    const telegramMeta = { user_id: tg_user_id, display: tg_user_id, input_value: tg_user_id, source: "telegram_dm" };
-    const { data: byId } = await sb.from("spenders").select("id,tg_user_id,telegram_username,handle,meta").eq("tg_user_id", tg_user_id).maybeSingle();
-    if (byId) {
-      const metaUp = { ...(byId.meta || {}), profile: { ...((byId.meta || {}).profile || {}), telegram: { ...telegramMeta, username: byId.telegram_username || null } } };
-      await sb.from("spenders").update({ meta: metaUp, updated_at: new Date().toISOString() }).eq("id", byId.id);
-      updated++;
-      continue;
-    }
-    const handle = "tg_" + tg_user_id;
-    await sb.from("spenders").insert({
-      handle, name: handle, tg_user_id, telegram_username: null, status: "active", source: "telegram_sync",
-      meta: { profile: { telegram: telegramMeta } }, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+    const meta = { profile: { telegram: { user_id: tg_user_id, display: "tg_" + tg_user_id, source: "telegram_sync" } } };
+    const { data: spenderId, error } = await sb.rpc("fn_upsert_spender_from_tg", {
+      p_tg_user_id: tg_user_id,
+      p_username: null,
+      p_display_name: null,
+      p_meta: meta,
     });
-    created++;
+    if (error) { console.warn("[SYNC_TG] upsert err tg=" + tg_user_id, error.message); continue; }
+    updated++;
   }
-  console.log("[SYNC_TG] total=" + total + " created=" + created + " updated=" + updated);
-  return { total, created, updated };
+  console.log("[SYNC_TG] total=" + total + " synced=" + updated);
+  return { total, created: updated, updated };
 };
 
 const apiHardRefresh = (loadDataFn) => {
@@ -27000,7 +26996,7 @@ const App = () => {
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
         safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
-        safe(sb.from("spenders").select("*"), "spenders"),
+        safe(sb.from("v_spenders").select("*"), "spenders"),
         safe(sb.from("profiles").select("*"), "profiles"),
         safe(sb.from("models").select("*"), "models"),
         safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
@@ -27097,7 +27093,8 @@ const App = () => {
     setTxs(txData);
     setTxSummary(txSumData);
     setTxTotal(txR.count||txData.length||0);
-    setSpenders(spenderData);
+    const dedupedSpenders = Array.from(new Map((spenderData||[]).filter(Boolean).map(s=>[s.id,s])).values());
+    setSpenders(dedupedSpenders);
     setProfiles(profileData);
     setModels(modelData);
     const normPayouts = normalizePayouts(payoutData);
@@ -27447,6 +27444,17 @@ const App = () => {
     }
   };
   const onRefresh = fn_afterMutationOrImportRefresh;
+
+  /* Pipeline spenders — polling 20s pour mise à jour auto (gerant) */
+  useEffect(() => {
+    if (!user || user.role !== "gerant") return;
+    const iv = setInterval(async () => {
+      const data = await apiFetchSpenders();
+      const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+      setSpenders(deduped);
+    }, 20000);
+    return () => clearInterval(iv);
+  }, [user?.role]);
 
   /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications */
   const afterMutationRefresh = useCallback(async () => {
