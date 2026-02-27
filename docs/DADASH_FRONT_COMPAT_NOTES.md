@@ -19,7 +19,7 @@
 
 ## Mapping meta.profile (bot enrich)
 
-Le front lit les champs depuis `spenders.meta.profile` avec fallback sur colonnes top-level:
+Helper central `getProfile(meta)` (index.html) lit les champs depuis `meta.profile` avec fallback ancien mapping:
 
 - `meta.profile.identity.first_name` ou `meta.profile.first_name` → prénom
 - `meta.profile.identity.age` ou `meta.profile.age` → âge
@@ -29,6 +29,7 @@ Le front lit les champs depuis `spenders.meta.profile` avec fallback sur colonne
 - `meta.profile.language` ou `meta.profile.langue` → langue
 - `meta.profile.status.relation` ou `meta.profile.relationship_status` → relation
 - `meta.profile.notes_chatter` → notes chatter
+- `meta.profile.budget.chf_range` ou `meta.profile.budget_range` → budget CHF
 - `meta.profile.telegram.username` → @username (display)
 
 ## Sync TG — colonnes safe
