@@ -180,7 +180,9 @@ GRANT SELECT ON public.v_spenders_ui TO authenticated;
 GRANT SELECT ON public.v_spenders_ui TO service_role;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 4. Ajouter 'spender_tier_changed' au CHECK constraint sur spender_events
+-- 4. Remplacer le CHECK constraint pour accepter 'spender_tier_changed'
+--    On drop l'ancien et on recrée avec NOT VALID pour ne pas bloquer sur
+--    les lignes existantes avec des event_types hors liste.
 -- ─────────────────────────────────────────────────────────────────────────────
 DO $$
 BEGIN
@@ -206,7 +208,7 @@ BEGIN
       'handle_set',
       'spender_tier_changed',
       'unknown'
-    ));
+    )) NOT VALID;
 END $$;
 
 -- ─────────────────────────────────────────────────────────────────────────────
