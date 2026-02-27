@@ -2555,14 +2555,24 @@ const apiFetchSpenders = async ({ scope } = {}) => {
   const allSpenders = await _fetchSpendersGlobal();
   if (s.type === 'chatter') {
     const modelIds = s._allowedModelIds || [];
-    const chatterTxs = s._chatterTxs || [];
-    const handleSet = new Set(chatterTxs.map(tx => (tx.spender_handle || "").trim()).filter(Boolean));
-    const idSet = new Set(chatterTxs.map(tx => tx.spender_id).filter(Boolean));
+    if (modelIds.length === 0) return [];
+    const handleSet = new Set();
+    const idSet = new Set();
+    try {
+      const { data: txRows } = await sb.from("transactions").select("spender_id, spender_handle").in("model_id", modelIds);
+      (txRows || []).forEach(tx => {
+        const h = (tx.spender_handle || "").trim();
+        if (h) handleSet.add(h);
+        if (tx.spender_id) idSet.add(tx.spender_id);
+      });
+      const { data: convRows } = await sb.from("tg_conversations").select("spender_id").in("model_id", modelIds);
+      (convRows || []).forEach(c => { if (c.spender_id) idSet.add(c.spender_id); });
+    } catch (e) { console.warn("[API_SPENDERS] chatter fetch model spenders:", e?.message || e); }
     const filtered = allSpenders.filter(sp => {
       const h = (sp.handle || sp.name || "").trim();
       return handleSet.has(h) || (sp.id && idSet.has(sp.id));
     });
-    const scopeWithHandles = { ...s, _allowedHandles: handleSet, _allowedSpenderIds: idSet };
+    const scopeWithHandles = { ...s, _allowedHandles: handleSet, _allowedSpenderIds: [...idSet] };
     const safe = assertChatterScope(filtered, scopeWithHandles, 'spender');
     return safe;
   }
@@ -8470,7 +8480,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           <button className={`micro-filter-chip${recentFilter==="new"?" active-green":""}`} onClick={()=>setRecentFilter(p=>p==="new"?null:"new")}>{"🟢"} NEW</button>
           <button className={`micro-filter-chip${recentFilter==="updated"?" active":""}`} onClick={()=>setRecentFilter(p=>p==="updated"?null:"updated")}>{"✏️"} UPDATED</button>
           {recentFilter && <button className="micro-filter-chip" onClick={()=>setRecentFilter(null)} style={{borderColor:"var(--text-tertiary)"}}>TOUT</button>}
-          {user.role==="gerant"&&<button onClick={async()=>{
+          {(user.role==="gerant"||user.role==="chatter")&&<button onClick={async()=>{
             if(syncingTg) return;
             setSyncingTg(true);
             try {
@@ -9123,12 +9133,9 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, products
     });
   }, [filteredTxs, dbSpenders, convertAmount]);
 
-  // Filter by role: chatter sees only spenders of their assigned models
+  // Filter by role: chatter — dbSpenders already scoped by apiFetchSpenders (model_id IN assigned_models)
   const mySpenders = useMemo(() => {
     let list = enrichedSpenders;
-    if (user.role === "chatter" && user.assigned_models && user.assigned_models.length > 0) {
-      list = list.filter(sp => sp.model_ids.some(mid => user.assigned_models.includes(mid)));
-    }
     if (filter !== "all") list = list.filter(sp => sp.tier === filter || sp.classification === filter);
     // Apply search
     if (debouncedSearch.trim()) {
@@ -17247,10 +17254,8 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
 // =============================================
 const ChatterSpendersTab = ({user, lang, spenders, txs, models, profiles, selectedSpenderKey, setSelectedSpenderKey, onRefresh, onNotify, providerPaymentMethods}) => {
   const myTxs = React.useMemo(() => (txs || []).filter(tx => tx.chatter_id === user?.id), [txs, user?.id]);
-  const mySpenderHandles = React.useMemo(() => new Set(myTxs.map(tx => (tx.spender_handle || "").trim()).filter(Boolean)), [myTxs]);
-  const myDbSpenders = React.useMemo(() => (spenders || []).filter(s => mySpenderHandles.has(s.handle) || mySpenderHandles.has(s.name)), [spenders, mySpenderHandles]);
   return React.createElement(SpendersTab, {
-    user, lang, txs: myTxs, models, profiles: profiles || [], dbSpenders: myDbSpenders,
+    user, lang, txs: myTxs, models, profiles: profiles || [], dbSpenders: spenders || [],
     selectedSpenderKey: selectedSpenderKey || null, setSelectedSpenderKey: setSelectedSpenderKey || (() => {}),
     onRefresh: onRefresh || (() => {}), onNotify: onNotify || (() => {}),
     providerPaymentMethods: providerPaymentMethods || [], readOnly: true
@@ -27557,9 +27562,7 @@ const App = () => {
     let ppData = ppR.data||[];
     if(currentUser) {
       if(isChatter) {
-        // PR1: spenderData already scoped by apiFetchSpenders — defense-in-depth
-        const chatterSpenderHandles = new Set(txSumData.map(tx=>tx.spender_handle).filter(Boolean));
-        spenderData = spenderData.filter(s=>chatterSpenderHandles.has(s.handle) || chatterSpenderHandles.has(s.name));
+        // PR1: spenderData already scoped by apiFetchSpenders (model_id IN assigned_models) — no TX filter
         profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter"||p.role==="provider");
         payoutData = payoutData.filter(p=>p.user_id===currentUser.id);
         expenseData = [];
