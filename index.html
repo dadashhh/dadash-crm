@@ -2242,103 +2242,109 @@ const SUPABASE_ANON_KEY = window.SUPABASE_ANON_KEY;
 const sb = window.sb;
 
 // =============================================
-// SYNC TG → SPENDERS  (POST /internal/sync-carla-telegram equivalent)
-// Parcourt toutes les tg_conversations et associe/crée les spenders.
-// Règles:
-//   • Ne jamais écraser un tg_user_id existant différent
-//   • Ne jamais modifier les transactions
-//   • Visible + exécutable uniquement par le gerant
+// DATA ACCESS LAYER — DADASH compat (VIEW/RPC stables, pas de colonnes fragiles)
+// VIEW/RPC attendus: v_activity_feed, fn_get_activity_feed_unified(limit,offset,category)
+// tg_conversations: colonnes safe = id, tg_chat_id, tg_peer_id, tg_user_id, spender_id
+// (tg_username/username/display_name peuvent être absentes — on lit depuis spenders)
 // =============================================
-const syncSpendersFromTelegram = async () => {
-  // ─ 1. Récupérer toutes les conversations ─
-  const { data: convs, error: convErr } = await sb
-    .from("tg_conversations")
-    .select("id,tg_chat_id,tg_peer_id,tg_user_id,username,tg_username,display_name,spender_id");
+const apiFetchActivity = async ({ tab, limit = 150 }) => {
+  try {
+    if (tab && tab !== "all") {
+      const { data, error } = await sb.rpc("fn_get_activity_feed_unified", {
+        p_limit: limit,
+        p_offset: 0,
+        p_category: tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "enrichment" : tab === "messages" ? "message" : null,
+      });
+      if (error) throw error;
+      console.log("[ACTIVITY] RPC fn_get_activity_feed_unified tab=" + tab + " n=" + (data?.length || 0));
+      return (data || []).map(v => ({
+        id: v.id,
+        tg_user_id: v.tg_user_id,
+        spender_id: v.spender_id,
+        conv_id: v.conv_id,
+        label: v.handle || (v.tg_user_id ? "#" + v.tg_user_id : "?"),
+        message: v.summary || v.title,
+        title: v.title,
+        eventType: tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "new_message",
+        ts: v.created_at,
+        data: v.payload?.data || v.payload || {},
+      }));
+    }
+    const { data, error } = await sb.from("v_activity_feed")
+      .select("id,event_type,tg_user_id,username,title,subtitle,created_at,data")
+      .order("created_at", { ascending: false }).limit(limit);
+    if (error) throw error;
+    console.log("[ACTIVITY] v_activity_feed n=" + (data?.length || 0));
+    return (data || []).map(ev => ({
+      id: ev.id,
+      tg_user_id: ev.tg_user_id,
+      label: ev.username || (ev.tg_user_id ? "#" + ev.tg_user_id : "?"),
+      message: ev.subtitle || ev.title || ev.event_type,
+      eventType: ev.event_type,
+      title: ev.title,
+      ts: ev.created_at,
+      data: ev.data || {},
+    }));
+  } catch (e) {
+    console.warn("[ACTIVITY] fallback spender_events:", e?.message || e);
+    const { data: evData, error } = await sb.from("spender_events")
+      .select("id,tg_user_id,event_type,data,created_at")
+      .order("created_at", { ascending: false }).limit(limit);
+    if (error || !evData?.length) return [];
+    const tgIds = [...new Set((evData || []).map(ev => ev.tg_user_id).filter(Boolean))];
+    let spMap = {};
+    if (tgIds.length > 0) {
+      const { data: spData } = await sb.from("spenders").select("id,tg_user_id,handle,name,meta").in("tg_user_id", tgIds);
+      (spData || []).forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
+    }
+    return (evData || []).map(ev => {
+      const sp = ev.tg_user_id ? spMap[String(ev.tg_user_id)] : null;
+      const label = sp ? (sp.handle || sp.name || sp.meta?.profile?.telegram?.username ? "@" + (sp.meta?.profile?.telegram?.username || sp.handle || sp.name) : "tg_" + ev.tg_user_id) : (ev.tg_user_id ? "#" + ev.tg_user_id : "?");
+      return { id: ev.id, tg_user_id: ev.tg_user_id, label, message: ev.data?.summary || ev.event_type, eventType: ev.event_type, ts: ev.created_at, data: ev.data || {} };
+    });
+  }
+};
+
+const apiFetchSpenders = async () => {
+  const { data, error } = await sb.from("spenders").select("*");
+  if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
+  console.log("[SPENDERS] loaded n=" + (data?.length || 0));
+  return data || [];
+};
+
+const apiSyncTG = async () => {
+  const safeCols = "id,tg_chat_id,tg_peer_id,tg_user_id,spender_id";
+  const { data: convs, error: convErr } = await sb.from("tg_conversations").select(safeCols);
   if (convErr) throw new Error("tg_conversations: " + convErr.message);
-
   let total = 0, created = 0, updated = 0;
-
   for (const conv of convs || []) {
-    // tg_chat_id pour un DM Telegram = user_id numérique de l'interlocuteur
-    const tg_user_id = String(
-      conv.tg_user_id || conv.tg_peer_id || conv.tg_chat_id || ""
-    ).trim();
+    const tg_user_id = String(conv.tg_user_id || conv.tg_peer_id || conv.tg_chat_id || "").trim();
     if (!tg_user_id || tg_user_id === "0") continue;
     total++;
-
-    const rawUsername = conv.tg_username || conv.username || null;
-    const username = rawUsername ? rawUsername.replace(/^@/, "") : null;
-    const display_name = conv.display_name || null;
-
-    const telegramMeta = {
-      user_id: tg_user_id,
-      username,
-      display: username ? "@" + username : tg_user_id,
-      input_value: username ? "@" + username : tg_user_id,
-      source: "telegram_dm",
-    };
-
-    // ─ 2a. Match par tg_user_id ─
-    const { data: byId } = await sb
-      .from("spenders")
-      .select("id,tg_user_id,telegram_username,handle,meta")
-      .eq("tg_user_id", tg_user_id)
-      .maybeSingle();
-
+    const telegramMeta = { user_id: tg_user_id, display: tg_user_id, input_value: tg_user_id, source: "telegram_dm" };
+    const { data: byId } = await sb.from("spenders").select("id,tg_user_id,telegram_username,handle,meta").eq("tg_user_id", tg_user_id).maybeSingle();
     if (byId) {
-      const metaUp = {
-        ...(byId.meta || {}),
-        profile: { ...((byId.meta || {}).profile || {}), telegram: telegramMeta },
-      };
-      const up = { meta: metaUp, updated_at: new Date().toISOString() };
-      if (!byId.telegram_username && username) up.telegram_username = username;
-      await sb.from("spenders").update(up).eq("id", byId.id);
+      const metaUp = { ...(byId.meta || {}), profile: { ...((byId.meta || {}).profile || {}), telegram: { ...telegramMeta, username: byId.telegram_username || null } } };
+      await sb.from("spenders").update({ meta: metaUp, updated_at: new Date().toISOString() }).eq("id", byId.id);
       updated++;
       continue;
     }
-
-    // ─ 2b. Match par username (case insensitive) ─
-    if (username) {
-      const { data: byUn } = await sb
-        .from("spenders")
-        .select("id,tg_user_id,handle,meta")
-        .ilike("telegram_username", username)
-        .maybeSingle();
-      if (byUn && !byUn.tg_user_id) {
-        // Ne jamais écraser un tg_user_id existant différent
-        const metaUp = {
-          ...(byUn.meta || {}),
-          profile: { ...((byUn.meta || {}).profile || {}), telegram: telegramMeta },
-        };
-        await sb.from("spenders").update({
-          tg_user_id,
-          meta: metaUp,
-          updated_at: new Date().toISOString(),
-        }).eq("id", byUn.id);
-        updated++;
-        continue;
-      }
-    }
-
-    // ─ 2c. Créer nouveau spender ─
-    const handle = username || ("tg_" + tg_user_id);
+    const handle = "tg_" + tg_user_id;
     await sb.from("spenders").insert({
-      handle,
-      name: display_name || handle,
-      tg_user_id,
-      telegram_username: username || null,
-      status: "active",
-      source: "telegram_sync",
-      meta: { profile: { telegram: telegramMeta } },
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      handle, name: handle, tg_user_id, telegram_username: null, status: "active", source: "telegram_sync",
+      meta: { profile: { telegram: telegramMeta } }, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     });
     created++;
   }
+  console.log("[SYNC_TG] total=" + total + " created=" + created + " updated=" + updated);
+  return { total, created, updated };
+};
 
-  const log = `SYNC_TG_DONE total=${total} created=${created} updated=${updated}`;
-  console.log("[DADASH]", log);
-  return { total, created, updated, log };
+const apiHardRefresh = (loadDataFn) => {
+  if (typeof loadDataFn === "function") {
+    console.log("[REFRESH] apiHardRefresh triggered");
+    return loadDataFn();
+  }
 };
 
 // =============================================
@@ -2358,14 +2364,36 @@ const getSpenderDisplayName = (sp) => {
   if (!sp) return "Inconnu";
   const tg = sp.meta?.profile?.telegram;
   if (tg?.display && tg.display !== "?" && tg.display !== "@?") return tg.display;
+  if (tg?.username && tg.username !== "?") return "@" + String(tg.username).replace(/^@/, "");
   if (tg?.input_value && tg.input_value !== "?") return tg.input_value;
+  if (sp.telegram_username && sp.telegram_username !== "?") return "@" + String(sp.telegram_username).replace(/^@/, "");
   if (sp.username && sp.username !== "?") return "@" + sp.username.replace(/^@/, "");
   if (sp.display_name && sp.display_name !== "?") return sp.display_name;
   if (sp.first_name && sp.first_name !== "?") return sp.first_name;
   const h = sp.handle || sp.name;
-  if (h && h !== "?") return "@" + h;
-  if (sp.tg_user_id) return "#" + sp.tg_user_id;
+  if (h && h !== "?") {
+    if (h.startsWith("tg_")) return "tg:" + (sp.tg_user_id || h.replace("tg_",""));
+    return (h.startsWith("@") ? h : "@" + h);
+  }
+  if (sp.tg_user_id) return "tg:" + sp.tg_user_id;
   return "Inconnu";
+};
+/** Extract profile fields from spenders.meta (bot enrich schema) */
+const getSpenderMetaProfile = (sp) => {
+  if (!sp?.meta?.profile) return {};
+  const p = sp.meta.profile;
+  return {
+    first_name: p.identity?.first_name || p.first_name || sp.first_name,
+    age: p.identity?.age ?? p.age ?? sp.age,
+    city: p.location?.city || p.city || sp.city,
+    country: p.location?.country || p.country || sp.country,
+    timezone: p.location?.timezone || sp.timezone,
+    language: p.language || p.langue || sp.langue,
+    relation: p.status?.relation || p.relationship_status || sp.relationship_status,
+    notes_chatter: p.notes_chatter || sp.notes || sp.dbNotes,
+    job: p.job || sp.job,
+    budget_range: p.budget_range || sp.budget_range,
+  };
 };
 
 // ═══ SPENDER VIEW MODEL — safe wrapper, never crashes on null/missing fields ═══
@@ -7357,69 +7385,36 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     });
   }, []);
 
-  // ── Activity feed: fetch from v_activity_feed view (joined events + spenders) ──
+  // ── Activity feed: apiFetchActivity (v_activity_feed / fn_get_activity_feed_unified) ──
   const fetchActivityFeed = React.useCallback(async () => {
-    try {
-      const { data: vData, error: vErr } = await sb.from("v_activity_feed")
-        .select("id,event_type,tg_user_id,username,title,subtitle,created_at,data")
-        .order("created_at", { ascending: false }).limit(150);
-      if (vErr) throw vErr;
-      if (vData && vData.length > 0) {
-        console.log("[DATA] activity_loaded n=" + vData.length);
-        setActivityFeed(vData.map(ev => ({
-          id: ev.id,
-          tg_user_id: ev.tg_user_id,
-          label: ev.username || (ev.tg_user_id ? "#" + ev.tg_user_id : "?"),
-          message: ev.subtitle || ev.title || ev.event_type,
-          eventType: ev.event_type,
-          title: ev.title,
-          ts: ev.created_at,
-          data: ev.data,
-        })));
-        return;
-      }
-    } catch (e) { console.warn("[DATA] v_activity_feed error, trying spender_events fallback:", e.message||e); }
-    // Fallback 1: raw spender_events
-    try {
-      const { data: evData, error: evErr } = await sb.from("spender_events")
-        .select("id,tg_user_id,event_type,data,created_at")
-        .order("created_at", { ascending: false }).limit(100);
-      if (evErr) throw evErr;
-      if (evData && evData.length > 0) {
-        const tgIds = [...new Set(safeArr(evData).map(ev => ev.tg_user_id).filter(Boolean))];
-        let spMap = {};
-        if (tgIds.length > 0) {
-          try {
-            const { data: spData } = await sb.from("spenders")
-              .select("id,tg_user_id,username,display_name,meta,handle,name")
-              .in("tg_user_id", tgIds);
-            if (spData) spData.forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
-          } catch (_) {}
+    let items = await apiFetchActivity({ tab: null, limit: 150 });
+    const hasMessages = items.some(i => ["new_message","message","tx_created"].includes(i.eventType));
+    if (!hasMessages) {
+      try {
+        const { data: msgData } = await sb.from("tg_messages").select("id,conversation_id,direction,text,created_at,meta").order("created_at", { ascending: false }).limit(50);
+        if (msgData && msgData.length > 0) {
+          const convIds = [...new Set(msgData.map(m => m.conversation_id))];
+          const { data: convs } = await sb.from("tg_conversations").select("id,tg_chat_id,tg_user_id,spender_id").in("id", convIds);
+          const convMap = {}; (convs || []).forEach(c => { convMap[c.id] = c; });
+          const tgIds = [...new Set((msgData || []).map(m => m.meta?.tg_user_id || convMap[m.conversation_id]?.tg_user_id).filter(Boolean))];
+          let spMap = {};
+          if (tgIds.length > 0) {
+            const { data: spData } = await sb.from("spenders").select("id,tg_user_id,handle,name,meta").in("tg_user_id", tgIds);
+            (spData || []).forEach(sp => { spMap[String(sp.tg_user_id)] = sp; });
+          }
+          const msgItems = (msgData || []).map(m => {
+            const c = convMap[m.conversation_id];
+            const tgId = m.meta?.tg_user_id || c?.tg_user_id;
+            const sp = tgId ? spMap[String(tgId)] : null;
+            const label = sp ? (sp.handle || sp.name || (sp.meta?.profile?.telegram?.username ? "@" + sp.meta.profile.telegram.username : "tg_" + tgId)) : (tgId ? "#" + tgId : "?");
+            return { id: "msg_" + m.id, tg_user_id: tgId, spender_id: sp?.id || c?.spender_id, label, message: (m.text || "").slice(0, 80) || (m.direction === "in" ? "Message reçu" : "Message envoyé"), eventType: "new_message", ts: m.created_at, data: {} };
+          });
+          items = [...msgItems, ...items];
+          console.log("[ACTIVITY] fallback tg_messages n=" + msgItems.length);
         }
-        console.log("[DATA] activity_loaded n=" + evData.length + " (fallback:spender_events)");
-        setActivityFeed(safeArr(evData).map(ev => {
-          const sp = ev.tg_user_id ? spMap[String(ev.tg_user_id)] : null;
-          const label = sp ? getSpenderDisplayName(sp) : (ev.tg_user_id ? "#" + ev.tg_user_id : "?");
-          return { id: ev.id, tg_user_id: ev.tg_user_id, spender_id: sp?.id, label, message: ev.data?.summary || ev.event_type, eventType: ev.event_type, ts: ev.created_at, data: ev.data };
-        }));
-        return;
-      }
-    } catch (e) { console.warn("[DATA] spender_events fallback error:", e.message||e); }
-    // Fallback 2: synthetic feed from spenders table
-    try {
-      const { data: fbData } = await sb.from("spenders")
-        .select("id,tg_user_id,username,display_name,meta,handle,name,created_at,updated_at")
-        .order("updated_at", { ascending: false }).limit(30);
-      if (fbData && fbData.length > 0) {
-        const now = Date.now(), h24 = 86400000;
-        console.log("[DATA] activity_loaded n=" + fbData.length + " (fallback:spenders)");
-        setActivityFeed(safeArr(fbData).map(sp => {
-          const label = getSpenderDisplayName(sp);
-          const isNew = sp.created_at && (now - new Date(sp.created_at).getTime()) < h24;
-          return { id: sp.id, spender_id: sp.id, tg_user_id: sp.tg_user_id, label, message: isNew ? "nouveau spender" : "profil mis à jour", eventType: isNew ? "new_spender" : "profile_updated", ts: isNew ? sp.created_at : sp.updated_at };
-        }));
-      }
-    } catch (e) { console.warn("[DATA] spenders fallback error:", e.message||e); }
+      } catch (e) { console.warn("[ACTIVITY] tg_messages fallback error:", e?.message || e); }
+    }
+    setActivityFeed(items);
   }, []);
 
   // Initial fetch on mount
@@ -7449,18 +7444,18 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     const recent = activityFeed.filter(a => a.ts && new Date(a.ts) >= todayStart);
     return {
       total: recent.length,
-      newSpender: recent.filter(a => a.eventType === "new_spender" || a.eventType === "spender_created").length,
-      enrichment: recent.filter(a => a.eventType === "profile_updated" || a.eventType === "classification_changed" || a.eventType === "handle_set" || a.eventType === "status_changed").length,
-      messages: recent.filter(a => a.eventType === "new_message" || a.eventType === "tx_created").length,
+      newSpender: recent.filter(a => ["new_spender","spender_created"].includes(a.eventType)).length,
+      enrichment: recent.filter(a => ["profile_updated","enriched","spender_enriched","classification_changed","handle_set","status_changed"].includes(a.eventType)).length,
+      messages: recent.filter(a => ["new_message","message","tx_created"].includes(a.eventType)).length,
     };
   }, [activityFeed]);
   const activityTodayCount = activityCounts.total;
 
   // Filtered feed by tab
   const filteredActivityFeed = useMemo(() => {
-    if (activityTab === "new_spender") return activityFeed.filter(a => a.eventType === "new_spender" || a.eventType === "spender_created");
-    if (activityTab === "enrichment") return activityFeed.filter(a => a.eventType === "profile_updated" || a.eventType === "classification_changed" || a.eventType === "handle_set" || a.eventType === "status_changed");
-    if (activityTab === "messages") return activityFeed.filter(a => a.eventType === "new_message" || a.eventType === "tx_created");
+    if (activityTab === "new_spender") return activityFeed.filter(a => ["new_spender","spender_created"].includes(a.eventType));
+    if (activityTab === "enrichment") return activityFeed.filter(a => ["profile_updated","enriched","spender_enriched","classification_changed","handle_set","status_changed"].includes(a.eventType));
+    if (activityTab === "messages") return activityFeed.filter(a => ["new_message","message","tx_created"].includes(a.eventType));
     return activityFeed;
   }, [activityFeed, activityTab]);
 
@@ -7960,10 +7955,11 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             if(syncingTg) return;
             setSyncingTg(true);
             try {
-              const {total,created,updated} = await syncSpendersFromTelegram();
-              addToast(`🔄 Sync TG: ${total} convs — ${created} créé(s) — ${updated} mis à jour`,"success");
+              const {total,created,updated} = await apiSyncTG();
+              addToast(`🔄 Sync TG OK: ${total} convs — ${created} créé(s) — ${updated} mis à jour`,"success");
               await onRefresh();
-            } catch(e){ addToast("Sync TG erreur: "+e.message,"error"); }
+              fetchActivityFeed();
+            } catch(e){ addToast("Sync TG erreur: "+(e?.message||e),"error"); }
             finally{ setSyncingTg(false); }
           }} disabled={syncingTg} title="Synchroniser les conversations Telegram → fiches Spenders" style={{marginLeft:"auto",padding:"7px 13px",borderRadius:9,border:"1px solid rgba(139,92,246,0.4)",background:"rgba(139,92,246,0.1)",color:"var(--accent)",fontSize:13,fontWeight:600,cursor:syncingTg?"wait":"pointer",opacity:syncingTg?0.7:1,transition:"all 0.15s"}}>{syncingTg?"⏳ Sync…":"🔄 Sync TG"}</button>}
           <button onClick={()=>setShowNewSpender(true)} style={{marginLeft:user.role==="gerant"?8:"auto",padding:"7px 13px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>{"➕"} {fr?"Nouveau":"New"}</button>
@@ -8029,6 +8025,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             const _cardKey = s.dbId || s.name || s.id;
             const _isHighlighted = highlightSpenderId === _cardKey;
             const _relTime = _isNew ? formatRelativeTime(s.created_at) : _isUpdated ? formatRelativeTime(s.updated_at) : "";
+            const _mp = getSpenderMetaProfile(s);
             return (
             <div key={_cardKey} id={`spender-card-${_cardKey}`} className={`spender-card${_hasGlow?" spender-card-glow":""}${_isHighlighted?" spender-card-highlight":""}`} onClick={()=>openSpenderModal(s)}
               style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,cursor:"pointer",transition:"all 0.18s",position:"relative"}}
@@ -8057,9 +8054,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                       {sp.has("mym")      && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(124,58,237,0.15)",color:"#7C3AED",fontWeight:700}}>MYM</span>}
                     </>) : null; })()}
                   </div>
-                  <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2,display:"flex",gap:8}}>
-                    {s.first_name && <span style={{color:"var(--text-secondary)",fontWeight:500}}>{s.first_name}</span>}
-                    {s.timezone && <span>🕐 {s.timezone.replace("Europe/","")}</span>}
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2,display:"flex",gap:8,flexWrap:"wrap"}}>
+                    {(_mp.first_name||s.first_name) && <span style={{color:"var(--text-secondary)",fontWeight:500}}>{_mp.first_name||s.first_name}</span>}
+                    {(_mp.age||s.age) && <span>{_mp.age||s.age} ans</span>}
+                    {(_mp.city||s.city) && <span>{_mp.city||s.city}</span>}
+                    {(_mp.language||s.langue) && <span>{LANG_FLAGS[_mp.language||s.langue]||""} {_mp.language||s.langue}</span>}
+                    {(_mp.timezone||s.timezone) && <span>🕐 {(_mp.timezone||s.timezone).replace("Europe/","")}</span>}
                   </div>
                 </div>
               </div>
@@ -8206,7 +8206,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 ) : (
                   <div>
                     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
-                      {[{l:fr?"Prénom":"Name",v:selected.first_name||selected.contactInfo?.prenom||"—"},{l:fr?"Âge":"Age",v:selected.age||"—"},{l:fr?"Ville":"City",v:selected.city||"—"},{l:fr?"Pays":"Country",v:selected.country||"—"},{l:fr?"Métier":"Job",v:selected.job||selected.contactInfo?.metier||"—"},{l:fr?"Langue":"Language",v:selected.langue?(LANG_FLAGS[selected.langue]||"")+" "+selected.langue:"—"},{l:"Timezone",v:selected.timezone||"Europe/Zurich"},{l:fr?"Budget":"Budget",v:selected.budget_range?selected.budget_range+" CHF":"—"},{l:"Source",v:selected.source||"—"}].map(f=>(
+                      {(()=>{const mp=getSpenderMetaProfile(selected); return [{l:fr?"Prénom":"Name",v:mp.first_name||selected.first_name||selected.contactInfo?.prenom||"—"},{l:fr?"Âge":"Age",v:mp.age||selected.age||"—"},{l:fr?"Ville":"City",v:mp.city||selected.city||"—"},{l:fr?"Pays":"Country",v:mp.country||selected.country||"—"},{l:fr?"Métier":"Job",v:mp.job||selected.job||selected.contactInfo?.metier||"—"},{l:fr?"Langue":"Language",v:(mp.language||selected.langue)?(LANG_FLAGS[mp.language||selected.langue]||"")+" "+(mp.language||selected.langue):"—"},{l:"Timezone",v:mp.timezone||selected.timezone||"Europe/Zurich"},{l:fr?"Budget":"Budget",v:(mp.budget_range||selected.budget_range)?(mp.budget_range||selected.budget_range)+" CHF":"—"},{l:"Source",v:selected.source||"—"},{l:fr?"Relation":"Relation",v:mp.relation||selected.relationship_status||"—"},{l:fr?"Notes chatter":"Chatter notes",v:mp.notes_chatter||selected.dbNotes||"—"}];})().map(f=>(
                         <div key={f.l}><div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:2}}>{f.l}</div><div style={{fontSize:13,fontWeight:600}}>{f.v}</div></div>
                       ))}
                     </div>
@@ -8442,10 +8442,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             )}
             {filteredActivityFeed.map((item, idx) => {
               const evIcon = (item.eventType === "new_spender" || item.eventType === "spender_created") ? "🟢"
-                : item.eventType === "profile_updated" ? "✏️"
+                : ["profile_updated","enriched","spender_enriched"].includes(item.eventType) ? "✏️"
                 : item.eventType === "classification_changed" ? "🏅"
                 : item.eventType === "status_changed" ? "🔄"
-                : item.eventType === "new_message" ? "💬"
+                : ["new_message","message"].includes(item.eventType) ? "💬"
                 : item.eventType === "tx_created" ? "💰"
                 : item.eventType === "handle_set" ? "🏷️" : "📋";
               return (
@@ -8453,7 +8453,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
                     <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label}</div>
-                    {item.message && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.title ? item.title + " — " : ""}{item.message}</div>}
+                    {(item.message || item.data?.summary) && <div style={{fontSize:11,color:"var(--text-secondary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{(item.eventType==="profile_updated"||item.eventType==="enriched"||item.eventType==="spender_enriched") && item.data?.summary ? "AI enriched: " + item.data.summary : (item.title ? item.title + " — " : "") + (item.message||"")}</div>}
                   </div>
                   <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts)}</span>
                 </div>
@@ -27036,7 +27036,7 @@ const App = () => {
     if (thisVersion !== _loadVersion.current) return;
     let txData = txR.data||[];
     let txSumData = txSumR.data||[];
-    console.log("[DATA] spenders_loaded n=" + (spR.data||[]).length + " tx_loaded n=" + txData.length);
+    console.log("[SPENDERS] loaded n=" + (spR.data||[]).length + " tx_loaded n=" + txData.length);
     let modelData = moR.data||[];
 
     // Filter data based on user role
