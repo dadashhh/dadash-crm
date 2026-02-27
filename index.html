@@ -2272,15 +2272,16 @@ const sb = window.sb;
 // Colonnes: id, created_at, title, subtitle, tg_user_id, spender_id, payload
 // =============================================
 
-// DADASH canon — v_activity_feed (colonnes v2: id, type, event_type, tg_user_id, tg_user_id_text, spender_id, title, subtitle, detail, created_at, payload)
+// DADASH canon — v_activity_feed (colonnes: id, category, event_type, type, tg_user_id, tg_user_id_text, username, title, subtitle, detail, created_at, spender_id, payload)
 const ACTIVITY_VIEW_MAP = {
   new_spender: "v_activity_new_spenders",
   enrichment: "v_activity_enrichments",
   messages: "v_activity_messages",
   all: "v_activity_feed",
 };
-const ACTIVITY_SELECT_COLS = "id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type";
-const ACTIVITY_SELECT_SAFE = "id,created_at,title,subtitle,tg_user_id,spender_id,payload";
+const ACTIVITY_TAB_TO_CATEGORY = { new_spender: "new_spender", enrichment: "enrichment", messages: "message" };
+const ACTIVITY_SELECT_COLS = "id,created_at,title,subtitle,detail,tg_user_id,tg_user_id_text,spender_id,payload,type,event_type,category,username";
+const ACTIVITY_SELECT_SAFE = "id,created_at,title,subtitle,tg_user_id,spender_id,payload,category";
 
 const _enrichDetailFromPayload = (payload) => {
   if (!payload || typeof payload !== "object") return "";
@@ -2302,14 +2303,15 @@ const _enrichDetailFromPayload = (payload) => {
 };
 
 const _mapActivityRow = (row, tab) => {
-  const pl = row.payload || {};
+  const pl = row.payload || row.data || {};
   const tgRaw = row.tg_user_id_text || row.tg_user_id;
-  const tgStr = tgRaw ? String(tgRaw) : "";
-  const evType = row.event_type || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message");
-  const isMsg = evType === "message" || evType === "new_message" || tab === "messages";
-  const isEnrich = ["profile_updated","enriched","spender_enriched","enrichment","classification_changed","handle_set","status_changed"].includes(evType) || tab === "enrichment";
+  const tgStr = tgRaw ? String(tgRaw).replace(/\D/g, "") : "";
+  const evType = row.event_type || row.type || row.category || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "profile_updated" : "message");
+  const cat = row.category || row.type || (tab === "new_spender" ? "new_spender" : tab === "enrichment" ? "enrichment" : tab === "messages" ? "message" : evType);
+  const isMsg = evType === "message" || evType === "new_message" || cat === "message" || tab === "messages";
+  const isEnrich = ["profile_updated","enriched","spender_enriched","enrichment","classification_changed","handle_set","status_changed","spender_tier_changed"].includes(evType) || cat === "enrichment" || tab === "enrichment";
 
-  const rawTitle = row.title || "";
+  const rawTitle = row.title || row.username || row.handle || "";
   const label = rawTitle || (tgStr ? "tg_" + tgStr : "?");
 
   let detail = row.detail || "";
@@ -2338,29 +2340,73 @@ const _mapActivityRow = (row, tab) => {
     payload: pl,
     data: pl,
     eventType: evType,
+    category: cat,
   };
 };
 
 const apiFetchActivityTab = async (tab, limit = 50, offset = 0) => {
   const view = ACTIVITY_VIEW_MAP[tab];
   if (!view) return [];
+  // ── Attempt 1: per-tab view with full columns ──
   try {
     const { data, error } = await sb.from(view)
       .select(ACTIVITY_SELECT_COLS)
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
-    if (!error) return (data || []).map(row => _mapActivityRow(row, tab));
-    console.warn("[ACTIVITY] full select failed, trying safe:", error.message);
+    if (!error && data) {
+      console.info("[ACTIVITY] " + view + " → " + data.length + " items" + (data[0] ? " keys=" + Object.keys(data[0]).join(",") : ""));
+      return data.map(row => _mapActivityRow(row, tab));
+    }
+    if (error) console.warn("[ACTIVITY] full select " + view + " failed:", error.message);
+  } catch (e) { console.warn("[ACTIVITY] full select " + view + " exception:", e?.message || e); }
+  // ── Attempt 2: per-tab view with safe columns ──
+  try {
     const { data: d2, error: e2 } = await sb.from(view)
       .select(ACTIVITY_SELECT_SAFE)
       .order("created_at", { ascending: false })
       .range(offset, offset + limit - 1);
-    if (e2) throw e2;
-    return (d2 || []).map(row => _mapActivityRow(row, tab));
-  } catch (e) {
-    console.warn("[ACTIVITY] apiFetchActivityTab", tab, e?.message || e);
-    return [];
+    if (!e2 && d2) {
+      console.info("[ACTIVITY] " + view + " (safe) → " + d2.length + " items");
+      return d2.map(row => _mapActivityRow(row, tab));
+    }
+    if (e2) console.warn("[ACTIVITY] safe select " + view + " failed:", e2.message);
+  } catch (e) { console.warn("[ACTIVITY] safe select " + view + " exception:", e?.message || e); }
+  // ── Attempt 3: fallback to v_activity_feed with category filter ──
+  if (tab !== "all") {
+    try {
+      const catFilter = ACTIVITY_TAB_TO_CATEGORY[tab];
+      let q = sb.from("v_activity_feed").select(ACTIVITY_SELECT_COLS).order("created_at", { ascending: false }).range(offset, offset + limit - 1);
+      if (catFilter) q = q.eq("category", catFilter);
+      const { data: d3, error: e3 } = await q;
+      if (!e3 && d3) {
+        console.info("[ACTIVITY] v_activity_feed (category=" + catFilter + ") → " + d3.length + " items");
+        return d3.map(row => _mapActivityRow(row, tab));
+      }
+      if (e3) console.warn("[ACTIVITY] v_activity_feed category fallback failed:", e3.message);
+    } catch (e) { console.warn("[ACTIVITY] v_activity_feed category fallback exception:", e?.message || e); }
   }
+  // ── Attempt 4: fallback to v_activity_feed_unified (legacy view with different columns) ──
+  try {
+    const catFilter = ACTIVITY_TAB_TO_CATEGORY[tab];
+    let q = sb.from("v_activity_feed_unified")
+      .select("id,category,tg_user_id,spender_id,handle,title,summary,created_at,data")
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (catFilter) q = q.eq("category", catFilter);
+    const { data: uData, error: uErr } = await q;
+    if (!uErr && uData && uData.length > 0) {
+      console.info("[ACTIVITY] v_activity_feed_unified (category=" + (catFilter || "all") + ") → " + uData.length + " items");
+      return uData.map(r => _mapActivityRow({
+        id: r.id, tg_user_id: r.tg_user_id, tg_user_id_text: r.tg_user_id ? String(r.tg_user_id) : "",
+        spender_id: r.spender_id, title: r.handle || r.title, username: r.handle,
+        subtitle: r.summary || r.title, detail: "", category: r.category,
+        payload: r.data || {}, type: r.category, event_type: r.category, created_at: r.created_at,
+      }, tab));
+    }
+    if (uErr) console.warn("[ACTIVITY] v_activity_feed_unified fallback failed:", uErr.message);
+  } catch (e) { console.warn("[ACTIVITY] v_activity_feed_unified fallback exception:", e?.message || e); }
+  console.warn("[ACTIVITY] all fallbacks exhausted for tab=" + tab);
+  return [];
 };
 
 const apiFetchActivity = async ({ tab, limit = 150 }) => {
@@ -2369,27 +2415,51 @@ const apiFetchActivity = async ({ tab, limit = 150 }) => {
     const { data, error } = await sb.from(view)
       .select(ACTIVITY_SELECT_COLS)
       .order("created_at", { ascending: false }).limit(limit);
-    if (!error) {
-      console.log("[ACTIVITY] " + view + " n=" + (data?.length || 0));
-      return (data || []).map(row => _mapActivityRow(row, tab));
+    if (!error && data) {
+      console.info("[ACTIVITY] apiFetchActivity " + view + " n=" + data.length);
+      return data.map(row => _mapActivityRow(row, tab));
     }
+    if (error) console.warn("[ACTIVITY] apiFetchActivity full failed:", error.message);
     const { data: d2, error: e2 } = await sb.from(view)
       .select(ACTIVITY_SELECT_SAFE)
       .order("created_at", { ascending: false }).limit(limit);
-    if (!e2) return (d2 || []).map(row => _mapActivityRow(row, tab));
-    throw e2;
+    if (!e2 && d2) return d2.map(row => _mapActivityRow(row, tab));
+    throw e2 || new Error("no data");
   } catch (e) {
-    console.warn("[ACTIVITY] fallback v_spender_events:", e?.message || e);
-    const { data: evData, error } = await sb.from("v_spender_events")
-      .select("id,type,spender_id,tg_user_id,payload,created_at,handle,conv_id")
-      .order("created_at", { ascending: false }).limit(limit);
-    if (error || !evData?.length) return [];
-    return (evData || []).map(ev => _mapActivityRow({
-      id: ev.id, tg_user_id: ev.tg_user_id, spender_id: ev.spender_id,
-      title: ev.handle || (ev.tg_user_id ? "tg_" + ev.tg_user_id : "?"),
-      subtitle: ev.payload?.summary || ev.type, detail: "",
-      payload: ev.payload || {}, type: ev.type, created_at: ev.created_at,
-    }, tab));
+    console.warn("[ACTIVITY] trying v_activity_feed_unified fallback:", e?.message || e);
+    try {
+      const catFilter = ACTIVITY_TAB_TO_CATEGORY[tab];
+      let q = sb.from("v_activity_feed_unified")
+        .select("id,category,tg_user_id,spender_id,handle,title,summary,created_at,data")
+        .order("created_at", { ascending: false }).limit(limit);
+      if (catFilter) q = q.eq("category", catFilter);
+      const { data: uData, error: uErr } = await q;
+      if (!uErr && uData && uData.length > 0) {
+        console.info("[ACTIVITY] v_activity_feed_unified fallback n=" + uData.length);
+        return uData.map(r => _mapActivityRow({
+          id: r.id, tg_user_id: r.tg_user_id, tg_user_id_text: r.tg_user_id ? String(r.tg_user_id) : "",
+          spender_id: r.spender_id, title: r.handle || r.title, username: r.handle,
+          subtitle: r.summary || r.title, detail: "", category: r.category,
+          payload: r.data || {}, type: r.category, event_type: r.category, created_at: r.created_at,
+        }, tab));
+      }
+    } catch (u) { console.warn("[ACTIVITY] v_activity_feed_unified fallback exception:", u?.message || u); }
+    // Last resort: v_spender_events
+    try {
+      const { data: evData, error } = await sb.from("v_spender_events")
+        .select("id,type,spender_id,tg_user_id,payload,created_at,handle,conv_id")
+        .order("created_at", { ascending: false }).limit(limit);
+      if (!error && evData && evData.length > 0) {
+        console.info("[ACTIVITY] v_spender_events last-resort n=" + evData.length);
+        return evData.map(ev => _mapActivityRow({
+          id: ev.id, tg_user_id: ev.tg_user_id, spender_id: ev.spender_id,
+          title: ev.handle || (ev.tg_user_id ? "tg_" + ev.tg_user_id : "?"),
+          subtitle: ev.payload?.summary || ev.type, detail: "",
+          payload: ev.payload || {}, type: ev.type, event_type: ev.type, created_at: ev.created_at,
+        }, tab));
+      }
+    } catch (ev) { console.warn("[ACTIVITY] v_spender_events fallback failed:", ev?.message || ev); }
+    return [];
   }
 };
 
@@ -27380,7 +27450,7 @@ const App = () => {
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
         safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions"),
-        safe(sb.from("v_spenders").select("*"), "spenders"),
+        safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders"),
         safe(sb.from("profiles").select("*"), "profiles"),
         safe(sb.from("models").select("*"), "models"),
         safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
@@ -27479,6 +27549,7 @@ const App = () => {
     setTxTotal(txR.count||txData.length||0);
     const dedupedSpenders = Array.from(new Map((spenderData||[]).filter(Boolean).map(s=>[s.id,s])).values());
     setSpenders(dedupedSpenders);
+    console.info("[BOOT] spenders hydrated n=" + dedupedSpenders.length, dedupedSpenders[0] ? { id: dedupedSpenders[0].id, handle: dedupedSpenders[0].handle || dedupedSpenders[0].name, tg: dedupedSpenders[0].tg_user_id } : "empty");
     setProfiles(profileData);
     setModels(modelData);
     const normPayouts = normalizePayouts(payoutData);
@@ -27860,16 +27931,31 @@ const App = () => {
   const onRefresh = fn_afterMutationOrImportRefresh;
   useEffect(() => { window.__softRefresh = fn_afterMutationOrImportRefresh; return () => { delete window.__softRefresh; }; }, [user?.id]);
 
-  /* Pipeline spenders — polling 20s pour mise à jour auto (gerant) */
+  /* Pipeline spenders — boot hydration immédiate + polling 20s pour tous les rôles */
   useEffect(() => {
-    if (!user || user.role !== "gerant") return;
+    if (!user) return;
+    // Hydratation immédiate au boot (v_spenders_ui → v_spenders_canon → v_spenders)
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiFetchSpenders();
+        if (cancelled) return;
+        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+        setSpenders(deduped);
+        console.info("[SPENDERS] boot hydration n=" + deduped.length);
+      } catch (e) { console.warn("[SPENDERS] boot hydration failed:", e?.message || e); }
+    })();
+    // Polling périodique 20s
     const iv = setInterval(async () => {
-      const data = await apiFetchSpenders();
-      const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
-      setSpenders(deduped);
+      try {
+        const data = await apiFetchSpenders();
+        if (cancelled) return;
+        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+        setSpenders(deduped);
+      } catch (e) { console.warn("[SPENDERS] periodic refresh failed:", e?.message || e); }
     }, 20000);
-    return () => clearInterval(iv);
-  }, [user?.role]);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [user?.id]);
 
   /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications */
   const afterMutationRefresh = useCallback(async () => {
