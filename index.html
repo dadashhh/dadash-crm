@@ -7528,7 +7528,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     };
     window.__onProfileUpdated = async ({ spender_id, tg_user_id }) => {
       const sel = selectedRef.current;
-      const matches = (sel && (spender_id && sel.dbId === spender_id)) || (tg_user_id && String((sel?.tg_user_id ?? sel?.telegramId) ?? "") === String(tg_user_id));
+      const selTg = String((sel?.tg_user_id ?? sel?.telegramId) ?? "");
+      const matches = (sel && spender_id && sel.dbId === spender_id) || (tg_user_id && selTg === String(tg_user_id));
       if (!matches) { if (onRefreshRef.current) onRefreshRef.current(); return; }
       try {
         let row = null;
@@ -7591,11 +7592,19 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     loadActivity(activityTab, 30, arr.length, true);
   };
 
-  const handleActivityClick = React.useCallback((feedItem) => {
+  const handleActivityClick = React.useCallback(async (feedItem) => {
     if (!feedItem || typeof feedItem !== "object") {
       console.warn("[CLICK_IGNORED] handleActivityClick: missing feedItem");
       return;
     }
+
+    // Extract tg_user_id — from feedItem prop or from label/id starting with "tg_"
+    let tgRaw = feedItem.tg_user_id || "";
+    if (!tgRaw) {
+      const src = String(feedItem.label || feedItem.id || "");
+      if (src.startsWith("tg_")) tgRaw = src.replace(/^tg_/, "").replace(/\D/g, "");
+    }
+
     let sp = null;
     if (feedItem.spender_id) {
       sp = spenders.find(s => s.dbId === feedItem.spender_id || s.id === feedItem.spender_id);
@@ -7604,19 +7613,18 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         if (dbSp) sp = spenders.find(s => (s.dbId||s.id) === dbSp.id);
       }
     }
-    if (!sp && feedItem.tg_user_id) {
-      sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === String(feedItem.tg_user_id));
-      // If not in spenders array, try dbSpenders and build synthetic entry
+    if (!sp && tgRaw) {
+      const tgStr = String(tgRaw);
+      sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === tgStr);
       if (!sp) {
-        const dbSp = (dbSpenders || []).find(d => d.tg_user_id && String(d.tg_user_id) === String(feedItem.tg_user_id));
+        const dbSp = (dbSpenders || []).find(d => d.tg_user_id && String(d.tg_user_id) === tgStr);
         if (dbSp) {
           const h = dbSp.handle || dbSp.name;
           sp = spenders.find(s => h && s.name === h);
           if (!sp && dbSp) {
-            // Build minimal compatible object (0-valued stats prevent crash)
             const _prof = getProfile(dbSp.meta);
             sp = {
-              name: h || String(feedItem.tg_user_id),
+              name: h || tgStr,
               dbId: dbSp.id, tg_user_id: dbSp.tg_user_id,
               meta: dbSp.meta || {},
               telegramId: dbSp.telegram_id || null, whatsapp_phone: dbSp.whatsapp_phone || null,
@@ -7644,16 +7652,30 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       const h = feedItem.spenderHandle.replace(/^@/, "");
       sp = spenders.find(s => (s.name||"").toLowerCase() === h.toLowerCase());
     }
+
+    // Fallback: resolve tg_user_id via RPC (auto-create spender if absent)
+    if (!sp && tgRaw) {
+      const tgNorm = String(tgRaw).replace(/\D/g, "");
+      if (tgNorm) {
+        try {
+          const { data: spenderId, error } = await sb.rpc("resolve_spender_by_tg_user_id", { p_tg_user_id: tgNorm });
+          if (!error && spenderId) {
+            setShowActivityDrawer(false);
+            openSpenderById(spenderId);
+            return;
+          }
+          if (error) console.warn("[RPC] resolve_spender_by_tg_user_id:", error.message);
+        } catch (e) { console.error("[RPC] resolve_spender_by_tg_user_id catch:", e); }
+      }
+    }
+
     if (!sp) {
-      // Spender not resolved — show toast instead of crashing
       setShowActivityDrawer(false);
       addToast("Spender introuvable (données manquantes)", "warning");
       return;
     }
-    // 2) Close drawer and open modal
     setShowActivityDrawer(false);
     openSpenderModal(sp);
-    // 3) Scroll + highlight the card in the list
     const cardKey = sp.dbId || sp.name;
     setTimeout(() => {
       const el = document.getElementById(`spender-card-${cardKey}`);
@@ -7662,7 +7684,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       setHighlightSpenderId(cardKey);
       highlightTimerRef.current = setTimeout(() => setHighlightSpenderId(null), 2000);
     }, 300);
-  }, [spenders, dbSpenders, openSpenderModal]);
+  }, [spenders, dbSpenders, openSpenderModal, openSpenderById, addToast]);
 
   const handleSpStatus = async (txId, newStatus) => {
     if (processingTxId) return;
@@ -7729,28 +7751,25 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       }).catch(e => { console.error("[SB_ERR] spenders (openById catch):", e.message||e); addToast(fr?"Erreur chargement spender":"Spender load error","error"); });
   }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
 
-  const openSpenderByTgUserId = React.useCallback((tgId) => {
+  const openSpenderByTgUserId = React.useCallback(async (tgId) => {
     if (!tgId) { console.warn("[CLICK_IGNORED] openSpenderByTgUserId: missing tgId"); return; }
-    // 1) try computed list first
     const sp = spenders.find(s => s.tg_user_id && String(s.tg_user_id) === String(tgId))
       || safeArr(dbSpenders).find(d => d.tg_user_id && String(d.tg_user_id) === String(tgId));
     if (sp) { openSpenderModal(sp); return; }
-    // 2) fetch from DB (v_spenders_canon par tg_user_id_text puis v_spenders fallback)
     console.info("[SB_FROM] spenders (openByTgUserId)", tgId);
     const tgNorm = String(tgId).replace(/\D/g, "");
-    sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).maybeSingle()
-      .then(({ data: canonData, error: canonErr }) => {
-        if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return null; }
-        return sb.from("v_spenders").select("*").eq("tg_user_id", tgNorm).limit(1).maybeSingle();
-      })
-      .then((r) => {
-        if (!r) return;
-        const { data, error } = r;
-        if (error) { addToast(fr?"Erreur chargement spender":"Spender load error","error"); return; }
-        if (data) openSpenderModal(data);
-        else addToast(`${fr?"Spender introuvable":"Spender not found"} (tg_user_id=${tgId})`,"warning");
-      }).catch(e => { console.error("[SB_ERR] spenders (openByTgUserId catch):", e.message||e); });
-  }, [spenders, dbSpenders, openSpenderModal, fr, addToast]);
+    try {
+      const { data: canonData, error: canonErr } = await sb.from("v_spenders_canon").select("*").eq("tg_user_id_text", tgNorm).maybeSingle();
+      if (!canonErr && canonData) { openSpenderModal(mapCanonToSpender(canonData)); return; }
+      const { data, error } = await sb.from("v_spenders").select("*").eq("tg_user_id", tgNorm).limit(1).maybeSingle();
+      if (!error && data) { openSpenderModal(data); return; }
+      // Auto-create via RPC if spender not found
+      const { data: spenderId, error: rpcErr } = await sb.rpc("resolve_spender_by_tg_user_id", { p_tg_user_id: tgNorm });
+      if (rpcErr) { addToast(fr?"Erreur chargement spender":"Spender load error","error"); console.error("[RPC] resolve_spender_by_tg_user_id:", rpcErr.message); return; }
+      if (spenderId) { openSpenderById(spenderId); return; }
+      addToast(fr?"Spender introuvable":"Spender not found","warning");
+    } catch (e) { console.error("[SB_ERR] spenders (openByTgUserId catch):", e.message||e); addToast(fr?"Erreur chargement spender":"Spender load error","error"); }
+  }, [spenders, dbSpenders, openSpenderModal, openSpenderById, fr, addToast]);
   const handleSaveProfile = async () => {
     if (!selected?.dbId) { addToast(fr ? "Spender sans ID DB" : "Spender has no DB ID", "error"); return; }
     setSpSavingProfile(true);
@@ -10817,7 +10836,7 @@ const ComptaTab = ({user, lang, txs, expenses, expenseCategories, payouts, model
   const filteredPayouts = dr.filterByDate(payoutsWithDate, "_date");
 
   // ── Fallback colonnes TX (amount, net_amount, chatter_commission, provider_fee, dada_fee) ──
-  const txAmount = (tx) => { const v = tx.amount; if (v == null && typeof console !== "undefined") console.warn("[P&L] TX sans amount:", tx.id || tx); return Number(v ?? 0); };
+  const txAmount = (tx) => { const v = tx.amount; if (v == null && typeof console !== "undefined") console.warn("[P&L] TX sans amount:", (tx.id || tx)); return Number((v ?? 0)); };
   const txNet = (tx) => Number(tx.net_amount ?? tx.amount ?? 0);
   const txComm = (tx) => Number(tx.chatter_commission ?? 0);
   const txProvFee = (tx) => Number(tx.provider_fee ?? 0);
@@ -15302,7 +15321,7 @@ const AdminSettingsTab = ({lang}) => {
           </div>
           <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr 1fr",gap:14,marginBottom:20}}>
             <div><label style={lbS}>Commission % défaut</label><input style={inS} type="number" min="0" max="100" step="0.5" value={form.default_comm_pct ?? 10} onChange={e=>setForm({...form,default_comm_pct:Number(e.target.value)})} /></div>
-            <div><label style={lbS}>Seuil WHALE ({form.currency||"CHF"})</label><input style={inS} type="number" min="0" step="50" value={form.whale_threshold ?? 500} onChange={e=>setForm({...form,whale_threshold:Number(e.target.value)})} /></div>
+            <div><label style={lbS}>Seuil WHALE ({(form.currency || "CHF")})</label><input style={inS} type="number" min="0" step="50" value={(form.whale_threshold ?? 500)} onChange={e=>setForm({...form,whale_threshold:Number(e.target.value)})} /></div>
             <div><label style={lbS}>{fr?"Seuil INACTIF (jours)":"Inactive (days)"}</label><input style={inS} type="number" min="1" step="1" value={form.inactive_days ?? 30} onChange={e=>setForm({...form,inactive_days:Number(e.target.value)})} /></div>
           </div>
           <button onClick={handleSave} disabled={saving} style={{padding:"10px 24px",borderRadius:10,border:"none",background:saving?"var(--surface2)":"#7c3aed",color:saving?"var(--muted2)":"#fff",fontSize:13,fontWeight:700,cursor:saving?"not-allowed":"pointer"}}>{saving?"...":(fr?"Sauvegarder":"Save")}</button>
