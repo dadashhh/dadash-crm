@@ -750,7 +750,17 @@
       font-size: 16px;
       flex-shrink: 0;
     }
+    .avatar-container {
+      width: 56px;
+      height: 56px;
+      flex-shrink: 0;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .avatar-container .avatar-img,
     .avatar-img {
+      width: 100%;
+      height: 100%;
       object-fit: cover;
       display: block;
     }
@@ -3038,16 +3048,20 @@ const computeVIPScore = (sp) => {
   return Math.round(ltvScore + freqScore + recencyScore + aovScore);
 };
 
-// ═══ BADGE AVATAR — priorité: profile_photo_url > gorille > orang_outan > ouistiti ═══
-const getBadgeAvatar = (sp) => {
-  if (!sp) return null;
-  if (sp.profile_photo_url) return sp.profile_photo_url;
-  const tier = sp.tier || sp.classification;
-  if (tier === "gorille") return "/assets/avatars/avatar_gorille.png";
-  if (tier === "orang_outan") return "/assets/avatars/avatar_orang_outan.png";
-  if (tier === "ouistiti") return "/assets/avatars/avatar_ouistiti.png";
-  return null;
+// ═══ getAvatarUrl(spender) — priorité: profile_photo > badge avatar par tier > default ═══
+const DEFAULT_AVATAR = "/assets/avatars/default.png";
+const getAvatarUrl = (sp, dbBadgesMap) => {
+  if (!sp) return DEFAULT_AVATAR;
+  const photo = sp.profile_photo_url || sp.meta?.profile?.photo_url || sp.meta?.enrich?.photo_url;
+  if (photo && String(photo).trim()) return photo;
+  const badges = getBadges(sp, dbBadgesMap);
+  const tier = (sp.tier || sp.classification || "").toString().toUpperCase().replace(/_/g, "-");
+  if (badges.includes("GORILLE") || tier === "GORILLE") return "/assets/avatars/avatar_gorille.png";
+  if (badges.includes("ORANG-OUTAN") || badges.includes("ORANG_OUTAN") || tier === "ORANG-OUTAN") return "/assets/avatars/avatar_orang_outan.png";
+  if (badges.includes("OUISTITI") || tier === "OUISTITI") return "/assets/avatars/avatar_ouistiti.png";
+  return DEFAULT_AVATAR;
 };
+const getBadgeAvatar = (sp, dbBadgesMap) => getAvatarUrl(sp, dbBadgesMap);
 
 const VIPScoreBar = ({score}) => {
   const color = score >= 70 ? "var(--success)" : score >= 40 ? "var(--warning)" : "var(--danger)";
@@ -4230,6 +4244,22 @@ const displayFees = (tx, role) => {
 const getSpenderSegment = (ltv, txCountValid) => {
   const tier = computeSpenderTier(ltv, txCountValid || (ltv > 0 ? 1 : 0));
   return tier.tier;
+};
+
+// ═══ getBadges(spender) — source unique pour badges, évite doublons segment+tags ═══
+const normalizeBadge = (s) => String(s || "").trim().toUpperCase().replace(/_/g, "-");
+const getBadges = (sp, dbBadgesMap) => {
+  if (!sp) return [];
+  const seg = normalizeBadge(sp.segment);
+  const tags = Array.isArray(sp.dbTags) ? sp.dbTags.map(normalizeBadge) : Array.isArray(sp.tags) ? sp.tags.map(normalizeBadge) : [];
+  const spId = sp.dbId || sp.id;
+  const dbB = (spId && dbBadgesMap && dbBadgesMap[spId]) ? dbBadgesMap[spId].map(normalizeBadge) : [];
+  const combined = [...(seg ? [seg] : []), ...tags, ...dbB].filter(Boolean);
+  const set = new Set(combined);
+  const out = [];
+  if (seg && set.has(seg)) out.push(seg);
+  for (const t of set) if (t !== seg) out.push(t);
+  return out;
 };
 
 const getDateRange = (period) => {
@@ -8538,8 +8568,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   if (filterLangue) filtered = filtered.filter(s=>(s.langue||"").toUpperCase()===filterLangue);
   if (debouncedSearch.trim()) { const q=debouncedSearch.trim().toLowerCase().replace(/^@/,""); filtered=filtered.filter(s=>(s.name||"").toLowerCase().includes(q)||(s.first_name||"").toLowerCase().includes(q)); }
   if (filterBadge) filtered = filtered.filter(s => {
-    const spId = s.dbId || s.id;
-    return spId ? (dbBadges[spId] || []).includes(filterBadge) : computeSpenderBadges(s).some(b => b.label === filterBadge);
+    const badges = getBadges(s, dbBadges);
+    const fb = normalizeBadge(filterBadge);
+    return badges.length > 0 ? badges.includes(fb) : computeSpenderBadges(s).some(b => normalizeBadge(b.label) === fb);
   });
   if (filterStatus) filtered = filtered.filter(s=>(s.dbStatus||"active")===filterStatus);
 
@@ -8570,7 +8601,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   let spCardSorted=sorted;
   if (!sortRecents) {
     if(spCardFilter==="actifs7j"){const c=Date.now()-7*86400000;spCardSorted=sorted.filter(s=>s.lastTxDate&&new Date(s.lastTxDate).getTime()>c);}
-    else if(spCardFilter==="gorilles"){spCardSorted=sorted.filter(s=>{ const spId=s.dbId||s.id; return spId?(dbBadges[spId]||[]).includes("GORILLE"):false; });}
+    else if(spCardFilter==="gorilles"){spCardSorted=sorted.filter(s=> getBadges(s, dbBadges).includes("GORILLE") || (!getBadges(s, dbBadges).length && computeSpenderBadges(s).some(b=>b.label==="GORILLE")));}
     else if(spCardFilter==="nouveaux"){const ms=new Date();ms.setDate(1);ms.setHours(0,0,0,0);spCardSorted=sorted.filter(s=>{if(!s.txs||!s.txs.length)return false;const e=[...s.txs].sort((a,b)=>new Date(a.date||0)-new Date(b.date||0))[0];return e&&new Date(e.date)>=ms;});}
   }
 
@@ -8655,7 +8686,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const _spFiltered = spenders.filter(s => !filterModel || s.byModel[filterModel]);
   const _kpiSpenders = isAllTime ? _spFiltered.length : spendersInPeriod.length;
   const _actifs7j = _spFiltered.filter(s => s.lastTxDate && (_now7 - new Date(s.lastTxDate).getTime()) < 7*86400000).length;
-  const _gorilles = _spFiltered.filter(s => { const spId = s.dbId || s.id; return spId ? (dbBadges[spId] || []).includes("GORILLE") : false; }).length;
+  const _gorilles = _spFiltered.filter(s => getBadges(s, dbBadges).includes("GORILLE") || (!getBadges(s, dbBadges).length && computeSpenderBadges(s).some(b=>b.label==="GORILLE"))).length;
   const _caTotal = _spFiltered.reduce((sum,s) => sum + s.validCA, 0);
 
   // GUARD — never render without a valid user (gérant crash-safety)
@@ -8861,12 +8892,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             const _vipScore = computeVIPScore(s);
             const _vipColor = _vipScore >= 70 ? "var(--success)" : _vipScore >= 40 ? "var(--warning)" : "var(--danger)";
             const _lastTxRel = (() => { if (!s.lastTxDate) return fr?"jamais":"never"; const d=Math.floor((Date.now()-new Date(s.lastTxDate).getTime())/86400000); if(d===0) return fr?"aujourd'hui":"today"; if(d===1) return fr?"hier":"yesterday"; return `${fr?"il y a ":""}${d}${fr?"j":"d ago"}`; })();
-            const _autoBadges = computeSpenderBadges(s);
             const _spId = s.dbId || s.id;
-            const _dbBadgeArr = _spId ? (dbBadges[_spId] || []) : [];
-            const _badges = _dbBadgeArr.length > 0
-              ? _dbBadgeArr.map(b => { const icons={"GORILLE":"🦍","ORANG-OUTAN":"🦧","OUISTITI":"🐒","TIMEWASTER":"💩","ACTIF":"🔥","INACTIF":"💤","NOUVEAU":"⭐","RÉGULIER":"🔄","SCAM":"🚨"}; const colors={"GORILLE":["var(--success)","var(--success-muted)"],"ORANG-OUTAN":["var(--accent)","var(--accent-subtle)"],"OUISTITI":["var(--warning)","var(--warning-muted)"],"TIMEWASTER":["var(--danger)","rgba(239,68,68,0.15)"],"ACTIF":["var(--success)","var(--success-muted)"],"INACTIF":["var(--text-quaternary)","var(--bg-overlay)"],"NOUVEAU":["var(--warning)","var(--warning-muted)"],"RÉGULIER":["var(--blue-accent)","rgba(96,165,250,0.1)"],"SCAM":["var(--danger)","rgba(239,68,68,0.15)"]}; return {icon:icons[b]||"🏷️",label:b,color:(colors[b]||["var(--text)","var(--surface)"])[0],bg:(colors[b]||["var(--text)","var(--surface)"])[1]}; })
-              : _autoBadges;
+            const _badgeList = getBadges(s, dbBadges);
+            const _badges = _badgeList.length > 0 ? _badgeList : computeSpenderBadges(s).map(b=>b.label);
             const _avatarColors = ["#8b5cf6","#10b981","#f59e0b","#3b82f6","#ef4444","#06b6d4","#ec4899","#f97316"];
             const _avatarHash = (s.name||"").split("").reduce((h,c)=>(h*31+c.charCodeAt(0))&0xffff,0);
             const _avatarColor = _avatarColors[_avatarHash % _avatarColors.length];
@@ -8892,14 +8920,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 </div>
               )}
               {/* ── HEADER: Avatar + Name + Flag ── */}
-              <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
-                {getBadgeAvatar(s) ? (
-                  <img src={getBadgeAvatar(s)} className="avatar-img" style={{width:44,height:44,borderRadius:"50%",objectFit:"cover",border:`2px solid ${_avatarColor}44`,flexShrink:0}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src="/assets/avatars/avatar_gorille.png"}} />
-                ) : (
-                  <div style={{width:44,height:44,borderRadius:"50%",background:_avatarColor+"22",border:`2px solid ${_avatarColor}44`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:_avatarColor,flexShrink:0}}>
-                    {getSpenderInitial(s)}
-                  </div>
-                )}
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+                <div className="avatar-container" style={{width:56,height:56,flexShrink:0,borderRadius:12,overflow:"hidden",border:`2px solid ${_avatarColor}44`}}>
+                  <img src={getAvatarUrl(s, dbBadges)} className="avatar-img" style={{width:"100%",height:"100%",objectFit:"cover"}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src=DEFAULT_AVATAR}} />
+                </div>
                 <div style={{minWidth:0,flex:1}}>
                   <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
                     <span style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{getSpenderDisplayName(s)}</span>
@@ -8919,22 +8943,20 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                   </div>
                 </div>
               </div>
-              {/* ── BADGES (DB-backed + computed fallback) ── */}
+              {/* ── BADGES (getBadges unique, pas de doublon segment+tags) ── */}
               {(()=>{
                 const spId = s.dbId || s.id;
-                const dbB = spId ? (dbBadges[spId] || []) : [];
-                const badgeIcons = {"GORILLE":"🦍","ORANG-OUTAN":"🦧","OUISTITI":"🐒","TIMEWASTER":"💩","ACTIF":"🔥","INACTIF":"💤","NOUVEAU":"⭐","RÉGULIER":"🔄","SCAM":"🚨"};
-                const badgeColors = {"GORILLE":{c:"var(--success)",bg:"var(--success-muted)"},"ORANG-OUTAN":{c:"var(--accent)",bg:"var(--accent-subtle)"},"OUISTITI":{c:"var(--warning)",bg:"var(--warning-muted)"},"TIMEWASTER":{c:"var(--danger)",bg:"rgba(239,68,68,0.12)"},"ACTIF":{c:"var(--success)",bg:"var(--success-muted)"},"INACTIF":{c:"var(--text-quaternary)",bg:"var(--bg-overlay)"},"NOUVEAU":{c:"var(--warning)",bg:"var(--warning-muted)"},"RÉGULIER":{c:"var(--blue-accent)",bg:"rgba(96,165,250,0.1)"},"SCAM":{c:"var(--danger)",bg:"rgba(239,68,68,0.15)"}};
-                const allBadgeKeys = ["GORILLE","ORANG-OUTAN","OUISTITI","TIMEWASTER","ACTIF","INACTIF","NOUVEAU","RÉGULIER"];
-                const showBadges = dbB.length > 0 ? dbB : _badges.map(b=>b.label);
+                const badgeIcons = {"GORILLE":"🦍","ORANG-OUTAN":"🦧","ORANG_OUTAN":"🦧","OUISTITI":"🐒","TIMEWASTER":"💩","ACTIF":"🔥","INACTIF":"💤","NOUVEAU":"⭐","RÉGULIER":"🔄","SCAM":"🚨"};
+                const badgeColors = {"GORILLE":{c:"var(--success)",bg:"var(--success-muted)"},"ORANG-OUTAN":{c:"var(--accent)",bg:"var(--accent-subtle)"},"ORANG_OUTAN":{c:"var(--accent)",bg:"var(--accent-subtle)"},"OUISTITI":{c:"var(--warning)",bg:"var(--warning-muted)"},"TIMEWASTER":{c:"var(--danger)",bg:"rgba(239,68,68,0.12)"},"ACTIF":{c:"var(--success)",bg:"var(--success-muted)"},"INACTIF":{c:"var(--text-quaternary)",bg:"var(--bg-overlay)"},"NOUVEAU":{c:"var(--warning)",bg:"var(--warning-muted)"},"RÉGULIER":{c:"var(--blue-accent)",bg:"rgba(96,165,250,0.1)"},"SCAM":{c:"var(--danger)",bg:"rgba(239,68,68,0.15)"}};
+                const showBadges = _badges;
                 if (showBadges.length === 0) return null;
                 return <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:10}}>
-                  {showBadges.map(badge=>{
-                    const col = badgeColors[badge] || {c:"var(--text-secondary)",bg:"var(--bg-overlay)"};
-                    return <span key={badge} onClick={e=>{e.stopPropagation();if(spId)toggleBadge(spId,badge);}} title={spId?"Cliquer pour retirer":""}
+                  {showBadges.map(b=>{
+                    const col = badgeColors[b] || badgeColors[b.replace(/-/g,"_")] || {c:"var(--text-secondary)",bg:"var(--bg-overlay)"};
+                    return <span key={b} onClick={e=>{e.stopPropagation();if(spId)toggleBadge(spId,b);}} title={spId?"Cliquer pour retirer":""}
                       style={{padding:"2px 8px",borderRadius:10,background:col.bg,color:col.c,fontSize:9,fontWeight:700,whiteSpace:"nowrap",cursor:spId?"pointer":"default",transition:"opacity 0.15s"}}
                       onMouseEnter={e=>{if(spId)e.currentTarget.style.opacity="0.7";}} onMouseLeave={e=>{e.currentTarget.style.opacity="1";}}>
-                      {badgeIcons[badge]||"🏷️"} {badge}
+                      {badgeIcons[b]||badgeIcons[b.replace(/-/g,"_")]||"🏷️"} {b}
                     </span>;
                   })}
                 </div>;
@@ -8989,11 +9011,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             {/* Modal Header */}
             <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
               <div style={{display:"flex",alignItems:"center",gap:12}}>
-                {getBadgeAvatar(selected) ? (
-                  <img src={getBadgeAvatar(selected)} className="avatar-img" style={{width:48,height:48,borderRadius:14,objectFit:"cover",border:"2px solid var(--accent-muted)",flexShrink:0}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src="/assets/avatars/avatar_gorille.png"}} />
-                ) : (
-                  <div className="avatar" style={{width:48,height:48,fontSize:20,background:"var(--accent-muted)",color:"var(--accent)",flexShrink:0}}>{getSpenderInitial(selected)}</div>
-                )}
+                <div className="avatar-container" style={{width:56,height:56,flexShrink:0,borderRadius:12,overflow:"hidden",border:"2px solid var(--accent-muted)"}}>
+                  <img src={getAvatarUrl(selected, dbBadges)} className="avatar-img" style={{width:"100%",height:"100%",objectFit:"cover"}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src=DEFAULT_AVATAR}} />
+                </div>
                 <div>
                   <div style={{display:"flex",alignItems:"center",gap:8}}>
                     <span style={{fontSize:18,fontWeight:800}}>{getSpenderDisplayName(selected)}</span>
@@ -9003,12 +9023,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                   <div style={{display:"flex",gap:4,marginTop:3,flexWrap:"wrap"}}>
                     {(()=>{
                       const spId = selected.dbId || selected.id;
-                      const bList = spId && dbBadges[spId] ? dbBadges[spId] : computeSpenderBadges(selected).map(b=>b.label);
-                      const icons={"GORILLE":"🦍","ORANG-OUTAN":"🦧","OUISTITI":"🐒","TIMEWASTER":"💩","ACTIF":"🔥","INACTIF":"💤","NOUVEAU":"⭐","RÉGULIER":"🔄","SCAM":"🚨"};
-                      const cols={"GORILLE":{c:"var(--success)",bg:"var(--success-muted)"},"ORANG-OUTAN":{c:"var(--accent)",bg:"var(--accent-subtle)"},"OUISTITI":{c:"var(--warning)",bg:"rgba(245,158,11,0.12)"},"TIMEWASTER":{c:"var(--danger)",bg:"rgba(239,68,68,0.12)"},"ACTIF":{c:"var(--success)",bg:"var(--success-muted)"},"INACTIF":{c:"var(--text-quaternary)",bg:"var(--bg-overlay)"},"NOUVEAU":{c:"var(--warning)",bg:"var(--warning-muted)"},"RÉGULIER":{c:"var(--blue-accent)",bg:"rgba(96,165,250,0.1)"},"SCAM":{c:"var(--danger)",bg:"rgba(239,68,68,0.15)"}};
-                      return bList.map(b=>{const col=cols[b]||{c:"var(--text-secondary)",bg:"var(--bg-overlay)"};return <span key={b} onClick={e=>{e.stopPropagation();if(spId)toggleBadge(spId,b);}} title={spId?"Cliquer pour retirer":""} style={{fontSize:8,padding:"1px 6px",borderRadius:6,background:col.bg,color:col.c,fontWeight:700,cursor:spId?"pointer":"default"}} onMouseEnter={e=>{if(spId)e.currentTarget.style.opacity="0.6";}} onMouseLeave={e=>{e.currentTarget.style.opacity="1";}}>{icons[b]||"🏷️"} {b}</span>});
+                      const bList = getBadges(selected, dbBadges);
+                      const badgesToShow = bList.length > 0 ? bList : computeSpenderBadges(selected).map(b=>b.label);
+                      const icons={"GORILLE":"🦍","ORANG-OUTAN":"🦧","ORANG_OUTAN":"🦧","OUISTITI":"🐒","TIMEWASTER":"💩","ACTIF":"🔥","INACTIF":"💤","NOUVEAU":"⭐","RÉGULIER":"🔄","SCAM":"🚨"};
+                      const cols={"GORILLE":{c:"var(--success)",bg:"var(--success-muted)"},"ORANG-OUTAN":{c:"var(--accent)",bg:"var(--accent-subtle)"},"ORANG_OUTAN":{c:"var(--accent)",bg:"var(--accent-subtle)"},"OUISTITI":{c:"var(--warning)",bg:"rgba(245,158,11,0.12)"},"TIMEWASTER":{c:"var(--danger)",bg:"rgba(239,68,68,0.12)"},"ACTIF":{c:"var(--success)",bg:"var(--success-muted)"},"INACTIF":{c:"var(--text-quaternary)",bg:"var(--bg-overlay)"},"NOUVEAU":{c:"var(--warning)",bg:"var(--warning-muted)"},"RÉGULIER":{c:"var(--blue-accent)",bg:"rgba(96,165,250,0.1)"},"SCAM":{c:"var(--danger)",bg:"rgba(239,68,68,0.15)"}};
+                      return badgesToShow.map(b=>{const col=cols[b]||cols[b?.replace?.(/-/g,"_")]||{c:"var(--text-secondary)",bg:"var(--bg-overlay)"};return <span key={b} onClick={e=>{e.stopPropagation();if(spId)toggleBadge(spId,b);}} title={spId?"Cliquer pour retirer":""} style={{fontSize:8,padding:"1px 6px",borderRadius:6,background:col.bg,color:col.c,fontWeight:700,cursor:spId?"pointer":"default"}} onMouseEnter={e=>{if(spId)e.currentTarget.style.opacity="0.6";}} onMouseLeave={e=>{e.currentTarget.style.opacity="1";}}>{icons[b]||icons[b?.replace?.(/-/g,"_")]||"🏷️"} {b}</span>});
                     })()}
-                    <span className={`badge badge-${selected.segment}`}>{selected.segment}</span>
                     {selected.meta?.enrich?.last && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(34,211,161,0.15)",color:"var(--success)",fontWeight:700}}>AUTO</span>}
                     {selected.telegramId && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-telegram-muted)",color:"var(--brand-telegram)",fontWeight:700}}>TG</span>}
                     {selected.whatsapp_phone && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-whatsapp-muted)",color:"var(--brand-whatsapp)",fontWeight:700}}>WA</span>}
@@ -9099,11 +9119,13 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                         <div key={f.l}><div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:2}}>{f.l}</div><div style={{fontSize:13,fontWeight:600}}>{f.v}</div></div>
                       ))}
                     </div>
-                    {selected.dbTags && selected.dbTags.length > 0 && (
+                    {getBadges(selected, dbBadges).length > 0 && (
                       <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:10}}>
-                        {selected.dbTags.map(tag=>(
-                          <span key={tag} style={{fontSize:10,padding:"2px 8px",borderRadius:8,background:(SINGE_TIERS[tag]||{bg:"var(--accent-muted)"}).bg,color:(SINGE_TIERS[tag]||{color:"var(--accent)"}).color,fontWeight:600}}>{(SINGE_TIERS[tag]||{icon:""}).icon} {tag}</span>
-                        ))}
+                        {getBadges(selected, dbBadges).map(b=>{
+                          const key = b.toLowerCase().replace(/-/g,"_");
+                          const col = SINGE_TIERS[key] || {bg:"var(--accent-muted)",color:"var(--accent)",icon:"🏷️"};
+                          return <span key={b} style={{fontSize:10,padding:"2px 8px",borderRadius:8,background:col.bg,color:col.color,fontWeight:600}}>{col.icon} {b}</span>;
+                        })}
                       </div>
                     )}
                     <div style={{display:"flex",gap:8}}>
@@ -9807,18 +9829,8 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, products
               )}
               {/* Row 1: Avatar + Tier overlay + Name + Classification + Channel badges */}
               <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
-                <div style={{position:"relative",flexShrink:0}}>
-                  {getBadgeAvatar(sp) ? (
-                    <img src={getBadgeAvatar(sp)} className="avatar-img" style={{width:44,height:44,borderRadius:14,objectFit:"cover",border:`2px solid ${c.border}`,display:"block"}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src="/assets/avatars/avatar_gorille.png"}} />
-                  ) : (
-                    <div style={{
-                      width: 44, height: 44, borderRadius: 14, background: c.bg, border: `2px solid ${c.border}`,
-                      display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800,
-                      color: c.text,
-                    }}>
-                      {sp.first_name?.[0]?.toUpperCase() || sp.spender_handle?.[0]?.toUpperCase() || "?"}
-                    </div>
-                  )}
+                <div style={{position:"relative",flexShrink:0,width:56,height:56,borderRadius:12,overflow:"hidden",border:`2px solid ${c.border}`}}>
+                  <img src={getAvatarUrl(sp)} className="avatar-img" style={{width:"100%",height:"100%",objectFit:"cover"}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src=DEFAULT_AVATAR}} />
                   <span style={{position:"absolute",bottom:-3,right:-3,width:18,height:18,borderRadius:"50%",background:"var(--surface)",border:"1.5px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:11,lineHeight:1}} title={sp.tier_label||sp.tier||sp.classification}>{(SINGE_TIERS[sp.tier||sp.classification]||SINGE_TIERS.timewaster).icon}</span>
                 </div>
                 <div style={{ flex: 1, minWidth: 0 }}>
@@ -10129,19 +10141,9 @@ const MesSpendersTab = ({user, lang, txs, models, profiles, dbSpenders, products
             {/* Modal Header */}
             <div style={{ padding: "24px 28px", borderBottom: "1px solid var(--border-subtle)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
-                {getBadgeAvatar(selectedSpender) ? (
-                  <img src={getBadgeAvatar(selectedSpender)} className="avatar-img" style={{width:52,height:52,borderRadius:16,objectFit:"cover",border:`1px solid ${(classColors[selectedSpender.classification]||classColors.new).border}`,flexShrink:0}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src="/assets/avatars/avatar_gorille.png"}} />
-                ) : (
-                  <div style={{
-                    width: 52, height: 52, borderRadius: 16,
-                    background: (classColors[selectedSpender.classification] || classColors.new).bg,
-                    border: `1px solid ${(classColors[selectedSpender.classification] || classColors.new).border}`,
-                    display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, fontWeight: 800,
-                    color: (classColors[selectedSpender.classification] || classColors.new).text, flexShrink: 0,
-                  }}>
-                    {selectedSpender.first_name?.[0]?.toUpperCase() || selectedSpender.spender_handle?.[0]?.toUpperCase() || "?"}
-                  </div>
-                )}
+                <div style={{width:56,height:56,flexShrink:0,borderRadius:12,overflow:"hidden",border:`1px solid ${(classColors[selectedSpender.classification]||classColors.new).border}`}}>
+                  <img src={getAvatarUrl(selectedSpender)} className="avatar-img" style={{width:"100%",height:"100%",objectFit:"cover"}} alt="" onError={(e)=>{e.target.onerror=null;e.target.src=DEFAULT_AVATAR}} />
+                </div>
                 <div>
                   <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>@{selectedSpender.spender_handle || selectedSpender.handle || selectedSpender.name || "?"}</h2>
                   <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>
