@@ -2,6 +2,7 @@ import { db } from '../supabaseClient.js';
 import { log } from '../logger.js';
 import { upsertSpenderAndEvent } from '../spenders/upsertSpenderAndEvent.js';
 import { enqueueEnrich } from '../queue/enqueueEnrich.js';
+import { notifyNewMessage, notifyNewSpender } from '../notifications/notifyManager.js';
 
 export interface IncomingMessage {
   chatId: string | number;
@@ -18,13 +19,14 @@ export interface IncomingMessage {
  * Full pipeline for one incoming Telegram message:
  *   1) Upsert conversation → get conversation_id
  *   2) Upsert message into tg_messages (idempotent via UNIQUE constraint)
- *   3) upsert_spender_and_event (unified: spender + event message)
- *   4) Enqueue enrichment (seulement si tg_user_id connu — évite crash NOT NULL)
+ *   3) upsert_spender_and_event (spender + event + link conversation)
+ *   4) Enqueue enrichment
+ *   5) Notify manager (new msg + new spender if applicable)
  */
 export async function handleIncomingMessage(msg: IncomingMessage): Promise<void> {
   const chatId = String(msg.chatId);
 
-  // 1. Upsert conversation via existing RPC
+  // 1. Upsert conversation
   const { data: convId, error: convErr } = await db.rpc('upsert_tg_conversation', {
     p_tg_chat_id: chatId,
   });
@@ -37,7 +39,7 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     return;
   }
 
-  // 2. Upsert message (idempotent via UNIQUE(conversation_id, tg_message_id))
+  // 2. Upsert message (idempotent)
   const tgMsgIdStr = String(msg.tgMessageId);
   const displayName = [msg.firstName, msg.lastName].filter(Boolean).join(' ') || undefined;
 
@@ -65,7 +67,6 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     .upsert(row, { onConflict: 'conversation_id,tg_message_id' });
 
   if (msgErr) {
-    // Never retry 400 errors (constraint/schema issues) — skip and continue
     const code = msgErr.code ?? '';
     const is400 = msgErr.message?.includes('400') || code === 'PGRST204';
     if (is400) {
@@ -73,10 +74,10 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
         tg_message_id: tgMsgIdStr,
         error: msgErr.message,
       });
-      // Fall through to spender upsert — don't block the pipeline
     } else if (code === '23505') {
       log.info('INGEST', 'msg_dedup', { msg_id: msg.tgMessageId, conv_id: convId });
-      return;
+      // Dedup = message already processed; still proceed to spender/enrich/notify
+      // in case the previous run failed partway through
     } else {
       log.error('INGEST', 'msg_upsert_failed', {
         tg_message_id: tgMsgIdStr,
@@ -89,9 +90,13 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     log.info('INGEST', 'msg_upsert_ok', { tg_message_id: tgMsgIdStr, conv_id: convId });
   }
 
-  // 3. upsert_spender_and_event (unified: spender + event message)
+  // 3. Upsert spender + event + link conversation.spender_id
+  const handle = msg.username ? `@${msg.username.replace(/^@/, '')}` : `tg_${chatId}`;
+  let spenderId: string | undefined;
+  let spenderCreated = false;
+
   try {
-    await upsertSpenderAndEvent({
+    const result = await upsertSpenderAndEvent({
       tg_user_id: msg.tgUserId,
       username: msg.username,
       display_name: displayName,
@@ -100,6 +105,8 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
       conversation_id: convId,
       tg_message_id: msg.tgMessageId,
     });
+    spenderId = result.spender_id;
+    spenderCreated = result.created;
   } catch (err) {
     log.error('SPENDER', 'upsert_failed', {
       tg_user_id: msg.tgUserId,
@@ -109,7 +116,7 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     });
   }
 
-  // 4. Enqueue enrichment — seulement si tg_user_id connu (évite crash spender_enrich_queue NOT NULL)
+  // 4. Enqueue enrichment
   const tgNorm = msg.tgUserId != null && String(msg.tgUserId).replace(/\D/g, '').length > 0;
   if (tgNorm) {
     try {
@@ -126,5 +133,24 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
     }
   } else {
     log.info('QUEUE', 'skip_no_tg_user_id', { conv_id: convId, chat_id: chatId });
+  }
+
+  // 5. Notify manager (fail-safe, never throws)
+  try {
+    await notifyNewMessage({
+      conversationId: convId,
+      tgMessageId: msg.tgMessageId,
+      handle,
+      snippet: msg.text,
+      spenderId,
+    });
+
+    if (spenderCreated && spenderId) {
+      await notifyNewSpender({ spenderId, handle });
+    }
+  } catch (err) {
+    log.error('NOTIF', 'pipeline_error', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }

@@ -10,11 +10,16 @@ import http from 'node:http';
 import { Bot } from 'grammy';
 import { handleIncomingMessage } from './ingest/handleMessage.js';
 import { log } from './logger.js';
+import { isManagerNotifEnabled, pingManager } from './notifications/notifyManager.js';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) {
   console.error('FATAL: TELEGRAM_BOT_TOKEN is required');
   process.exit(1);
+}
+
+if (!process.env.MANAGER_TG_CHAT_ID) {
+  log.warn('BOT', 'MANAGER_TG_CHAT_ID not set — manager notifications disabled');
 }
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
@@ -83,6 +88,11 @@ async function main() {
   server.listen(PORT, () => {
     log.info('BOT', 'health_server_started', { port: PORT });
   });
+
+  if (isManagerNotifEnabled()) {
+    const ok = await pingManager();
+    log.info('BOT', 'manager_ping', { ok });
+  }
 
   log.info('BOT', 'starting_polling');
   await bot.start({
