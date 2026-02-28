@@ -223,7 +223,7 @@ export async function upsertSpenderAndEvent(
     // --- Primary lookup: tg_user_id ---
     const { data: existing } = await supabase
       .from('spenders')
-      .select('id, meta')
+      .select('id, meta, display_name, first_name')
       .eq('tg_user_id', tgNorm)
       .maybeSingle();
 
@@ -231,17 +231,23 @@ export async function upsertSpenderAndEvent(
       const currentMeta = (existing.meta as Record<string, unknown>) || {};
       const merged = deepMergeNoNull(currentMeta, newMeta);
       const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
+      const updatePayload: Record<string, unknown> = {
+        handle,
+        meta: merged,
+        last_seen_at: now,
+        updated_at: now,
+        ...topLevelCols,
+      };
+      if (!(existing as { display_name?: string }).display_name && displayName) {
+        updatePayload.display_name = displayName;
+        updatePayload.name = name;
+      }
+      if (!(existing as { first_name?: string }).first_name && displayName) {
+        updatePayload.first_name = displayName.split(' ')[0];
+      }
       const { error } = await supabase
         .from('spenders')
-        .update({
-          handle,
-          display_name: displayName || null,
-          name,
-          meta: merged,
-          last_seen_at: now,
-          updated_at: now,
-          ...topLevelCols,
-        })
+        .update(updatePayload)
         .eq('id', existing.id);
       if (error) throw new Error(`upsertSpender update: ${error.message}`);
       spenderId = existing.id;
@@ -270,6 +276,7 @@ export async function upsertSpenderAndEvent(
         log.info('SPENDER', 'linked_manual', { spender_id: spenderId, tg_user_id: tgNorm, username });
       } else {
         const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
+        const firstName = displayName ? displayName.split(' ')[0] : null;
         const { data: inserted, error } = await supabase
           .from('spenders')
           .insert({
@@ -277,6 +284,7 @@ export async function upsertSpenderAndEvent(
             handle,
             display_name: displayName || null,
             name,
+            first_name: firstName,
             meta: newMeta,
             last_seen_at: now,
             updated_at: now,
@@ -312,15 +320,18 @@ export async function upsertSpenderAndEvent(
       const merged = deepMergeNoNull(currentMeta, newMeta);
       const existingDisplayName = (existing as { display_name?: string }).display_name;
       const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
+      const updatePayload: Record<string, unknown> = {
+        meta: merged,
+        last_seen_at: now,
+        updated_at: now,
+        ...topLevelCols,
+      };
+      if (!existingDisplayName && displayName) {
+        updatePayload.display_name = displayName;
+      }
       const { error } = await supabase
         .from('spenders')
-        .update({
-          display_name: displayName || existingDisplayName,
-          meta: merged,
-          last_seen_at: now,
-          updated_at: now,
-          ...topLevelCols,
-        })
+        .update(updatePayload)
         .eq('id', existing.id);
       if (error) throw new Error(`upsertSpender update: ${error.message}`);
       spenderId = existing.id;
