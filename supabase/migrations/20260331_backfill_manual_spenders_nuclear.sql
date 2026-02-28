@@ -21,11 +21,7 @@ BEGIN;
 -- ─────────────────────────────────────────────────────────────────────────────
 UPDATE tg_conversations c SET
   username = sub.username,
-  tg_user_id = CASE
-    WHEN sub.tg_user_id ~ '^\d+$' AND c.tg_user_id IS NULL
-    THEN sub.tg_user_id::bigint
-    ELSE c.tg_user_id
-  END,
+  tg_user_id = COALESCE(c.tg_user_id, sub.tg_user_id),
   display_name = COALESCE(c.display_name, sub.display_name)
 FROM (
   SELECT DISTINCT ON (m.conversation_id)
@@ -301,16 +297,16 @@ DECLARE
   v_linked INT;
   v_queued INT;
 BEGIN
-  SELECT COUNT(*) INTO v_total FROM spenders WHERE status = 'active' OR is_active = true;
-  SELECT COUNT(*) INTO v_with_age FROM spenders WHERE age IS NOT NULL AND (status = 'active' OR is_active = true);
-  SELECT COUNT(*) INTO v_with_city FROM spenders WHERE city IS NOT NULL AND TRIM(city) <> '' AND (status = 'active' OR is_active = true);
-  SELECT COUNT(*) INTO v_with_job FROM spenders WHERE job IS NOT NULL AND TRIM(job) <> '' AND (status = 'active' OR is_active = true);
-  SELECT COUNT(*) INTO v_linked FROM spenders WHERE tg_user_id IS NOT NULL AND (status = 'active' OR is_active = true);
+  SELECT COUNT(*) INTO v_total FROM spenders;
+  SELECT COUNT(*) INTO v_with_age FROM spenders WHERE age IS NOT NULL;
+  SELECT COUNT(*) INTO v_with_city FROM spenders WHERE city IS NOT NULL AND TRIM(city) <> '';
+  SELECT COUNT(*) INTO v_with_job FROM spenders WHERE job IS NOT NULL AND TRIM(job) <> '';
+  SELECT COUNT(*) INTO v_linked FROM spenders WHERE tg_user_id IS NOT NULL;
   SELECT COUNT(*) INTO v_queued FROM spender_enrich_queue WHERE status = 'queued';
 
   RAISE NOTICE '═══════════════════════════════════════════';
   RAISE NOTICE 'BACKFILL RESULTS:';
-  RAISE NOTICE '  Total spenders actifs: %', v_total;
+  RAISE NOTICE '  Total spenders:        %', v_total;
   RAISE NOTICE '  Avec tg_user_id lié:   %', v_linked;
   RAISE NOTICE '  Avec age:              %', v_with_age;
   RAISE NOTICE '  Avec city:             %', v_with_city;
