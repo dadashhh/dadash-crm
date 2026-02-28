@@ -3289,12 +3289,13 @@ const PAGE_TABS = {
     { id: "push",   label: "💬 Push",   icon: "" },
   ],
   admin: [
-    { id: "users",     label: "Utilisateurs",       icon: "\u{1F465}" },
-    { id: "roles",     label: "Rôles & Permissions", icon: "\u{1F510}" },
-    { id: "logs",      label: "Logs",               icon: "\u{1F4CB}" },
-    { id: "export",    label: "Export",              icon: "\u{1F4E4}" },
-    { id: "platforms", label: "Plateformes",         icon: "\u{1F50C}" },
-    { id: "settings",  label: "Paramètres",          icon: "\u2699\uFE0F" },
+    { id: "users",       label: "Utilisateurs",       icon: "\u{1F465}" },
+    { id: "roles",       label: "Rôles & Permissions", icon: "\u{1F510}" },
+    { id: "suggestions", label: "Suggestions IA",      icon: "\u{1F916}" },
+    { id: "logs",        label: "Logs",               icon: "\u{1F4CB}" },
+    { id: "export",      label: "Export",              icon: "\u{1F4E4}" },
+    { id: "platforms",   label: "Plateformes",         icon: "\u{1F50C}" },
+    { id: "settings",    label: "Paramètres",          icon: "\u2699\uFE0F" },
   ],
 };
 // AD1 — Nav pour rôles admin/ceo (accès Admin uniquement)
@@ -16201,17 +16202,551 @@ const AdminPipelineDebugTab = ({lang}) => {
   );
 };
 
-// ── AdminShell — 6 tabs (feat/admin-page + pipeline debug) ──
+// =============================================
+// TRANSACTION SUGGESTIONS (AI) — HUMAN-IN-THE-LOOP
+// =============================================
+const SuggestionConfidenceBadge = ({value}) => {
+  const v = Number(value) || 0;
+  const pct = Math.round(v * 100);
+  const color = v >= 0.8 ? "#10B981" : v >= 0.5 ? "#F59E0B" : "#EF4444";
+  const bg = v >= 0.8 ? "rgba(16,185,129,0.12)" : v >= 0.5 ? "rgba(245,158,11,0.12)" : "rgba(239,68,68,0.12)";
+  return <span style={{display:"inline-block",padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:700,color,background:bg,border:`1px solid ${color}33`}}>{pct}%</span>;
+};
+
+const SuggestionStatusBadge = ({status}) => {
+  const map = {pending:{label:"En attente",color:"#F59E0B",bg:"rgba(245,158,11,0.12)"},accepted:{label:"Acceptée",color:"#10B981",bg:"rgba(16,185,129,0.12)"},rejected:{label:"Rejetée",color:"#EF4444",bg:"rgba(239,68,68,0.12)"}};
+  const s = map[status] || map.pending;
+  return <span style={{display:"inline-block",padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:700,color:s.color,background:s.bg,border:`1px solid ${s.color}33`}}>{s.label}</span>;
+};
+
+const SuggestionTypeBadge = ({type}) => {
+  const isCreate = type === "create";
+  return <span style={{display:"inline-block",padding:"2px 8px",borderRadius:6,fontSize:11,fontWeight:700,color:isCreate?"#8B5CF6":"#3B82F6",background:isCreate?"rgba(139,92,246,0.12)":"rgba(59,130,246,0.12)",border:isCreate?"1px solid rgba(139,92,246,0.2)":"1px solid rgba(59,130,246,0.2)"}}>{isCreate?"+ Créer":"~ Modifier"}</span>;
+};
+
+const SuggestionDiffView = ({fieldChanges, suggestionType, currentTx}) => {
+  if (!fieldChanges || typeof fieldChanges !== "object") return null;
+  const fields = Object.keys(fieldChanges);
+  if (fields.length === 0 && suggestionType === "create") return <div style={{color:"var(--text-tertiary)",fontSize:12}}>Nouvelle transaction (voir champs principaux ci-dessus)</div>;
+  if (fields.length === 0) return null;
+  const labelStyle = {fontSize:11,color:"var(--text-tertiary)",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.5px"};
+  const valStyle = {fontSize:13,fontWeight:600,padding:"4px 8px",borderRadius:6};
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      {fields.map(field => {
+        const change = fieldChanges[field];
+        const from = change?.from ?? (currentTx ? currentTx[field] : null);
+        const to = change?.to ?? change;
+        return (
+          <div key={field} style={{padding:"8px 12px",background:"var(--surface)",borderRadius:8,border:"1px solid var(--border-subtle)"}}>
+            <div style={labelStyle}>{field}</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginTop:4}}>
+              {from != null && (<>
+                <span style={{...valStyle,background:"rgba(239,68,68,0.08)",color:"#EF4444",textDecoration:"line-through"}}>{String(from)}</span>
+                <span style={{color:"var(--text-tertiary)"}}>&rarr;</span>
+              </>)}
+              <span style={{...valStyle,background:"rgba(16,185,129,0.08)",color:"#10B981"}}>{String(to)}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+const TransactionSuggestionsTab = ({lang, user, profiles, spenders, onRefresh}) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const {sort, onSort, doSort} = useSortable("created_at","desc");
+
+  const [suggestions, setSuggestions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [filterStatus, setFilterStatus] = useState("pending");
+  const [filterType, setFilterType] = useState("");
+  const [filterSpender, setFilterSpender] = useState("");
+  const [filterProvider, setFilterProvider] = useState("");
+  const [filterMinConf, setFilterMinConf] = useState("");
+  const [filterDateStart, setFilterDateStart] = useState("");
+  const [filterDateEnd, setFilterDateEnd] = useState("");
+
+  const [selected, setSelected] = useState(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [currentTx, setCurrentTx] = useState(null);
+  const [loadingTx, setLoadingTx] = useState(false);
+
+  const [confirmAction, setConfirmAction] = useState(null);
+  const [actionLoading, setActionLoading] = useState(false);
+  const [duplicateWarning, setDuplicateWarning] = useState(null);
+
+  const loadSuggestions = async () => {
+    setLoading(true);
+    try {
+      let q = sb.from("transaction_suggestions").select("*").order("created_at", {ascending: false}).limit(500);
+      if (filterStatus) q = q.eq("status", filterStatus);
+      if (filterType) q = q.eq("suggestion_type", filterType);
+      if (filterSpender) q = q.eq("spender_id", filterSpender);
+      if (filterProvider) q = q.eq("provider_id", filterProvider);
+      if (filterDateStart) q = q.gte("created_at", filterDateStart + "T00:00:00");
+      if (filterDateEnd) q = q.lte("created_at", filterDateEnd + "T23:59:59");
+      if (filterMinConf) q = q.gte("confidence", parseFloat(filterMinConf));
+      const {data, error} = await q;
+      if (error) throw error;
+      setSuggestions(data || []);
+    } catch (e) {
+      console.error("[SUGGESTIONS] Load error:", e.message);
+      addToast("Erreur chargement suggestions: " + e.message, "error");
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => { loadSuggestions(); }, [filterStatus, filterType, filterSpender, filterProvider, filterMinConf, filterDateStart, filterDateEnd]);
+
+  const openDrawer = async (s) => {
+    setSelected(s);
+    setDrawerOpen(true);
+    setCurrentTx(null);
+    if (s.suggestion_type === "update" && s.transaction_id) {
+      setLoadingTx(true);
+      try {
+        const {data} = await sb.from("transactions").select("*").eq("id", s.transaction_id).single();
+        setCurrentTx(data);
+      } catch (e) { console.warn("[SUGGESTIONS] Load tx:", e.message); }
+      setLoadingTx(false);
+    }
+  };
+
+  const closeDrawer = () => { setDrawerOpen(false); setSelected(null); setCurrentTx(null); };
+
+  const resolveSpenderName = (sid) => {
+    if (!sid) return "—";
+    const sp = (spenders || []).find(s => s.id === sid);
+    if (sp) return sp.handle || sp.name || sp.first_name || sid.slice(0,8);
+    return sid.slice(0, 8) + "...";
+  };
+
+  const resolveProfileName = (pid) => {
+    if (!pid) return "—";
+    const p = (profiles || []).find(pr => pr.id === pid);
+    return p ? (p.name || p.email || pid.slice(0,8)) : pid.slice(0,8) + "...";
+  };
+
+  const fmtDt = (d) => d ? new Date(d).toLocaleString("fr-CH", { timeZone:"Europe/Zurich", day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" }) : "—";
+
+  const checkDuplicate = async (s) => {
+    if (s.suggestion_type !== "create") return null;
+    try {
+      const {data} = await sb.rpc("check_duplicate_transaction_for_suggestion", {
+        p_spender_id: s.spender_id,
+        p_provider_id: s.provider_id,
+        p_currency: s.currency,
+        p_amount: s.amount,
+        p_suggested_date: s.suggested_date
+      });
+      if (data && data.length > 0) return data[0];
+    } catch (e) {
+      const {data} = await sb.from("transactions")
+        .select("id,date,amount,currency,spender_handle")
+        .eq("spender_id", s.spender_id || "00000000-0000-0000-0000-000000000000")
+        .eq("currency", s.currency)
+        .gte("amount", Math.max(0, s.amount * 0.98 - 1))
+        .lte("amount", s.amount * 1.02 + 1)
+        .limit(5);
+      if (data && data.length > 0) {
+        const sugDate = new Date(s.suggested_date).getTime();
+        const match = data.find(tx => Math.abs(new Date(tx.date).getTime() - sugDate) <= 86400000);
+        if (match) return match;
+      }
+    }
+    return null;
+  };
+
+  const handleAccept = async (s) => {
+    if (s.suggestion_type === "create") {
+      const dup = await checkDuplicate(s);
+      if (dup) {
+        setDuplicateWarning({suggestion: s, duplicate: dup});
+        return;
+      }
+    }
+    setConfirmAction({type: "accept", suggestion: s});
+  };
+
+  const handleReject = (s) => {
+    setConfirmAction({type: "reject", suggestion: s});
+  };
+
+  const executeAccept = async (s) => {
+    setActionLoading(true);
+    try {
+      if (s.suggestion_type === "update" && s.transaction_id) {
+        const updates = {};
+        if (s.field_changes) {
+          Object.entries(s.field_changes).forEach(([key, val]) => {
+            updates[key] = val?.to ?? val;
+          });
+        }
+        if (Object.keys(updates).length > 0) {
+          updates.updated_at = new Date().toISOString();
+          const {error: txErr} = await sb.from("transactions").update(updates).eq("id", s.transaction_id);
+          if (txErr) throw txErr;
+        }
+      } else if (s.suggestion_type === "create") {
+        const newTx = {
+          spender_id: s.spender_id || null,
+          provider_id: s.provider_id || null,
+          amount: s.amount,
+          currency: s.currency || "CHF",
+          date: s.suggested_date || new Date().toISOString(),
+          status: "pending",
+          notes: "Créé via suggestion IA — " + (s.reason || "").slice(0, 100),
+        };
+        if (s.field_changes) {
+          if (s.field_changes.spender_handle) newTx.spender_handle = s.field_changes.spender_handle?.to || s.field_changes.spender_handle;
+          if (s.field_changes.model_id) newTx.model_id = s.field_changes.model_id?.to || s.field_changes.model_id;
+          if (s.field_changes.chatter_id) newTx.chatter_id = s.field_changes.chatter_id?.to || s.field_changes.chatter_id;
+          if (s.field_changes.product) newTx.product = s.field_changes.product?.to || s.field_changes.product;
+          if (s.field_changes.payment_method) newTx.payment_method = s.field_changes.payment_method?.to || s.field_changes.payment_method;
+        }
+        const {error: txErr} = await sb.from("transactions").insert(newTx);
+        if (txErr) throw txErr;
+      }
+      const {error: sErr} = await sb.from("transaction_suggestions")
+        .update({status: "accepted", reviewed_at: new Date().toISOString(), reviewed_by: user.id})
+        .eq("id", s.id).eq("status", "pending");
+      if (sErr) throw sErr;
+      addToast(fr ? "Suggestion acceptée" : "Suggestion accepted", "success");
+      closeDrawer();
+      setConfirmAction(null);
+      setDuplicateWarning(null);
+      loadSuggestions();
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      console.error("[SUGGESTIONS] Accept error:", e.message);
+      addToast("Erreur: " + e.message, "error");
+    }
+    setActionLoading(false);
+  };
+
+  const executeReject = async (s) => {
+    setActionLoading(true);
+    try {
+      const {error} = await sb.from("transaction_suggestions")
+        .update({status: "rejected", reviewed_at: new Date().toISOString(), reviewed_by: user.id})
+        .eq("id", s.id).eq("status", "pending");
+      if (error) throw error;
+      addToast(fr ? "Suggestion rejetée" : "Suggestion rejected", "success");
+      closeDrawer();
+      setConfirmAction(null);
+      loadSuggestions();
+    } catch (e) {
+      console.error("[SUGGESTIONS] Reject error:", e.message);
+      addToast("Erreur: " + e.message, "error");
+    }
+    setActionLoading(false);
+  };
+
+  const filtered = doSort(suggestions, {
+    created_at: x => x.created_at,
+    amount: x => Number(x.amount) || 0,
+    confidence: x => Number(x.confidence) || 0,
+    suggestion_type: x => x.suggestion_type,
+    status: x => x.status,
+  });
+
+  const pendingCount = suggestions.filter(s => s.status === "pending").length;
+  const isCEO = user && (user.role === "ceo" || user.role === "admin" || user.role === "gerant");
+  const canReview = isCEO;
+
+  const inputSt = {padding:"7px 10px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,width:"100%",outline:"none"};
+  const selectSt = {...inputSt, cursor:"pointer"};
+
+  return (
+    <div>
+      {/* Header */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:18}}>{"🤖"}</span>
+          <span style={{fontSize:16,fontWeight:700,color:"var(--text)"}}>Suggestions IA</span>
+          {pendingCount > 0 && <span style={{background:"var(--accent)",color:"#fff",padding:"2px 8px",borderRadius:10,fontSize:11,fontWeight:700}}>{pendingCount}</span>}
+        </div>
+        <button onClick={loadSuggestions} disabled={loading} style={{padding:"6px 14px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>{loading ? "..." : "Rafraîchir"}</button>
+      </div>
+
+      {/* Filters */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:8,marginBottom:16,padding:"12px",background:"var(--surface)",borderRadius:10,border:"1px solid var(--border-subtle)"}}>
+        <div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:3,fontWeight:600}}>STATUS</div>
+          <select value={filterStatus} onChange={e=>setFilterStatus(e.target.value)} style={selectSt}>
+            <option value="">Tous</option>
+            <option value="pending">En attente</option>
+            <option value="accepted">Acceptées</option>
+            <option value="rejected">Rejetées</option>
+          </select>
+        </div>
+        <div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:3,fontWeight:600}}>TYPE</div>
+          <select value={filterType} onChange={e=>setFilterType(e.target.value)} style={selectSt}>
+            <option value="">Tous</option>
+            <option value="create">Créer</option>
+            <option value="update">Modifier</option>
+          </select>
+        </div>
+        <div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:3,fontWeight:600}}>DATE DÉBUT</div>
+          <input type="date" value={filterDateStart} onChange={e=>setFilterDateStart(e.target.value)} style={inputSt} />
+        </div>
+        <div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:3,fontWeight:600}}>DATE FIN</div>
+          <input type="date" value={filterDateEnd} onChange={e=>setFilterDateEnd(e.target.value)} style={inputSt} />
+        </div>
+        <div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:3,fontWeight:600}}>CONFIANCE MIN</div>
+          <select value={filterMinConf} onChange={e=>setFilterMinConf(e.target.value)} style={selectSt}>
+            <option value="">Toutes</option>
+            <option value="0.9">90%+</option>
+            <option value="0.8">80%+</option>
+            <option value="0.5">50%+</option>
+          </select>
+        </div>
+      </div>
+
+      {/* Table */}
+      {loading ? (
+        <div style={{display:"flex",justifyContent:"center",padding:40}}><div className="spinner" style={{width:28,height:28,borderWidth:3}}></div></div>
+      ) : suggestions.length === 0 ? (
+        <div style={{textAlign:"center",padding:48,color:"var(--text-tertiary)"}}>
+          <div style={{fontSize:36,marginBottom:8}}>{"📭"}</div>
+          <div style={{fontSize:14,fontWeight:600}}>Aucune suggestion {filterStatus === "pending" ? "en attente" : ""}</div>
+          <div style={{fontSize:12,marginTop:4}}>Les suggestions IA apparaîtront ici.</div>
+        </div>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <SortTh label="Date" sortKey="created_at" sort={sort} onSort={onSort} />
+                <th>Type</th>
+                <th>Spender</th>
+                <th>Provider</th>
+                <SortTh label="Montant" sortKey="amount" sort={sort} onSort={onSort} />
+                <th>Date suggérée</th>
+                <SortTh label="Confiance" sortKey="confidence" sort={sort} onSort={onSort} />
+                <th>Raison</th>
+                <th>Status</th>
+                {canReview && <th>Actions</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(s => (
+                <tr key={s.id} onClick={() => openDrawer(s)} style={{cursor:"pointer",transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="var(--hover)"} onMouseLeave={e=>e.currentTarget.style.background=""}>
+                  <td style={{whiteSpace:"nowrap",fontSize:12}}>{fmtDt(s.created_at)}</td>
+                  <td><SuggestionTypeBadge type={s.suggestion_type} /></td>
+                  <td style={{fontSize:12,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{resolveSpenderName(s.spender_id)}</td>
+                  <td style={{fontSize:12,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{resolveProfileName(s.provider_id)}</td>
+                  <td style={{fontWeight:600,fontSize:13}}>{Number(s.amount).toFixed(2)} {s.currency}</td>
+                  <td style={{whiteSpace:"nowrap",fontSize:12}}>{fmtDt(s.suggested_date)}</td>
+                  <td><SuggestionConfidenceBadge value={s.confidence} /></td>
+                  <td style={{fontSize:11,maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={s.reason}>{s.reason || "—"}</td>
+                  <td><SuggestionStatusBadge status={s.status} /></td>
+                  {canReview && (
+                    <td onClick={e => e.stopPropagation()}>
+                      {s.status === "pending" && (
+                        <div style={{display:"flex",gap:4}}>
+                          <button onClick={() => handleAccept(s)} title="Accepter" style={{padding:"4px 8px",borderRadius:6,border:"1px solid rgba(16,185,129,0.3)",background:"rgba(16,185,129,0.1)",color:"#10B981",fontSize:11,fontWeight:700,cursor:"pointer"}}>{"✓"}</button>
+                          <button onClick={() => handleReject(s)} title="Rejeter" style={{padding:"4px 8px",borderRadius:6,border:"1px solid rgba(239,68,68,0.3)",background:"rgba(239,68,68,0.1)",color:"#EF4444",fontSize:11,fontWeight:700,cursor:"pointer"}}>{"✗"}</button>
+                        </div>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* ── DRAWER: Suggestion Detail ── */}
+      {drawerOpen && selected && (
+        <div style={{position:"fixed",inset:0,zIndex:4500,display:"flex"}} onClick={closeDrawer}>
+          <div style={{flex:1,background:"rgba(0,0,0,0.5)"}}></div>
+          <div style={{width:_isMobile?"100%":"520px",maxWidth:"100vw",background:"var(--bg-raised)",borderLeft:"1px solid var(--border)",display:"flex",flexDirection:"column",boxShadow:"-8px 0 32px rgba(0,0,0,0.3)",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            {/* Drawer Header */}
+            <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0}}>
+              <div>
+                <div style={{fontSize:16,fontWeight:700,color:"var(--text)",display:"flex",alignItems:"center",gap:8}}>
+                  {"🤖"} Suggestion IA
+                  <SuggestionStatusBadge status={selected.status} />
+                </div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:4}}>{selected.id}</div>
+              </div>
+              <button onClick={closeDrawer} style={{background:"none",border:"none",color:"var(--text-secondary)",fontSize:22,cursor:"pointer",lineHeight:1}}>{"×"}</button>
+            </div>
+
+            {/* Drawer Body */}
+            <div style={{padding:"20px 24px",flex:1,overflowY:"auto",display:"flex",flexDirection:"column",gap:16}}>
+              {/* Type + Confidence */}
+              <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+                <SuggestionTypeBadge type={selected.suggestion_type} />
+                <SuggestionConfidenceBadge value={selected.confidence} />
+                {selected.source && <span style={{fontSize:11,color:"var(--text-tertiary)",background:"var(--surface)",padding:"2px 8px",borderRadius:6}}>Source: {selected.source}</span>}
+              </div>
+
+              {/* Key Fields */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <div style={{padding:"10px 12px",background:"var(--surface)",borderRadius:8,border:"1px solid var(--border-subtle)"}}>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600,textTransform:"uppercase"}}>Spender</div>
+                  <div style={{fontSize:13,fontWeight:600,color:"var(--text)",marginTop:2}}>{resolveSpenderName(selected.spender_id)}</div>
+                </div>
+                <div style={{padding:"10px 12px",background:"var(--surface)",borderRadius:8,border:"1px solid var(--border-subtle)"}}>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600,textTransform:"uppercase"}}>Provider</div>
+                  <div style={{fontSize:13,fontWeight:600,color:"var(--text)",marginTop:2}}>{resolveProfileName(selected.provider_id)}</div>
+                </div>
+                <div style={{padding:"10px 12px",background:"var(--surface)",borderRadius:8,border:"1px solid var(--border-subtle)"}}>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600,textTransform:"uppercase"}}>Montant</div>
+                  <div style={{fontSize:15,fontWeight:700,color:"var(--accent)",marginTop:2}}>{Number(selected.amount).toFixed(2)} {selected.currency}</div>
+                </div>
+                <div style={{padding:"10px 12px",background:"var(--surface)",borderRadius:8,border:"1px solid var(--border-subtle)"}}>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600,textTransform:"uppercase"}}>Date suggérée</div>
+                  <div style={{fontSize:13,fontWeight:600,color:"var(--text)",marginTop:2}}>{fmtDt(selected.suggested_date)}</div>
+                </div>
+              </div>
+
+              {/* Reason */}
+              {selected.reason && (
+                <div style={{padding:"12px 14px",background:"rgba(139,92,246,0.06)",borderRadius:8,border:"1px solid rgba(139,92,246,0.15)"}}>
+                  <div style={{fontSize:10,color:"#8B5CF6",fontWeight:700,textTransform:"uppercase",marginBottom:4}}>Raison</div>
+                  <div style={{fontSize:13,color:"var(--text)",lineHeight:1.5}}>{selected.reason}</div>
+                </div>
+              )}
+
+              {/* Diff View */}
+              {selected.field_changes && Object.keys(selected.field_changes).length > 0 && (
+                <div>
+                  <div style={{fontSize:12,fontWeight:700,color:"var(--text-secondary)",marginBottom:8}}>{"📝"} Changements proposés</div>
+                  <SuggestionDiffView fieldChanges={selected.field_changes} suggestionType={selected.suggestion_type} currentTx={currentTx} />
+                </div>
+              )}
+
+              {/* Current Transaction (for updates) */}
+              {selected.suggestion_type === "update" && selected.transaction_id && (
+                <div>
+                  <div style={{fontSize:12,fontWeight:700,color:"var(--text-secondary)",marginBottom:8}}>{"📄"} Transaction actuelle</div>
+                  {loadingTx ? (
+                    <div style={{display:"flex",justifyContent:"center",padding:16}}><div className="spinner" style={{width:20,height:20,borderWidth:2}}></div></div>
+                  ) : currentTx ? (
+                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                      {[["ID", currentTx.id?.slice(0,8)], ["Date", fmtDt(currentTx.date)], ["Montant", `${Number(currentTx.amount).toFixed(2)} ${currentTx.currency||"CHF"}`], ["Status", currentTx.status], ["Spender", currentTx.spender_handle || "—"], ["Créé le", fmtDt(currentTx.created_at)]].map(([k,v]) => (
+                        <div key={k} style={{padding:"6px 10px",background:"var(--surface)",borderRadius:6,border:"1px solid var(--border-subtle)"}}>
+                          <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600}}>{k}</div>
+                          <div style={{fontSize:12,color:"var(--text)",marginTop:1}}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",padding:8}}>Transaction non trouvée (ID: {selected.transaction_id?.slice(0,8)}...)</div>
+                  )}
+                </div>
+              )}
+
+              {/* Review info */}
+              {selected.reviewed_at && (
+                <div style={{padding:"8px 12px",background:"var(--surface)",borderRadius:8,border:"1px solid var(--border-subtle)",fontSize:12,color:"var(--text-tertiary)"}}>
+                  Revu le {fmtDt(selected.reviewed_at)} par {resolveProfileName(selected.reviewed_by)}
+                </div>
+              )}
+
+              {/* Timestamps */}
+              <div style={{fontSize:11,color:"var(--text-tertiary)",display:"flex",gap:16}}>
+                <span>Créé : {fmtDt(selected.created_at)}</span>
+                <span>Key : {selected.idempotency_key?.slice(0,16)}...</span>
+              </div>
+            </div>
+
+            {/* Drawer Footer — Actions */}
+            {canReview && selected.status === "pending" && (
+              <div style={{padding:"16px 24px",borderTop:"1px solid var(--border)",display:"flex",gap:10,flexShrink:0}}>
+                <button onClick={() => handleAccept(selected)} style={{flex:1,padding:"10px",borderRadius:10,border:"none",background:"#10B981",color:"#fff",fontSize:14,fontWeight:700,cursor:"pointer"}}>{"✓"} Accepter</button>
+                <button onClick={() => handleReject(selected)} style={{flex:1,padding:"10px",borderRadius:10,border:"1px solid rgba(239,68,68,0.3)",background:"rgba(239,68,68,0.1)",color:"#EF4444",fontSize:14,fontWeight:700,cursor:"pointer"}}>{"✗"} Rejeter</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL: Confirm Accept/Reject ── */}
+      {confirmAction && (
+        <div style={{position:"fixed",inset:0,zIndex:5000,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,0.6)"}} onClick={() => !actionLoading && setConfirmAction(null)}>
+          <div style={{background:"var(--modal-bg)",borderRadius:14,padding:"24px",maxWidth:420,width:"90vw",border:"1px solid var(--border)",boxShadow:"var(--shadow-lg)"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:12}}>
+              {confirmAction.type === "accept" ? "✓ Confirmer l'acceptation" : "✗ Confirmer le rejet"}
+            </div>
+            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:8}}>
+              {confirmAction.type === "accept"
+                ? confirmAction.suggestion.suggestion_type === "create"
+                  ? `Créer une nouvelle transaction de ${Number(confirmAction.suggestion.amount).toFixed(2)} ${confirmAction.suggestion.currency} ?`
+                  : `Appliquer les modifications à la transaction ${confirmAction.suggestion.transaction_id?.slice(0,8)}... ?`
+                : "Cette suggestion sera marquée comme rejetée. Aucune modification ne sera appliquée."}
+            </div>
+            {confirmAction.type === "accept" && confirmAction.suggestion.reason && (
+              <div style={{fontSize:12,color:"var(--text-tertiary)",padding:"8px 10px",background:"var(--surface)",borderRadius:8,marginBottom:12}}>{confirmAction.suggestion.reason}</div>
+            )}
+            <div style={{display:"flex",gap:10,marginTop:16}}>
+              <button onClick={() => setConfirmAction(null)} disabled={actionLoading} style={{flex:1,padding:"10px",borderRadius:10,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:13,fontWeight:600,cursor:"pointer"}}>Annuler</button>
+              <button
+                onClick={() => confirmAction.type === "accept" ? executeAccept(confirmAction.suggestion) : executeReject(confirmAction.suggestion)}
+                disabled={actionLoading}
+                style={{flex:1,padding:"10px",borderRadius:10,border:"none",background:confirmAction.type==="accept"?"#10B981":"#EF4444",color:"#fff",fontSize:13,fontWeight:700,cursor:actionLoading?"wait":"pointer",opacity:actionLoading?0.7:1}}
+              >
+                {actionLoading ? "..." : confirmAction.type === "accept" ? "Accepter" : "Rejeter"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL: Duplicate Warning ── */}
+      {duplicateWarning && (
+        <div style={{position:"fixed",inset:0,zIndex:5000,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,0.6)"}} onClick={() => !actionLoading && setDuplicateWarning(null)}>
+          <div style={{background:"var(--modal-bg)",borderRadius:14,padding:"24px",maxWidth:480,width:"90vw",border:"1px solid var(--border)",boxShadow:"var(--shadow-lg)"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:700,color:"#F59E0B",marginBottom:12,display:"flex",alignItems:"center",gap:8}}>
+              {"⚠️"} Possible doublon détecté
+            </div>
+            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:12}}>
+              Une transaction similaire existe déjà :
+            </div>
+            <div style={{padding:"10px 14px",background:"rgba(245,158,11,0.08)",borderRadius:8,border:"1px solid rgba(245,158,11,0.2)",marginBottom:12,fontSize:12}}>
+              <div><strong>ID :</strong> {duplicateWarning.duplicate.id?.slice(0,8)}...</div>
+              <div><strong>Date :</strong> {fmtDt(duplicateWarning.duplicate.date)}</div>
+              <div><strong>Montant :</strong> {Number(duplicateWarning.duplicate.amount).toFixed(2)} {duplicateWarning.duplicate.currency || "CHF"}</div>
+              <div><strong>Spender :</strong> {duplicateWarning.duplicate.spender_handle || "—"}</div>
+            </div>
+            <div style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:16}}>
+              Vous pouvez rejeter cette suggestion ou forcer la création malgré le doublon.
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={() => { handleReject(duplicateWarning.suggestion); setDuplicateWarning(null); }} disabled={actionLoading} style={{flex:1,padding:"10px",borderRadius:10,border:"1px solid rgba(239,68,68,0.3)",background:"rgba(239,68,68,0.1)",color:"#EF4444",fontSize:13,fontWeight:700,cursor:"pointer"}}>Rejeter</button>
+              <button onClick={() => { setDuplicateWarning(null); setConfirmAction({type:"accept",suggestion:duplicateWarning.suggestion}); }} disabled={actionLoading} style={{flex:1,padding:"10px",borderRadius:10,border:"1px solid rgba(245,158,11,0.3)",background:"rgba(245,158,11,0.1)",color:"#F59E0B",fontSize:13,fontWeight:700,cursor:"pointer"}}>Forcer la création</button>
+              <button onClick={() => setDuplicateWarning(null)} disabled={actionLoading} style={{padding:"10px 14px",borderRadius:10,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:13,fontWeight:600,cursor:"pointer"}}>Annuler</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── AdminShell — 7 tabs (feat/admin-page + pipeline debug + suggestions IA) ──
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
   const fr = lang === "fr";
   const ADMIN_TABS = [
-    {id:"users",     icon:"👥", label:fr?"Utilisateurs":"Users"},
-    {id:"roles",     icon:"🔐", label:fr?"Rôles & Permissions":"Roles & Permissions"},
-    {id:"logs",      icon:"📋", label:"Logs"},
-    {id:"export",    icon:"📤", label:"Export"},
-    {id:"platforms", icon:"🔌", label:fr?"Plateformes":"Platforms"},
-    {id:"pipeline",  icon:"🔧", label:fr?"Pipeline Debug":"Pipeline Debug"},
-    {id:"settings",  icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
+    {id:"users",       icon:"👥", label:fr?"Utilisateurs":"Users"},
+    {id:"roles",       icon:"🔐", label:fr?"Rôles & Permissions":"Roles & Permissions"},
+    {id:"suggestions", icon:"🤖", label:fr?"Suggestions IA":"AI Suggestions"},
+    {id:"logs",        icon:"📋", label:"Logs"},
+    {id:"export",      icon:"📤", label:"Export"},
+    {id:"platforms",   icon:"🔌", label:fr?"Plateformes":"Platforms"},
+    {id:"pipeline",    icon:"🔧", label:fr?"Pipeline Debug":"Pipeline Debug"},
+    {id:"settings",    icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
   ];
   const activeSub = (subTab && ADMIN_TABS.some(t => t.id === subTab)) ? subTab : "users";
   const tabStyle = (id) => ({padding:"8px 14px",borderRadius:9,border:"1px solid "+(activeSub===id?"#8b5cf6":"var(--border)"),background:activeSub===id?"rgba(139,92,246,0.15)":"var(--surface)",color:activeSub===id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0,whiteSpace:"nowrap",transition:"all 0.15s"});
@@ -16232,6 +16767,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
       <div className="fade-in">
         {activeSub==="users"&&<AdminUsersTab lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} />}
         {activeSub==="roles"&&<AdminRolesTab lang={lang} user={user} profiles={profiles} />}
+        {activeSub==="suggestions"&&<TransactionSuggestionsTab lang={lang} user={user} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
         {activeSub==="logs"&&<AdminLogsTab lang={lang} profiles={profiles} />}
         {activeSub==="export"&&<AdminExportTab lang={lang} txs={txs} spenders={spenders} profiles={profiles} models={models} expenses={expenses} />}
         {activeSub==="platforms"&&<PlatformSettingsTab lang={lang} />}
