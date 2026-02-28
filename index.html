@@ -8477,35 +8477,84 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const handleSpEditSave = async (updates) => {
     if (!editingTx) { return; }
     setSpSaving(true);
+    const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     try {
       if (!editingTx.id) {
-        // Création nouvelle TX
-        const row = {
-          spender_handle: updates.spender_handle || editingTx.spender_handle,
-          amount: updates.amount, currency: updates.currency || "CHF",
-          model_id: updates.model_id || null, provider_id: updates.provider_id || null,
-          chatter_id: updates.chatter_id || user.id,
-          product: updates.product || null, tag: updates.tag || null,
-          product_id: updates.product_id || null, product_tag_id: updates.product_tag_id || null,
-          notes: updates.notes || null, status: "pending",
-          date: updates.date || new Date().toISOString().slice(0, 10),
+        // ── Résolution du spender_handle ──
+        // Pour les spenders créés par l'IA, le handle peut être vide/invalide.
+        // On résout depuis la DB via _spender_id si disponible.
+        let resolvedHandle = (updates.spender_handle || editingTx.spender_handle || "").trim();
+        const invalidHandle = !resolvedHandle || resolvedHandle === "—" || resolvedHandle === "\u2014" || resolvedHandle === "?";
+        const spenderId = editingTx._spender_id || null;
+
+        if (invalidHandle && spenderId) {
+          try {
+            const { data: spRow } = await sb.from("spenders").select("handle, name, tg_username, telegram_username").eq("id", spenderId).maybeSingle();
+            if (spRow) {
+              resolvedHandle = spRow.handle || spRow.name || spRow.tg_username || spRow.telegram_username || spenderId;
+            }
+          } catch(_) {}
+        }
+        if (!resolvedHandle || resolvedHandle === "—" || resolvedHandle === "\u2014" || resolvedHandle === "?") {
+          resolvedHandle = spenderId || "unknown";
+        }
+
+        // ── Upsert spender si handle propre ──
+        if (resolvedHandle && resolvedHandle !== "unknown" && resolvedHandle !== spenderId) {
+          try { await safeUpsertSpender({ handle: resolvedHandle, name: resolvedHandle, status: "active" }); } catch(_) {}
+        }
+
+        // ── Construction de la row TX ──
+        const txRow = {
+          date: new Date().toISOString(),
+          spender_handle: resolvedHandle,
+          amount: parseFloat(updates.amount) || 0,
+          currency: updates.currency || "CHF",
+          amount_original: parseFloat(updates.amount) || 0,
+          currency_original: updates.currency || "CHF",
+          status: "pending",
+          notes: updates.notes || null,
         };
-        const {error} = await sb.from("transactions").insert(row);
+        if (isUUID(updates.model_id)) txRow.model_id = updates.model_id;
+        else if (isUUID(editingTx.model_id)) txRow.model_id = editingTx.model_id;
+        if (isUUID(updates.provider_id)) txRow.provider_id = updates.provider_id;
+        const chatterId = updates.chatter_id || editingTx.chatter_id || user?.id;
+        if (isUUID(chatterId)) txRow.chatter_id = chatterId;
+        if (updates.product) txRow.product = updates.product;
+        if (updates.tag) txRow.tag = updates.tag;
+        if (isUUID(updates.product_id)) txRow.product_id = updates.product_id;
+        if (isUUID(updates.product_tag_id)) txRow.product_tag_id = updates.product_tag_id;
+        if (isUUID(spenderId)) txRow.spender_id = spenderId;
+
+        const res = await safeInsertTx(txRow);
         setSpSaving(false);
-        if(error) { addToast("Erreur: " + error.message, "error"); return; }
+        if (res.error) { addToast((fr ? "Erreur: " : "Error: ") + res.error.message, "error"); return; }
         setEditingTx(null);
         await onRefresh();
         addToast(fr ? "TX créée ✓" : "TX created ✓", "success");
       } else {
         if (editingTx.status !== "pending") { setEditingTx(null); setSpSaving(false); return; }
-        const {error} = await sb.from("transactions").update({spender_handle:updates.spender_handle,amount:updates.amount,currency:updates.currency,model_id:updates.model_id,provider_id:updates.provider_id,chatter_id:updates.chatter_id,product:updates.product,tag:updates.tag,product_id:updates.product_id||null,product_tag_id:updates.product_tag_id||null,notes:updates.notes}).eq("id",editingTx.id).eq("status","pending");
+        const updateRow = {
+          spender_handle: updates.spender_handle || null,
+          amount: parseFloat(updates.amount) || 0,
+          currency: updates.currency || "CHF",
+          notes: updates.notes || null,
+          product: updates.product || null,
+          tag: updates.tag || null,
+        };
+        if (isUUID(updates.model_id)) updateRow.model_id = updates.model_id;
+        if (isUUID(updates.provider_id)) updateRow.provider_id = updates.provider_id;
+        if (isUUID(updates.chatter_id)) updateRow.chatter_id = updates.chatter_id;
+        if (isUUID(updates.product_id)) updateRow.product_id = updates.product_id;
+        if (isUUID(updates.product_tag_id)) updateRow.product_tag_id = updates.product_tag_id;
+        const {error} = await sb.from("transactions").update(updateRow).eq("id", editingTx.id).eq("status", "pending");
         setSpSaving(false);
-        if(error) { addToast("Erreur: " + error.message, "error"); return; }
+        if(error) { addToast((fr ? "Erreur: " : "Error: ") + error.message, "error"); return; }
         setEditingTx(null);
         await onRefresh();
         addToast(t(lang,"tx_updated"), "success");
       }
-    } catch(e) { setSpSaving(false); addToast("Erreur: " + e.message, "error"); }
+    } catch(e) { setSpSaving(false); addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"); }
   };
 
   const openSpenderModal = (sp) => {
@@ -9201,7 +9250,19 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 </div>
               </div>
               <div style={{display:"flex",gap:6,alignItems:"center"}}>
-                {(!readOnly||chatterMode)&&<button onClick={()=>{setEditingTx({status:"pending",spender_handle:selected.name||selected.handle||"?",amount:"",currency:"CHF",date:new Date().toISOString().slice(0,10)});}} className="ui-btn-primary" style={{fontSize:10,padding:"5px 10px"}}>{"➕"} {fr?"Créer TX":"Create TX"}</button>}
+                {(!readOnly||chatterMode)&&<button onClick={()=>{
+                  const rawHandle = selected.handle || selected.name || "";
+                  const cleanHandle = (rawHandle === "—" || rawHandle === "\u2014" || rawHandle === "?" || !rawHandle) ? "" : rawHandle;
+                  setEditingTx({
+                    status:"pending",
+                    spender_handle: cleanHandle,
+                    _spender_id: selected.dbId || selected.id || null,
+                    amount:"", currency:"CHF",
+                    date: new Date().toISOString().slice(0,10),
+                    model_id: selected.model_id || "",
+                    chatter_id: user?.id || "",
+                  });
+                }} className="ui-btn-primary" style={{fontSize:10,padding:"5px 10px"}}>{"➕"} {fr?"Créer TX":"Create TX"}</button>}
                 {(!readOnly||chatterMode)&&<button onClick={()=>{setSpEditMode(!spEditMode);if(!spEditMode)setSpForm({langue:selected.langue||"FR",timezone:selected.timezone||"Europe/Zurich",budget_range:selected.budget_range||"",first_name:selected.first_name||selected.contactInfo?.prenom||"",age:selected.age||"",city:selected.city||"",country:selected.country||"",job:selected.job||selected.contactInfo?.metier||"",telegram_username:selected.telegram_username||selected.telegramId||"",whatsapp_phone:selected.whatsapp_phone||"",relationship_status:selected.relationship_status||"",preferences:selected.preferences||"",personality_notes:selected.personality_notes||"",chatter_notes:selected.dbNotes||"",favorite_content:selected.favorite_content||"",best_time:selected.best_time||"",classification:selected.classification||"new",risk_level:selected.risk_level||"safe",source:selected.source||"",tags:selected.dbTags||[],status:selected.dbStatus||"active"});}} className="ui-btn-secondary" style={{fontSize:10,padding:"5px 12px"}}>{spEditMode?(fr?"Annuler":"Cancel"):(fr?"Modifier":"Edit")}</button>}
                 {(!readOnly||chatterMode)&&selected.dbId && (selected.tg_user_id||selected.telegramId) && (
                   <button onClick={async ()=>{
