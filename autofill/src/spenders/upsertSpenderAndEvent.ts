@@ -353,14 +353,17 @@ export async function upsertSpenderAndEvent(
     }
   }
 
-  // ── Link spender_id to tg_conversations ──
+  // ── Link spender_id to tg_conversations + populate username/tg_user_id ──
   if (payload.conversation_id) {
     try {
+      const convPatch: Record<string, unknown> = { spender_id: spenderId };
+      if (username) convPatch.username = username;
+      if (tgNorm) convPatch.tg_user_id = tgNorm;
+      if (displayName) convPatch.display_name = displayName;
       await supabase
         .from('tg_conversations')
-        .update({ spender_id: spenderId })
-        .eq('id', payload.conversation_id)
-        .is('spender_id', null);
+        .update(convPatch)
+        .eq('id', payload.conversation_id);
     } catch (err) {
       log.warn('SPENDER', 'conv_link_failed', {
         conv_id: payload.conversation_id,
