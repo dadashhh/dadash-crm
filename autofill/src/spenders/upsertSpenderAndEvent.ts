@@ -1,8 +1,9 @@
 /**
- * Fonction unique d'écriture: upsert_spender_and_event
- * - Upsert spenders (clé = tg_user_id ou username/peer_id)
- * - Deep-merge meta (standard shape profile + enrich.last)
+ * Unified write: upsert_spender_and_event
+ * - Upsert spenders (key = tg_user_id, then fallback to telegram_username/handle)
+ * - Deep-merge meta (profile + enrich.last) — never wipe manual notes/tags
  * - Insert spender_events (new_spender | profile_updated | message)
+ * - Link spender_id back to tg_conversations
  * - Idempotent via idempotency_key
  */
 import { db } from '../supabaseClient.js';
@@ -18,9 +19,7 @@ export interface UpsertSpenderAndEventPayload {
   direction?: 'in' | 'out';
   conversation_id?: string | null;
   tg_message_id?: string | number | null;
-  /** Pour enrich IA: "Fields: status.relation, language, notes_chatter" */
   enrich_fields_list?: string[];
-  /** Patch brut de l'enrichissement */
   enrich_patch?: Record<string, unknown>;
 }
 
@@ -31,16 +30,14 @@ export interface UpsertSpenderAndEventResult {
   event_type: 'new_spender' | 'profile_updated' | 'message';
 }
 
-/** Normalise tg_user_id en string digits-only */
 function normalizeTgUserId(val: string | number | null | undefined): string | null {
   if (val === null || val === undefined) return null;
   const s = String(val).trim();
   if (!s) return null;
   const digits = s.replace(/\D/g, '');
-  return digits ? digits : null;
+  return digits || null;
 }
 
-/** SHA1-like hash simple pour idempotency (Node crypto si dispo) */
 function hashIdempotency(input: string): string {
   try {
     const crypto = require('crypto');
@@ -50,7 +47,6 @@ function hashIdempotency(input: string): string {
   }
 }
 
-/** Construit meta.profile standard */
 function buildProfileMeta(extracted: Record<string, unknown>): Record<string, unknown> {
   const profile: Record<string, unknown> = { identity: {}, status: {} };
   const identity = profile.identity as Record<string, unknown>;
@@ -74,7 +70,6 @@ function buildProfileMeta(extracted: Record<string, unknown>): Record<string, un
   return profile;
 }
 
-/** Deep merge sans remplacer non-null par null */
 function deepMergeNoNull(
   target: Record<string, unknown>,
   source: Record<string, unknown>,
@@ -100,22 +95,38 @@ function deepMergeNoNull(
   return result;
 }
 
-/** Construit meta enrich.last */
 function buildEnrichLast(
   fields: string[],
   patch: Record<string, unknown>,
   ts: string,
 ): Record<string, unknown> {
-  return {
-    ts,
-    fields: [...fields].sort(),
-    patch: patch || {},
-  };
+  return { ts, fields: [...fields].sort(), patch: patch || {} };
 }
 
 /**
- * Fonction unique: upsert spender + event
+ * Try to find an existing spender created manually by username/handle.
+ * Only matches spenders that don't already have a tg_user_id set.
  */
+async function findManualSpender(
+  supabase: SupabaseClient,
+  username: string | null,
+): Promise<{ id: string; meta: Record<string, unknown> } | null> {
+  if (!username) return null;
+
+  const clean = username.replace(/^@/, '').toLowerCase();
+  if (!clean) return null;
+
+  const { data } = await supabase
+    .from('spenders')
+    .select('id, meta')
+    .is('tg_user_id', null)
+    .or(`telegram_username.ilike.${clean},handle.ilike.${clean},handle.ilike.@${clean}`)
+    .limit(1)
+    .maybeSingle();
+
+  return data ? { id: data.id, meta: (data.meta as Record<string, unknown>) || {} } : null;
+}
+
 export async function upsertSpenderAndEvent(
   payload: UpsertSpenderAndEventPayload,
   supabase: SupabaseClient = db,
@@ -125,7 +136,6 @@ export async function upsertSpenderAndEvent(
   const username = payload.username?.replace(/^@/, '').trim() || null;
   const displayName = payload.display_name?.trim() || null;
 
-  // Handle: @username ou tg_<id> ou peer_<conversation>
   const handle = username
     ? (username.startsWith('@') ? username : `@${username}`)
     : tgNorm
@@ -139,7 +149,6 @@ export async function upsertSpenderAndEvent(
   const hasExtracted = payload.extracted_fields && Object.keys(payload.extracted_fields).length > 0;
   const hasEnrichFields = payload.enrich_fields_list && payload.enrich_fields_list.length > 0;
 
-  // 2) Upsert spenders
   const metaBase: Record<string, unknown> = {
     last_seen: now,
     last_message: payload.message ? now : undefined,
@@ -173,7 +182,7 @@ export async function upsertSpenderAndEvent(
   let created = false;
 
   if (tgNorm) {
-    // Upsert on tg_user_id
+    // --- Primary lookup: tg_user_id ---
     const { data: existing } = await supabase
       .from('spenders')
       .select('id, meta')
@@ -197,37 +206,61 @@ export async function upsertSpenderAndEvent(
       if (error) throw new Error(`upsertSpender update: ${error.message}`);
       spenderId = existing.id;
     } else {
-      const { data: inserted, error } = await supabase
-        .from('spenders')
-        .insert({
-          tg_user_id: tgNorm,
-          handle,
-          display_name: displayName || null,
-          name,
-          meta: newMeta,
-          last_seen_at: now,
-          updated_at: now,
-          status: 'active',
-          telegram_username: username,
-        })
-        .select('id')
-        .single();
-      if (error) {
-        if (error.code === '23505') {
-          const { data: retry } = await supabase.from('spenders').select('id').eq('tg_user_id', tgNorm).single();
-          spenderId = retry!.id;
-        } else throw new Error(`upsertSpender insert: ${error.message}`);
+      // Before creating, check for manual spender by username
+      const manual = await findManualSpender(supabase, username);
+      if (manual) {
+        const merged = deepMergeNoNull(manual.meta, newMeta);
+        const { error } = await supabase
+          .from('spenders')
+          .update({
+            tg_user_id: tgNorm,
+            handle,
+            display_name: displayName || null,
+            name,
+            telegram_username: username,
+            meta: merged,
+            last_seen_at: now,
+            updated_at: now,
+          })
+          .eq('id', manual.id);
+        if (error) throw new Error(`upsertSpender link-manual: ${error.message}`);
+        spenderId = manual.id;
+        log.info('SPENDER', 'linked_manual', { spender_id: spenderId, tg_user_id: tgNorm, username });
       } else {
-        spenderId = inserted!.id;
-        created = true;
+        const { data: inserted, error } = await supabase
+          .from('spenders')
+          .insert({
+            tg_user_id: tgNorm,
+            handle,
+            display_name: displayName || null,
+            name,
+            meta: newMeta,
+            last_seen_at: now,
+            updated_at: now,
+            status: 'active',
+            telegram_username: username,
+          })
+          .select('id')
+          .single();
+        if (error) {
+          if (error.code === '23505') {
+            const { data: retry } = await supabase.from('spenders').select('id').eq('tg_user_id', tgNorm).single();
+            spenderId = retry!.id;
+          } else throw new Error(`upsertSpender insert: ${error.message}`);
+        } else {
+          spenderId = inserted!.id;
+          created = true;
+        }
       }
     }
   } else {
-    // Upsert on handle (fallback)
+    // --- Fallback: handle-based lookup ---
+    const handleClean = handle.replace(/^@/, '');
     const { data: existing } = await supabase
       .from('spenders')
       .select('id, meta, display_name')
-      .eq('handle', handle)
+      .or(`handle.eq.${handle},handle.eq.${handleClean},telegram_username.ilike.${handleClean}`)
+      .limit(1)
       .maybeSingle();
 
     if (existing) {
@@ -272,7 +305,24 @@ export async function upsertSpenderAndEvent(
     }
   }
 
-  // Déterminer event_type après upsert
+  // ── Link spender_id to tg_conversations ──
+  if (payload.conversation_id) {
+    try {
+      await supabase
+        .from('tg_conversations')
+        .update({ spender_id: spenderId })
+        .eq('id', payload.conversation_id)
+        .is('spender_id', null);
+    } catch (err) {
+      log.warn('SPENDER', 'conv_link_failed', {
+        conv_id: payload.conversation_id,
+        spender_id: spenderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // ── Determine event_type ──
   let eventType: 'new_spender' | 'profile_updated' | 'message' = 'message';
   if (created) {
     eventType = 'new_spender';
@@ -284,7 +334,7 @@ export async function upsertSpenderAndEvent(
 
   log.info('UPSERT', 'spender ok', { spender_id: spenderId, tg_user_id: tgNorm ?? handle, created });
 
-  // 3) Insert spender_events (idempotent)
+  // ── Insert spender_events (idempotent) ──
   const tgForEvent = tgNorm || '0';
   let summary = '';
   let idempotencyKey = '';
@@ -322,14 +372,12 @@ export async function upsertSpenderAndEvent(
     spender_id: spenderId,
   };
 
-  // Essayer insert direct (idempotent via ON CONFLICT côté DB ou catch 23505)
   const { error: insertErr } = await supabase.from('spender_events').insert(eventRow);
   if (!insertErr) {
     eventInserted = true;
   } else if (insertErr.code === '23505') {
-    eventInserted = true; // doublon = idempotent ok
+    eventInserted = true;
   } else {
-    // Fallback: RPC fn_insert_spender_event (overload TEXT si migration 20260327 appliquée)
     try {
       const { error: rpcErr } = await supabase.rpc('fn_insert_spender_event', {
         p_tg_user_id: tgForEvent,

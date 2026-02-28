@@ -26,8 +26,11 @@ export const metrics: Metrics = {
 // ── Helpers ───────────────────────────────────
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** Fetch tg_chat_id from the singleton manager_settings row. */
+/** Fetch tg_chat_id: env var override → DB singleton fallback. */
 async function getManagerChatId(): Promise<string | null> {
+  const envChatId = process.env.MANAGER_TG_CHAT_ID;
+  if (envChatId) return envChatId;
+
   const { data, error } = await db
     .from('manager_settings')
     .select('tg_chat_id')
@@ -39,7 +42,7 @@ async function getManagerChatId(): Promise<string | null> {
     return null;
   }
   if (!data?.tg_chat_id) {
-    console.warn('[POLLER] manager_settings: tg_chat_id is empty — configure it to receive alerts');
+    console.warn('[POLLER] No MANAGER_TG_CHAT_ID env var and manager_settings.tg_chat_id is empty');
     return null;
   }
   return data.tg_chat_id;
