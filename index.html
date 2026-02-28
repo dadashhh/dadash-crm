@@ -7964,7 +7964,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [filterLangue, setFilterLangue] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
   const [spCardFilter, setSpCardFilter] = useState(null);
-  const [spChartMetric, setSpChartMetric] = useState("nouveaux_ia");
+  const [spChartMetric, setSpChartMetric] = useState("nouveaux");
+  const [sourceScope, setSourceScope] = useState("total");
   const [highlightSpenderId, setHighlightSpenderId] = useState(null);
   const [activity, setActivity] = useState({ newSpenders: [], enrichments: [], messages: [], all: [] });
   const [showActivityDrawer, setShowActivityDrawer] = useState(false);
@@ -8494,38 +8495,95 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   }
 
   const spPag = usePagination(spCardSorted);
+
+  // ── SOURCE SCOPE FILTER HELPER ──
+  const matchSource = (s) => {
+    if (sourceScope === "total") return true;
+    return (s.created_source || "manual") === sourceScope;
+  };
+
+  // ── DATE RANGE HELPERS (Europe/Zurich, exclusive end) ──
+  const isAllTime = dr.activePreset === "all" && !dr.startDate && !dr.endDate;
+  const drStart = dr.startDate || null;
+  const drEnd = dr.endDate || null;
+  const drEndExcl = drEnd ? (() => { const d = new Date(drEnd); d.setDate(d.getDate() + 1); return d.toLocaleDateString('fr-CA', { timeZone: 'Europe/Zurich' }); })() : null;
+  const inDateRange = (dateStr) => {
+    if (isAllTime) return true;
+    if (!dateStr) return false;
+    try {
+      const local = new Date(dateStr).toLocaleDateString('fr-CA', { timeZone: 'Europe/Zurich' });
+      if (drStart && local < drStart) return false;
+      if (drEndExcl && local >= drEndExcl) return false;
+      return true;
+    } catch (_) { return false; }
+  };
+
+  // ── Spenders filtered by created_at in date range + source scope + model ──
+  const spendersInPeriod = React.useMemo(() => {
+    return spenders.filter(s => {
+      if (!matchSource(s)) return false;
+      if (!inDateRange(s.created_at)) return false;
+      if (filterModel && !s.byModel[filterModel]) return false;
+      return true;
+    });
+  }, [spenders, sourceScope, drStart, drEnd, dr.activePreset, filterModel]);
+
+  // ── CHART DATA: complete day series, never empty ──
   const spChartData = React.useMemo(()=>{
     if(spChartMetric==="ltv"){
-      return [...spenders].sort((a,b)=>b.ltv-a.ltv).slice(0,10).map(s=>({name:"@"+(s.name||"?"),ltv:Math.round(s.ltv||0)}));
+      const src = spenders.filter(s => matchSource(s) && (!filterModel || s.byModel[filterModel]));
+      return [...src].sort((a,b)=>b.ltv-a.ltv).slice(0,10).map(s=>({name:"@"+(s.name||"?"),ltv:Math.round(s.ltv||0)}));
     }
-    const g={};
-    (spenders||[]).forEach(s=>{
-      (s.txs||[]).forEach(tx=>{const d=(tx.date||tx.created_at||"").slice(0,10);if(!d)return;if(!g[d])g[d]={day:d,nouveaux_ia:0,nouveaux_manual:0,actifs:new Set()};g[d].actifs.add(s.name);});
-      if(s.txs&&s.txs.length>0){
-        const first=[...s.txs].sort((a,b)=>new Date(a.date||0)-new Date(b.date||0))[0];
-        const d=(first.date||first.created_at||"").slice(0,10);
-        if(d){
-          if(!g[d])g[d]={day:d,nouveaux_ia:0,nouveaux_manual:0,actifs:new Set()};
-          const src=s.created_source||"manual";
-          if(src==="tg_ai") g[d].nouveaux_ia++;
-          else g[d].nouveaux_manual++;
-        }
+
+    const tz = 'Europe/Zurich';
+    const today = new Date().toLocaleDateString('fr-CA', { timeZone: tz });
+    const chartStart = drStart || (() => { const d = new Date(); d.setDate(d.getDate() - 29); return d.toLocaleDateString('fr-CA', { timeZone: tz }); })();
+    const chartEnd = drEnd || today;
+
+    const daySeries = [];
+    const cur = new Date(chartStart + 'T12:00:00');
+    const endD = new Date(chartEnd + 'T12:00:00');
+    while (cur <= endD) {
+      daySeries.push(cur.toLocaleDateString('fr-CA', { timeZone: tz }));
+      cur.setDate(cur.getDate() + 1);
+    }
+    if (daySeries.length === 0) daySeries.push(today);
+
+    const counts = {};
+    daySeries.forEach(d => { counts[d] = { nouveaux: 0, nouveaux_ia: 0, nouveaux_manual: 0, actifs: new Set() }; });
+
+    const scopedSpenders = spenders.filter(s => !filterModel || s.byModel[filterModel]);
+    scopedSpenders.forEach(s => {
+      (s.txs || []).forEach(tx => {
+        const d = tx.date ? new Date(tx.date).toLocaleDateString('fr-CA', { timeZone: tz }) : null;
+        if (d && counts[d]) counts[d].actifs.add(s.name);
+      });
+      const createdDay = s.created_at ? new Date(s.created_at).toLocaleDateString('fr-CA', { timeZone: tz }) : null;
+      if (createdDay && counts[createdDay]) {
+        const src = s.created_source || "manual";
+        if (src === "tg_ai") counts[createdDay].nouveaux_ia++;
+        else counts[createdDay].nouveaux_manual++;
+        counts[createdDay].nouveaux++;
       }
     });
-    return Object.values(g).sort((a,b)=>a.day<b.day?-1:1).map(d=>({...d,label:d.day.slice(5).replace("-","/"),actifs:d.actifs.size}));
-  },[spenders,spChartMetric]);
-  const avgLtv = sorted.length>0 ? sorted.reduce((s,x)=>s+x.ltv,0)/sorted.length : 0;
-  const multiModelCount = sorted.filter(s=>s.modelCount>1).length;
-  const totalValidated = sorted.reduce((s,x)=>s+x.validCA,0);
-  const totalPending = sorted.reduce((s,x)=>s+x.pendingCA,0);
 
-  // ── KPI computations for strip ──
+    return daySeries.map(d => ({
+      day: d,
+      label: d.slice(5).replace("-", "/"),
+      nouveaux: counts[d].nouveaux,
+      nouveaux_ia: counts[d].nouveaux_ia,
+      nouveaux_manual: counts[d].nouveaux_manual,
+      actifs: counts[d].actifs.size,
+    }));
+  },[spenders, spChartMetric, sourceScope, drStart, drEnd, dr.activePreset, filterModel]);
+
+  // ── KPI computations — respect filters ──
   const _now7 = Date.now();
-  const _actifs7j = spenders.filter(s => s.lastTxDate && (_now7 - new Date(s.lastTxDate).getTime()) < 7*86400000).length;
-  const _whales = spenders.filter(s => computeSpenderBadges(s).some(b => b.label === "WHALE")).length;
-  const _monthStart = new Date(); _monthStart.setDate(1); _monthStart.setHours(0,0,0,0);
-  const _nouveaux = spenders.filter(s => { if(!s.txs||s.txs.length===0) return false; const earliest = [...s.txs].sort((a,b)=>new Date(a.date)-new Date(b.date))[0]; return earliest && new Date(earliest.date) >= _monthStart; }).length;
-  const _caTotal = spenders.reduce((sum,s) => sum + s.validCA, 0);
+  const _spFiltered = spenders.filter(s => matchSource(s) && (!filterModel || s.byModel[filterModel]));
+  const _kpiSpenders = isAllTime ? _spFiltered.length : spendersInPeriod.length;
+  const _actifs7j = _spFiltered.filter(s => s.lastTxDate && (_now7 - new Date(s.lastTxDate).getTime()) < 7*86400000).length;
+  const _whales = _spFiltered.filter(s => computeSpenderBadges(s).some(b => b.label === "WHALE")).length;
+  const _caTotal = _spFiltered.reduce((sum,s) => sum + s.validCA, 0);
 
   // GUARD — never render without a valid user (gérant crash-safety)
   if (!user) return null;
@@ -8550,22 +8608,31 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             <div style={{fontSize:20,fontWeight:800,color:green?"var(--success)":"var(--text)",lineHeight:1.1}}>{val}</div>
           </div>;
         };
+        const scopeLabel = sourceScope === "tg_ai" ? " IA" : sourceScope === "manual" ? " Man." : "";
+        const periodLabel = isAllTime ? (fr?"Total":"Total") : (fr?"Période":"Period");
         return <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(5, 1fr)",gap:10,marginBottom:12}}>
-          {mkSp(t(lang,"spenders"),spenders.length,null)}
+          {mkSp(fr?`Spenders${scopeLabel} (${periodLabel})`:`Spenders${scopeLabel} (${periodLabel})`,_kpiSpenders,null)}
           {mkSp(fr?"Actifs 7j":"Active 7d",_actifs7j,"actifs7j")}
           {mkSp("Whales",_whales,"whales")}
-          {mkSp(fr?"Nouveaux ce mois":"New this month",_nouveaux,"nouveaux")}
-          {mkSp("CA Total",`${Math.round(_caTotal).toLocaleString()}${currencySymbol}`,null,true)}
+          {mkSp(fr?`Total${scopeLabel}`:`Total${scopeLabel}`,_spFiltered.length,null)}
+          {mkSp("CA",`${Math.round(_caTotal).toLocaleString()}${currencySymbol}`,null,true)}
         </div>;
       })()}
+      {/* ── Source Scope Toggle [TOTAL / IA / MANUAL] ── */}
+      <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:10}}>
+        <span style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",marginRight:4}}>{"🔍"} Source :</span>
+        {[{v:"total",l:"TOTAL",c:"#8b5cf6"},{v:"tg_ai",l:"IA",c:"#10b981"},{v:"manual",l:"MANUAL",c:"#f59e0b"}].map(m=>(
+          <button key={m.v} type="button" onClick={()=>setSourceScope(m.v)} style={{padding:"4px 14px",borderRadius:8,border:`1px solid ${sourceScope===m.v?m.c:"var(--border)"}`,background:sourceScope===m.v?m.c+"22":"var(--surface)",color:sourceScope===m.v?m.c:"var(--text-tertiary)",fontSize:11,fontWeight:700,cursor:"pointer",transition:"all 0.15s"}}>{m.l}</button>
+        ))}
+      </div>
       {/* ── Graphe Spenders ── */}
       {rechartsReady&&(
         <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px 8px",marginBottom:16}}>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:10}}>
-            {[{v:"nouveaux_ia",l:"NOUVEAUX IA",c:"#8b5cf6"},{v:"nouveaux_manual",l:"MANUELS",c:"#f59e0b"},{v:"actifs",l:"ACTIFS",c:"#10b981"},{v:"ltv",l:"LTV",c:"#8b5cf6"}].map(m=>(
+            {[{v:"nouveaux",l:"NOUVEAUX",c:"#8b5cf6"},{v:"actifs",l:"ACTIFS",c:"#10b981"},{v:"ltv",l:"LTV",c:"#6366f1"}].map(m=>(
               <button key={m.v} type="button" onClick={()=>setSpChartMetric(m.v)} style={{padding:"3px 12px",borderRadius:7,border:`1px solid ${spChartMetric===m.v?m.c:"var(--border)"}`,background:spChartMetric===m.v?m.c+"22":"var(--surface2)",color:spChartMetric===m.v?m.c:"var(--text-tertiary)",fontSize:11,fontWeight:700,cursor:"pointer",transition:"all 0.15s"}}>{m.l}</button>
             ))}
-            {spCardFilter&&<span style={{marginLeft:"auto",fontSize:11,color:"var(--text-tertiary)",alignSelf:"center"}}>Filtre : {spCardFilter==="actifs7j"?"🔥 actifs 7j":spCardFilter==="gorilles"?"🦍 gorilles":"⭐ nouveaux"}</span>}
+            <span style={{marginLeft:"auto",fontSize:10,color:"var(--text-tertiary)"}}>{sourceScope==="tg_ai"?"🤖 IA":sourceScope==="manual"?"✋ Manual":"📊 Total"}{isAllTime?"":" · "+dr.startDate+" → "+dr.endDate}</span>
           </div>
           {spChartMetric==="ltv"?(
             spChartData.length>0?(
@@ -8588,18 +8655,21 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                   <YAxis tick={{fill:"var(--text-tertiary)",fontSize:10}} tickLine={false} axisLine={false} width={28} allowDecimals={false}/>
                   <RechartsTooltip content={({active,payload,label})=>{
                     if(!active||!payload||!payload.length)return null;
-                    const pIA=payload.find(p=>p.dataKey==="nouveaux_ia");
-                    const pMan=payload.find(p=>p.dataKey==="nouveaux_manual");
-                    const pA=payload.find(p=>p.dataKey==="actifs");
+                    const dataKey = spChartMetric === "nouveaux"
+                      ? (sourceScope === "tg_ai" ? "nouveaux_ia" : sourceScope === "manual" ? "nouveaux_manual" : "nouveaux")
+                      : "actifs";
+                    const entry = payload.find(p=>p.dataKey===dataKey);
+                    const color = spChartMetric === "nouveaux" ? "#8b5cf6" : "#10b981";
+                    const icon = spChartMetric === "nouveaux" ? (sourceScope==="tg_ai"?"🤖":sourceScope==="manual"?"✋":"⭐") : "🔥";
+                    const lbl = spChartMetric === "nouveaux" ? "Nouveaux" : "Actifs";
                     return <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:8,padding:"10px 14px",fontSize:12}}>
                       <div style={{fontWeight:700,marginBottom:4,color:"var(--text)"}}>{label}</div>
-                      {pIA&&<div style={{color:"#8b5cf6"}}>{"🤖"} Nouveaux IA : {pIA.value||0}</div>}
-                      {pMan&&<div style={{color:"#f59e0b"}}>{"✋"} Manuels : {pMan.value||0}</div>}
-                      {pA&&<div style={{color:"#10b981"}}>{"🔥"} Actifs : {pA.value||0}</div>}
+                      {entry&&<div style={{color}}>{icon} {lbl} : {entry.value||0}</div>}
                     </div>;
                   }}/>
-                  {spChartMetric==="nouveaux_ia"&&<Line type="monotone" dataKey="nouveaux_ia" stroke="#8b5cf6" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#8b5cf6"}} name="Nouveaux IA"/>}
-                  {spChartMetric==="nouveaux_manual"&&<Line type="monotone" dataKey="nouveaux_manual" stroke="#f59e0b" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#f59e0b"}} name="Manuels"/>}
+                  {spChartMetric==="nouveaux"&&sourceScope==="total"&&<Line type="monotone" dataKey="nouveaux" stroke="#8b5cf6" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#8b5cf6"}} name="Nouveaux"/>}
+                  {spChartMetric==="nouveaux"&&sourceScope==="tg_ai"&&<Line type="monotone" dataKey="nouveaux_ia" stroke="#10b981" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#10b981"}} name="Nouveaux IA"/>}
+                  {spChartMetric==="nouveaux"&&sourceScope==="manual"&&<Line type="monotone" dataKey="nouveaux_manual" stroke="#f59e0b" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#f59e0b"}} name="Manuels"/>}
                   {spChartMetric==="actifs"&&<Line type="monotone" dataKey="actifs" stroke="#10b981" strokeWidth={2} dot={false} activeDot={{r:5,fill:"#10b981"}}/>}
                 </LineChart>
               </ResponsiveContainer>
