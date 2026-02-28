@@ -3017,15 +3017,17 @@ const computeSpenderTier = (totalSpent, txCountValid) => {
 const computeSpenderBadges = (sp) => {
   const badges = [];
   if (sp.scam_flag || (sp.scam_count && sp.scam_count >= 2)) badges.push({ icon: "\u{1F6A8}", label: "SCAM", color: "var(--danger)", bg: "rgba(239,68,68,0.15)" });
-  const ltv = sp.ltv || sp.total_spent || 0;
-  const cnt = sp.cnt || sp.tx_count || 0;
+  // FIX: ltv, cnt, activité = uniquement TX validées
+  const ltv = sp.ltv || sp.validCA || sp.total_spent || 0;
+  const cnt = sp.cnt || sp.validCount || sp.tx_count_valid || 0;
   const txArr = sp.txs || [];
-  const sortedTx = [...txArr].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const validTxArr = txArr.filter(tx => tx.status === "validated");
+  const sortedTx = [...validTxArr].sort((a, b) => new Date(b.date) - new Date(a.date));
   const lastTxDate = sortedTx.length > 0 ? new Date(sortedTx[0].date) : (sp.last_purchase_date ? new Date(sp.last_purchase_date) : null);
   const daysSinceLast = lastTxDate ? Math.floor((Date.now() - lastTxDate.getTime()) / 86400000) : Infinity;
   const now30 = Date.now() - 30 * 86400000;
-  const txLast30 = txArr.filter(tx => new Date(tx.date).getTime() > now30).length;
-  const validCnt = sp.tx_count_valid || sp.validCount || cnt;
+  const txLast30 = validTxArr.filter(tx => new Date(tx.date).getTime() > now30).length;
+  const validCnt = cnt;
   const tierInfo = computeSpenderTier(ltv, validCnt);
   badges.push({ icon: tierInfo.icon, label: tierInfo.label.toUpperCase(), color: tierInfo.color, bg: tierInfo.bg });
   if (daysSinceLast <= 7 && cnt > 0) badges.push({ icon: "\u{1F525}", label: "ACTIF", color: "var(--success)", bg: "var(--success-muted)" });
@@ -3036,15 +3038,17 @@ const computeSpenderBadges = (sp) => {
 };
 
 const computeVIPScore = (sp) => {
-  const ltv = sp.ltv || sp.total_spent || 0;
-  const cnt = sp.cnt || sp.tx_count || 0;
+  // FIX: ltv, cnt, aov, fréquence = uniquement TX validées
+  const ltv = sp.ltv || sp.validCA || sp.total_spent || 0;
+  const cnt = sp.cnt || sp.validCount || sp.tx_count_valid || 0;
   const aov = cnt > 0 ? ltv / cnt : 0;
   const txArr = sp.txs || [];
-  const sortedTx = [...txArr].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const validTxArr = txArr.filter(tx => tx.status === "validated");
+  const sortedTx = [...validTxArr].sort((a, b) => new Date(b.date) - new Date(a.date));
   const lastTxDate = sortedTx.length > 0 ? new Date(sortedTx[0].date) : (sp.last_purchase_date ? new Date(sp.last_purchase_date) : null);
   const daysSinceLast = lastTxDate ? Math.floor((Date.now() - lastTxDate.getTime()) / 86400000) : 365;
   const now30 = Date.now() - 30 * 86400000;
-  const txLast30 = txArr.filter(tx => new Date(tx.date).getTime() > now30).length;
+  const txLast30 = validTxArr.filter(tx => new Date(tx.date).getTime() > now30).length;
   const ltvScore = Math.min(ltv / 1000, 1) * 40;
   const freqScore = Math.min(txLast30 / 5, 1) * 25;
   const recencyScore = Math.max(1 - daysSinceLast / 90, 0) * 20;
@@ -3405,9 +3409,10 @@ const ExportRapportsTab = ({lang, txs, spenders, expenses, models, profiles, pay
     const headers = ["Spender", "Prenom", "Langue", "LTV", "TX Count", "Last Purchase", "Segment", "Timewaster"];
     const rows = (spenders || []).map(sp => {
       const sTxs = (txs || []).filter(tx => (tx.spender_handle || "").toLowerCase() === (sp.handle || sp.name || "").toLowerCase());
-      const ltv = sTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const validSTxs = sTxs.filter(tx => tx.status === "validated");
+      const ltv = validSTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
       const last = sTxs.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-      return [sp.handle || sp.name, sp.prenom || "", sp.langue || "", ltv.toFixed(2), sTxs.length, last ? last.date : "", sp.segment || "", sp.is_timewaster ? "YES" : ""];
+      return [sp.handle || sp.name, sp.prenom || "", sp.langue || "", ltv.toFixed(2), validSTxs.length, last ? last.date : "", sp.segment || "", sp.is_timewaster ? "YES" : ""];
     });
     downloadCSV("dadash-spenders-" + new Date().toISOString().slice(0, 10) + ".csv", headers, rows);
     setTimeout(() => setGenerating(null), 500);
@@ -3720,7 +3725,7 @@ const LogsAuditTab = ({lang, txs, chatterLogs, screenshotChecks, broadcasts, pro
   const msgCount = timeline.filter(i => i.type === "message").length;
   const scanCount = timeline.filter(i => i.type === "scan").length;
   const bcCount = timeline.filter(i => i.type === "broadcast").length;
-  const totalTxAmount = timeline.filter(i => i.type === "tx").reduce((s, i) => s + i.amount, 0);
+  const totalTxAmount = timeline.filter(i => i.type === "tx" && i.status === "validated").reduce((s, i) => s + i.amount, 0);
 
   // ── CSV Export ──
   const exportCSV = () => {
@@ -6012,17 +6017,20 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   }, [filteredTxs, dateDebut, dateFin, convertAmount]);
 
   const modelStats = useMemo(() => {
-    const total = filteredTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0) || 1;
+    // FIX: CA = uniquement TX validées
+    const validFilteredTxs = filteredTxs.filter(tx => tx.status === "validated");
+    const validPrevFilteredTxs = prevFilteredTxs.filter(tx => tx.status === "validated");
+    const total = validFilteredTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0) || 1;
     const result = DASHBOARD_MODELS.map(name => {
       const m = allModels.find(x => (x.name || "").toLowerCase() === name.toLowerCase()) || modeleProfiles.find(p => (p.name || "").toLowerCase() === name.toLowerCase());
       if (!m) return null;
-      const mTxs = filteredTxs.filter(tx => tx.model_id === m.id);
-      const allMTxs = allTxs.filter(tx => tx.model_id === m.id).sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at));
-      const prevMTxs = prevFilteredTxs.filter(tx => tx.model_id === m.id);
+      const mTxs = validFilteredTxs.filter(tx => tx.model_id === m.id);
+      const allMTxs = allTxs.filter(tx => tx.model_id === m.id && tx.status === "validated").sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at));
+      const prevMTxs = validPrevFilteredTxs.filter(tx => tx.model_id === m.id);
       const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
       const prevCa = prevMTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
       const convs = new Set(mTxs.map(tx => tx.spender_handle)).size;
-      const actives = mTxs.filter(tx => tx.status === "pending").length;
+      const actives = filteredTxs.filter(tx => tx.model_id === m.id && tx.status === "pending").length;
       const weeklyCA = [];
       for (let w = 7; w >= 0; w--) {
         const ws = new Date(); ws.setDate(ws.getDate() - (w + 1) * 7); ws.setHours(0, 0, 0, 0);
@@ -6617,7 +6625,7 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
         const d = new Date(tx.date).getTime();
         return d > latest ? d : latest;
       }, 0);
-      const totalSpent = spTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const totalSpent = spTxs.filter(tx => tx.status === "validated").reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
       if (lastTx < now12d && totalSpent >= 200) {
         const daysSince = Math.floor((Date.now() - lastTx) / 86400000);
         items.push({
@@ -8748,21 +8756,25 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     });
 
     return Object.values(map).map(s => {
-      const ltv = s.txs.reduce((sum, tx) => sum + Number(tx.amount), 0);
-      const cnt = s.txs.length;
+      // FIX: LTV, AOV, cnt = uniquement TX validées (status === "validated")
+      const validTxs = s.txs.filter(tx => tx.status === "validated");
+      const ltv = validTxs.reduce((sum, tx) => sum + Number(tx.amount), 0);
+      const cnt = validTxs.length;
       const aov = cnt > 0 ? ltv / cnt : 0;
-      const validCA = s.txs.filter(tx => tx.status === "validated").reduce((sum, tx) => sum + Number(tx.amount), 0);
+      const validCA = ltv; // ltv IS validCA now
       const pendingCA = s.txs.filter(tx => tx.status === "pending").reduce((sum, tx) => sum + Number(tx.amount), 0);
-      const validCount = s.txs.filter(tx => tx.status === "validated").length;
+      const validCount = cnt;
       const pendingCount = s.txs.filter(tx => tx.status === "pending").length;
       const lastTxDate = s.txs.length > 0 ? [...s.txs].sort((a,b)=>new Date(b.date)-new Date(a.date))[0].date : (s.last_purchase_date || null);
       const modelCount = Object.keys(s.byModel).length;
       const modelBreakdown = Object.entries(s.byModel).map(([mid, data]) => {
         const mName = models.find(m => m.id === mid)?.name || "?";
-        return {id: mid, name: mName, ca: data.ca, validated: data.validated, pending: data.pending, txCount: data.txs.length, txs: data.txs, pct: ltv > 0 ? ((data.ca / ltv) * 100) : 0};
-      }).sort((a, b) => b.ca - a.ca);
-      const chatterBreakdown = Object.values(s.byChatter).sort((a, b) => b.ca - a.ca);
-      const providerBreakdown = Object.values(s.byProvider).sort((a, b) => b.ca - a.ca);
+        // pct basé sur validCA (data.validated) et ltv global validé
+        return {id: mid, name: mName, ca: data.ca, validated: data.validated, pending: data.pending, txCount: data.txs.length, txs: data.txs, pct: ltv > 0 ? ((data.validated / ltv) * 100) : 0};
+      }).sort((a, b) => b.validated - a.validated);
+      const chatterBreakdown = Object.values(s.byChatter).sort((a, b) => b.validated - a.validated);
+      const providerBreakdown = Object.values(s.byProvider).sort((a, b) => b.validated - a.validated);
+      // segment basé sur ltv validé uniquement
       return {...s, ltv, cnt, aov, validCA, pendingCA, validCount, pendingCount, lastTxDate, segment: getSpenderSegment(ltv), modelCount, modelBreakdown, chatterBreakdown, providerBreakdown};
     });
   }, [spFilteredTxs, models, profiles, dbSpenders]);
