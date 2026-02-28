@@ -22099,11 +22099,342 @@ const LedgerTab = ({user, lang, ledgerEntries, profiles, isGerant}) => {
   );
 };
 
+// =============================================
+// PAYMENT FLOWS V2 — Flow A (salaire) + Flow B (déclaration)
+// =============================================
+
+/* ── generatePaymentInvoicePDF — génère et télécharge une facture PDF via html2pdf ── */
+const generatePaymentInvoicePDF = (payment, fromProfile, toProfile, fr) => {
+  try {
+    if (!window.html2pdf) { alert(fr ? "html2pdf non chargé" : "html2pdf not loaded"); return; }
+    const fmtDate = (d) => d ? new Date(d).toLocaleDateString("fr-CH") : "—";
+    const fmtAmt = (a, c) => `${Number(a||0).toLocaleString("fr-CH", {minimumFractionDigits:2})} ${c||"EUR"}`;
+    const fromName = fromProfile ? (fromProfile.name || fromProfile.email || (fromProfile.id||"").slice(0,8)) : (payment.from_user_id||"").slice(0,8);
+    const toName = toProfile ? (toProfile.name || toProfile.email || (toProfile.id||"").slice(0,8)) : (payment.to_user_id||"").slice(0,8);
+    const invNum = payment.invoice_number || ("INV-" + new Date().getFullYear() + "-" + Date.now().toString().slice(-4));
+    const statusLabel = payment.status === "confirmed" ? (fr ? "PAYÉ / CONFIRMÉ" : "PAID / CONFIRMED") : payment.status === "validated" ? (fr ? "VALIDÉ" : "VALIDATED") : (fr ? "PAYÉ" : "PAID");
+    const rows = [
+      [fr ? "Type" : "Kind", payment.kind || "—"],
+      [fr ? "Méthode" : "Method", payment.method || "—"],
+      [fr ? "Titre" : "Title", payment.title || "—"],
+      [fr ? "Note" : "Note", payment.note || "—"],
+      [fr ? "Date création" : "Created", fmtDate(payment.created_at)],
+      [fr ? "Date confirmation" : "Confirmed", fmtDate(payment.confirmed_at || payment.validated_at || payment.created_at)],
+    ];
+    const el = document.createElement("div");
+    el.style.cssText = "font-family:Arial,sans-serif;padding:32px;background:#fff;color:#111;max-width:600px;";
+    el.innerHTML = `
+      <div style="background:#8b5cf6;color:#fff;padding:20px 24px;border-radius:10px;margin-bottom:24px;display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <div style="font-size:24px;font-weight:900;letter-spacing:-1px;">DADASH</div>
+          <div style="font-size:11px;opacity:0.85;margin-top:4px;">${fr?"Facture de paiement interne":"Internal Payment Invoice"}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:14px;font-weight:700;">${invNum}</div>
+          <div style="font-size:11px;opacity:0.85;margin-top:3px;">${fmtDate(payment.confirmed_at||payment.created_at)}</div>
+        </div>
+      </div>
+      <div style="background:#22c55e;color:#fff;display:inline-block;padding:5px 16px;border-radius:20px;font-size:12px;font-weight:700;margin-bottom:20px;">${statusLabel}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;">
+        <div style="background:#f5f3ff;border-radius:8px;padding:14px;">
+          <div style="font-size:10px;color:#7c3aed;font-weight:700;text-transform:uppercase;margin-bottom:6px;">${fr?"Émetteur":"From"}</div>
+          <div style="font-size:14px;font-weight:600;">${fromName}</div>
+        </div>
+        <div style="background:#f5f3ff;border-radius:8px;padding:14px;">
+          <div style="font-size:10px;color:#7c3aed;font-weight:700;text-transform:uppercase;margin-bottom:6px;">${fr?"Destinataire":"To"}</div>
+          <div style="font-size:14px;font-weight:600;">${toName}</div>
+        </div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
+        ${rows.map(([l,v])=>`<tr><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-size:11px;color:#6b7280;font-weight:600;width:40%;">${l}</td><td style="padding:7px 10px;border-bottom:1px solid #e5e7eb;font-size:12px;color:#111;">${v}</td></tr>`).join("")}
+      </table>
+      <div style="background:#f5f3ff;border-radius:10px;padding:18px;text-align:center;margin-bottom:24px;">
+        <div style="font-size:11px;color:#7c3aed;font-weight:600;margin-bottom:6px;">${fr?"MONTANT TOTAL":"TOTAL AMOUNT"}</div>
+        <div style="font-size:28px;font-weight:900;color:#8b5cf6;">${fmtAmt(payment.amount,payment.currency)}</div>
+      </div>
+      <div style="text-align:center;font-size:10px;color:#9ca3af;border-top:1px solid #e5e7eb;padding-top:12px;">
+        DADASH CRM — ${fr?"Document généré automatiquement":"Automatically generated document"} — ${new Date().toISOString().slice(0,10)}
+      </div>
+    `;
+    document.body.appendChild(el);
+    window.html2pdf().set({
+      margin: 10, filename: `${invNum}.pdf`,
+      image: { type: "jpeg", quality: 0.98 },
+      html2canvas: { scale: 2 },
+      jsPDF: { unit: "mm", format: "a4", orientation: "portrait" }
+    }).from(el).save().then(() => document.body.removeChild(el)).catch(e => { document.body.removeChild(el); console.error(e); });
+  } catch (e) {
+    console.error("PDF error:", e);
+    alert((fr ? "Erreur génération PDF: " : "PDF error: ") + (e.message || e));
+  }
+};
+
+/* ── UploadProofButton — upload screenshot vers Supabase Storage ── */
+const UploadProofButton = ({ user, paymentId, label, onUploaded, lang, required: isRequired }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [uploading, setUploading] = useState(false);
+  const inputRef = React.useRef(null);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.type)) {
+      addToast(fr ? "Format non supporté (JPG/PNG/WEBP)" : "Unsupported format (JPG/PNG/WEBP)", "error"); return;
+    }
+    if (file.size > 5 * 1024 * 1024) { addToast(fr ? "Fichier trop lourd (max 5MB)" : "File too large (max 5MB)", "error"); return; }
+    setUploading(true);
+    try {
+      const ext = file.name.split(".").pop();
+      const path = `${user.id}/${paymentId || "new"}_${Date.now()}.${ext}`;
+      const { data, error } = await sb.storage.from("payment-proofs").upload(path, file, { upsert: true });
+      if (error) throw new Error(error.message);
+      const { data: urlData } = sb.storage.from("payment-proofs").getPublicUrl(path);
+      const url = urlData?.publicUrl || path;
+      onUploaded(url);
+      addToast(fr ? "Screenshot uploadé ✓" : "Screenshot uploaded ✓", "success");
+    } catch (err) {
+      addToast((fr ? "Erreur upload: " : "Upload error: ") + (err.message || err), "error");
+    } finally { setUploading(false); e.target.value = ""; }
+  };
+
+  return (
+    <div>
+      <input ref={inputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFile} />
+      <button type="button" onClick={() => inputRef.current?.click()} disabled={uploading}
+        style={{ padding: "7px 14px", borderRadius: 9, border: "1px dashed var(--border-default)", background: "var(--bg-raised)",
+          color: "var(--text-secondary)", fontSize: 12, cursor: uploading ? "wait" : "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+        {uploading ? "⏳" : "📎"} {uploading ? (fr ? "Upload…" : "Uploading…") : label}
+        {isRequired && <span style={{ color: "var(--danger)", fontWeight: 700 }}>*</span>}
+      </button>
+    </div>
+  );
+};
+
+/* ── ConfirmReceiptModal — Flow A : chatter confirme réception d'un salaire ── */
+const ConfirmReceiptModal = ({ payment, user, profiles, onClose, onConfirmed, lang }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [receiptUrl, setReceiptUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+  const fromProfile = (profiles || []).find(p => p.id === payment.from_user_id);
+  const fmtAmt = (a, c) => `${Number(a||0).toLocaleString("fr-CH", {minimumFractionDigits:2})} ${c||"EUR"}`;
+
+  const handleConfirm = async () => {
+    setSaving(true);
+    try {
+      const now = new Date().toISOString();
+      // Générer numéro de facture
+      let invNum = null;
+      try {
+        const { data: invData } = await sb.rpc("next_invoice_number");
+        invNum = invData;
+      } catch (_) { invNum = "INV-" + new Date().getFullYear() + "-" + Date.now().toString().slice(-4); }
+
+      const { error } = await sb.from("payment_events").update({
+        status: "confirmed",
+        confirmed_at: now,
+        receipt_url: receiptUrl || null,
+        invoice_number: invNum,
+      }).eq("id", payment.id);
+
+      if (error) throw new Error(error.message);
+
+      // Notif gérant
+      try {
+        const receiverName = user.name || user.email || "Quelqu'un";
+        const gerants = (profiles || []).filter(p => p.role === "gerant");
+        await Promise.all(gerants.map(g =>
+          sb.from("notifications").insert({
+            user_id: g.id, type: "payment_confirmed",
+            title: `✅ ${receiverName} a confirmé la réception`,
+            message: `${receiverName} a confirmé avoir reçu ${fmtAmt(payment.amount, payment.currency)}${payment.title ? " — " + payment.title : ""}`,
+            read: false,
+          }).then(() => {})
+        ));
+      } catch (_) {}
+
+      addToast(fr ? "Réception confirmée ✓" : "Receipt confirmed ✓", "success");
+      onConfirmed({ ...payment, status: "confirmed", confirmed_at: now, receipt_url: receiptUrl || null, invoice_number: invNum });
+    } catch (e) {
+      addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-strong)", borderRadius: 16, padding: 24, width: "100%", maxWidth: 440, boxShadow: "var(--shadow-lg)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <h3 style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)", margin: 0 }}>✅ {fr ? "Confirmer la réception" : "Confirm receipt"}</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text-tertiary)", fontSize: 20, cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ background: "var(--accent-muted)", borderRadius: 12, padding: "14px 16px", marginBottom: 20 }}>
+          <div style={{ fontSize: 13, color: "var(--text-secondary)", marginBottom: 4 }}>
+            💰 {fr ? "Paiement reçu de" : "Payment from"} <strong>{fromProfile?.name || fromProfile?.email || "—"}</strong>
+          </div>
+          <div style={{ fontSize: 22, fontWeight: 800, color: "var(--accent)" }}>{fmtAmt(payment.amount, payment.currency)}</div>
+          {payment.title && <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 4 }}>{payment.title}</div>}
+          {payment.method && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>📋 {payment.method}</div>}
+          {payment.screenshot_url && (
+            <a href={payment.screenshot_url} target="_blank" rel="noreferrer"
+              style={{ display: "inline-block", marginTop: 8, fontSize: 11, color: "var(--accent)", fontWeight: 600 }}>
+              🖼 {fr ? "Voir preuve de paiement" : "View payment proof"}
+            </a>
+          )}
+        </div>
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 8, fontWeight: 600 }}>
+            📎 {fr ? "Screenshot de votre réception (optionnel)" : "Your receipt screenshot (optional)"}
+          </div>
+          <UploadProofButton user={user} paymentId={payment.id} lang={lang}
+            label={fr ? "Uploader preuve de réception" : "Upload receipt proof"}
+            onUploaded={url => setReceiptUrl(url)} />
+          {receiptUrl && <div style={{ fontSize: 11, color: "var(--success)", marginTop: 6 }}>✓ {fr ? "Screenshot uploadé" : "Screenshot uploaded"}</div>}
+        </div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <button onClick={onClose} style={{ ...UI.btnSecondary }}>{fr ? "Annuler" : "Cancel"}</button>
+          <button onClick={handleConfirm} disabled={saving}
+            style={{ padding: "9px 20px", borderRadius: 10, border: "none", background: "var(--success)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: saving ? "wait" : "pointer", opacity: saving ? 0.6 : 1 }}>
+            {saving ? "⏳" : "✅"} {saving ? (fr ? "Confirmation…" : "Confirming…") : (fr ? "Confirmer la réception" : "Confirm receipt")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ── DeclarePaymentModal — Flow B : provider déclare un paiement reçu ── */
+const DeclarePaymentModal = ({ user, profiles, onClose, onSaved, lang }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [form, setForm] = useState({ amount: "", currency: "EUR", method: "", note: "", title: "" });
+  const [screenshotUrl, setScreenshotUrl] = useState("");
+  const [saving, setSaving] = useState(false);
+  const set = (k, v) => setForm(prev => ({ ...prev, [k]: v }));
+  const gerants = (profiles || []).filter(p => p.role === "gerant");
+  const fmtAmt = (a, c) => `${Number(a||0).toLocaleString("fr-CH", {minimumFractionDigits:2})} ${c||"EUR"}`;
+
+  const handleDeclare = async () => {
+    if (!form.amount || isNaN(Number(form.amount)) || Number(form.amount) <= 0)
+      return addToast(fr ? "Montant invalide" : "Invalid amount", "error");
+    if (!screenshotUrl)
+      return addToast(fr ? "Screenshot obligatoire pour déclarer un paiement" : "Screenshot required to declare a payment", "error");
+    const gerantId = gerants[0]?.id;
+    if (!gerantId) return addToast(fr ? "Aucun gérant trouvé" : "No manager found", "error");
+
+    setSaving(true);
+    try {
+      const now = new Date().toISOString();
+      const { data, error } = await sb.from("payment_events").insert({
+        created_by: user.id,
+        from_user_id: user.id,
+        to_user_id: gerantId,
+        amount: Number(form.amount),
+        currency: form.currency || "EUR",
+        kind: "declaration",
+        title: form.title.trim() || (fr ? "Déclaration paiement" : "Payment declaration"),
+        note: form.note.trim() || null,
+        method: form.method || null,
+        screenshot_url: screenshotUrl,
+        status: "declared",
+        declared_at: now,
+      }).select().single();
+
+      if (error) throw new Error(error.message);
+
+      // Notif gérant
+      try {
+        const declarerName = user.name || user.email || "Quelqu'un";
+        await Promise.all(gerants.map(g =>
+          sb.from("notifications").insert({
+            user_id: g.id, type: "payment_declared",
+            title: `💸 ${declarerName} a déclaré un paiement`,
+            message: `${declarerName} a déclaré avoir reçu ${fmtAmt(form.amount, form.currency)}. Valider ?`,
+            read: false,
+          }).then(() => {})
+        ));
+      } catch (_) {}
+
+      addToast(fr ? "Déclaration envoyée ✓" : "Declaration sent ✓", "success");
+      onSaved(data);
+    } catch (e) {
+      addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
+    } finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-strong)", borderRadius: 16, padding: 24, width: "100%", maxWidth: 460, maxHeight: "90vh", overflowY: "auto", boxShadow: "var(--shadow-lg)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <h3 style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)", margin: 0 }}>💸 {fr ? "Déclarer un paiement reçu" : "Declare a received payment"}</h3>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text-tertiary)", fontSize: 20, cursor: "pointer" }}>×</button>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "flex", gap: 10 }}>
+            <div style={{ flex: 1 }}>
+              <label style={{ fontSize: 11, color: "var(--text-secondary)", display: "block", marginBottom: 4 }}>{fr ? "Montant" : "Amount"} *</label>
+              <input type="number" min="0.01" step="0.01" value={form.amount} onChange={e => set("amount", e.target.value)}
+                style={{ ...UI.input, marginBottom: 0 }} placeholder="0.00" />
+            </div>
+            <div style={{ width: 90 }}>
+              <label style={{ fontSize: 11, color: "var(--text-secondary)", display: "block", marginBottom: 4 }}>{fr ? "Devise" : "Currency"}</label>
+              <select value={form.currency} onChange={e => set("currency", e.target.value)} style={{ ...UI.input, marginBottom: 0 }}>
+                <option value="EUR">EUR</option><option value="CHF">CHF</option><option value="USD">USD</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-secondary)", display: "block", marginBottom: 4 }}>{fr ? "Méthode de paiement" : "Payment method"}</label>
+            <select value={form.method} onChange={e => set("method", e.target.value)} style={{ ...UI.input, marginBottom: 0 }}>
+              <option value="">— {fr ? "Choisir" : "Select"} —</option>
+              {["Twint", "Revolut", "Virement bancaire", "PayPal", "Cash", "Crypto", "Autre"].map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-secondary)", display: "block", marginBottom: 4 }}>Titre</label>
+            <input type="text" value={form.title} onChange={e => set("title", e.target.value)}
+              style={{ ...UI.input, marginBottom: 0 }} placeholder={fr ? "Ex: Paiement client Mars 2026" : "E.g. Client payment March 2026"} />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-secondary)", display: "block", marginBottom: 4 }}>{fr ? "Note (optionnel)" : "Note (optional)"}</label>
+            <textarea value={form.note} onChange={e => set("note", e.target.value)}
+              style={{ ...UI.input, height: 60, resize: "vertical", marginBottom: 0 }} />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-secondary)", display: "block", marginBottom: 6 }}>
+              📎 {fr ? "Screenshot preuve de paiement" : "Payment proof screenshot"} <span style={{ color: "var(--danger)", fontWeight: 700 }}>*</span>
+            </label>
+            <UploadProofButton user={user} paymentId="new" lang={lang} required
+              label={fr ? "Uploader screenshot (obligatoire)" : "Upload screenshot (required)"}
+              onUploaded={url => setScreenshotUrl(url)} />
+            {screenshotUrl && (
+              <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 11, color: "var(--success)", fontWeight: 600 }}>✓ {fr ? "Screenshot uploadé" : "Screenshot uploaded"}</span>
+                <a href={screenshotUrl} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--accent)" }}>🖼 {fr ? "Voir" : "View"}</a>
+              </div>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 4 }}>
+            <button onClick={onClose} style={UI.btnSecondary}>{fr ? "Annuler" : "Cancel"}</button>
+            <button onClick={handleDeclare} disabled={saving || !screenshotUrl}
+              style={{ ...UI.btnPrimary, opacity: (saving || !screenshotUrl) ? 0.6 : 1 }}>
+              {saving ? "⏳" : "💸"} {saving ? (fr ? "Envoi…" : "Sending…") : (fr ? "Déclarer le paiement" : "Declare payment")}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 /* CreatePaymentModal — modal to create a payment_event (status: pending) */
 const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
   const fr = lang === "fr";
   const addToast = useToast();
-  const [form, setForm] = useState({from_user_id:user.id,to_user_id:"",amount:"",currency:"EUR",kind:"salary",title:"",note:""});
+  const [form, setForm] = useState({from_user_id:user.id,to_user_id:"",amount:"",currency:"EUR",kind:"salary",title:"",note:"",method:""});
+  const [screenshotUrl, setScreenshotUrl] = useState("");
   const [saving, setSaving] = useState(false);
   const set = (k,v) => setForm(prev=>({...prev,[k]:v}));
   const inpStyle = {...UI.input,marginBottom:0};
@@ -22115,6 +22446,8 @@ const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
     if (!form.amount||isNaN(Number(form.amount))||Number(form.amount)<=0) return addToast(fr?"Montant invalide":"Invalid amount","error");
     if (form.from_user_id===form.to_user_id) return addToast(fr?"Payeur et receveur identiques":"Payer = Receiver","error");
     setSaving(true);
+    const toProfile = allUsers.find(u=>u.id===form.to_user_id);
+    const toName = toProfile?.name || toProfile?.email || "";
     const {error} = await sb.from("payment_events").insert({
       created_by:user.id,
       from_user_id:form.from_user_id,
@@ -22124,11 +22457,24 @@ const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
       kind:form.kind||"salary",
       title:form.title.trim()||form.kind,
       note:form.note.trim()||null,
+      method:form.method||null,
+      screenshot_url:screenshotUrl||null,
       status:"pending"
     });
     setSaving(false);
     if (error) return addToast("Erreur: "+error.message,"error");
-    addToast("\u{1F4B8} Paiement créé — marquer payé pour écrire la compta","success");
+    // Notif destinataire
+    try {
+      const senderName = user.name || user.email || "Le gérant";
+      const amt = `${Number(form.amount).toLocaleString("fr-CH",{minimumFractionDigits:2})} ${form.currency||"EUR"}`;
+      await sb.from("notifications").insert({
+        user_id:form.to_user_id, type:"payment_pending",
+        title:`💰 Nouveau paiement reçu — ${amt}`,
+        message:`${senderName} vous a envoyé ${amt}${form.title?" — "+form.title:""}. Confirmer la réception ?`,
+        read:false,
+      });
+    } catch(_){}
+    addToast("\u{1F4B8} Paiement créé — notif envoyée au destinataire","success");
     onSaved();
   };
 
@@ -22182,8 +22528,22 @@ const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
             <input type="text" value={form.title} onChange={e=>set("title",e.target.value)} style={inpStyle} placeholder={fr?"Ex: Salaire Janvier 2026":"E.g. January 2026 salary"} />
           </div>
           <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Méthode de paiement":"Payment method"}</label>
+            <select value={form.method} onChange={e=>set("method",e.target.value)} style={inpStyle}>
+              <option value="">— {fr?"Choisir":"Select"} —</option>
+              {["Twint","Revolut","Virement bancaire","PayPal","Cash","Crypto","Autre"].map(m=><option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+          <div>
             <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Note (optionnel)":"Note (optional)"}</label>
             <textarea value={form.note} onChange={e=>set("note",e.target.value)} style={{...inpStyle,height:58,resize:"vertical"}} placeholder={fr?"Note interne...":"Internal note..."} />
+          </div>
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:6}}>📎 {fr?"Screenshot preuve de paiement (optionnel)":"Payment proof screenshot (optional)"}</label>
+            <UploadProofButton user={user} paymentId="new" lang={lang}
+              label={fr?"Uploader screenshot":"Upload screenshot"}
+              onUploaded={url=>setScreenshotUrl(url)} />
+            {screenshotUrl&&<div style={{fontSize:11,color:"var(--success)",marginTop:4}}>✓ {fr?"Screenshot uploadé":"Screenshot uploaded"}</div>}
           </div>
           <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:4}}>
             <button onClick={onClose} style={UI.btnSecondary}>{fr?"Annuler":"Cancel"}</button>
@@ -22202,6 +22562,10 @@ const PaymentEventsSection = ({user, lang, paymentEvents, profiles, onRefresh, o
   const fr = lang === "fr";
   const addToast = useToast();
   const [marking, setMarking] = useState(null);
+  const [validating, setValidating] = useState(null);
+  const [rejectModal, setRejectModal] = useState(null); // {evt}
+  const [rejectReason, setRejectReason] = useState("");
+  const [viewSection, setViewSection] = useState("all"); // all | pending_confirm | declarations
 
   const handleMarkPaid = async (evt) => {
     setMarking(evt.id);
@@ -22212,22 +22576,117 @@ const PaymentEventsSection = ({user, lang, paymentEvents, profiles, onRefresh, o
     if (afterMutationRefresh) afterMutationRefresh(); else if (onRefresh) onRefresh();
   };
 
+  const handleValidateDeclaration = async (evt) => {
+    setValidating(evt.id);
+    try {
+      let invNum = null;
+      try { const {data} = await sb.rpc("next_invoice_number"); invNum = data; } catch(_){}
+      const {error} = await sb.from("payment_events").update({
+        status:"validated", validated_by:user.id,
+        confirmed_at:new Date().toISOString(),
+        invoice_number:invNum||null,
+      }).eq("id",evt.id);
+      if (error) throw new Error(error.message);
+      // Notif provider
+      try {
+        const managerName = user.name||user.email||"Le gérant";
+        const amt = `${Number(evt.amount||0).toLocaleString("fr-CH",{minimumFractionDigits:2})} ${evt.currency||"EUR"}`;
+        await sb.from("notifications").insert({
+          user_id:evt.from_user_id, type:"payment_validated",
+          title:`✅ Paiement validé par ${managerName}`,
+          message:`Votre déclaration de ${amt} a été validée.`,
+          read:false,
+        });
+      } catch(_){}
+      addToast("✅ Déclaration validée","success");
+      if (afterMutationRefresh) afterMutationRefresh(); else if (onRefresh) onRefresh();
+    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+    finally { setValidating(null); }
+  };
+
+  const handleRejectDeclaration = async () => {
+    if (!rejectModal) return;
+    const evt = rejectModal;
+    setValidating(evt.id);
+    try {
+      const {error} = await sb.from("payment_events").update({
+        status:"rejected", validated_by:user.id,
+        rejected_at:new Date().toISOString(),
+        rejected_reason:rejectReason||null,
+      }).eq("id",evt.id);
+      if (error) throw new Error(error.message);
+      try {
+        const managerName = user.name||user.email||"Le gérant";
+        const amt = `${Number(evt.amount||0).toLocaleString("fr-CH",{minimumFractionDigits:2})} ${evt.currency||"EUR"}`;
+        await sb.from("notifications").insert({
+          user_id:evt.from_user_id, type:"payment_rejected",
+          title:`❌ Paiement rejeté par ${managerName}`,
+          message:`Votre déclaration de ${amt} a été rejetée.${rejectReason?" Motif: "+rejectReason:""}`,
+          read:false,
+        });
+      } catch(_){}
+      addToast("❌ Déclaration rejetée","info");
+      setRejectModal(null); setRejectReason("");
+      if (afterMutationRefresh) afterMutationRefresh(); else if (onRefresh) onRefresh();
+    } catch(e){ addToast("Erreur: "+e.message,"error"); }
+    finally { setValidating(null); }
+  };
+
   const getUserName = (id) => {
     if (!id||!profiles) return id?(id||"").slice(0,8)+"…":"—";
     const p = profiles.find(x=>x.id===id);
     return p ? displayUserName(p) : (id||"").slice(0,8)+"…";
   };
 
+  const STATUS_CFG = {
+    paid:{bg:"rgba(34,197,94,0.15)",col:"#22c55e",label:"payé"},
+    confirmed:{bg:"rgba(34,197,94,0.15)",col:"#22c55e",label:"confirmé"},
+    pending:{bg:"rgba(245,158,11,0.15)",col:"#f59e0b",label:"en attente"},
+    declared:{bg:"rgba(99,102,241,0.15)",col:"#818cf8",label:"déclaré"},
+    validated:{bg:"rgba(34,197,94,0.15)",col:"#22c55e",label:"validé"},
+    rejected:{bg:"rgba(239,68,68,0.15)",col:"#ef4444",label:"rejeté"},
+    cancelled:{bg:"rgba(107,114,128,0.15)",col:"#6b7280",label:"annulé"},
+  };
   const statusBadge = (s) => {
-    const map = {paid:["var(--success-bg)","var(--success)"],pending:["var(--warning-bg)","var(--warning)"],cancelled:["var(--danger-bg)","var(--danger)"]};
-    const [bg,col] = map[s]||["var(--accent-muted)","var(--accent)"];
-    return <span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:bg,color:col}}>{s||"pending"}</span>;
+    const cfg = STATUS_CFG[s]||{bg:"var(--accent-muted)",col:"var(--accent)",label:s||"—"};
+    return <span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:cfg.bg,color:cfg.col}}>{cfg.label}</span>;
   };
 
-  const sorted = useMemo(()=>[...(paymentEvents||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)),[paymentEvents]);
+  const all = useMemo(()=>[...(paymentEvents||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)),[paymentEvents]);
+  const pendingConfirm = useMemo(()=>all.filter(e=>e.status==="pending"&&e.kind!=="declaration"),[all]);
+  const declarations = useMemo(()=>all.filter(e=>e.kind==="declaration"),[all]);
+  const sorted = viewSection==="pending_confirm" ? pendingConfirm : viewSection==="declarations" ? declarations : all;
+
+  const navBtn = (id,label,count) => (
+    <button key={id} onClick={()=>setViewSection(id)} style={{
+      padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:600,
+      border:`1px solid ${viewSection===id?"var(--accent)":"var(--border-subtle)"}`,
+      background:viewSection===id?"var(--accent-muted)":"var(--bg-raised)",
+      color:viewSection===id?"var(--accent)":"var(--text-secondary)",
+    }}>
+      {label}{count>0&&<span style={{marginLeft:5,background:"#EF4444",color:"#fff",borderRadius:8,padding:"1px 6px",fontSize:10,fontWeight:700}}>{count}</span>}
+    </button>
+  );
 
   return (
     <div>
+      {/* Reject modal */}
+      {rejectModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+          <div style={{background:"var(--bg-modal)",border:"1px solid var(--border-strong)",borderRadius:14,padding:22,width:"100%",maxWidth:380}}>
+            <h4 style={{fontSize:14,fontWeight:700,color:"var(--text-primary)",marginBottom:12}}>❌ {fr?"Motif du rejet (optionnel)":"Rejection reason (optional)"}</h4>
+            <textarea value={rejectReason} onChange={e=>setRejectReason(e.target.value)}
+              style={{...UI.input,height:70,resize:"vertical",marginBottom:14}} placeholder={fr?"Ex: Screenshot illisible, montant incorrect…":"E.g. Unreadable screenshot…"} />
+            <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+              <button onClick={()=>{setRejectModal(null);setRejectReason("");}} style={UI.btnSecondary}>{fr?"Annuler":"Cancel"}</button>
+              <button onClick={handleRejectDeclaration} disabled={validating===rejectModal?.id}
+                style={{padding:"8px 18px",borderRadius:9,border:"none",background:"var(--danger)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                {fr?"Confirmer rejet":"Confirm rejection"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
         <div>
           <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4B8}"} {fr?"Paiements Internes":"Internal Payments"}</h2>
@@ -22235,43 +22694,85 @@ const PaymentEventsSection = ({user, lang, paymentEvents, profiles, onRefresh, o
         </div>
         <button onClick={onCreatePayment} style={{...UI.btnPrimary,display:"flex",alignItems:"center",gap:6}}>
           <span style={{fontSize:16,lineHeight:1}}>+</span>
-          <span>{fr?"Créer paiement":"Create payment"}</span>
+          <span>{fr?"Nouveau salaire":"New salary"}</span>
         </button>
+      </div>
+      {/* Section nav */}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
+        {navBtn("all", fr?"Tous":"All", 0)}
+        {navBtn("pending_confirm", fr?"En attente confirmation":"Pending confirm", pendingConfirm.length)}
+        {navBtn("declarations", fr?"Déclarations providers":"Provider declarations", declarations.filter(d=>d.status==="declared").length)}
       </div>
       <div className="ui-panel">
         <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
-          <table className="table" style={{fontSize:12,minWidth:_isMobile?620:undefined}}>
+          <table className="table" style={{fontSize:12,minWidth:_isMobile?700:undefined}}>
             <thead><tr>
               <th>{fr?"Date":"Date"}</th>
               <th>{fr?"Type":"Kind"}</th>
-              <th>{fr?"Payeur":"From"}</th>
-              <th>{fr?"Receveur":"To"}</th>
+              <th>{fr?"De":"From"}</th>
+              <th>{fr?"À":"To"}</th>
               <th style={{textAlign:"right"}}>{fr?"Montant":"Amount"}</th>
+              <th>{fr?"Méthode":"Method"}</th>
               <th>{fr?"Titre":"Title"}</th>
               <th>{fr?"Statut":"Status"}</th>
-              <th style={{textAlign:"center"}}>{fr?"Action":"Action"}</th>
+              <th style={{textAlign:"center"}}>{fr?"Actions":"Actions"}</th>
             </tr></thead>
             <tbody>
-              {sorted.map(evt=>(
-                <tr key={evt.id}>
-                  <td style={{whiteSpace:"nowrap"}}>{formatDateSafe(evt.created_at)}</td>
-                  <td><span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:"var(--accent-muted)",color:"var(--accent)"}}>{evt.kind||"—"}</span></td>
-                  <td>{getUserName(evt.from_user_id)}</td>
-                  <td>{getUserName(evt.to_user_id)}</td>
-                  <td style={{textAlign:"right",fontWeight:700}}>{Number(evt.amount||0).toLocaleString("fr-FR",{maximumFractionDigits:2})} {evt.currency||"EUR"}</td>
-                  <td style={{maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{evt.title||"—"}</td>
-                  <td>{statusBadge(evt.status)}</td>
-                  <td style={{textAlign:"center"}}>
-                    {evt.status==="pending"
-                      ? <button onClick={()=>handleMarkPaid(evt)} disabled={marking===evt.id} style={{padding:"4px 12px",borderRadius:8,background:"var(--success)",color:"#fff",border:"none",fontSize:11,fontWeight:700,cursor:"pointer",opacity:marking===evt.id?0.6:1,whiteSpace:"nowrap"}}>
-                          {marking===evt.id?"...":(fr?"\u2713 Marquer payé":"\u2713 Mark paid")}
-                        </button>
-                      : <span style={{color:"var(--text-tertiary)",fontSize:11}}>—</span>
-                    }
-                  </td>
-                </tr>
-              ))}
-              {sorted.length===0&&<tr><td colSpan={8} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr?"Aucun paiement interne — créez-en un avec le bouton ci-dessus":"No internal payments — create one with the button above"}</td></tr>}
+              {sorted.map(evt=>{
+                const fromP = (profiles||[]).find(p=>p.id===evt.from_user_id);
+                const toP = (profiles||[]).find(p=>p.id===evt.to_user_id);
+                return (
+                  <tr key={evt.id}>
+                    <td style={{whiteSpace:"nowrap"}}>{formatDateSafe(evt.created_at)}</td>
+                    <td><span style={{padding:"2px 8px",borderRadius:10,fontSize:10,fontWeight:700,background:"var(--accent-muted)",color:"var(--accent)"}}>{evt.kind||"—"}</span></td>
+                    <td>{getUserName(evt.from_user_id)}</td>
+                    <td>{getUserName(evt.to_user_id)}</td>
+                    <td style={{textAlign:"right",fontWeight:700}}>{Number(evt.amount||0).toLocaleString("fr-CH",{minimumFractionDigits:2})} {evt.currency||"EUR"}</td>
+                    <td style={{color:"var(--text-tertiary)"}}>{evt.method||"—"}</td>
+                    <td style={{maxWidth:130,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{evt.title||"—"}</td>
+                    <td>{statusBadge(evt.status)}</td>
+                    <td style={{textAlign:"center"}}>
+                      <div style={{display:"flex",gap:5,justifyContent:"center",flexWrap:"wrap"}}>
+                        {/* Flow A : marquer payé */}
+                        {evt.status==="pending"&&evt.kind!=="declaration"&&(
+                          <button onClick={()=>handleMarkPaid(evt)} disabled={marking===evt.id}
+                            style={{padding:"3px 10px",borderRadius:7,background:"var(--success)",color:"#fff",border:"none",fontSize:11,fontWeight:700,cursor:"pointer",opacity:marking===evt.id?0.6:1,whiteSpace:"nowrap"}}>
+                            {marking===evt.id?"…":(fr?"✓ Payé":"✓ Paid")}
+                          </button>
+                        )}
+                        {/* Flow B : valider/rejeter déclaration */}
+                        {evt.status==="declared"&&(
+                          <>
+                            <button onClick={()=>handleValidateDeclaration(evt)} disabled={validating===evt.id}
+                              style={{padding:"3px 10px",borderRadius:7,background:"var(--success)",color:"#fff",border:"none",fontSize:11,fontWeight:700,cursor:"pointer",opacity:validating===evt.id?0.6:1,whiteSpace:"nowrap"}}>
+                              {validating===evt.id?"…":"✅ Valider"}
+                            </button>
+                            <button onClick={()=>setRejectModal(evt)}
+                              style={{padding:"3px 10px",borderRadius:7,background:"var(--danger)",color:"#fff",border:"none",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+                              ❌ Rejeter
+                            </button>
+                          </>
+                        )}
+                        {/* Screenshot preuve */}
+                        {evt.screenshot_url&&(
+                          <a href={evt.screenshot_url} target="_blank" rel="noreferrer"
+                            style={{padding:"3px 8px",borderRadius:7,background:"var(--bg-overlay)",color:"var(--text-secondary)",fontSize:11,textDecoration:"none",border:"1px solid var(--border-subtle)"}}>
+                            🖼
+                          </a>
+                        )}
+                        {/* Facture PDF */}
+                        {(evt.status==="confirmed"||evt.status==="validated"||evt.status==="paid")&&(
+                          <button onClick={()=>generatePaymentInvoicePDF(evt, fromP, toP, fr)}
+                            style={{padding:"3px 8px",borderRadius:7,background:"var(--bg-overlay)",color:"var(--accent)",fontSize:11,fontWeight:600,border:"1px solid var(--border-subtle)",cursor:"pointer",whiteSpace:"nowrap"}}>
+                            📄 {fr?"Facture":"Invoice"}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+              {sorted.length===0&&<tr><td colSpan={9} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr?"Aucun paiement":"No payments"}</td></tr>}
             </tbody>
           </table>
         </div>
@@ -22288,17 +22789,24 @@ const PaymentEventsSection = ({user, lang, paymentEvents, profiles, onRefresh, o
 // =============================================
 const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntries: propLedger, notifications: propNotifs, profiles, onMarkRead, onMarkAllRead}) => {
   const fr = lang === "fr";
+  const addToast = useToast();
   const [payments, setPayments] = React.useState([]);
+  const [myDeclarations, setMyDeclarations] = React.useState([]);
   const [ledger, setLedger] = React.useState([]);
   const [balance, setBalance] = React.useState({});
   const [notifs, setNotifs] = React.useState([]);
   const [unread, setUnread] = React.useState(0);
   const [section, setSection] = React.useState("overview");
+  const [confirmModal, setConfirmModal] = React.useState(null); // payment to confirm
+  const [showDeclareModal, setShowDeclareModal] = React.useState(false);
 
   // ── Sync from parent props (realtime flows through) ──
   React.useEffect(() => {
-    const p = (propPayments||[]).filter(e=>e.to_user_id===user.id).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+    const all = propPayments || [];
+    const p = all.filter(e=>e.to_user_id===user.id).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
     setPayments(p);
+    const decl = all.filter(e=>e.from_user_id===user.id&&e.kind==="declaration").sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
+    setMyDeclarations(decl);
   }, [propPayments, user.id]);
 
   React.useEffect(() => {
@@ -22320,12 +22828,14 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
   const doFetch = React.useCallback(async () => {
     if (!window.sb || !window.__sbReady) return;
     try {
-      const [pe, le, no] = await Promise.all([
+      const [pe, decl, le, no] = await Promise.all([
         window.sb.from("payment_events").select("*").eq("to_user_id", user.id).order("created_at",{ascending:false}).limit(200),
+        window.sb.from("payment_events").select("*").eq("from_user_id", user.id).eq("kind","declaration").order("created_at",{ascending:false}).limit(100),
         window.sb.from("ledger_entries").select("*").eq("owner_user_id", user.id).order("created_at",{ascending:false}).limit(500),
         window.sb.from("notifications").select("*").eq("user_id", user.id).order("created_at",{ascending:false}).limit(200),
       ]);
       if (!pe.error) setPayments((pe.data||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)));
+      if (!decl.error) setMyDeclarations((decl.data||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)));
       if (!le.error) {
         const l = (le.data||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
         setLedger(l);
@@ -22408,16 +22918,59 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
   const COL_HEAD = {padding:"8px 10px",textAlign:"left",color:"var(--text-tertiary)",fontWeight:600,fontSize:11,whiteSpace:"nowrap",borderBottom:"1px solid var(--border-subtle)"};
   const COL_CELL = {padding:"10px 10px",borderBottom:"1px solid var(--border-subtle)",fontSize:12};
 
+  const toConfirmCount = React.useMemo(()=>payments.filter(p=>p.status==="pending").length,[payments]);
+  const pendingDeclCount = React.useMemo(()=>myDeclarations.filter(d=>d.status==="declared").length,[myDeclarations]);
+
   return (
     <div style={{padding:"0 0 32px"}}>
+      {/* ── Modals ── */}
+      {confirmModal && (
+        <ConfirmReceiptModal payment={confirmModal} user={user} profiles={profiles} lang={lang}
+          onClose={()=>setConfirmModal(null)}
+          onConfirmed={(updated)=>{
+            setPayments(prev=>prev.map(p=>p.id===updated.id?updated:p));
+            setConfirmModal(null);
+            addToast(fr?"Réception confirmée ✓":"Receipt confirmed ✓","success");
+          }} />
+      )}
+      {showDeclareModal && (
+        <DeclarePaymentModal user={user} profiles={profiles} lang={lang}
+          onClose={()=>setShowDeclareModal(false)}
+          onSaved={(newDecl)=>{
+            setMyDeclarations(prev=>[newDecl,...prev]);
+            setShowDeclareModal(false);
+          }} />
+      )}
+      {/* ── Alerte paiements à confirmer ── */}
+      {toConfirmCount > 0 && (
+        <div style={{background:"rgba(245,158,11,0.12)",border:"1px solid rgba(245,158,11,0.4)",borderRadius:12,padding:"12px 16px",marginBottom:20,display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:20}}>💰</span>
+            <div>
+              <div style={{fontSize:13,fontWeight:700,color:"#f59e0b"}}>{toConfirmCount} {fr?"paiement(s) en attente de confirmation":"payment(s) awaiting confirmation"}</div>
+              <div style={{fontSize:11,color:"var(--text-secondary)",marginTop:2}}>{fr?"Confirmez la réception pour valider votre solde":"Confirm receipt to validate your balance"}</div>
+            </div>
+          </div>
+          <button onClick={()=>setSection("to_confirm")}
+            style={{padding:"7px 16px",borderRadius:9,border:"none",background:"#f59e0b",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+            ✅ {fr?"Voir et confirmer":"View & confirm"}
+          </button>
+        </div>
+      )}
       {/* ── Title ── */}
-      <div style={{marginBottom:20}}>
+      <div style={{marginBottom:20,display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:10}}>
+        <div>
         <h2 style={{fontSize:22,fontWeight:800,color:"var(--text-primary)",fontFamily:"'DM Sans',sans-serif",margin:0}}>
           🏦 {fr?"Espace Comptabilité":"My Accounting"}
         </h2>
         <p style={{fontSize:12,color:"var(--text-tertiary)",marginTop:4,fontFamily:"'Inter',sans-serif"}}>
           {fr?"Paiements internes, solde et notifications — actualisé en temps réel":"Internal payments, balance & notifications — live"}
         </p>
+        </div>
+        <button onClick={()=>setShowDeclareModal(true)}
+          style={{padding:"8px 16px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap",flexShrink:0}}>
+          💸 {fr?"Déclarer un paiement":"Declare payment"}
+        </button>
       </div>
 
       {/* ── KPIs ── */}
@@ -22441,10 +22994,12 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
 
       {/* ── Section nav ── */}
       <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:2}}>
-        {navBtn("overview",  fr?"Vue d'ensemble":"Overview",  "📋", 0)}
-        {navBtn("payments",  fr?"Paiements reçus":"Payments", "💸", 0)}
-        {navBtn("ledger",    fr?"Historique Ledger":"Ledger", "📖", 0)}
-        {navBtn("notifs",    fr?"Notifications":"Notifs",     "🔔", unread)}
+        {navBtn("overview",    fr?"Vue d'ensemble":"Overview",      "📋", 0)}
+        {navBtn("to_confirm",  fr?"À confirmer":"To confirm",       "✅", toConfirmCount)}
+        {navBtn("payments",    fr?"Paiements reçus":"Payments",     "💸", 0)}
+        {navBtn("declarations",fr?"Mes déclarations":"My requests", "📤", pendingDeclCount)}
+        {navBtn("ledger",      fr?"Historique Ledger":"Ledger",     "📖", 0)}
+        {navBtn("notifs",      fr?"Notifications":"Notifs",         "🔔", unread)}
       </div>
 
       {/* ── Overview ── */}
@@ -22495,6 +23050,97 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
         </div>
       )}
 
+      {/* ── À confirmer (Flow A) ── */}
+      {section==="to_confirm" && (
+        <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+          <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",marginBottom:6,fontFamily:"'DM Sans',sans-serif"}}>
+            ✅ {fr?"Paiements à confirmer":"Payments to confirm"}
+          </h3>
+          <p style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:16}}>{fr?"Ces paiements ont été envoyés par le gérant. Confirmez la réception pour valider votre solde.":"These payments were sent by the manager. Confirm receipt to validate your balance."}</p>
+          {payments.filter(p=>p.status==="pending").length === 0
+            ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"32px 0",textAlign:"center"}}>✅ {fr?"Aucun paiement en attente":"No pending payments"}</div>
+            : payments.filter(p=>p.status==="pending").map(p => {
+                const from = getProfile(p.from_user_id);
+                return (
+                  <div key={p.id} style={{background:"rgba(245,158,11,0.06)",border:"1px solid rgba(245,158,11,0.25)",borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:15,fontWeight:700,color:"var(--text-primary)"}}>{fmtCurr(p.amount,p.currency)}</div>
+                        <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:3}}>
+                          {fr?"De":"From"} <strong>{displayUserName(from)||"—"}</strong> · {formatDateSafe(p.created_at)}
+                        </div>
+                        {p.title&&<div style={{fontSize:12,color:"var(--text-tertiary)",marginTop:2}}>{p.title}</div>}
+                        {p.method&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>📋 {p.method}</div>}
+                        {p.note&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,fontStyle:"italic"}}>"{p.note}"</div>}
+                        {p.screenshot_url&&(
+                          <a href={p.screenshot_url} target="_blank" rel="noreferrer"
+                            style={{display:"inline-block",marginTop:6,fontSize:11,color:"var(--accent)",fontWeight:600}}>
+                            🖼 {fr?"Voir preuve de paiement":"View payment proof"}
+                          </a>
+                        )}
+                      </div>
+                      <button onClick={()=>setConfirmModal(p)}
+                        style={{padding:"9px 18px",borderRadius:10,border:"none",background:"var(--success)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>
+                        ✅ {fr?"Confirmer réception":"Confirm receipt"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+          }
+        </div>
+      )}
+
+      {/* ── Mes déclarations (Flow B) ── */}
+      {section==="declarations" && (
+        <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6,flexWrap:"wrap",gap:8}}>
+            <h3 style={{fontSize:15,fontWeight:700,color:"var(--text-primary)",fontFamily:"'DM Sans',sans-serif",margin:0}}>
+              📤 {fr?"Mes déclarations de paiement":"My payment declarations"}
+            </h3>
+            <button onClick={()=>setShowDeclareModal(true)}
+              style={{padding:"7px 14px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+              + {fr?"Nouvelle déclaration":"New declaration"}
+            </button>
+          </div>
+          <p style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:16}}>{fr?"Déclarez un paiement reçu avec screenshot. Le gérant validera ou rejettera.":"Declare a received payment with screenshot. The manager will validate or reject."}</p>
+          {myDeclarations.length === 0
+            ? <div style={{color:"var(--text-tertiary)",fontSize:13,padding:"32px 0",textAlign:"center"}}>{fr?"Aucune déclaration — utilisez le bouton ci-dessus":"No declarations yet — use the button above"}</div>
+            : myDeclarations.map(d => {
+                const STATUS_CFG2 = {declared:{bg:"rgba(99,102,241,0.12)",col:"#818cf8",label:fr?"En attente":"Pending"},validated:{bg:"rgba(34,197,94,0.12)",col:"#22c55e",label:fr?"Validé":"Validated"},rejected:{bg:"rgba(239,68,68,0.12)",col:"#ef4444",label:fr?"Rejeté":"Rejected"}};
+                const cfg = STATUS_CFG2[d.status]||{bg:"var(--bg-overlay)",col:"var(--text-tertiary)",label:d.status};
+                return (
+                  <div key={d.id} style={{background:cfg.bg,border:`1px solid ${cfg.col}33`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:8}}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                          <span style={{fontSize:15,fontWeight:700,color:"var(--text-primary)"}}>{fmtCurr(d.amount,d.currency)}</span>
+                          <span style={{padding:"2px 8px",borderRadius:8,fontSize:10,fontWeight:700,background:cfg.bg,color:cfg.col,border:`1px solid ${cfg.col}44`}}>{cfg.label}</span>
+                        </div>
+                        <div style={{fontSize:12,color:"var(--text-secondary)"}}>{formatDateSafe(d.created_at)}{d.method?" · "+d.method:""}</div>
+                        {d.title&&<div style={{fontSize:12,color:"var(--text-tertiary)",marginTop:2}}>{d.title}</div>}
+                        {d.rejected_reason&&<div style={{fontSize:11,color:"#ef4444",marginTop:4,fontStyle:"italic"}}>❌ {fr?"Motif: ":"Reason: "}{d.rejected_reason}</div>}
+                        {d.screenshot_url&&(
+                          <a href={d.screenshot_url} target="_blank" rel="noreferrer"
+                            style={{display:"inline-block",marginTop:4,fontSize:11,color:"var(--accent)",fontWeight:600}}>
+                            🖼 {fr?"Voir screenshot":"View screenshot"}
+                          </a>
+                        )}
+                      </div>
+                      {(d.status==="validated"||d.status==="paid")&&(
+                        <button onClick={()=>generatePaymentInvoicePDF(d, (profiles||[]).find(p=>p.id===d.from_user_id), (profiles||[]).find(p=>p.id===d.to_user_id), fr)}
+                          style={{padding:"6px 12px",borderRadius:8,border:"1px solid var(--border-subtle)",background:"var(--bg-overlay)",color:"var(--accent)",fontSize:11,fontWeight:600,cursor:"pointer",whiteSpace:"nowrap",flexShrink:0}}>
+                          📄 {fr?"Facture":"Invoice"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })
+          }
+        </div>
+      )}
+
       {/* ── Paiements reçus ── */}
       {section==="payments" && (
         <div style={{background:"var(--bg-raised)",border:"1px solid var(--border-default)",borderRadius:16,padding:"18px 20px"}}>
@@ -22507,7 +23153,7 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
                 <table style={{width:"100%",borderCollapse:"collapse"}}>
                   <thead>
                     <tr>
-                      {[fr?"Date":"Date", fr?"De":"From", fr?"Titre":"Title", fr?"Montant":"Amount", "Statut"].map(h=>(
+                      {[fr?"Date":"Date", fr?"De":"From", fr?"Titre":"Title", fr?"Montant":"Amount", "Statut", fr?"Actions":"Actions"].map(h=>(
                         <th key={h} style={COL_HEAD}>{h}</th>
                       ))}
                     </tr>
@@ -22522,6 +23168,22 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
                           <td style={{...COL_CELL,color:"var(--text-primary)",maxWidth:200}}><div style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.title||"—"}</div></td>
                           <td style={{...COL_CELL,fontWeight:700,color:"var(--text-primary)",whiteSpace:"nowrap"}}>{fmtCurr(p.amount,p.currency)}</td>
                           <td style={COL_CELL}><span style={badgeStatus(p.status)}>{p.status}</span></td>
+                          <td style={COL_CELL}>
+                            <div style={{display:"flex",gap:5}}>
+                              {p.status==="pending"&&(
+                                <button onClick={()=>setConfirmModal(p)}
+                                  style={{padding:"3px 10px",borderRadius:7,background:"var(--success)",color:"#fff",border:"none",fontSize:11,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+                                  ✅ {fr?"Confirmer":"Confirm"}
+                                </button>
+                              )}
+                              {(p.status==="confirmed"||p.status==="paid")&&(
+                                <button onClick={()=>generatePaymentInvoicePDF(p,from,null,fr)}
+                                  style={{padding:"3px 8px",borderRadius:7,background:"var(--bg-overlay)",color:"var(--accent)",fontSize:11,fontWeight:600,border:"1px solid var(--border-subtle)",cursor:"pointer"}}>
+                                  📄
+                                </button>
+                              )}
+                            </div>
+                          </td>
                         </tr>
                       );
                     })}
