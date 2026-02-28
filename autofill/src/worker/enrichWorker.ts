@@ -123,13 +123,15 @@ async function processJob(job: QueueRow): Promise<void> {
     return;
   }
 
+  let spenderId: string | null = null;
   try {
-    await upsertSpenderAndEvent({
+    const result = await upsertSpenderAndEvent({
       tg_user_id: tgUserIdStr,
       extracted_fields: flatProfile,
       enrich_fields_list: enrichFields,
       enrich_patch: flatProfile,
     });
+    spenderId = result.spender_id;
     log.info('EVENT', 'inserted', { type: 'profile_updated', fields: enrichFields.join(',') });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
@@ -137,6 +139,21 @@ async function processJob(job: QueueRow): Promise<void> {
     await completeJob(job.id, 'failed', `upsert: ${errMsg}`);
     metrics.enriched_fail++;
     return;
+  }
+
+  // Apply enrichment to top-level columns via RPC (age, city, job, etc.)
+  if (spenderId && enrichFields.length > 0) {
+    try {
+      await db.rpc('fn_apply_spender_enrichment', {
+        p_spender_id: spenderId,
+        p_tg_user_id: tgUserIdStr,
+        p_enrichment: flatProfile,
+      });
+      log.info('ENRICH', 'top_level_applied', { spender_id: spenderId, fields: enrichFields.join(',') });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log.warn('ENRICH', 'apply_enrichment_rpc_failed', { ...ctx, spender_id: spenderId, error: errMsg });
+    }
   }
 
   // F) Complete
