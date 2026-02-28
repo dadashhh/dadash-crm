@@ -22,7 +22,7 @@ new_badges AS (
     s.classification AS current_classification,
     COALESCE(sp.total_spent, 0) AS total_spent,
     CASE
-      WHEN COALESCE(sp.total_spent, 0) >= 600 THEN 'gorille'
+      WHEN COALESCE(sp.total_spent, 0) >= 400 THEN 'gorille'
       WHEN COALESCE(sp.total_spent, 0) >= 200 THEN 'orang_outan'
       WHEN COALESCE(sp.total_spent, 0) >= 50  THEN 'ouistiti'
       ELSE 'lead'
