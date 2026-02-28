@@ -1918,6 +1918,9 @@
     window.TELEGRAM_BOT_URL = window.TELEGRAM_BOT_URL || "";
     window.BOT_CAM_URL = window.BOT_CAM_URL || "https://dadash-telegram-bot-production.up.railway.app";
     window.DADASH_INTERNAL_API_KEY = window.DADASH_INTERNAL_API_KEY || "";
+    // Carlos API — messagerie TG complète
+    window.CARLOS_API_URL = window.CARLOS_API_URL || window.BOT_CAM_URL || "";
+    window.CRM_API_KEY = window.CRM_API_KEY || window.DADASH_INTERNAL_API_KEY || "";
 
     // ═══ RESILIENT AUTH LOCK — prevents navigator.locks deadlock (lock:dadash-auth) ═══
     (function() {
@@ -17071,9 +17074,10 @@ const TransactionSuggestionsTab = ({lang, user, profiles, spenders, onRefresh}) 
   );
 };
 
-// ── AdminShell — 7 tabs (feat/admin-page + pipeline debug + suggestions IA) ──
+// ── AdminShell — tabs (feat/admin-page + pipeline debug + suggestions IA + scripts) ──
 const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
   const fr = lang === "fr";
+  const isGerant = user?.role === "gerant";
   const ADMIN_TABS = [
     {id:"users",       icon:"👥", label:fr?"Utilisateurs":"Users"},
     {id:"roles",       icon:"🔐", label:fr?"Rôles & Permissions":"Roles & Permissions"},
@@ -17083,6 +17087,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
     {id:"platforms",   icon:"🔌", label:fr?"Plateformes":"Platforms"},
     {id:"pipeline",    icon:"🔧", label:fr?"Pipeline Debug":"Pipeline Debug"},
     {id:"settings",    icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
+    ...(isGerant ? [{id:"scripts", icon:"📝", label:fr?"Scripts TG":"TG Scripts"}] : []),
   ];
   const activeSub = (subTab && ADMIN_TABS.some(t => t.id === subTab)) ? subTab : "users";
   const tabStyle = (id) => ({padding:"8px 14px",borderRadius:9,border:"1px solid "+(activeSub===id?"#8b5cf6":"var(--border)"),background:activeSub===id?"rgba(139,92,246,0.15)":"var(--surface)",color:activeSub===id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0,whiteSpace:"nowrap",transition:"all 0.15s"});
@@ -17109,6 +17114,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
         {activeSub==="platforms"&&<PlatformSettingsTab lang={lang} />}
         {activeSub==="pipeline"&&<AdminPipelineDebugTab lang={lang} />}
         {activeSub==="settings"&&<AdminSettingsTab lang={lang} />}
+        {activeSub==="scripts"&&isGerant&&<ScriptsAdminTab user={user} lang={lang} models={models} />}
       </div>
     </div>
   );
@@ -19147,6 +19153,926 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
 };
 
 // =============================================
+// CARLOS API — helpers pour la messagerie TG complète
+// =============================================
+const CARLOS_API_BASE = () => (window.CARLOS_API_URL || window.BOT_CAM_URL || "").replace(/\/$/, "");
+const CARLOS_API_KEY = () => window.CRM_API_KEY || window.DADASH_INTERNAL_API_KEY || "";
+const carlosHeaders = () => ({ "Content-Type": "application/json", "X-API-Key": CARLOS_API_KEY() });
+
+const carlosFetch = async (path, opts = {}) => {
+  const base = CARLOS_API_BASE();
+  if (!base) throw new Error("CARLOS_API_URL non configurée");
+  const res = await fetch(base + path, { headers: carlosHeaders(), ...opts });
+  if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error(`HTTP ${res.status}: ${t || res.statusText}`); }
+  return res.json().catch(() => ({}));
+};
+
+// =============================================
+// SCRIPTS LIBRARY — Bibliothèque scripts (colonne gauche)
+// =============================================
+const SCRIPT_TYPES = [
+  { id: "text",  icon: "💬", label: "Texte" },
+  { id: "photo", icon: "📸", label: "Photo" },
+  { id: "video", icon: "🎥", label: "Vidéo" },
+  { id: "audio", icon: "🎵", label: "Vocal" },
+];
+
+const ScriptsLibrary = ({ user, lang, models, activeModelId, selectedConv, onScriptSend, restrictions }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [scripts, setScripts] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [activeType, setActiveType] = useState("text");
+  const [sending, setSending] = useState(null);
+
+  const canUseScripts = restrictions ? restrictions.can_use_scripts !== false : true;
+  const canSendMedia = restrictions ? restrictions.can_send_media !== false : true;
+
+  useEffect(() => {
+    if (!activeModelId) { setScripts([]); return; }
+    setLoading(true);
+    sb.from("scripts").select("*").eq("model_id", activeModelId).order("sort_order", { ascending: true })
+      .then(({ data, error }) => {
+        if (error) { addToast((fr ? "Erreur scripts: " : "Scripts error: ") + error.message, "error"); setScripts([]); }
+        else setScripts(data || []);
+        setLoading(false);
+      });
+  }, [activeModelId]);
+
+  const filteredScripts = scripts.filter(s => s.type === activeType);
+
+  const handleScriptClick = async (script) => {
+    if (!canUseScripts) { addToast(fr ? "Scripts désactivés par le gérant" : "Scripts disabled by manager", "error"); return; }
+    if (!selectedConv) { addToast(fr ? "Sélectionne une conversation d'abord" : "Select a conversation first", "info"); return; }
+    if ((script.type === "photo" || script.type === "video" || script.type === "audio") && !canSendMedia) {
+      addToast(fr ? "Envoi média désactivé par le gérant" : "Media sending disabled by manager", "error"); return;
+    }
+    setSending(script.id);
+    try {
+      if (script.type === "text") {
+        if (onScriptSend) onScriptSend(script.content || "");
+      } else if (script.type === "audio") {
+        await carlosFetch("/send-voice", {
+          method: "POST",
+          body: JSON.stringify({ chat_id: selectedConv.tg_chat_id, audio_url: script.media_url }),
+        });
+        addToast(fr ? "Vocal envoyé" : "Voice note sent", "success");
+      } else {
+        await carlosFetch("/send-media", {
+          method: "POST",
+          body: JSON.stringify({ chat_id: selectedConv.tg_chat_id, media_url: script.media_url, type: script.type }),
+        });
+        addToast(fr ? "Média envoyé" : "Media sent", "success");
+      }
+    } catch (e) {
+      addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
+    } finally {
+      setSending(null);
+    }
+  };
+
+  if (!canUseScripts) return (
+    <div style={{ padding: "12px 16px", fontSize: 11, color: "var(--text-tertiary)", textAlign: "center" }}>
+      {fr ? "Scripts désactivés" : "Scripts disabled"}
+    </div>
+  );
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", borderTop: "1px solid var(--border-subtle)" }}>
+      <div style={{ padding: "10px 12px 6px", borderBottom: "1px solid var(--border-subtle)" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 8, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          {fr ? "Bibliothèque Scripts" : "Script Library"}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {SCRIPT_TYPES.map(t => (
+            <button key={t.id} onClick={() => setActiveType(t.id)}
+              style={{ padding: "4px 8px", borderRadius: 8, border: "1px solid " + (activeType === t.id ? "var(--accent)" : "var(--border-subtle)"),
+                background: activeType === t.id ? "var(--accent-muted)" : "transparent",
+                color: activeType === t.id ? "var(--accent)" : "var(--text-tertiary)",
+                fontSize: 11, cursor: "pointer", fontWeight: 600, transition: "all 0.15s" }}
+              title={t.label}>{t.icon}</button>
+          ))}
+        </div>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: "6px 8px" }}>
+        {loading && <div style={{ textAlign: "center", padding: 12, fontSize: 11, color: "var(--text-quaternary)" }}>{fr ? "Chargement…" : "Loading…"}</div>}
+        {!loading && filteredScripts.length === 0 && (
+          <div style={{ textAlign: "center", padding: 16, fontSize: 11, color: "var(--text-quaternary)" }}>
+            {fr ? "Aucun script" : "No scripts"}
+          </div>
+        )}
+        {!loading && filteredScripts.map(script => (
+          <div key={script.id} onClick={() => handleScriptClick(script)}
+            style={{ padding: "8px 10px", borderRadius: 8, marginBottom: 4, cursor: "pointer",
+              background: sending === script.id ? "var(--accent-muted)" : "var(--bg-raised)",
+              border: "1px solid var(--border-subtle)", transition: "all 0.15s",
+              opacity: sending && sending !== script.id ? 0.6 : 1 }}
+            onMouseEnter={e => { if (!sending) e.currentTarget.style.background = "var(--bg-hover)"; }}
+            onMouseLeave={e => { e.currentTarget.style.background = sending === script.id ? "var(--accent-muted)" : "var(--bg-raised)"; }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-primary)", marginBottom: 2 }}>
+              {sending === script.id ? "⏳ " : ""}{script.title}
+            </div>
+            {script.type === "text" && script.content && (
+              <div style={{ fontSize: 10, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {script.content.slice(0, 60)}{script.content.length > 60 ? "…" : ""}
+              </div>
+            )}
+            {(script.type === "photo" || script.type === "video" || script.type === "audio") && (
+              <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>
+                {SCRIPT_TYPES.find(t => t.id === script.type)?.icon} {script.type === "audio" ? (fr ? "Voice note TG" : "TG Voice note") : (fr ? "Média" : "Media")}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// SPENDER FICHE PANEL — Colonne droite messagerie TG
+// =============================================
+const COUNTRY_FLAGS = { "CH": "🇨🇭", "FR": "🇫🇷", "BE": "🇧🇪", "DE": "🇩🇪", "IT": "🇮🇹", "ES": "🇪🇸", "US": "🇺🇸", "GB": "🇬🇧", "CA": "🇨🇦", "AU": "🇦🇺", "NL": "🇳🇱", "PT": "🇵🇹", "MA": "🇲🇦", "TN": "🇹🇳", "DZ": "🇩🇿", "SN": "🇸🇳", "CI": "🇨🇮", "CM": "🇨🇲", "LU": "🇱🇺", "MC": "🇲🇨" };
+const SPENDER_BADGES = { WHALE: { color: "#6366f1", bg: "rgba(99,102,241,0.15)", label: "🐋 WHALE" }, VIP: { color: "#f59e0b", bg: "rgba(245,158,11,0.15)", label: "⭐ VIP" }, REGULAR: { color: "#22d3a1", bg: "rgba(34,211,161,0.15)", label: "✅ REGULAR" }, LEAD: { color: "#0088cc", bg: "rgba(0,136,204,0.15)", label: "🎯 LEAD" }, TIMEWASTER: { color: "#ef4444", bg: "rgba(239,68,68,0.15)", label: "⚠️ TIMEWASTER" } };
+
+const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSpender }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [notes, setNotes] = useState("");
+  const [savingNotes, setSavingNotes] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+
+  const spender = conv?.spender_id ? (spenders || []).find(s => s.id === conv.spender_id) : null;
+  const spenderByTg = !spender && conv?.tg_chat_id
+    ? (spenders || []).find(s => String(s.telegram_id) === String(conv.tg_chat_id) || (s.tg_user_id && String(s.tg_user_id) === String(conv.tg_chat_id)))
+    : null;
+  const sp = spender || spenderByTg;
+
+  useEffect(() => { setNotes(sp?.notes || ""); }, [sp?.id]);
+
+  if (!conv) return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-quaternary)", fontSize: 13, flexDirection: "column", gap: 8 }}>
+      <div style={{ fontSize: 28 }}>👤</div>
+      <div>{fr ? "Sélectionne une conversation" : "Select a conversation"}</div>
+    </div>
+  );
+
+  if (!sp) return (
+    <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16, alignItems: "center" }}>
+      <div style={{ fontSize: 32 }}>🔍</div>
+      <div style={{ fontSize: 13, color: "var(--text-secondary)", textAlign: "center" }}>
+        {fr ? "Spender non trouvé" : "Spender not found"}
+        <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 4 }}>TG: {conv.tg_chat_id || "—"}</div>
+      </div>
+      {user?.role === "gerant" && (
+        <button className="btn btn-primary" style={{ fontSize: 12 }} onClick={() => setShowCreateModal(true)}>
+          ➕ {fr ? "Créer ce spender" : "Create spender"}
+        </button>
+      )}
+      {showCreateModal && onCreateSpender && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }}
+          onClick={e => { if (e.target === e.currentTarget) setShowCreateModal(false); }}>
+          <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: 340, maxWidth: "95vw" }}>
+            <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 16 }}>➕ {fr ? "Créer spender" : "Create spender"}</div>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 16 }}>
+              {fr ? "TG Chat ID:" : "TG Chat ID:"} <strong>{conv.tg_chat_id}</strong>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => { onCreateSpender(conv); setShowCreateModal(false); }}>
+                {fr ? "Créer" : "Create"}
+              </button>
+              <button className="btn btn-secondary" style={{ flex: 1 }} onClick={() => setShowCreateModal(false)}>
+                {fr ? "Annuler" : "Cancel"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  const model = sp.model_id ? (models || []).find(m => m.id === sp.model_id) : null;
+  const spTxs = (txs || []).filter(t => t.spender_handle === sp.handle || t.spender_id === sp.id).slice(0, 5);
+  const totalSpent = (txs || []).filter(t => (t.spender_handle === sp.handle || t.spender_id === sp.id) && t.status === "valid").reduce((acc, t) => acc + (parseFloat(t.amount_chf || t.amount || 0)), 0);
+  const initials = ((sp.first_name || sp.handle || "?")[0] || "?").toUpperCase();
+  const countryFlag = sp.country ? (COUNTRY_FLAGS[sp.country.toUpperCase()] || "") : "";
+  const badge = sp.classification ? SPENDER_BADGES[sp.classification.toUpperCase()] : null;
+
+  const saveNotes = async () => {
+    if (!sp.id) return;
+    setSavingNotes(true);
+    try {
+      await sb.from("spenders").update({ notes }).eq("id", sp.id);
+    } catch (e) { addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"); }
+    setSavingNotes(false);
+  };
+
+  const sectionStyle = { marginBottom: 16, paddingBottom: 16, borderBottom: "1px solid var(--border-subtle)" };
+  const labelStyle = { fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 };
+  const valueStyle = { fontSize: 12, color: "var(--text-primary)", fontWeight: 500 };
+
+  return (
+    <div style={{ height: "100%", overflowY: "auto", padding: "16px 14px" }}>
+      {/* Section 1 — Identité */}
+      <div style={sectionStyle}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+          <div style={{ width: 44, height: 44, borderRadius: "50%", background: "var(--accent-muted)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 700, color: "var(--accent)", flexShrink: 0 }}>
+            {initials}
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: "var(--text-primary)" }}>
+              {sp.first_name || sp.handle || "—"}
+              {sp.handle && sp.first_name && <span style={{ fontSize: 11, color: "var(--text-tertiary)", marginLeft: 6 }}>@{sp.handle}</span>}
+            </div>
+            {sp.telegram_username && (
+              <div style={{ fontSize: 11, color: "var(--brand-telegram)" }}>✈️ @{String(sp.telegram_username).replace(/^@/, "")}</div>
+            )}
+          </div>
+        </div>
+        {badge && (
+          <span style={{ display: "inline-block", padding: "2px 10px", borderRadius: 20, background: badge.bg, color: badge.color, fontSize: 10, fontWeight: 700, marginBottom: 6 }}>
+            {badge.label}
+          </span>
+        )}
+      </div>
+
+      {/* Section 2 — Infos personnelles */}
+      <div style={sectionStyle}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 10, textTransform: "uppercase" }}>
+          {fr ? "Infos" : "Info"}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 10px" }}>
+          {sp.age && <div><div style={labelStyle}>{fr ? "Âge" : "Age"}</div><div style={valueStyle}>{sp.age} ans</div></div>}
+          {(sp.city || sp.country) && (
+            <div><div style={labelStyle}>{fr ? "Ville / Pays" : "City / Country"}</div>
+              <div style={valueStyle}>{[sp.city, sp.country ? `${countryFlag} ${sp.country}` : ""].filter(Boolean).join(", ")}</div>
+            </div>
+          )}
+          {sp.job && <div><div style={labelStyle}>{fr ? "Métier" : "Job"}</div><div style={valueStyle}>{sp.job}</div></div>}
+          {sp.langue && <div><div style={labelStyle}>{fr ? "Langue" : "Language"}</div><div style={valueStyle}>{sp.langue}</div></div>}
+          {sp.timezone && <div><div style={labelStyle}>Timezone</div><div style={valueStyle}>{sp.timezone}</div></div>}
+          {sp.source && <div><div style={labelStyle}>Source</div><div style={valueStyle}>{sp.source}</div></div>}
+        </div>
+      </div>
+
+      {/* Section 3 — Données financières */}
+      <div style={sectionStyle}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 10, textTransform: "uppercase" }}>
+          {fr ? "Finance" : "Finance"}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 10px" }}>
+          {sp.budget_range && <div><div style={labelStyle}>Budget</div><div style={{ ...valueStyle, color: "var(--success)" }}>{sp.budget_range} CHF</div></div>}
+          <div><div style={labelStyle}>{fr ? "Total dépensé" : "Total spent"}</div><div style={{ ...valueStyle, color: "var(--success)", fontWeight: 700 }}>{totalSpent.toFixed(0)} CHF</div></div>
+          {model && <div style={{ gridColumn: "1/-1" }}><div style={labelStyle}>{fr ? "Modèle assigné" : "Assigned model"}</div><div style={valueStyle}>{model.name}</div></div>}
+        </div>
+      </div>
+
+      {/* Section 4 — Dernières TX */}
+      {spTxs.length > 0 && (
+        <div style={sectionStyle}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 8, textTransform: "uppercase" }}>
+            {fr ? "Dernières TX" : "Last TX"}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {spTxs.map((tx, i) => (
+              <div key={tx.id || i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 8px", background: "var(--bg-raised)", borderRadius: 6, fontSize: 11 }}>
+                <span style={{ color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "60%" }}>{tx.product || tx.tag || tx.notes || "TX"}</span>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                  <span style={{ color: "var(--success)", fontWeight: 700 }}>{parseFloat(tx.amount_chf || tx.amount || 0).toFixed(0)} CHF</span>
+                  <span style={{ color: "var(--text-quaternary)", fontSize: 9 }}>{tx.created_at ? new Date(tx.created_at).toLocaleDateString("fr-CH", { day: "2-digit", month: "2-digit" }) : ""}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Section 5 — Note interne */}
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 8, textTransform: "uppercase" }}>
+          {fr ? "Note interne" : "Internal note"}
+        </div>
+        <textarea
+          value={notes}
+          onChange={e => setNotes(e.target.value)}
+          onBlur={saveNotes}
+          placeholder={fr ? "Ajouter une note sur ce spender…" : "Add a note about this spender…"}
+          style={{ width: "100%", minHeight: 80, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-input)", color: "var(--text-primary)", fontSize: 11, resize: "vertical", fontFamily: "'Inter', sans-serif", boxSizing: "border-box" }}
+        />
+        {savingNotes && <div style={{ fontSize: 10, color: "var(--text-tertiary)", marginTop: 2 }}>💾 {fr ? "Sauvegarde…" : "Saving…"}</div>}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// TG CARLOS MESSAGERIE — 3 colonnes complètes
+// =============================================
+const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+
+  // State conversations
+  const [conversations, setConversations] = useState([]);
+  const [convLoading, setConvLoading] = useState(true);
+  const [convFilter, setConvFilter] = useState("all"); // all | bot | human | escalation
+  const [selectedConv, setSelectedConv] = useState(null);
+
+  // State messages
+  const [messages, setMessages] = useState([]);
+  const [msgLoading, setMsgLoading] = useState(false);
+  const [msgInput, setMsgInput] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // State restrictions chatter
+  const [restrictions, setRestrictions] = useState(null);
+
+  // Mobile state
+  const [mobilePane, setMobilePane] = useState("list"); // list | chat | spender
+
+  // Refresh auto
+  const refreshTimerRef = React.useRef(null);
+
+  // Charger restrictions chatter
+  useEffect(() => {
+    if (!user?.id || user?.role === "gerant") return;
+    sb.from("chatter_restrictions").select("*").eq("chatter_id", user.id).maybeSingle()
+      .then(({ data }) => setRestrictions(data || null));
+  }, [user?.id]);
+
+  const isReadOnly = restrictions?.read_only === true;
+  const canSendMedia = restrictions ? restrictions.can_send_media !== false : true;
+  const canUseScripts = restrictions ? restrictions.can_use_scripts !== false : true;
+
+  // Charger conversations depuis API Carlos
+  const loadConversations = useCallback(async () => {
+    setConvLoading(true);
+    try {
+      const data = await carlosFetch("/conversations");
+      const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      setConversations(list);
+    } catch (e) {
+      // Fallback Supabase si Carlos indispo
+      try {
+        let q = sb.from("v_tg_conversations").select("*");
+        if (user?.role === "chatter") {
+          const myModelIds = getChatterContext(user, models).assignedModelIds;
+          if (myModelIds.length > 0) q = q.in("model_id", myModelIds);
+          else q = q.eq("assigned_chatter_id", user.id);
+        }
+        const { data: sbData } = await q.order("last_message_at", { ascending: false });
+        setConversations(sbData || []);
+      } catch (_) { setConversations([]); }
+    }
+    setConvLoading(false);
+  }, [user?.id, user?.role]);
+
+  useEffect(() => { loadConversations(); }, [loadConversations]);
+
+  // Refresh auto toutes les 10s
+  useEffect(() => {
+    if (!selectedConv) return;
+    refreshTimerRef.current = setInterval(() => { loadMessages(selectedConv.id || selectedConv.chat_id); }, 10000);
+    return () => clearInterval(refreshTimerRef.current);
+  }, [selectedConv?.id]);
+
+  // Charger messages
+  const loadMessages = useCallback(async (convId) => {
+    if (!convId) return;
+    setMsgLoading(true);
+    try {
+      const data = await carlosFetch(`/conversations/${convId}/messages?limit=50`);
+      const list = Array.isArray(data) ? data : (data.messages || data.data || []);
+      setMessages(list);
+    } catch (e) {
+      // Fallback Supabase
+      try {
+        const { data: sbData } = await sb.from("v_tg_messages").select("*").eq("conversation_id", convId).order("created_at", { ascending: false }).limit(50);
+        setMessages((sbData || []).reverse());
+      } catch (_) { setMessages([]); }
+    }
+    setMsgLoading(false);
+  }, []);
+
+  const selectConv = (conv) => {
+    setSelectedConv(conv);
+    setMsgInput("");
+    setMessages([]);
+    loadMessages(conv.id || conv.chat_id);
+    if (_isMobile) setMobilePane("chat");
+  };
+
+  // Envoi message
+  const sendMessage = useCallback(async () => {
+    if (!selectedConv || !msgInput.trim() || sending || isReadOnly) return;
+    setSending(true);
+    try {
+      const chatId = selectedConv.tg_chat_id || selectedConv.chat_id || selectedConv.id;
+      await carlosFetch("/send-message", {
+        method: "POST",
+        body: JSON.stringify({ chat_id: chatId, text: msgInput.trim() }),
+      });
+      setMsgInput("");
+      await loadMessages(selectedConv.id || selectedConv.chat_id);
+      addToast(fr ? "Message envoyé" : "Message sent", "success");
+    } catch (e) {
+      addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
+    } finally { setSending(false); }
+  }, [selectedConv, msgInput, sending, isReadOnly, fr, addToast, loadMessages]);
+
+  // Injection script texte
+  const handleScriptInject = (text) => {
+    setMsgInput(text);
+    // Auto-envoyer le script texte
+    if (!isReadOnly && text.trim()) {
+      setSending(true);
+      const chatId = selectedConv?.tg_chat_id || selectedConv?.chat_id || selectedConv?.id;
+      carlosFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatId, text: text.trim() }) })
+        .then(() => { setMsgInput(""); loadMessages(selectedConv?.id || selectedConv?.chat_id); addToast(fr ? "Script envoyé" : "Script sent", "success"); })
+        .catch(e => addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"))
+        .finally(() => setSending(false));
+    }
+  };
+
+  // Filtres conversations
+  const CONV_FILTERS = [
+    { id: "all", label: fr ? "Tout" : "All" },
+    { id: "bot", label: "Bot" },
+    { id: "human", label: "Human" },
+    { id: "escalation", label: fr ? "Escalades" : "Escalations" },
+  ];
+
+  const filteredConvs = useMemo(() => {
+    let list = conversations;
+    if (convFilter === "bot") list = list.filter(c => c.status === "bot" || c.type === "bot");
+    else if (convFilter === "human") list = list.filter(c => c.status === "human" || c.type === "human");
+    else if (convFilter === "escalation") list = list.filter(c => c.escalated || c.status === "escalated");
+    return list;
+  }, [conversations, convFilter]);
+
+  const getSpenderName = (conv) => {
+    if (conv?.spender_id) {
+      const sp = (spenders || []).find(s => s.id === conv.spender_id);
+      if (sp) return sp.first_name || sp.handle || conv.tg_chat_id || "—";
+    }
+    if (conv?.tg_chat_id) {
+      const sp = (spenders || []).find(s => String(s.telegram_id) === String(conv.tg_chat_id) || String(s.tg_user_id) === String(conv.tg_chat_id));
+      if (sp) return sp.first_name || sp.handle || conv.tg_chat_id;
+    }
+    return conv?.display_name || conv?.tg_chat_id || conv?.chat_id || "—";
+  };
+
+  const getSpenderInitials = (conv) => (getSpenderName(conv)[0] || "?").toUpperCase();
+
+  const getActiveModelId = () => {
+    if (!selectedConv) return null;
+    return selectedConv.model_id || null;
+  };
+
+  // Trouver le modèle actif du chatter (pour les scripts)
+  const chatterModelId = useMemo(() => {
+    if (user?.role === "gerant") return getActiveModelId();
+    const ctx = getChatterContext(user, models);
+    return ctx.assignedModelIds?.[0] || getActiveModelId();
+  }, [user?.id, selectedConv?.model_id, models]);
+
+  // ── Rendu colonne gauche ──
+  const renderLeftCol = () => (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-sidebar)", borderRight: "1px solid var(--border-subtle)" }}>
+      {/* Header + filtres */}
+      <div style={{ padding: "12px 12px 8px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)", marginBottom: 8 }}>
+          ✈️ {fr ? "Conversations" : "Conversations"}
+          <button onClick={loadConversations} style={{ float: "right", background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14 }} title={fr ? "Rafraîchir" : "Refresh"}>🔄</button>
+        </div>
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {CONV_FILTERS.map(f => (
+            <button key={f.id} onClick={() => setConvFilter(f.id)}
+              style={{ padding: "3px 8px", borderRadius: 8, border: "1px solid " + (convFilter === f.id ? "var(--accent)" : "var(--border-subtle)"),
+                background: convFilter === f.id ? "var(--accent-muted)" : "transparent",
+                color: convFilter === f.id ? "var(--accent)" : "var(--text-tertiary)",
+                fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+              {f.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Liste conversations */}
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {convLoading && <div style={{ padding: 20, textAlign: "center", fontSize: 12, color: "var(--text-quaternary)" }}>{fr ? "Chargement…" : "Loading…"}</div>}
+        {!convLoading && filteredConvs.length === 0 && (
+          <div style={{ padding: 20, textAlign: "center", fontSize: 12, color: "var(--text-quaternary)" }}>
+            {fr ? "Aucune conversation" : "No conversations"}
+          </div>
+        )}
+        {!convLoading && filteredConvs.map(conv => {
+          const isSelected = selectedConv?.id === conv.id || selectedConv?.chat_id === conv.chat_id;
+          return (
+            <div key={conv.id || conv.chat_id} onClick={() => selectConv(conv)}
+              style={{ padding: "12px 14px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer",
+                background: isSelected ? "var(--accent-subtle)" : "transparent", transition: "background 0.15s" }}
+              onMouseEnter={e => { if (!isSelected) e.currentTarget.style.background = "var(--bg-hover)"; }}
+              onMouseLeave={e => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 34, height: 34, borderRadius: "50%", background: isSelected ? "var(--accent)" : "var(--accent-muted)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: isSelected ? "#fff" : "var(--accent)", flexShrink: 0 }}>
+                  {getSpenderInitials(conv)}
+                </div>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {getSpenderName(conv)}
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>
+                    {conv.last_message || conv.last_message_text || ""}
+                  </div>
+                </div>
+                <div style={{ fontSize: 9, color: "var(--text-quaternary)", flexShrink: 0, textAlign: "right" }}>
+                  {conv.last_message_at ? new Date(conv.last_message_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : ""}
+                  {conv.escalated && <div style={{ color: "var(--warning)", fontWeight: 700 }}>⚠️</div>}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Bibliothèque scripts */}
+      <div style={{ flexShrink: 0, maxHeight: "40%", display: "flex", flexDirection: "column", borderTop: "1px solid var(--border-subtle)" }}>
+        <ScriptsLibrary
+          user={user} lang={lang} models={models}
+          activeModelId={chatterModelId}
+          selectedConv={selectedConv}
+          onScriptSend={handleScriptInject}
+          restrictions={restrictions}
+        />
+      </div>
+    </div>
+  );
+
+  // ── Rendu colonne centre ──
+  const renderCenterCol = () => (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-base)" }}>
+      {!selectedConv ? (
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-quaternary)", flexDirection: "column", gap: 8 }}>
+          <div style={{ fontSize: 32 }}>✈️</div>
+          <div style={{ fontSize: 13 }}>{fr ? "Sélectionne une conversation" : "Select a conversation"}</div>
+        </div>
+      ) : (
+        <>
+          {/* Header conv */}
+          <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-overlay)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+            {_isMobile && (
+              <button onClick={() => setMobilePane("list")} style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: 18, padding: 0 }}>←</button>
+            )}
+            <div style={{ width: 32, height: 32, borderRadius: "50%", background: "var(--accent-muted)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700, color: "var(--accent)", flexShrink: 0 }}>
+              {getSpenderInitials(selectedConv)}
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>{getSpenderName(selectedConv)}</div>
+              <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>
+                {selectedConv.status || "—"}
+                {selectedConv.model_id && " · " + ((models || []).find(m => m.id === selectedConv.model_id)?.name || "")}
+              </div>
+            </div>
+            {_isMobile && (
+              <button onClick={() => setMobilePane("spender")} style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 16, padding: "4px 8px", borderRadius: 8, border: "1px solid var(--border-subtle)" }}>👤</button>
+            )}
+          </div>
+
+          {/* Messages */}
+          <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 8 }}>
+            {msgLoading && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 20, fontSize: 12 }}>{fr ? "Chargement…" : "Loading…"}</div>}
+            {!msgLoading && messages.length === 0 && <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 20, fontSize: 12 }}>{fr ? "Aucun message" : "No messages"}</div>}
+            {!msgLoading && messages.map((msg, i) => {
+              const isOut = msg.direction === "out" || msg.from_bot || msg.sender_type === "bot" || msg.sender_type === "chatter";
+              return (
+                <div key={msg.id || i} style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%" }}>
+                  <div style={{ padding: "9px 13px", borderRadius: isOut ? "14px 14px 2px 14px" : "14px 14px 14px 2px", fontSize: 13, lineHeight: 1.4,
+                    background: isOut ? "#3B82F6" : "rgba(255,255,255,0.07)", color: "#fff", wordBreak: "break-word" }}>
+                    {msg.text || msg.content || msg.message || "—"}
+                  </div>
+                  <div style={{ fontSize: 9, color: "var(--text-quaternary)", marginTop: 2, textAlign: isOut ? "right" : "left" }}>
+                    {msg.created_at ? new Date(msg.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : ""}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Input */}
+          {isReadOnly ? (
+            <div style={{ padding: "12px 16px", borderTop: "1px solid var(--border-subtle)", fontSize: 12, color: "var(--text-tertiary)", textAlign: "center" }}>
+              🔒 {fr ? "Mode lecture seule" : "Read-only mode"}
+            </div>
+          ) : (
+            <div style={{ padding: "10px 14px", borderTop: "1px solid var(--border-subtle)", display: "flex", gap: 8, background: "var(--bg-overlay)", flexShrink: 0 }}>
+              <textarea
+                value={msgInput}
+                onChange={e => setMsgInput(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                placeholder={fr ? "Écrire un message… (Entrée pour envoyer)" : "Write a message… (Enter to send)"}
+                disabled={sending}
+                style={{ flex: 1, resize: "none", minHeight: 40, maxHeight: 100, padding: "9px 12px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--bg-input)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter', sans-serif", outline: "none" }}
+              />
+              <button className="btn btn-primary" onClick={sendMessage} disabled={sending || !msgInput.trim()} style={{ alignSelf: "flex-end", padding: "9px 16px", fontSize: 13 }}>
+                {sending ? "⏳" : (fr ? "Envoyer" : "Send")}
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+
+  // ── Rendu colonne droite ──
+  const renderRightCol = () => (
+    <div style={{ height: "100%", background: "var(--bg-raised)", borderLeft: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "12px 14px 8px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase" }}>
+          {fr ? "Fiche Spender" : "Spender Profile"}
+        </div>
+        {_isMobile && (
+          <button onClick={() => setMobilePane("chat")} style={{ float: "right", background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 16, marginTop: -2 }}>✕</button>
+        )}
+      </div>
+      <div style={{ flex: 1, overflow: "hidden" }}>
+        <SpenderFichePanel conv={selectedConv} spenders={spenders} models={models} txs={txs} lang={lang} user={user} />
+      </div>
+    </div>
+  );
+
+  // ── Layout desktop 3 colonnes ──
+  if (!_isMobile) {
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "280px 1fr 300px", height: "calc(100vh - 200px)", minHeight: 500, border: "1px solid var(--border-subtle)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow-md)" }}>
+        {renderLeftCol()}
+        {renderCenterCol()}
+        {renderRightCol()}
+      </div>
+    );
+  }
+
+  // ── Layout mobile ──
+  return (
+    <div style={{ height: "calc(100vh - 160px)", minHeight: 400, border: "1px solid var(--border-subtle)", borderRadius: 12, overflow: "hidden", position: "relative" }}>
+      {mobilePane === "list" && renderLeftCol()}
+      {mobilePane === "chat" && renderCenterCol()}
+      {mobilePane === "spender" && renderRightCol()}
+    </div>
+  );
+};
+
+// =============================================
+// SCRIPTS ADMIN TAB — Gestion scripts (gérant uniquement)
+// =============================================
+const ScriptsAdminTab = ({ user, lang, models }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [scripts, setScripts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+  const [editScript, setEditScript] = useState(null);
+  const [filterModel, setFilterModel] = useState("all");
+  const [uploading, setUploading] = useState(false);
+  const [form, setForm] = useState({ title: "", type: "text", content: "", media_url: "", model_id: "", sort_order: 0 });
+  const [previewScript, setPreviewScript] = useState(null);
+
+  const loadScripts = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await sb.from("scripts").select("*").order("model_id").order("sort_order");
+    if (error) addToast((fr ? "Erreur: " : "Error: ") + error.message, "error");
+    else setScripts(data || []);
+    setLoading(false);
+  }, [fr, addToast]);
+
+  useEffect(() => { loadScripts(); }, [loadScripts]);
+
+  const openCreate = () => {
+    setEditScript(null);
+    setForm({ title: "", type: "text", content: "", media_url: "", model_id: models?.[0]?.id || "", sort_order: 0 });
+    setShowModal(true);
+  };
+
+  const openEdit = (script) => {
+    setEditScript(script);
+    setForm({ title: script.title, type: script.type, content: script.content || "", media_url: script.media_url || "", model_id: script.model_id || "", sort_order: script.sort_order || 0 });
+    setShowModal(true);
+  };
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    try {
+      const ext = file.name.split(".").pop();
+      const path = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const { error: upErr } = await sb.storage.from("scripts-media").upload(path, file, { upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = sb.storage.from("scripts-media").getPublicUrl(path);
+      setForm(f => ({ ...f, media_url: urlData.publicUrl }));
+      addToast(fr ? "Fichier uploadé" : "File uploaded", "success");
+    } catch (e) {
+      addToast((fr ? "Erreur upload: " : "Upload error: ") + (e.message || e), "error");
+    } finally { setUploading(false); }
+  };
+
+  const saveScript = async () => {
+    if (!form.title.trim()) { addToast(fr ? "Titre requis" : "Title required", "error"); return; }
+    if (!form.model_id) { addToast(fr ? "Modèle requis" : "Model required", "error"); return; }
+    if (form.type === "text" && !form.content.trim()) { addToast(fr ? "Contenu requis pour script texte" : "Content required for text script", "error"); return; }
+    if (form.type !== "text" && !form.media_url) { addToast(fr ? "URL média requise" : "Media URL required", "error"); return; }
+
+    const payload = { title: form.title.trim(), type: form.type, content: form.type === "text" ? form.content : null, media_url: form.type !== "text" ? form.media_url : null, model_id: form.model_id, sort_order: parseInt(form.sort_order) || 0, created_by: user.id };
+
+    let error;
+    if (editScript) {
+      ({ error } = await sb.from("scripts").update(payload).eq("id", editScript.id));
+    } else {
+      ({ error } = await sb.from("scripts").insert(payload));
+    }
+    if (error) { addToast((fr ? "Erreur: " : "Error: ") + error.message, "error"); return; }
+    addToast(editScript ? (fr ? "Script modifié" : "Script updated") : (fr ? "Script créé" : "Script created"), "success");
+    setShowModal(false);
+    loadScripts();
+  };
+
+  const deleteScript = async (id) => {
+    if (!confirm(fr ? "Supprimer ce script ?" : "Delete this script?")) return;
+    const { error } = await sb.from("scripts").delete().eq("id", id);
+    if (error) addToast((fr ? "Erreur: " : "Error: ") + error.message, "error");
+    else { addToast(fr ? "Script supprimé" : "Script deleted", "success"); loadScripts(); }
+  };
+
+  const filteredScripts = filterModel === "all" ? scripts : scripts.filter(s => s.model_id === filterModel);
+  const groupedByModel = filteredScripts.reduce((acc, s) => { const k = s.model_id || "none"; if (!acc[k]) acc[k] = []; acc[k].push(s); return acc; }, {});
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20, flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <h3 style={{ fontSize: 18, fontWeight: 800, margin: 0 }}>📝 {fr ? "Gestion Scripts" : "Scripts Management"}</h3>
+          <p style={{ fontSize: 12, color: "var(--text-secondary)", margin: "4px 0 0" }}>{fr ? "Scripts envoyés automatiquement via la messagerie TG" : "Scripts sent automatically via TG messaging"}</p>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <select value={filterModel} onChange={e => setFilterModel(e.target.value)}
+            style={{ padding: "7px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 12 }}>
+            <option value="all">{fr ? "Tous les modèles" : "All models"}</option>
+            {(models || []).map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+          </select>
+          <button className="btn btn-primary" onClick={openCreate} style={{ fontSize: 13 }}>
+            ➕ {fr ? "Nouveau script" : "New script"}
+          </button>
+        </div>
+      </div>
+
+      {loading && <div style={{ textAlign: "center", padding: 40, color: "var(--text-quaternary)" }}>{fr ? "Chargement…" : "Loading…"}</div>}
+      {!loading && filteredScripts.length === 0 && (
+        <div style={{ textAlign: "center", padding: 40, color: "var(--text-quaternary)", fontSize: 14 }}>
+          {fr ? "Aucun script. Créez le premier !" : "No scripts yet. Create the first one!"}
+        </div>
+      )}
+
+      {!loading && Object.entries(groupedByModel).map(([modelId, modelScripts]) => {
+        const model = (models || []).find(m => m.id === modelId);
+        return (
+          <div key={modelId} style={{ marginBottom: 24 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 10, padding: "6px 12px", background: "var(--bg-raised)", borderRadius: 8, display: "inline-block" }}>
+              🎭 {model?.name || (fr ? "Modèle inconnu" : "Unknown model")} <span style={{ fontSize: 11, color: "var(--text-tertiary)", fontWeight: 400 }}>({modelScripts.length})</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 }}>
+              {modelScripts.map(script => (
+                <div key={script.id} style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 12, padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div>
+                      <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 6, background: "var(--accent-muted)", color: "var(--accent)", fontWeight: 700, marginRight: 6 }}>
+                        {SCRIPT_TYPES.find(t => t.id === script.type)?.icon} {script.type}
+                      </span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-primary)" }}>{script.title}</span>
+                    </div>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button onClick={() => setPreviewScript(script)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, color: "var(--text-tertiary)" }} title={fr ? "Aperçu" : "Preview"}>👁</button>
+                      <button onClick={() => openEdit(script)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, color: "var(--text-tertiary)" }} title={fr ? "Modifier" : "Edit"}>✏️</button>
+                      <button onClick={() => deleteScript(script.id)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, color: "var(--danger)" }} title={fr ? "Supprimer" : "Delete"}>🗑</button>
+                    </div>
+                  </div>
+                  {script.type === "text" && script.content && (
+                    <div style={{ fontSize: 11, color: "var(--text-secondary)", background: "var(--bg-base)", padding: "6px 8px", borderRadius: 6, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                      {script.content}
+                    </div>
+                  )}
+                  {script.type !== "text" && script.media_url && (
+                    <div style={{ fontSize: 10, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      🔗 {script.media_url}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 10, color: "var(--text-quaternary)" }}>Ordre: {script.sort_order}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Modal création/édition */}
+      {showModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+          onClick={e => { if (e.target === e.currentTarget) setShowModal(false); }}>
+          <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: 480, maxWidth: "95vw", maxHeight: "90vh", overflowY: "auto" }}>
+            <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 20 }}>
+              {editScript ? (fr ? "✏️ Modifier script" : "✏️ Edit script") : (fr ? "➕ Nouveau script" : "➕ New script")}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>
+                <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4 }}>{fr ? "Titre *" : "Title *"}</label>
+                <input className="form-input" value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} placeholder={fr ? "Ex: Intro chaude" : "Ex: Warm intro"} style={{ width: "100%", boxSizing: "border-box" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4 }}>{fr ? "Type *" : "Type *"}</label>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {SCRIPT_TYPES.map(t => (
+                    <button key={t.id} onClick={() => setForm(f => ({ ...f, type: t.id }))}
+                      style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid " + (form.type === t.id ? "var(--accent)" : "var(--border-subtle)"),
+                        background: form.type === t.id ? "var(--accent-muted)" : "var(--bg-raised)",
+                        color: form.type === t.id ? "var(--accent)" : "var(--text-secondary)",
+                        fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                      {t.icon} {t.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4 }}>{fr ? "Modèle *" : "Model *"}</label>
+                <select className="filter-select" value={form.model_id} onChange={e => setForm(f => ({ ...f, model_id: e.target.value }))} style={{ width: "100%" }}>
+                  <option value="">— {fr ? "Choisir modèle" : "Select model"} —</option>
+                  {(models || []).map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select>
+              </div>
+              {form.type === "text" ? (
+                <div>
+                  <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4 }}>{fr ? "Contenu *" : "Content *"}</label>
+                  <textarea className="form-input" value={form.content} onChange={e => setForm(f => ({ ...f, content: e.target.value }))} rows={5} placeholder={fr ? "Texte du script…" : "Script text…"} style={{ width: "100%", resize: "vertical", boxSizing: "border-box" }} />
+                </div>
+              ) : (
+                <div>
+                  <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4 }}>
+                    {fr ? "Fichier média" : "Media file"} {form.type === "audio" && <span style={{ color: "var(--warning)", fontSize: 10 }}>({fr ? "Voice note TG natif" : "Native TG voice note"})</span>}
+                  </label>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <label style={{ padding: "7px 14px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-secondary)", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
+                      📎 {uploading ? (fr ? "Upload…" : "Uploading…") : (fr ? "Choisir fichier" : "Choose file")}
+                      <input type="file" style={{ display: "none" }} onChange={handleFileUpload} disabled={uploading}
+                        accept={form.type === "photo" ? "image/*" : form.type === "video" ? "video/*" : "audio/*"} />
+                    </label>
+                    <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{fr ? "ou" : "or"}</span>
+                    <input className="form-input" value={form.media_url} onChange={e => setForm(f => ({ ...f, media_url: e.target.value }))} placeholder="https://…" style={{ flex: 1, minWidth: 120 }} />
+                  </div>
+                  {form.media_url && <div style={{ fontSize: 10, color: "var(--success)", marginTop: 4 }}>✅ {form.media_url.slice(0, 60)}…</div>}
+                </div>
+              )}
+              <div>
+                <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4 }}>{fr ? "Ordre d'affichage" : "Display order"}</label>
+                <input type="number" className="form-input" value={form.sort_order} onChange={e => setForm(f => ({ ...f, sort_order: e.target.value }))} style={{ width: 80 }} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+              <button className="btn btn-primary" onClick={saveScript} style={{ flex: 1 }}>
+                {editScript ? (fr ? "Sauvegarder" : "Save") : (fr ? "Créer" : "Create")}
+              </button>
+              <button className="btn btn-secondary" onClick={() => setShowModal(false)} style={{ flex: 1 }}>
+                {fr ? "Annuler" : "Cancel"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal preview */}
+      {previewScript && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+          onClick={() => setPreviewScript(null)}>
+          <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: 400, maxWidth: "95vw" }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>
+              👁 {fr ? "Aperçu:" : "Preview:"} {previewScript.title}
+            </div>
+            <div style={{ padding: "12px 14px", borderRadius: 12, background: "#3B82F6", color: "#fff", fontSize: 13, lineHeight: 1.5, marginBottom: 12 }}>
+              {previewScript.type === "text" ? (previewScript.content || "—") : (
+                <div>
+                  {SCRIPT_TYPES.find(t => t.id === previewScript.type)?.icon} {previewScript.type === "audio" ? "🎤 Voice note TG" : (fr ? "Média" : "Media")}
+                  {previewScript.media_url && <div style={{ fontSize: 10, marginTop: 4, opacity: 0.8 }}>{previewScript.media_url.slice(0, 50)}…</div>}
+                </div>
+              )}
+            </div>
+            <button className="btn btn-secondary" onClick={() => setPreviewScript(null)} style={{ width: "100%" }}>
+              {fr ? "Fermer" : "Close"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // TELEGRAM BETA — Messagerie (gerant/chatter) + enforcement messaging_permissions
 // =============================================
 const DEFAULT_MP = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
@@ -19590,6 +20516,172 @@ const LS_BOT_URL = "dadash_tg_admin_bot_url";
 const LS_API_KEY = "dadash_tg_admin_api_key";
 
 const ASSIGN_COLUMNS = ["assigned_chatter_id", "assigned_to", "assigned_profile_id"];
+
+// =============================================
+// SUPERVISION MANAGER PANEL — Restrictions chatters (gérant uniquement)
+// =============================================
+const SupervisionManagerPanel = ({ user, lang, profiles, models, onRefresh }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const [restrictions, setRestrictions] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(null);
+  const [supervisionChatter, setSupervisionChatter] = useState("");
+  const [supervisionConvs, setSupervisionConvs] = useState([]);
+  const [supervisionLoading, setSupervisionLoading] = useState(false);
+
+  const chatters = (profiles || []).filter(p => p.role === "chatter");
+
+  // Charger toutes les restrictions
+  const loadRestrictions = useCallback(async () => {
+    setLoading(true);
+    const { data } = await sb.from("chatter_restrictions").select("*");
+    const map = {};
+    (data || []).forEach(r => { map[r.chatter_id] = r; });
+    setRestrictions(map);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { loadRestrictions(); }, [loadRestrictions]);
+
+  const getRestriction = (chatterId, key) => {
+    const r = restrictions[chatterId];
+    if (!r) return key === "read_only" ? false : true;
+    return r[key] !== undefined ? r[key] : (key === "read_only" ? false : true);
+  };
+
+  const toggleRestriction = async (chatterId, key, value) => {
+    setSaving(chatterId + "_" + key);
+    try {
+      const existing = restrictions[chatterId];
+      const payload = { chatter_id: chatterId, can_send_media: true, can_use_scripts: true, read_only: false, ...existing, [key]: value, updated_at: new Date().toISOString() };
+      delete payload.id;
+      const { error } = await sb.from("chatter_restrictions").upsert(payload, { onConflict: "chatter_id" });
+      if (error) throw new Error(error.message);
+      setRestrictions(prev => ({ ...prev, [chatterId]: { ...prev[chatterId], chatter_id: chatterId, [key]: value } }));
+      addToast(fr ? "Restriction mise à jour" : "Restriction updated", "success");
+    } catch (e) {
+      addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
+    } finally { setSaving(null); }
+  };
+
+  // Vue supervision : conversations d'un chatter
+  const loadSupervisionConvs = async (chatterId) => {
+    if (!chatterId) { setSupervisionConvs([]); return; }
+    setSupervisionLoading(true);
+    try {
+      const { data } = await sb.from("v_tg_conversations").select("*").eq("assigned_chatter_id", chatterId).order("last_message_at", { ascending: false }).limit(50);
+      setSupervisionConvs(data || []);
+    } catch (_) { setSupervisionConvs([]); }
+    setSupervisionLoading(false);
+  };
+
+  useEffect(() => { loadSupervisionConvs(supervisionChatter); }, [supervisionChatter]);
+
+  const getSpenderName = (conv) => conv?.display_name || conv?.tg_chat_id || "—";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* Supervision conversations */}
+      <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: 24, boxShadow: "var(--shadow-md)" }}>
+        <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 16px", fontFamily: "'Inter', sans-serif" }}>
+          👁 {fr ? "Supervision conversations" : "Conversation supervision"}
+        </h3>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 16, flexWrap: "wrap" }}>
+          <select value={supervisionChatter} onChange={e => setSupervisionChatter(e.target.value)}
+            style={{ padding: "8px 14px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter', sans-serif" }}>
+            <option value="">{fr ? "Voir toutes les convs" : "View all convs"}</option>
+            {chatters.map(ch => (
+              <option key={ch.id} value={ch.id}>{ch.name || ch.email || ch.handle || "?"}</option>
+            ))}
+          </select>
+          {supervisionChatter && (
+            <span style={{ padding: "4px 10px", borderRadius: 8, background: "var(--accent-muted)", color: "var(--accent)", fontSize: 11, fontWeight: 600 }}>
+              👤 {(chatters.find(c => c.id === supervisionChatter)?.name || "?")}
+            </span>
+          )}
+        </div>
+        {supervisionLoading && <div style={{ fontSize: 12, color: "var(--text-quaternary)", padding: 8 }}>{fr ? "Chargement…" : "Loading…"}</div>}
+        {!supervisionLoading && supervisionConvs.length === 0 && supervisionChatter && (
+          <div style={{ fontSize: 12, color: "var(--text-quaternary)", padding: 8 }}>{fr ? "Aucune conversation assignée" : "No assigned conversations"}</div>
+        )}
+        {!supervisionLoading && supervisionConvs.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 300, overflowY: "auto" }}>
+            {supervisionConvs.map(conv => {
+              const chatterName = (profiles || []).find(p => p.id === conv.assigned_chatter_id)?.name || "—";
+              return (
+                <div key={conv.id} style={{ padding: "10px 14px", background: "var(--bg-base)", borderRadius: 10, border: "1px solid var(--border-subtle)", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>{getSpenderName(conv)}</div>
+                    <div style={{ fontSize: 10, color: "var(--text-tertiary)", marginTop: 2 }}>
+                      {conv.last_message_at ? new Date(conv.last_message_at).toLocaleString("fr-CH", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—"}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+                    {conv.assigned_chatter_id && (
+                      <span style={{ padding: "2px 8px", borderRadius: 6, background: "var(--accent-muted)", color: "var(--accent)", fontSize: 10, fontWeight: 600 }}>
+                        👤 {chatterName}
+                      </span>
+                    )}
+                    <span style={{ padding: "2px 8px", borderRadius: 6, background: conv.status === "closed" ? "rgba(239,68,68,0.15)" : "rgba(34,211,161,0.15)", color: conv.status === "closed" ? "var(--danger)" : "var(--success)", fontSize: 10, fontWeight: 600 }}>
+                      {conv.status || "—"}
+                    </span>
+                    <span style={{ fontSize: 9, color: "var(--text-quaternary)", padding: "2px 6px", borderRadius: 4, background: "var(--bg-raised)", fontWeight: 600 }}>
+                      READ-ONLY
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Panneau restrictions chatters */}
+      <div style={{ background: "var(--card-bg)", border: "1px solid var(--border-subtle)", borderRadius: 16, padding: 24, boxShadow: "var(--shadow-md)" }}>
+        <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 16px", fontFamily: "'Inter', sans-serif" }}>
+          🔒 {fr ? "Restrictions Chatters" : "Chatter Restrictions"}
+        </h3>
+        {loading && <div style={{ fontSize: 12, color: "var(--text-quaternary)" }}>{fr ? "Chargement…" : "Loading…"}</div>}
+        {!loading && chatters.length === 0 && <div style={{ fontSize: 12, color: "var(--text-quaternary)" }}>{fr ? "Aucun chatter" : "No chatters"}</div>}
+        {!loading && chatters.map(ch => {
+          const isSaving = (k) => saving === ch.id + "_" + k;
+          return (
+            <div key={ch.id} style={{ padding: "14px 16px", background: "var(--bg-base)", borderRadius: 12, border: "1px solid var(--border-subtle)", marginBottom: 10 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)", marginBottom: 10 }}>
+                {ch.name || ch.email || ch.handle || "?"}
+                <span style={{ fontSize: 10, color: "var(--text-tertiary)", marginLeft: 8, fontWeight: 400 }}>
+                  {(ch.assigned_models || []).map(mid => (models || []).find(m => m.id === mid)?.name).filter(Boolean).join(", ") || (fr ? "Aucun modèle" : "No model")}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+                {[
+                  { key: "can_send_media", label: fr ? "Peut envoyer médias" : "Can send media", icon: "📸" },
+                  { key: "can_use_scripts", label: fr ? "Peut utiliser scripts" : "Can use scripts", icon: "📝" },
+                  { key: "read_only", label: fr ? "Lecture seule" : "Read only", icon: "🔒", danger: true },
+                ].map(({ key, label, icon, danger }) => {
+                  const val = getRestriction(ch.id, key);
+                  const saving_ = isSaving(key);
+                  return (
+                    <label key={key} style={{ display: "flex", alignItems: "center", gap: 8, cursor: saving_ ? "not-allowed" : "pointer", opacity: saving_ ? 0.6 : 1 }}>
+                      <input type="checkbox" checked={val} disabled={saving_} onChange={e => toggleRestriction(ch.id, key, e.target.checked)}
+                        style={{ accentColor: danger ? "var(--danger)" : "var(--accent)", width: 15, height: 15 }} />
+                      <span style={{ fontSize: 12, color: danger && val ? "var(--danger)" : "var(--text-secondary)", fontWeight: danger && val ? 700 : 400 }}>
+                        {icon} {label}
+                      </span>
+                      {saving_ && <span style={{ fontSize: 10, color: "var(--text-tertiary)" }}>⏳</span>}
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 
 const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spenders, onRefresh}) => {
   const fr = lang === "fr";
@@ -20273,6 +21365,9 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
           </>
         )}
       </div>
+
+      {/* ── Supervision Manager ── */}
+      <SupervisionManagerPanel user={user} lang={lang} profiles={profiles} models={models} onRefresh={onRefresh} />
     </div>
   );
 };
@@ -29678,13 +30773,14 @@ const App = () => {
         return (<>
           <div style={{overflowX:"auto",overflowY:"hidden",WebkitOverflowScrolling:"touch",marginBottom:24,borderBottom:"1px solid var(--border-subtle)"}}>
             <div style={{display:"flex",gap:8,flexWrap:"nowrap",minWidth:"min-content",alignItems:"center",paddingBottom:4}}>
+              <button onClick={()=>setMessagerieSubTab("telegram")} style={msgTabStyle("telegram")}>✈️ Telegram</button>
               <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={msgTabStyle("telegram_beta")}>Telegram BETA</button>
               <button onClick={()=>setMessagerieSubTab("whatsapp")} style={msgTabStyle("whatsapp")}>WhatsApp</button>
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("admin_panel")} style={msgTabStyle("admin_panel")}>{"\u{1F6E0}"} Admin Panel</button>}
               {simuEnabled&&<span style={{padding:"4px 10px",borderRadius:10,background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,marginLeft:4,flexShrink:0}}>{"\u{1F4DD}"} Mode test</span>}
             </div>
           </div>
-          {user?.role==="gerant"&&(
+          {user?.role==="gerant"&&messagerieSubTab!=="telegram"&&(
             <div style={{marginBottom:20,padding:14,background:"var(--card-bg)",borderRadius:12,border:"1px solid var(--border-subtle)",fontSize:12,fontFamily:"'Inter', sans-serif"}}>
               <span style={{fontWeight:600,color:"var(--text-secondary)",marginRight:12}}>{"\u{1F4DD}"} Mode test UI (local)</span>
               <label style={{display:"inline-flex",alignItems:"center",gap:8,cursor:"pointer",marginRight:12}}>
@@ -29704,6 +30800,7 @@ const App = () => {
               )}
             </div>
           )}
+          {messagerieSubTab==="telegram"&&<TgCarlosMessagerieTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} txs={txSummary} />}
           {messagerieSubTab==="whatsapp"&&<GerantMessagerieTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
           {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} simuOverride={simuOverride} />}
           {messagerieSubTab==="admin_panel"&&user?.role==="gerant"&&<MessagerieGerantAdminPanel user={user} lang={lang} profiles={profiles} models={models} botStats={botStats} spenders={spenders} onRefresh={onRefresh} />}
@@ -30144,10 +31241,12 @@ const App = () => {
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
             <div style={{display:"flex",flexWrap:"nowrap",gap:8,marginBottom:16,overflowX:"auto",WebkitOverflowScrolling:"touch",paddingBottom:4,scrollbarWidth:"none"}}>
-              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="telegram_beta"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="telegram_beta"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="telegram_beta"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>Telegram</button>
+              <button onClick={()=>setMessagerieSubTab("telegram")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="telegram"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="telegram"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="telegram"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>✈️ Telegram</button>
+              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="telegram_beta"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="telegram_beta"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="telegram_beta"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>Telegram BETA</button>
               <button onClick={()=>setMessagerieSubTab("whatsapp")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="whatsapp"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="whatsapp"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="whatsapp"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>WhatsApp</button>
               <button onClick={()=>setMessagerieSubTab("escalades")} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${messagerieSubTab==="escalades"?"#8b5cf6":"var(--border)"}`,background:messagerieSubTab==="escalades"?"rgba(139,92,246,0.15)":"var(--surface)",color:messagerieSubTab==="escalades"?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0}}>{"\u{1F4A5}"} {lang==="fr"?"Escalades":"Escalations"}</button>
             </div>
+            {messagerieSubTab==="telegram"&&<TgCarlosMessagerieTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} txs={txSummary} />}
             {messagerieSubTab==="whatsapp"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} models={models} />}
             {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
             {messagerieSubTab==="escalades"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} escaladesOnly />}
