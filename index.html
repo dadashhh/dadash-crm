@@ -7785,6 +7785,628 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
 });
 
 // =============================================
+// UNIFIED SPENDER MODAL — composant unique, réutilisé partout
+// Props: open, spenderId, spenderObj, onClose, user, lang, models, profiles,
+//        dbSpenders, txs, onRefresh, onNotify, products, productTags,
+//        providerPaymentMethods, readOnly, chatterMode
+// =============================================
+const UnifiedSpenderModal = React.memo(({
+  open, spenderId, spenderObj, onClose, user, lang, models, profiles,
+  dbSpenders, txs, onRefresh, onNotify, products, productTags,
+  providerPaymentMethods, readOnly, chatterMode
+}) => {
+  const addToast = useToast();
+  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const _isMobile = useIsMobile ? useIsMobile() : (window.innerWidth < 768);
+
+  const [selected, setSelected] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+  const [spModalTab, setSpModalTab] = React.useState("profil");
+  const [spEditMode, setSpEditMode] = React.useState(false);
+  const [spForm, setSpForm] = React.useState({});
+  const [spSavingProfile, setSpSavingProfile] = React.useState(false);
+  const [spenderJustUpdated, setSpenderJustUpdated] = React.useState(false);
+  const [editingTx, setEditingTx] = React.useState(null);
+  const [spSaving, setSpSaving] = React.useState(false);
+  const [processingTxId, setProcessingTxId] = React.useState(null);
+  const [confirmRefuse, setConfirmRefuse] = React.useState(null);
+  const [deleteConfirm, setDeleteConfirm] = React.useState(null);
+  const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep");
+  const [deleteLoading, setDeleteLoading] = React.useState(false);
+
+  // Badge state (local)
+  const [dbBadges, setDbBadges] = React.useState({});
+  const loadBadges = React.useCallback(async () => {
+    try {
+      const { data } = await sb.from("spender_badges").select("spender_id,badge");
+      const map = {};
+      (data || []).forEach(r => { if (!map[r.spender_id]) map[r.spender_id] = []; map[r.spender_id].push(r.badge); });
+      setDbBadges(map);
+    } catch (e) { /* silent */ }
+  }, []);
+  React.useEffect(() => { if (open) loadBadges(); }, [open]);
+
+  const hasDbBadge = (spenderId, badge) => (dbBadges[spenderId] || []).includes(badge);
+  const toggleBadge = async (spenderId, badge) => {
+    const has = hasDbBadge(spenderId, badge);
+    setDbBadges(prev => {
+      const next = { ...prev };
+      if (has) { next[spenderId] = (next[spenderId] || []).filter(b => b !== badge); if (next[spenderId].length === 0) delete next[spenderId]; }
+      else { next[spenderId] = [...(next[spenderId] || []), badge]; }
+      return next;
+    });
+    try {
+      if (has) await sb.from("spender_badges").delete().eq("spender_id", spenderId).eq("badge", badge);
+      else await sb.from("spender_badges").insert({ spender_id: spenderId, badge, created_by: user?.id || null });
+    } catch (e) { addToast("Erreur badge: " + e.message, "error"); loadBadges(); }
+  };
+
+  // Build enriched spender VM from ID or obj
+  const buildSpenderVM = React.useCallback((spId) => {
+    const safeDbSp = Array.isArray(dbSpenders) ? dbSpenders : [];
+    const safeTxs = Array.isArray(txs) ? txs : [];
+
+    let rawSp = null;
+    if (spId) {
+      rawSp = safeDbSp.find(s => s.id === spId);
+    }
+    if (!rawSp && spId) return null;
+
+    const _prof = getProfile(rawSp.meta);
+    let contactInfo = {};
+    try { contactInfo = typeof rawSp.contact_info === "string" ? JSON.parse(rawSp.contact_info) : (rawSp.contact_info || {}); } catch(e) {}
+
+    const h = rawSp.handle || rawSp.name;
+    const sp = {
+      name: h, dbId: rawSp.id, tg_user_id: rawSp.tg_user_id || null,
+      telegramId: rawSp.telegram_id ?? rawSp.tg_user_id ?? null,
+      meta: rawSp.meta || {}, whatsapp_phone: rawSp.whatsapp_phone || null,
+      age: rawSp.age || null, city: rawSp.city || null,
+      country: _prof.country || rawSp.country || null, job: rawSp.job || null,
+      first_name: _prof.first_name || rawSp.first_name || null,
+      langue: _prof.language || rawSp.langue || null,
+      timezone: _prof.timezone || rawSp.timezone || "Europe/Zurich",
+      budget_range: _prof.budget_chf_range || rawSp.budget_range || null,
+      classification: rawSp.classification || "new", source: rawSp.source || null,
+      dbTags: Array.isArray(rawSp.tags) ? rawSp.tags : [],
+      dbStatus: rawSp.status || "active", contactInfo,
+      dbNotes: _prof.notes_chatter || rawSp.notes || "",
+      totalSpentDb: Number(rawSp.total_spent) || 0,
+      preferences: rawSp.preferences || null, personality_notes: rawSp.personality_notes || null,
+      favorite_content: rawSp.favorite_content || null, best_time: rawSp.best_time || null,
+      relationship_status: _prof.relation ?? rawSp.relationship_status ?? null,
+      risk_level: rawSp.risk_level || "safe", telegram_username: rawSp.telegram_username || null,
+      created_at: rawSp.created_at || null, updated_at: rawSp.updated_at || null,
+      model_id: rawSp.model_id || null,
+      txs: [], byModel: {}, byChatter: {}, byProvider: {},
+    };
+
+    // Enrich with transactions
+    safeTxs.forEach(tx => {
+      const matchById = tx.spender_id && tx.spender_id === rawSp.id;
+      const matchByHandle = h && tx.spender_handle === h;
+      if (!matchById && !matchByHandle) return;
+      sp.txs.push(tx);
+      const mid = tx.model_id;
+      if (!sp.byModel[mid]) sp.byModel[mid] = { txs: [], ca: 0, validated: 0, pending: 0 };
+      sp.byModel[mid].txs.push(tx); sp.byModel[mid].ca += Number(tx.amount);
+      if (tx.status === "validated") sp.byModel[mid].validated += Number(tx.amount);
+      if (tx.status === "pending") sp.byModel[mid].pending += Number(tx.amount);
+      const cid = tx.chatter_id || "unknown";
+      const cName = (profiles || []).find(p => p.id === cid)?.name || "?";
+      if (!sp.byChatter[cid]) sp.byChatter[cid] = { id: cid, name: cName, ca: 0, count: 0, validated: 0, pending: 0 };
+      sp.byChatter[cid].ca += Number(tx.amount); sp.byChatter[cid].count++;
+      if (tx.status === "validated") sp.byChatter[cid].validated += Number(tx.amount);
+      if (tx.status === "pending") sp.byChatter[cid].pending += Number(tx.amount);
+      const pid = tx.provider_id || "unknown";
+      const pName = (profiles || []).find(p => p.id === pid)?.name || "?";
+      if (!sp.byProvider[pid]) sp.byProvider[pid] = { id: pid, name: pName, ca: 0, count: 0, validated: 0, pending: 0 };
+      sp.byProvider[pid].ca += Number(tx.amount); sp.byProvider[pid].count++;
+      if (tx.status === "validated") sp.byProvider[pid].validated += Number(tx.amount);
+      if (tx.status === "pending") sp.byProvider[pid].pending += Number(tx.amount);
+    });
+
+    const validTxs = sp.txs.filter(tx => tx.status === "validated");
+    const ltv = validTxs.reduce((sum, tx) => sum + Number(tx.amount), 0);
+    const cnt = validTxs.length;
+    const aov = cnt > 0 ? ltv / cnt : 0;
+    const pendingCA = sp.txs.filter(tx => tx.status === "pending").reduce((sum, tx) => sum + Number(tx.amount), 0);
+    const validCount = cnt;
+    const pendingCount = sp.txs.filter(tx => tx.status === "pending").length;
+    const modelBreakdown = Object.entries(sp.byModel).map(([mid, data]) => {
+      const mName = (models || []).find(m => m.id === mid)?.name || "?";
+      return { id: mid, name: mName, ca: data.ca, validated: data.validated, pending: data.pending, txCount: data.txs.length, txs: data.txs, pct: ltv > 0 ? ((data.validated / ltv) * 100) : 0 };
+    }).sort((a, b) => b.validated - a.validated);
+    const chatterBreakdown = Object.values(sp.byChatter).sort((a, b) => b.validated - a.validated);
+    const providerBreakdown = Object.values(sp.byProvider).sort((a, b) => b.validated - a.validated);
+
+    return spenderVM({ ...sp, ltv, cnt, aov, validCA: ltv, pendingCA, validCount, pendingCount, segment: getSpenderSegment(ltv), modelCount: Object.keys(sp.byModel).length, modelBreakdown, chatterBreakdown, providerBreakdown });
+  }, [dbSpenders, txs, models, profiles]);
+
+  // Load spender when modal opens
+  React.useEffect(() => {
+    if (!open) { setSelected(null); setSpModalTab("profil"); setSpEditMode(false); setSpenderJustUpdated(false); return; }
+    const targetId = spenderId || (spenderObj?.dbId) || (spenderObj?.id) || null;
+    if (!targetId && spenderObj) {
+      const vm = spenderVM(spenderObj);
+      setSelected(vm);
+      initForm(vm);
+      return;
+    }
+    if (!targetId) return;
+
+    // Try from local data first
+    const localVM = buildSpenderVM(targetId);
+    if (localVM) { setSelected(localVM); initForm(localVM); }
+    else { setLoading(true); }
+
+    // Always fetch fresh from DB
+    (async () => {
+      try {
+        const { data: uiData } = await sb.from("v_spenders_ui").select("*").eq("id", targetId).maybeSingle();
+        if (uiData) { const vm = buildSpenderVM(targetId) || spenderVM(mapUiToSpender(uiData)); setSelected(vm); initForm(vm); setLoading(false); return; }
+        const { data: canonData } = await sb.from("v_spenders_canon").select("*").eq("spender_id", targetId).maybeSingle();
+        if (canonData) { const vm = spenderVM(mapCanonToSpender(canonData)); setSelected(vm); initForm(vm); setLoading(false); return; }
+        const { data } = await sb.from("v_spenders").select("*").eq("id", targetId).maybeSingle();
+        if (data) { const vm = buildSpenderVM(targetId) || spenderVM(data); setSelected(vm); initForm(vm); }
+        else if (!localVM) { addToast(fr ? "Spender introuvable" : "Spender not found", "warning"); }
+      } catch (e) { addToast(fr ? "Erreur chargement spender" : "Spender load error", "error"); }
+      setLoading(false);
+    })();
+  }, [open, spenderId, spenderObj?.dbId, spenderObj?.id]);
+
+  const initForm = (vm) => {
+    if (!vm) return;
+    setSpForm({
+      langue: vm.langue || "FR", timezone: vm.timezone || "Europe/Zurich",
+      budget_range: vm.budget_range || "",
+      first_name: vm.first_name !== "\u2014" ? vm.first_name : (vm.contactInfo?.prenom || ""),
+      age: vm.age || "", city: vm.city || "", country: vm.country || "",
+      job: vm.job || (vm.contactInfo?.metier || ""),
+      telegram_username: vm.telegram_username || vm.telegramId || "",
+      whatsapp_phone: vm.whatsapp_phone || "",
+      relationship_status: vm.relationship_status || "",
+      preferences: vm.preferences || "", personality_notes: vm.personality_notes || "",
+      chatter_notes: vm.dbNotes || "", favorite_content: vm.favorite_content || "",
+      best_time: vm.best_time || "", classification: vm.classification || "new",
+      risk_level: vm.risk_level || "safe", source: vm.source || "",
+      tags: vm.dbTags || [], status: vm.dbStatus || "active"
+    });
+  };
+
+  // ── Save profile ──
+  const handleSaveProfile = async () => {
+    if (!selected?.dbId) { addToast(fr ? "Spender sans ID DB" : "Spender has no DB ID", "error"); return; }
+    setSpSavingProfile(true);
+    try {
+      if (chatterMode) {
+        const { error } = await sb.from("spenders").update({
+          notes: spForm.chatter_notes || null, classification: spForm.classification || "new",
+          relationship_status: spForm.relationship_status || null, budget_range: spForm.budget_range || null,
+        }).eq("id", selected.dbId);
+        if (error) throw new Error(error.message);
+      } else {
+        const profilePatch = { first_name: spForm.first_name || null, age: spForm.age ? parseInt(spForm.age) : null, city: spForm.city || null, country: spForm.country || null, job: spForm.job || null, language: spForm.langue || "FR", timezone: spForm.timezone || "Europe/Zurich", budget_range: spForm.budget_range || null, relationship_status: spForm.relationship_status || null, notes_chatter: spForm.chatter_notes || null };
+        const currentMeta = selected.meta || {};
+        const mergedProfile = { ...(currentMeta.profile || {}), ...profilePatch };
+        const updates = { first_name: spForm.first_name || null, age: spForm.age ? parseInt(spForm.age) : null, city: spForm.city || null, country: spForm.country || null, job: spForm.job || null, langue: spForm.langue || "FR", timezone: spForm.timezone || "Europe/Zurich", budget_range: spForm.budget_range || null, telegram_username: spForm.telegram_username || null, whatsapp_phone: spForm.whatsapp_phone || null, relationship_status: spForm.relationship_status || null, preferences: spForm.preferences || null, personality_notes: spForm.personality_notes || null, notes: spForm.chatter_notes || null, favorite_content: spForm.favorite_content || null, best_time: spForm.best_time || null, classification: spForm.classification || "new", risk_level: spForm.risk_level || "safe", source: spForm.source || null, tags: spForm.tags || [], status: spForm.status || "active", meta: { ...currentMeta, profile: mergedProfile, last_enrich_source: "crm_manual", last_enrich_at: new Date().toISOString() } };
+        const { error } = await sb.from("spenders").update(updates).eq("id", selected.dbId);
+        if (error) throw new Error(error.message);
+      }
+      addToast(fr ? "Sauvegardé ✓" : "Saved ✓", "success");
+      setSpEditMode(false);
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); }
+    setSpSavingProfile(false);
+  };
+
+  // ── Delete spender ──
+  const handleDeleteSpender = async (sp) => {
+    if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
+    setDeleteLoading(true);
+    try {
+      if (deleteConfirmTxAction === "delete") {
+        await sb.from("transactions").delete().eq("spender_id", sp.dbId);
+        if (sp.handle && sp.handle !== "unknown") await sb.from("transactions").delete().eq("spender_handle", sp.handle).is("spender_id", null);
+      } else {
+        await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
+      }
+      const { error } = await sb.from("spenders").delete().eq("id", sp.dbId);
+      if (error) { addToast("Erreur: " + error.message, "error"); setDeleteLoading(false); return; }
+      addToast(fr ? "Spender supprimé ✓" : "Spender deleted ✓", "success");
+      setDeleteConfirm(null); setDeleteConfirmTxAction("keep"); setDeleteLoading(false);
+      onClose();
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); setDeleteLoading(false); }
+  };
+
+  // ── TX status change ──
+  const handleSpStatus = async (txId, newStatus) => {
+    if (processingTxId) return;
+    setProcessingTxId(txId);
+    try {
+      const currentTx = (selected?.txs || []).find(tx => tx.id === txId);
+      if (currentTx && currentTx.status !== "pending") { addToast(t(lang, "tx_immutable"), "error"); setProcessingTxId(null); return; }
+      const { error } = await sb.from("transactions").update({ status: newStatus }).eq("id", txId);
+      if (error) { addToast("Erreur: " + error.message, "error"); setProcessingTxId(null); return; }
+      if (onRefresh) await onRefresh();
+      addToast(newStatus === "validated" ? (t(lang, "tx_validated")) : (t(lang, "tx_refused")), newStatus === "validated" ? "success" : "error");
+    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+    setProcessingTxId(null);
+  };
+
+  // ── TX edit/create within modal ──
+  const handleSpEditSave = async (updates) => {
+    if (!editingTx) return;
+    setSpSaving(true);
+    const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+    try {
+      if (!editingTx.id) {
+        const rawHandle = (updates.spender_handle || editingTx.spender_handle || "").trim();
+        const existingSpenderId = editingTx._spender_id || null;
+        let resolvedSpenderId = null;
+        let resolvedHandle = rawHandle;
+        if (isUUID(existingSpenderId)) {
+          const { data: spRow } = await sb.from("spenders").select("id,handle,name").eq("id", existingSpenderId).maybeSingle();
+          if (spRow) { resolvedSpenderId = spRow.id; resolvedHandle = spRow.handle || spRow.name || rawHandle; }
+        }
+        if (!resolvedSpenderId) {
+          const resolved = await resolveOrCreateSpender({ handle: rawHandle, name: rawHandle });
+          resolvedSpenderId = resolved.id; resolvedHandle = resolved.handle || rawHandle || "unknown";
+        }
+        const txRow = {
+          date: new Date().toISOString(), spender_handle: resolvedHandle,
+          amount: parseFloat(updates.amount) || 0, currency: updates.currency || "CHF",
+          amount_original: parseFloat(updates.amount) || 0, currency_original: updates.currency || "CHF",
+          status: "pending", notes: updates.notes || null,
+        };
+        if (isUUID(updates.model_id)) txRow.model_id = updates.model_id;
+        else if (isUUID(editingTx.model_id)) txRow.model_id = editingTx.model_id;
+        if (isUUID(updates.provider_id)) txRow.provider_id = updates.provider_id;
+        const chatterId = updates.chatter_id || editingTx.chatter_id || user?.id;
+        if (isUUID(chatterId)) txRow.chatter_id = chatterId;
+        if (updates.product) txRow.product = updates.product;
+        if (isUUID(updates.product_id)) txRow.product_id = updates.product_id;
+        if (isUUID(updates.product_tag_id)) txRow.product_tag_id = updates.product_tag_id;
+        if (isUUID(resolvedSpenderId)) txRow.spender_id = resolvedSpenderId;
+        const res = await safeInsertTx(txRow);
+        setSpSaving(false);
+        if (res.error) { addToast("Erreur: " + res.error.message, "error"); return; }
+        setEditingTx(null);
+        if (onRefresh) await onRefresh();
+        addToast(fr ? "TX créée ✓" : "TX created ✓", "success");
+      } else {
+        if (editingTx.status !== "pending") { setEditingTx(null); setSpSaving(false); return; }
+        const updateRow = { spender_handle: updates.spender_handle || null, amount: parseFloat(updates.amount) || 0, currency: updates.currency || "CHF", notes: updates.notes || null, product: updates.product || null };
+        if (isUUID(updates.model_id)) updateRow.model_id = updates.model_id;
+        if (isUUID(updates.provider_id)) updateRow.provider_id = updates.provider_id;
+        if (isUUID(updates.chatter_id)) updateRow.chatter_id = updates.chatter_id;
+        if (isUUID(updates.product_id)) updateRow.product_id = updates.product_id;
+        if (isUUID(updates.product_tag_id)) updateRow.product_tag_id = updates.product_tag_id;
+        const { error } = await sb.from("transactions").update(updateRow).eq("id", editingTx.id).eq("status", "pending");
+        setSpSaving(false);
+        if (error) { addToast("Erreur: " + error.message, "error"); return; }
+        setEditingTx(null);
+        if (onRefresh) await onRefresh();
+        addToast(t(lang, "tx_updated"), "success");
+      }
+    } catch (e) { setSpSaving(false); addToast("Erreur: " + (e.message || e), "error"); }
+  };
+
+  // ── Copy tg_id to clipboard ──
+  const copyTgId = () => {
+    const tgId = selected?.tg_user_id || selected?.telegramId || "";
+    if (!tgId) return;
+    try { navigator.clipboard.writeText(String(tgId)); addToast(fr ? "tg_id copié ✓" : "tg_id copied ✓", "success"); }
+    catch (e) { addToast("Erreur copie", "error"); }
+  };
+
+  if (!open) return null;
+
+  // Loading state
+  if (loading && !selected) {
+    return React.createElement(ModalShell, { open: true, onClose, closeOnBackdrop: true, closeOnEsc: true },
+      React.createElement("div", { className: "ui-panel", style: { maxWidth: 480, width: "90vw", padding: 48, textAlign: "center", borderRadius: 20 } },
+        React.createElement("div", { style: { fontSize: 32, marginBottom: 16 } }, "\u23F3"),
+        React.createElement("div", { style: { fontSize: 14, color: "var(--text-tertiary)" } }, fr ? "Chargement..." : "Loading...")
+      )
+    );
+  }
+
+  // Null guard
+  if (!selected || selected._isNull) {
+    return React.createElement(ModalShell, { open: true, onClose, closeOnBackdrop: true, closeOnEsc: true },
+      React.createElement("div", { className: "ui-panel", style: { maxWidth: 480, width: "90vw", padding: 48, textAlign: "center", borderRadius: 20 } },
+        React.createElement("div", { style: { fontSize: 48, marginBottom: 16 } }, "\u{1F464}"),
+        React.createElement("h3", { style: { fontSize: 18, fontWeight: 800, marginBottom: 8 } }, fr ? "Spender introuvable" : "Spender not found"),
+        React.createElement("button", { onClick: onClose, className: "ui-btn-secondary", style: { fontSize: 13, padding: "10px 24px" } }, fr ? "Fermer" : "Close")
+      )
+    );
+  }
+
+  const _badgeList = getSpenderBadges(selected, dbBadges);
+  const _badges = _badgeList.length > 0 ? _badgeList : computeSpenderBadges(selected).map(b => b.label);
+  const _vipScore = computeVIPScore(selected);
+
+  // ── TG tag display ──
+  const tgTag = selected.telegram_username || selected.telegramId || selected.tg_user_id || null;
+  const tgTagLabel = selected.telegram_username ? ("@" + selected.telegram_username) : (tgTag ? ("TG:" + tgTag) : null);
+
+  // ── Header buttons helper ──
+  const canEdit = !readOnly || chatterMode;
+  const canDelete = !readOnly && !chatterMode && selected.dbId;
+
+  return (
+    <>
+    <ModalShell open={true} onClose={onClose} closeOnBackdrop={true} closeOnEsc={true}>
+      <div className="ui-panel" style={{maxWidth:720,width:"95vw",maxHeight:"90vh",overflowY:"auto",borderRadius:_isMobile?"20px 20px 0 0":24}}>
+        {/* ══ HEADER ══ */}
+        <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <SpenderAvatar sp={selected} size={56} radius={12} />
+            <div>
+              <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+                <span style={{fontSize:18,fontWeight:800}}>{getSpenderDisplayName(selected)}</span>
+                {selected?.langue && LANG_FLAGS[selected.langue] && <span style={{fontSize:16}}>{LANG_FLAGS[selected.langue]}</span>}
+                {_badges.length > 0 && _badges.slice(0,2).map(b => { const bs = getBadgeStyle(b); return <span key={b} style={{fontSize:8,padding:"1px 6px",borderRadius:6,background:bs.bg,color:bs.c,fontWeight:700}}>{bs.icon} {b}</span>; })}
+                {spenderJustUpdated && <span style={{fontSize:9,padding:"2px 8px",borderRadius:8,background:"var(--success-muted)",color:"var(--success)",fontWeight:700}}>UPDATED</span>}
+              </div>
+              <div style={{display:"flex",gap:6,marginTop:4,alignItems:"center",flexWrap:"wrap"}}>
+                {tgTagLabel && <span onClick={copyTgId} title={fr?"Cliquer pour copier tg_id":"Click to copy tg_id"} style={{fontSize:10,padding:"2px 8px",borderRadius:6,background:"rgba(0,136,204,0.12)",color:"#0088cc",fontWeight:700,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.7"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>{tgTagLabel}</span>}
+                {selected.whatsapp_phone && <span style={{fontSize:10,padding:"2px 8px",borderRadius:6,background:"rgba(37,211,102,0.08)",color:"var(--brand-whatsapp,#25d366)",fontWeight:700}}>WA</span>}
+              </div>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            {canEdit && <button onClick={()=>{
+              const rawHandle = selected.handle || selected.name || "";
+              const cleanHandle = (rawHandle === "\u2014" || rawHandle === "?" || !rawHandle) ? "" : rawHandle;
+              setEditingTx({ status:"pending", spender_handle:cleanHandle, _spender_id:selected.dbId||selected.id||null, amount:"", currency:"CHF", date:new Date().toISOString().slice(0,10), model_id:selected.model_id||"", chatter_id:user?.id||"" });
+            }} className="ui-btn-primary" style={{fontSize:10,padding:"5px 10px"}}>{"\u2795"} {fr?"Créer TX":"Create TX"}</button>}
+            {canEdit && <button onClick={()=>{setSpEditMode(!spEditMode);if(!spEditMode)initForm(selected);}} className="ui-btn-secondary" style={{fontSize:10,padding:"5px 12px"}}>{spEditMode?(fr?"Annuler":"Cancel"):(fr?"Modifier":"Edit")}</button>}
+            {canEdit && selected.dbId && (selected.tg_user_id||selected.telegramId) && (
+              <button onClick={async()=>{
+                try {
+                  const{data,error}=await sb.rpc("fn_refresh_spender_from_tg",{p_spender_id:selected.dbId});
+                  if(error){addToast(fr?"Erreur: "+error.message:"Error: "+error.message,"error");return;}
+                  addToast(data?.enrich_queued?(fr?"Enrich mis en file d'attente":"Enrich queued"):(fr?"Rafraîchi":"Refreshed"),"success");
+                  if(onRefresh)await onRefresh();
+                }catch(e){addToast("Erreur: "+(e?.message||e),"error");}
+              }} style={{padding:"5px 10px",borderRadius:10,background:"rgba(0,136,204,0.12)",border:"1px solid rgba(0,136,204,0.3)",color:"#0088cc",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"\u{1F504}"} Sync TG</button>
+            )}
+            {canDelete && <button onClick={()=>setDeleteConfirm(selected)} style={{padding:"5px 10px",borderRadius:10,background:"var(--danger-muted)",border:"none",color:"var(--danger)",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"\u{1F5D1}"}</button>}
+            <button onClick={onClose} style={{width:28,height:28,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border-default)",color:"var(--text-tertiary)",fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"\u2715"}</button>
+          </div>
+        </div>
+
+        {/* ══ KPI ROW + VIP ══ */}
+        <div style={{padding:"16px 24px",borderBottom:"1px solid var(--border-subtle)"}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr",gap:10,marginBottom:10}}>
+            <div style={{textAlign:"center",padding:8,borderRadius:10,background:"var(--bg-overlay)"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>LTV</div><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{(selected.ltv||0).toFixed(0)}{currencySymbol}</div></div>
+            <div style={{textAlign:"center",padding:8,borderRadius:10,background:"var(--bg-overlay)"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>{t(lang,"aov")}</div><div style={{fontSize:16,fontWeight:800}}>{(selected.aov||0).toFixed(0)}{currencySymbol}</div></div>
+            <div style={{textAlign:"center",padding:8,borderRadius:10,background:"var(--bg-overlay)"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>TX</div><div style={{fontSize:16,fontWeight:800}}>{selected.cnt}</div></div>
+            <div style={{textAlign:"center",padding:8,borderRadius:10,background:"var(--bg-overlay)"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>{fr?"Validé":"Valid"}</div><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{(selected.validCA||0).toFixed(0)}{currencySymbol}</div></div>
+            <div style={{textAlign:"center",padding:8,borderRadius:10,background:"var(--bg-overlay)"}}><div style={{fontSize:9,color:"var(--text-quaternary)",textTransform:"uppercase"}}>Pending</div><div style={{fontSize:16,fontWeight:800,color:"var(--warning)"}}>{(selected.pendingCA||0).toFixed(0)}{currencySymbol}</div></div>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:10,fontWeight:700,color:"var(--text-tertiary)"}}>VIP</span><div style={{flex:1}}><VIPScoreBar score={_vipScore}/></div></div>
+        </div>
+
+        {/* ══ TABS ══ */}
+        <div style={{display:"flex",gap:0,borderBottom:"1px solid var(--border-subtle)"}}>
+          {[{key:"profil",label:"Profil",icon:"\u{1F464}"},{key:"historique",label:"Historique TX",icon:"\u{1F4B0}"},{key:"prefs",label:fr?"Préférences":"Preferences",icon:"\u2764\uFE0F"}].map(tb=>(
+            <button key={tb.key} onClick={()=>setSpModalTab(tb.key)} style={{flex:1,padding:"12px 8px",border:"none",borderBottom:spModalTab===tb.key?"2px solid var(--accent)":"2px solid transparent",background:"transparent",color:spModalTab===tb.key?"var(--accent)":"var(--text-tertiary)",fontSize:12,fontWeight:700,cursor:"pointer"}}>{tb.icon} {tb.label}</button>
+          ))}
+        </div>
+
+        <div style={{padding:"16px 24px"}}>
+        {/* ── TAB PROFIL ── */}
+        {spModalTab==="profil" && (
+          <div>
+            {spEditMode ? (
+              <div>
+                {chatterMode && (
+                  <div style={{padding:"8px 12px",borderRadius:8,background:"var(--accent-muted)",border:"1px solid var(--accent)",fontSize:11,color:"var(--accent)",fontWeight:600,marginBottom:12}}>
+                    {"\u270F\uFE0F"} {fr?"Champs modifiables : Notes, Badge, Relation, Budget":"Editable fields: Notes, Badge, Relation, Budget"}
+                  </div>
+                )}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+                  {!chatterMode&&<div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>ID Telegram</div><input className="filter-select" style={{width:"100%"}} value={spForm.telegram_username||""} onChange={e=>setSpForm(p=>({...p,telegram_username:e.target.value}))} placeholder="@username ou 123456789"/></div>}
+                  {!chatterMode&&[{l:fr?"Prénom":"First name",f:"first_name",t:"text"},{l:fr?"Âge":"Age",f:"age",t:"number"},{l:fr?"Ville":"City",f:"city",t:"text"},{l:fr?"Pays":"Country",f:"country",t:"text"},{l:fr?"Métier":"Job",f:"job",t:"text"},{l:"Source",f:"source",t:"text"}].map(fd=>(
+                    <div key={fd.f}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fd.l}</div><input type={fd.t} className="filter-select" style={{width:"100%"}} value={spForm[fd.f]||""} onChange={e=>setSpForm(p=>({...p,[fd.f]:e.target.value}))}/></div>
+                  ))}
+                  {chatterMode&&[{l:fr?"Prénom":"Name",v:spForm.first_name||"\u2014"},{l:fr?"Âge":"Age",v:spForm.age||"\u2014"},{l:fr?"Ville":"City",v:spForm.city||"\u2014"},{l:fr?"Pays":"Country",v:spForm.country||"\u2014"},{l:fr?"Métier":"Job",v:spForm.job||"\u2014"},{l:"Source",v:spForm.source||"\u2014"}].map(fd=>(
+                    <div key={fd.l}><div style={{fontSize:10,color:"var(--text-quaternary)",marginBottom:4,textTransform:"uppercase"}}>{fd.l}</div><div style={{fontSize:12,color:"var(--text-secondary)",padding:"6px 10px",borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border-subtle)"}}>{fd.v}</div></div>
+                  ))}
+                  {!chatterMode&&<div><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fr?"Langue":"Language"}</div><select className="filter-select" style={{width:"100%"}} value={spForm.langue||"FR"} onChange={e=>setSpForm(p=>({...p,langue:e.target.value}))}>{SPENDER_LANGUAGES.map(l=><option key={l} value={l}>{LANG_FLAGS[l]} {l}</option>)}</select></div>}
+                  {!chatterMode&&<div><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>Timezone</div><select className="filter-select" style={{width:"100%"}} value={spForm.timezone||"Europe/Zurich"} onChange={e=>setSpForm(p=>({...p,timezone:e.target.value}))}><option value="Europe/Zurich">Europe/Zurich</option><option value="Europe/Paris">Europe/Paris</option><option value="Europe/Berlin">Europe/Berlin</option><option value="Europe/Rome">Europe/Rome</option><option value="America/New_York">America/NY</option></select></div>}
+                  <div><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fr?"Budget (CHF)":"Budget (CHF)"}</div><input className="filter-select" style={{width:"100%"}} value={spForm.budget_range||""} onChange={e=>setSpForm(p=>({...p,budget_range:e.target.value}))} placeholder="ex: 100-500"/></div>
+                  <div><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fr?"Relation":"Relationship"}</div><select className="filter-select" style={{width:"100%"}} value={spForm.relationship_status||""} onChange={e=>setSpForm(p=>({...p,relationship_status:e.target.value}))}><option value="">{"\u2014"}</option><option value="célibataire">{fr?"Célibataire":"Single"}</option><option value="en couple">{fr?"En couple":"In relationship"}</option><option value="marié">{fr?"Marié":"Married"}</option></select></div>
+                  {!chatterMode&&<div><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>WhatsApp</div><input className="filter-select" style={{width:"100%"}} value={spForm.whatsapp_phone||""} onChange={e=>setSpForm(p=>({...p,whatsapp_phone:e.target.value}))} placeholder="+41..."/></div>}
+                  <div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:6,textTransform:"uppercase"}}>{fr?"Notes chatter":"Chatter notes"}</div><textarea className="filter-select" style={{width:"100%",minHeight:50,resize:"vertical"}} value={spForm.chatter_notes||""} onChange={e=>setSpForm(p=>({...p,chatter_notes:e.target.value}))} placeholder={fr?"Notes internes\u2026":"Internal notes\u2026"}/></div>
+                </div>
+                <div style={{marginBottom:10}}>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:6,textTransform:"uppercase"}}>{fr?"Badge manuel":"Manual badge"}</div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    {[{v:"gorille",l:"\u{1F98D} GORILLE",c:"#c4b5fd"},{v:"orang_outan",l:"\u{1F9A7} ORANG-OUTAN",c:"#fdba74"},{v:"ouistiti",l:"\u{1F412} OUISTITI",c:"#93c5fd"},{v:"lead",l:"\u{1F435} LEAD",c:"#86efac"},{v:"timewaster",l:"\u{1F64A} TIMEWASTER",c:"#fca5a5"}].map(cls=>(
+                      <button key={cls.v} onClick={()=>setSpForm(p=>({...p,classification:p.classification===cls.v?"new":cls.v}))} style={{padding:"5px 12px",borderRadius:10,border:spForm.classification===cls.v?`2px solid ${cls.c}`:"1px solid var(--border-subtle)",background:spForm.classification===cls.v?cls.c+"22":"transparent",color:spForm.classification===cls.v?cls.c:"var(--text-quaternary)",fontSize:10,fontWeight:700,cursor:"pointer"}}>{cls.l}</button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{display:"flex",justifyContent:"flex-end",gap:8,paddingTop:12,borderTop:"1px solid var(--border-subtle)"}}>
+                  <button onClick={()=>setSpEditMode(false)} className="btn" style={{fontSize:11}}>{fr?"Annuler":"Cancel"}</button>
+                  <button onClick={handleSaveProfile} disabled={spSavingProfile} className="btn btn-primary" style={{fontSize:11}}>{spSavingProfile?React.createElement(Spinner,{size:14}):(fr?"Sauvegarder \u2713":"Save \u2713")}</button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
+                  {(()=>{const mp=getSpenderMetaProfile(selected); const _fmtCreatedAt=(d)=>{if(!d)return"\u2014";try{const dt=new Date(d);const pad=n=>String(n).padStart(2,"0");return`${pad(dt.getDate())}.${pad(dt.getMonth()+1)}.${dt.getFullYear()} \u00e0 ${pad(dt.getHours())}:${pad(dt.getMinutes())}`;}catch{return"\u2014";}};return [{l:fr?"Prénom":"Name",v:mp.first_name||selected.first_name||selected.contactInfo?.prenom||"\u2014"},{l:fr?"Âge":"Age",v:mp.age||selected.age||"\u2014"},{l:fr?"Ville":"City",v:mp.city||selected.city||"\u2014"},{l:fr?"Pays":"Country",v:mp.country||selected.country||"\u2014"},{l:fr?"Métier":"Job",v:mp.job||selected.job||selected.contactInfo?.metier||"\u2014"},{l:fr?"Langue":"Language",v:(mp.language||selected.langue)?(LANG_FLAGS[mp.language||selected.langue]||"")+" "+(mp.language||selected.langue):"\u2014"},{l:"Timezone",v:mp.timezone||selected.timezone||"Europe/Zurich"},{l:fr?"Budget":"Budget",v:(mp.budget_range||selected.budget_range)?(mp.budget_range||selected.budget_range)+" CHF":"\u2014"},{l:"Source",v:selected.source||"\u2014"},{l:fr?"Relation":"Relation",v:mp.relation||selected.relationship_status||"\u2014"},{l:fr?"Notes chatter":"Chatter notes",v:mp.notes_chatter||selected.dbNotes||"\u2014"},{l:fr?"Créé le":"Created at",v:_fmtCreatedAt(selected.created_at)}];})().map(f=>(
+                    <div key={f.l}><div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:2}}>{f.l}</div><div style={{fontSize:13,fontWeight:600}}>{f.v}</div></div>
+                  ))}
+                </div>
+                {_badges.length > 0 && (
+                  <div style={{display:"flex",gap:4,flexWrap:"wrap",marginBottom:10}}>
+                    {_badges.map(b=>{const bs=getBadgeStyle(b); return <span key={b} onClick={e=>{e.stopPropagation();if(selected.dbId)toggleBadge(selected.dbId,b);}} title={selected.dbId?(fr?"Cliquer pour retirer":"Click to remove"):""} style={{fontSize:10,padding:"2px 8px",borderRadius:8,background:bs.bg,color:bs.c,fontWeight:600,cursor:selected.dbId?"pointer":"default"}} onMouseEnter={e=>{if(selected.dbId)e.currentTarget.style.opacity="0.6";}} onMouseLeave={e=>{e.currentTarget.style.opacity="1";}}>{bs.icon} {b}</span>;})}
+                  </div>
+                )}
+                <div style={{display:"flex",gap:8}}>
+                  {selected.telegramId && <div style={{padding:8,borderRadius:10,background:"rgba(0,136,204,0.08)",border:"1px solid rgba(0,136,204,0.15)",fontSize:11}}><span style={{fontWeight:700,color:"var(--brand-telegram)"}}>TG</span> <span style={{fontFamily:"monospace"}}>{selected.telegramId}</span></div>}
+                  {selected.whatsapp_phone && <div style={{padding:8,borderRadius:10,background:"rgba(37,211,102,0.08)",border:"1px solid rgba(37,211,102,0.15)",fontSize:11}}><span style={{fontWeight:700,color:"var(--brand-whatsapp)"}}>WA</span> {selected.whatsapp_phone}</div>}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── TAB PRÉFÉRENCES ── */}
+        {spModalTab==="prefs" && (
+          <div>
+            {(()=>{
+              const txArr = selected.txs || [];
+              const prodMap = {}; txArr.forEach(tx=>{const p=tx.product||tx.tag;if(p){prodMap[p]=(prodMap[p]||{count:0,ca:0});prodMap[p].count++;prodMap[p].ca+=Number(tx.amount);}});
+              const topProds = Object.entries(prodMap).sort((a,b)=>b[1].count-a[1].count).slice(0,3);
+              const modMap = {}; txArr.forEach(tx=>{if(tx.model_id){modMap[tx.model_id]=(modMap[tx.model_id]||{count:0,ca:0});modMap[tx.model_id].count++;modMap[tx.model_id].ca+=Number(tx.amount);}});
+              const topModel = Object.entries(modMap).sort((a,b)=>b[1].ca-a[1].ca)[0];
+              const topModelName = topModel ? ((models||[]).find(m=>m.id===topModel[0])?.name||topModel[0]) : null;
+              const pmMap = {}; txArr.forEach(tx=>{if(tx.payment_method){pmMap[tx.payment_method]=(pmMap[tx.payment_method]||0)+1;}});
+              const topPM = Object.entries(pmMap).sort((a,b)=>b[1]-a[1])[0];
+              if (topProds.length===0 && !topModelName && !topPM) return null;
+              return (
+                <div style={{marginBottom:16,padding:14,borderRadius:12,background:"rgba(139,92,246,0.05)",border:"1px solid rgba(139,92,246,0.15)"}}>
+                  <div style={{fontSize:11,fontWeight:700,color:"var(--accent)",marginBottom:10}}>{"\u2728"} {fr?"Préférences auto-calculées":"Auto-detected preferences"}</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10}}>
+                    <div><div style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{fr?"\u{1F6CD}\uFE0F Produits favoris":"\u{1F6CD}\uFE0F Top products"}</div>
+                      {topProds.length>0?topProds.map(([p,d],i)=>(<div key={p} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,padding:"3px 8px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}><span style={{fontSize:11,fontWeight:600,color:i===0?"var(--accent)":"var(--text-secondary)"}}>{i===0?"\u{1F947}":i===1?"\u{1F948}":"\u{1F949}"} {p}</span><span style={{fontSize:9,color:"var(--text-tertiary)"}}>{d.count}\u00d7</span></div>)):<span style={{fontSize:11,color:"var(--text-quaternary)",fontStyle:"italic"}}>{"\u2014"}</span>}
+                    </div>
+                    <div><div style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{"\u{1F49C}"} {fr?"Modèle préférée":"Fav model"}</div>
+                      {topModelName?<div style={{padding:"6px 10px",borderRadius:10,background:"rgba(139,92,246,0.1)",border:"1px solid rgba(139,92,246,0.2)",fontSize:12,fontWeight:700,color:"var(--accent)"}}>{topModelName}</div>:<span style={{fontSize:11,color:"var(--text-quaternary)",fontStyle:"italic"}}>{"\u2014"}</span>}
+                    </div>
+                    <div><div style={{fontSize:9,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6}}>{"\u{1F4B3}"} {fr?"Paiement fav.":"Fav payment"}</div>
+                      {topPM?<div style={{padding:"6px 10px",borderRadius:10,background:"rgba(16,185,129,0.1)",border:"1px solid rgba(16,185,129,0.2)",fontSize:12,fontWeight:700,color:"var(--success)"}}>{topPM[0]}</div>:<span style={{fontSize:11,color:"var(--text-quaternary)",fontStyle:"italic"}}>{"\u2014"}</span>}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+            {spEditMode ? (
+              <div>
+                {[{l:fr?"Préférences / Kinks":"Preferences / Kinks",f:"preferences",ph:fr?"Ex: pieds, lingerie, vidéos POV...":"Ex: feet, lingerie, POV videos..."},{l:fr?"Personnalité":"Personality",f:"personality_notes",ph:fr?"Comment lui parler, ses habitudes...":"How to talk, habits..."},{l:fr?"Contenu favori":"Favorite content",f:"favorite_content",ph:"cam, pack_photo, sexting..."},{l:fr?"Meilleur moment":"Best time",f:"best_time",ph:"ex: soir 21h-23h"},{l:fr?"Notes chatter":"Chatter notes",f:"chatter_notes",ph:fr?"Notes libres...":"Free notes..."}].map(fd=>(
+                  <div key={fd.f} style={{marginBottom:12}}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fd.l}</div><textarea className="filter-select" style={{width:"100%",minHeight:50,resize:"vertical"}} value={spForm[fd.f]||""} onChange={e=>setSpForm(p=>({...p,[fd.f]:e.target.value}))} placeholder={fd.ph}/></div>
+                ))}
+                <div style={{display:"flex",justifyContent:"flex-end",gap:8,paddingTop:12,borderTop:"1px solid var(--border-subtle)"}}>
+                  <button onClick={()=>setSpEditMode(false)} className="btn" style={{fontSize:11}}>{fr?"Annuler":"Cancel"}</button>
+                  <button onClick={handleSaveProfile} disabled={spSavingProfile} className="btn btn-primary" style={{fontSize:11}}>{spSavingProfile?React.createElement(Spinner,{size:14}):(fr?"Sauvegarder":"Save")}</button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                {[{l:fr?"Préférences":"Preferences",v:selected.preferences},{l:fr?"Personnalité":"Personality",v:selected.personality_notes},{l:fr?"Contenu favori":"Fav content",v:selected.favorite_content},{l:fr?"Meilleur moment":"Best time",v:selected.best_time},{l:"Notes",v:selected.dbNotes}].map(f=>(
+                  <div key={f.l} style={{marginBottom:12}}><div style={{fontSize:10,color:"var(--text-quaternary)",textTransform:"uppercase",marginBottom:4}}>{f.l}</div><div style={{fontSize:13,color:f.v?"var(--text-secondary)":"var(--text-quaternary)",fontStyle:f.v?"normal":"italic",lineHeight:1.5}}>{f.v||"\u2014"}</div></div>
+                ))}
+                <button onClick={()=>setSpEditMode(true)} className="btn" style={{fontSize:11,marginTop:8}}>{"\u270F\uFE0F"} {fr?"Modifier":"Edit"}</button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── TAB HISTORIQUE TX ── */}
+        {spModalTab==="historique" && (
+          <div>
+            {canEdit && <button onClick={()=>{
+              const rawHandle = selected.handle || selected.name || "";
+              const cleanHandle = (rawHandle === "\u2014" || rawHandle === "?" || !rawHandle) ? "" : rawHandle;
+              setEditingTx({ status:"pending", spender_handle:cleanHandle, _spender_id:selected.dbId||selected.id||null, amount:"", currency:"CHF", date:new Date().toISOString().slice(0,10), model_id:selected.model_id||"", chatter_id:user?.id||"" });
+            }} className="ui-btn-primary" style={{fontSize:11,padding:"6px 14px",marginBottom:12}}>{"\u2795"} {fr?"Créer TX":"Create TX"}</button>}
+            {(()=>{
+              const txSorted = [...(selected.txs||[])].sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
+              const totalSpent = txSorted.reduce((s,tx)=>s+Number(tx.amount),0);
+              return (
+                <>
+                  <div className="table-wrap" style={{marginBottom:14}}>
+                    <table className="table" style={{fontSize:11}}>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>{fr?"Montant":"Amount"}</th>
+                          <th>{fr?"Produit":"Product"}</th>
+                          <th>Statut</th>
+                          <th>Chatter</th>
+                          <th>Provider</th>
+                          {(user.role==="gerant"||user.role==="provider")&&<th>Actions</th>}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {txSorted.map((tx,idx)=>{
+                          const mName=(models||[]).find(m=>m.id===tx.model_id)?.name||"\u2014";
+                          const chatterName=(profiles||[]).find(p=>p.id===tx.chatter_id)?.name||"\u2014";
+                          const provName=(profiles||[]).find(p=>p.id===tx.provider_id)?.name||"\u2014";
+                          const canEditTx=tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id));
+                          return (
+                            <tr key={tx.id||idx}>
+                              <td style={{fontFamily:"monospace",fontSize:11,whiteSpace:"nowrap",color:"var(--text-secondary)"}}>{fmtDate(tx.date)}</td>
+                              <td style={{fontWeight:800,color:"var(--success)"}}>{fmtAmount(tx.amount,tx.currency)}</td>
+                              <td style={{fontSize:11}}>{tx.product||tx.tag||"\u2014"}</td>
+                              <td><StatusPill status={tx.status} lang={lang}/></td>
+                              <td style={{fontSize:11}}>{chatterName}</td>
+                              <td style={{fontSize:11}}>{provName}</td>
+                              {(user.role==="gerant"||user.role==="provider")&&(
+                                <td style={{whiteSpace:"nowrap"}}>
+                                  {canEditTx&&<button className="btn-edit" style={{marginRight:4}} onClick={()=>setEditingTx(tx)}>{"\u270F\uFE0F"}</button>}
+                                  {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
+                                    <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>handleSpStatus(tx.id,"validated")} disabled={!!processingTxId}>{processingTxId===tx.id?React.createElement(Spinner,{size:12}):"\u2713"}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>setConfirmRefuse(tx)} disabled={!!processingTxId}>{processingTxId===tx.id?React.createElement(Spinner,{size:12}):"\u2715"}</button></>
+                                  )}
+                                </td>
+                              )}
+                            </tr>
+                          );
+                        })}
+                        {txSorted.length===0&&<tr><td colSpan={7} style={{textAlign:"center",color:"var(--text-quaternary)",padding:20}}>{fr?"Aucune transaction":"No transactions"}</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"flex-end",padding:"10px 0",borderTop:"1px solid var(--border-subtle)"}}>
+                    <span style={{fontSize:13,color:"var(--text-tertiary)",marginRight:8}}>{fr?"Total dépensé :":"Total spent:"}</span>
+                    <span style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{totalSpent.toFixed(0)}{currencySymbol}</span>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        )}
+        </div>
+      </div>
+    </ModalShell>
+
+    {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleSpEditSave} onCancel={()=>setEditingTx(null)} saving={spSaving} models={models||[]} profiles={profiles||[]} products={products||[]} productTags={productTags||[]} providerPaymentMethods={providerPaymentMethods} />}
+    <ConfirmModal open={!!confirmRefuse} title={t(lang,"refuse_tx_confirm")} message={confirmRefuse?`${confirmRefuse.spender_handle} \u2014 ${confirmRefuse.amount} ${confirmRefuse.currency||"CHF"}`:""} lang={lang} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleSpStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)}/>
+
+    {deleteConfirm && (
+      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setDeleteConfirm(null)}>
+        <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:400,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:16,fontWeight:800,color:"var(--danger)",marginBottom:8}}>{"\u{1F5D1}\uFE0F"} {fr?"Supprimer ce spender ?":"Delete this spender?"}</div>
+          <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:16}}>{getSpenderDisplayName(deleteConfirm)} {"\u2014"} {fr?"Cette action est irréversible.":"This action is irreversible."}</div>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>{fr?"Que faire des transactions associées ?":"What to do with associated transactions?"}</div>
+          {[{v:"keep",label:fr?"Conserver les TX (orphelines)":"Keep TX (orphaned)"},{v:"delete",label:fr?"Supprimer aussi les TX":"Delete TX as well"}].map(opt=>(
+            <div key={opt.v} onClick={()=>setDeleteConfirmTxAction(opt.v)} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,border:"2px solid "+(deleteConfirmTxAction===opt.v?"var(--danger)":"var(--border)"),background:deleteConfirmTxAction===opt.v?"rgba(239,68,68,0.08)":"var(--bg-overlay)",cursor:"pointer",marginBottom:8}}>
+              <div style={{width:14,height:14,borderRadius:"50%",border:"2px solid "+(deleteConfirmTxAction===opt.v?"var(--danger)":"var(--border)"),background:deleteConfirmTxAction===opt.v?"var(--danger)":"transparent",flexShrink:0}}/>
+              <span style={{fontSize:13}}>{opt.label}</span>
+            </div>
+          ))}
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:16}}>
+            <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+            <button onClick={()=>handleDeleteSpender(deleteConfirm)} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
+              {deleteLoading ? "\u23F3 ..." : `\u{1F5D1}\uFE0F ${fr?"Supprimer":"Delete"}`}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
+  );
+});
+
+// =============================================
 // TRANSACTIONS TAB
 // =============================================
 const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, models, profiles, dbSpenders, onRefresh, onNotify, products, productTags, modelPrices, providerPaymentMethods, navigateToSpender}) => {
@@ -7813,6 +8435,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     document.addEventListener("mousedown",h);
     return ()=>document.removeEventListener("mousedown",h);
   },[showSpDrop]);
+  const [unifiedSpenderId, setUnifiedSpenderId] = useState(null);
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
   const {sort, onSort, doSort} = useSortable();
@@ -8277,6 +8900,10 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                       const rawHandle=tx.spender_handle||"";
                       const displayName=dbSp?.first_name||(dbSp?.telegram_username?`@${dbSp.telegram_username}`:null)||(TG_NUM.test(rawHandle)?null:rawHandle)||rawHandle;
                       const spKey=dbSp?.handle||dbSp?.name||rawHandle;
+                      const openId = dbSp?.id || tx.spender_id || null;
+                      if(openId){
+                        return <span onClick={()=>setUnifiedSpenderId(openId)} style={{cursor:"pointer",textDecoration:"underline dotted",textUnderlineOffset:3}} title={`Ouvrir fiche ${spKey}`}><Tag type="spender" label={displayName} id={spKey}/></span>;
+                      }
                       if(navigateToSpender&&spKey){
                         return <span onClick={()=>navigateToSpender(spKey)} style={{cursor:"pointer",textDecoration:"underline dotted",textUnderlineOffset:3}} title={`Ouvrir fiche ${spKey}`}><Tag type="spender" label={displayName} id={spKey}/></span>;
                       }
@@ -8328,6 +8955,17 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
       </div>
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={() => setEditingTx(null)} saving={saving} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
       <ConfirmModal open={!!confirmRefuse} title={t(lang,"refuse_tx_confirm")||"Refuser cette transaction ?"} message={confirmRefuse?`${confirmRefuse.spender_handle} — ${confirmRefuse.amount} ${confirmRefuse.currency||"CHF"}`:""} lang={lang} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)}/>
+      <UnifiedSpenderModal
+        open={!!unifiedSpenderId}
+        spenderId={unifiedSpenderId}
+        onClose={()=>setUnifiedSpenderId(null)}
+        user={user} lang={lang} models={models} profiles={profiles}
+        dbSpenders={dbSpenders} txs={txs} onRefresh={onRefresh} onNotify={onNotify}
+        products={products} productTags={productTags}
+        providerPaymentMethods={providerPaymentMethods}
+        readOnly={user.role!=="gerant"&&user.role!=="chatter"}
+        chatterMode={user.role==="chatter"}
+      />
     </div>
   );
 });
@@ -8347,6 +8985,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [sortBy, setSortBy] = useState("ltv");
   const [filterModel, setFilterModel] = useState("");
   const [selected, setSelected] = useState(null);
+  const [unifiedSpenderId, setUnifiedSpenderId] = useState(null);
   const [detailModel, setDetailModel] = useState("");
   const [detailTab, setDetailTab] = useState("models");
   const [editingTx, setEditingTx] = useState(null);
@@ -9011,7 +9650,11 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   useEffect(()=>{
     if(selectedSpenderKey && spenders.length > 0) {
       const found = spenders.find(s => (s.name||"").toLowerCase() === selectedSpenderKey.toLowerCase());
-      if(found) { setSelected(found); setDetailModel(""); setDetailTab("models"); }
+      if(found) {
+        const spDbId = found.dbId || found.id;
+        if (spDbId) { setUnifiedSpenderId(spDbId); }
+        else { setSelected(found); setDetailModel(""); setDetailTab("models"); }
+      }
       if(setSelectedSpenderKey) setSelectedSpenderKey(null);
     }
   },[selectedSpenderKey, spenders]);
@@ -9360,7 +10003,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             const _relTime = _isNew ? formatRelativeTime(s.created_at) : _isUpdated ? formatRelativeTime(s.updated_at) : "";
             const _mp = getSpenderMetaProfile(s);
             return (
-            <div key={_cardKey} id={`spender-card-${_cardKey}`} className={`spender-card${_hasGlow?" spender-card-glow":""}${_isHighlighted?" spender-card-highlight":""}`} onClick={()=>openSpenderModal(s)}
+            <div key={_cardKey} id={`spender-card-${_cardKey}`} className={`spender-card${_hasGlow?" spender-card-glow":""}${_isHighlighted?" spender-card-highlight":""}`} onClick={()=>{const spDbId=s.dbId||s.id;if(spDbId){setUnifiedSpenderId(spDbId);}else{openSpenderModal(s);}}}
               style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:16,cursor:"pointer",transition:"all 0.18s",position:"relative"}}
               onMouseEnter={e=>{e.currentTarget.style.borderColor="var(--accent)";e.currentTarget.style.transform="translateY(-2px)";e.currentTarget.style.boxShadow="0 8px 24px rgba(139,92,246,0.12)";}}
               onMouseLeave={e=>{e.currentTarget.style.borderColor=_hasGlow?"rgba(139,92,246,0.45)":"var(--border)";e.currentTarget.style.transform="";e.currentTarget.style.boxShadow=_hasGlow?"0 0 12px 2px rgba(139,92,246,0.10)":"";}}
@@ -9889,6 +10532,16 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           </div>
         </div>
       </>)}
+      <UnifiedSpenderModal
+        open={!!unifiedSpenderId}
+        spenderId={unifiedSpenderId}
+        onClose={()=>setUnifiedSpenderId(null)}
+        user={user} lang={lang} models={models} profiles={profiles}
+        dbSpenders={dbSpenders} txs={txs} onRefresh={onRefresh} onNotify={onNotify}
+        products={products} productTags={productTags}
+        providerPaymentMethods={providerPaymentMethods}
+        readOnly={readOnly} chatterMode={chatterMode}
+      />
     </div>
   );
 });
