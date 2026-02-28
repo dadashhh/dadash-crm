@@ -3881,12 +3881,98 @@ const safeInsertTx = async (txData) => {
 const safeUpsertSpender = async (spenderData) => {
   let res = await sb.from("spenders").upsert(spenderData, {onConflict: "handle"});
   if (!res.error) return res;
-  // Full upsert failed, try minimal fallback
-  // Fallback: minimal
   return await sb.from("spenders").upsert(
     {handle: spenderData.handle, name: spenderData.name || spenderData.handle},
     {onConflict: "handle"}
   );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveOrCreateSpender — FONCTION CENTRALE ANTI-DOUBLON
+// Résout un spender existant ou en crée un nouveau.
+// Ordre de priorité : tg_user_id → tg_username → phone → nom exact → handle
+// Retourne { id, handle, isNew }
+// ─────────────────────────────────────────────────────────────────────────────
+const resolveOrCreateSpender = async ({ tg_user_id, tg_username, phone, name, handle, extra = {} } = {}) => {
+  // Normalise le tg_user_id en string numérique pure
+  const normTgId = tg_user_id ? String(tg_user_id).replace(/\D/g, "") : null;
+  // Normalise le username sans @
+  const normUsername = tg_username ? String(tg_username).replace(/^@/, "").trim() : null;
+  // Normalise le handle sans @ pour la recherche
+  const normHandle = handle ? String(handle).replace(/^@/, "").trim() : null;
+
+  let existing = null;
+
+  // 1. Match par tg_user_id (le plus fiable)
+  if (normTgId) {
+    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username").eq("tg_user_id", normTgId).maybeSingle();
+    if (data) existing = data;
+  }
+
+  // 2. Match par username TG (sans @, case insensitive)
+  if (!existing && normUsername) {
+    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username")
+      .or(`telegram_username.ilike.${normUsername},handle.ilike.${normUsername},handle.ilike.@${normUsername}`)
+      .maybeSingle();
+    if (data) existing = data;
+  }
+
+  // 3. Match par téléphone
+  if (!existing && phone) {
+    const normPhone = String(phone).replace(/\s/g, "");
+    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username").eq("whatsapp_phone", normPhone).maybeSingle();
+    if (data) existing = data;
+  }
+
+  // 4. Match par handle exact (avec ou sans @)
+  if (!existing && normHandle) {
+    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username")
+      .or(`handle.eq.${normHandle},handle.eq.@${normHandle}`)
+      .maybeSingle();
+    if (data) existing = data;
+  }
+
+  // 5. Match par nom exact (fallback)
+  if (!existing && name && name !== "?" && !name.startsWith("tg_") && !name.startsWith("@TG_")) {
+    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username").ilike("name", name).maybeSingle();
+    if (data) existing = data;
+  }
+
+  if (existing) {
+    // Enrichir la fiche existante si on a de nouvelles infos
+    const patch = {};
+    if (normTgId && !existing.tg_user_id) patch.tg_user_id = normTgId;
+    if (normUsername && !existing.telegram_username) patch.telegram_username = normUsername;
+    if (Object.keys(patch).length > 0) {
+      await sb.from("spenders").update(patch).eq("id", existing.id);
+    }
+    return { id: existing.id, handle: existing.handle || existing.name, isNew: false };
+  }
+
+  // Pas trouvé → créer un nouveau spender
+  // Construire un handle propre (jamais de doublon @TG_ si tg_user_id connu)
+  let newHandle = normUsername ? normUsername : (normHandle || (normTgId ? "tg_" + normTgId : null) || name || "unknown");
+  // Déduplique le handle si déjà pris
+  const { data: handleCheck } = await sb.from("spenders").select("id").eq("handle", newHandle).maybeSingle();
+  if (handleCheck) newHandle = newHandle + "_" + Date.now().toString().slice(-4);
+
+  const insertData = {
+    handle: newHandle,
+    name: name || newHandle,
+    status: "active",
+    last_seen_at: new Date().toISOString(),
+    ...extra,
+  };
+  if (normTgId) insertData.tg_user_id = normTgId;
+  if (normUsername) insertData.telegram_username = normUsername;
+
+  const { data: created, error } = await sb.from("spenders").insert(insertData).select("id,handle").maybeSingle();
+  if (error || !created) {
+    // Dernier recours : upsert sur handle
+    const { data: upserted } = await sb.from("spenders").upsert(insertData, { onConflict: "handle" }).select("id,handle").maybeSingle();
+    return { id: upserted?.id || null, handle: upserted?.handle || newHandle, isNew: true };
+  }
+  return { id: created.id, handle: created.handle, isNew: true };
 };
 
 // =============================================
@@ -8488,28 +8574,38 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     try {
       if (!editingTx.id) {
-        // ── Résolution du spender_handle ──
-        // Pour les spenders créés par l'IA, le handle peut être vide/invalide.
-        // On résout depuis la DB via _spender_id si disponible.
-        let resolvedHandle = (updates.spender_handle || editingTx.spender_handle || "").trim();
-        const invalidHandle = !resolvedHandle || resolvedHandle === "—" || resolvedHandle === "\u2014" || resolvedHandle === "?";
-        const spenderId = editingTx._spender_id || null;
+        // ── Résolution du spender via resolveOrCreateSpender (anti-doublon) ──
+        const rawHandle = (updates.spender_handle || editingTx.spender_handle || "").trim();
+        const invalidHandle = !rawHandle || rawHandle === "—" || rawHandle === "\u2014" || rawHandle === "?";
+        const existingSpenderId = editingTx._spender_id || null;
 
-        if (invalidHandle && spenderId) {
-          try {
-            const { data: spRow } = await sb.from("spenders").select("handle, name, tg_username, telegram_username").eq("id", spenderId).maybeSingle();
-            if (spRow) {
-              resolvedHandle = spRow.handle || spRow.name || spRow.tg_username || spRow.telegram_username || spenderId;
-            }
-          } catch(_) {}
+        let resolvedSpenderId = null;
+        let resolvedHandle = rawHandle;
+
+        if (isUUID(existingSpenderId)) {
+          // On a déjà un UUID → récupérer le handle propre depuis la DB
+          const { data: spRow } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username").eq("id", existingSpenderId).maybeSingle();
+          if (spRow) {
+            resolvedSpenderId = spRow.id;
+            resolvedHandle = spRow.handle || spRow.name || spRow.telegram_username || rawHandle;
+          }
         }
+
+        if (!resolvedSpenderId) {
+          // Pas d'UUID connu → utiliser resolveOrCreateSpender pour éviter tout doublon
+          const tgIdFromHandle = (invalidHandle && rawHandle.startsWith("tg_")) ? rawHandle.replace("tg_", "") : null;
+          const resolved = await resolveOrCreateSpender({
+            tg_user_id: tgIdFromHandle || null,
+            tg_username: (!invalidHandle && !rawHandle.match(/^\d+$/) && !rawHandle.startsWith("tg_")) ? rawHandle : null,
+            handle: invalidHandle ? null : rawHandle,
+            name: invalidHandle ? null : rawHandle,
+          });
+          resolvedSpenderId = resolved.id;
+          resolvedHandle = resolved.handle || rawHandle || "unknown";
+        }
+
         if (!resolvedHandle || resolvedHandle === "—" || resolvedHandle === "\u2014" || resolvedHandle === "?") {
-          resolvedHandle = spenderId || "unknown";
-        }
-
-        // ── Upsert spender si handle propre ──
-        if (resolvedHandle && resolvedHandle !== "unknown" && resolvedHandle !== spenderId) {
-          try { await safeUpsertSpender({ handle: resolvedHandle, name: resolvedHandle, status: "active" }); } catch(_) {}
+          resolvedHandle = resolvedSpenderId || "unknown";
         }
 
         // ── Construction de la row TX ──
@@ -8532,7 +8628,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         if (updates.tag) txRow.tag = updates.tag;
         if (isUUID(updates.product_id)) txRow.product_id = updates.product_id;
         if (isUUID(updates.product_tag_id)) txRow.product_tag_id = updates.product_tag_id;
-        if (isUUID(spenderId)) txRow.spender_id = spenderId;
+        if (isUUID(resolvedSpenderId)) txRow.spender_id = resolvedSpenderId;
 
         const res = await safeInsertTx(txRow);
         setSpSaving(false);
@@ -8641,12 +8737,21 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       await onRefresh(); setSelected(null);
     } catch (e) { setSpSavingProfile(false); addToast("Erreur: " + e.message, "error"); }
   };
+  const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep"); // "keep" | "delete"
   const handleDeleteSpender = async (sp) => {
     try {
+      if (deleteConfirmTxAction === "delete") {
+        // Supprimer aussi les TX associées
+        await sb.from("transactions").delete().eq("spender_id", sp.dbId);
+        if (sp.handle) await sb.from("transactions").delete().eq("spender_handle", sp.handle).is("spender_id", null);
+      } else {
+        // Garder les TX mais orpheliner le spender_id
+        await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
+      }
       const {error} = await sb.from("spenders").delete().eq("id", sp.dbId);
       if (error) { addToast("Erreur: " + error.message, "error"); return; }
       addToast(fr ? "Spender supprimé" : "Spender deleted", "success");
-      setSelected(null); setDeleteConfirm(null); await onRefresh();
+      setSelected(null); setDeleteConfirm(null); setDeleteConfirmTxAction("keep"); await onRefresh();
     } catch (e) { addToast("Erreur: " + e.message, "error"); }
   };
   const handleCreateSpender = async () => {
@@ -9533,7 +9638,25 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         </ModalShell>
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleSpEditSave} onCancel={() => setEditingTx(null)} saving={spSaving} models={models} profiles={profiles} providerPaymentMethods={providerPaymentMethods} products={products||[]} productTags={productTags||[]} />}
       <ConfirmModal open={!!confirmRefuse} title={t(lang,"refuse_tx_confirm")} message={confirmRefuse?`${confirmRefuse.spender_handle} — ${confirmRefuse.amount} ${confirmRefuse.currency||"EUR"}`:""} lang={lang} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleSpStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)}/>
-      <ConfirmModal open={!!deleteConfirm} title={fr?"Supprimer ce spender ?":"Delete this spender?"} message={deleteConfirm?`${getSpenderDisplayName(deleteConfirm)} \u2014 ${fr?"Cette action est irréversible":"This action is irreversible"}`:""} lang={lang} onConfirm={()=>{if(deleteConfirm)handleDeleteSpender(deleteConfirm);}} onCancel={()=>setDeleteConfirm(null)}/>
+      {deleteConfirm&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setDeleteConfirm(null)}>
+          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:400,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:800,color:"var(--danger)",marginBottom:8}}>🗑️ {fr?"Supprimer ce spender ?":"Delete this spender?"}</div>
+            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:16}}>{getSpenderDisplayName(deleteConfirm)} — {fr?"Cette action est irréversible.":"This action is irreversible."}</div>
+            <div style={{fontSize:13,fontWeight:700,marginBottom:10}}>{fr?"Que faire des transactions associées ?":"What to do with associated transactions?"}</div>
+            {[{v:"keep",label:fr?"Conserver les TX (orphelines)":"Keep TX (orphaned)"},{v:"delete",label:fr?"Supprimer aussi les TX":"Delete TX as well"}].map(opt=>(
+              <div key={opt.v} onClick={()=>setDeleteConfirmTxAction(opt.v)} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 12px",borderRadius:8,border:"2px solid "+(deleteConfirmTxAction===opt.v?"var(--danger)":"var(--border)"),background:deleteConfirmTxAction===opt.v?"rgba(239,68,68,0.08)":"var(--bg-overlay)",cursor:"pointer",marginBottom:8}}>
+                <div style={{width:14,height:14,borderRadius:"50%",border:"2px solid "+(deleteConfirmTxAction===opt.v?"var(--danger)":"var(--border)"),background:deleteConfirmTxAction===opt.v?"var(--danger)":"transparent",flexShrink:0}}/>
+                <span style={{fontSize:13}}>{opt.label}</span>
+              </div>
+            ))}
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:16}}>
+              <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+              <button onClick={()=>{handleDeleteSpender(deleteConfirm);}} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>🗑️ {fr?"Supprimer":"Delete"}</button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* New Spender Modal — form complet */}
       <ModalShell open={showNewSpender} onClose={()=>setShowNewSpender(false)} closeOnBackdrop={true} closeOnEsc={true}>
           <div className="ui-panel" style={{maxWidth:560,width:"94vw",maxHeight:"90vh",overflowY:"auto",borderRadius:20,padding:_isMobile?16:28}}>
@@ -17197,7 +17320,7 @@ const TransactionSuggestionsTab = ({lang, user, profiles, spenders, onRefresh}) 
 };
 
 // ── AdminShell — tabs (feat/admin-page + pipeline debug + suggestions IA + scripts) ──
-const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices}) => {
+const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh, exchangeRate, setExchangeRate, txs, chatterLogs, screenshotChecks, broadcasts, spenders, payslips, payouts, expenses, invoices, dbSpenders}) => {
   const fr = lang === "fr";
   const isGerant = user?.role === "gerant";
   const ADMIN_TABS = [
@@ -17210,6 +17333,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
     {id:"pipeline",    icon:"🔧", label:fr?"Pipeline Debug":"Pipeline Debug"},
     {id:"settings",    icon:"⚙️", label:fr?"Paramètres Agence":"Agency Settings"},
     ...(isGerant ? [{id:"scripts", icon:"📝", label:fr?"Scripts TG":"TG Scripts"}] : []),
+    ...(isGerant ? [{id:"duplicates", icon:"🔀", label:fr?"Doublons":"Duplicates"}] : []),
   ];
   const activeSub = (subTab && ADMIN_TABS.some(t => t.id === subTab)) ? subTab : "users";
   const tabStyle = (id) => ({padding:"8px 14px",borderRadius:9,border:"1px solid "+(activeSub===id?"#8b5cf6":"var(--border)"),background:activeSub===id?"rgba(139,92,246,0.15)":"var(--surface)",color:activeSub===id?"#c4b5fd":"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer",flexShrink:0,whiteSpace:"nowrap",transition:"all 0.15s"});
@@ -17237,6 +17361,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
         {activeSub==="pipeline"&&<AdminPipelineDebugTab lang={lang} />}
         {activeSub==="settings"&&<AdminSettingsTab lang={lang} />}
         {activeSub==="scripts"&&isGerant&&<ScriptsAdminTab user={user} lang={lang} models={models} />}
+        {activeSub==="duplicates"&&isGerant&&<SpenderDuplicatesPanel lang={lang} dbSpenders={dbSpenders||spenders} onRefresh={onRefresh} user={user} />}
       </div>
     </div>
   );
@@ -20110,6 +20235,203 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
       {mobilePane === "list" && renderLeftCol()}
       {mobilePane === "chat" && renderCenterCol()}
       {mobilePane === "spender" && renderRightCol()}
+    </div>
+  );
+};
+
+// =============================================
+// SPENDER DUPLICATES PANEL — Détection & merge doublons (gérant uniquement)
+// =============================================
+const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
+  const fr = lang === "fr";
+  const [merging, setMerging] = React.useState(false);
+  const [mergeModal, setMergeModal] = React.useState(null); // { a, b }
+  const [masterId, setMasterId] = React.useState(null);
+  const [reassignLoading, setReassignLoading] = React.useState(false);
+  const [autoReassignResult, setAutoReassignResult] = React.useState(null);
+  const [autoReassignLoading, setAutoReassignLoading] = React.useState(false);
+
+  // Réassignation automatique des TX orphelines @tg_XXXXXXX
+  const handleAutoReassign = async () => {
+    setAutoReassignLoading(true);
+    setAutoReassignResult(null);
+    let fixed = 0, errors = 0;
+    try {
+      // Récupérer toutes les TX avec handle de type tg_XXXXXXX ou @tg_XXXXXXX
+      const { data: orphanTxs } = await sb.from("transactions")
+        .select("id,spender_handle,spender_id")
+        .or("spender_handle.like.tg_%,spender_handle.like.@tg_%")
+        .limit(500);
+
+      for (const tx of (orphanTxs || [])) {
+        const raw = (tx.spender_handle || "").replace(/^@/, "").replace(/^tg_/, "");
+        const numId = raw.replace(/\D/g, "");
+        if (!numId) continue;
+        // Chercher le spender par tg_user_id
+        const { data: sp } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", numId).maybeSingle();
+        if (!sp) continue;
+        if (tx.spender_id === sp.id) continue; // déjà correct
+        const { error } = await sb.from("transactions").update({
+          spender_id: sp.id,
+          spender_handle: sp.handle || sp.name || tx.spender_handle,
+        }).eq("id", tx.id);
+        if (error) errors++;
+        else fixed++;
+      }
+      setAutoReassignResult({ fixed, errors });
+      if (fixed > 0) await onRefresh();
+    } catch (e) {
+      setAutoReassignResult({ fixed, errors: errors + 1, msg: e.message });
+    }
+    setAutoReassignLoading(false);
+  };
+
+  // Détection des doublons
+  const duplicates = React.useMemo(() => {
+    const pairs = [];
+    const seen = new Set();
+    const spenders = (dbSpenders || []).filter(Boolean);
+
+    for (let i = 0; i < spenders.length; i++) {
+      for (let j = i + 1; j < spenders.length; j++) {
+        const a = spenders[i], b = spenders[j];
+        const key = [a.id, b.id].sort().join("|");
+        if (seen.has(key)) continue;
+
+        let reason = null;
+        // 1. Même tg_user_id
+        if (a.tg_user_id && b.tg_user_id && String(a.tg_user_id) === String(b.tg_user_id)) {
+          reason = "tg_id: " + a.tg_user_id;
+        }
+        // 2. Même telegram_username (sans @, case insensitive)
+        else if (a.telegram_username && b.telegram_username &&
+          a.telegram_username.replace(/^@/,"").toLowerCase() === b.telegram_username.replace(/^@/,"").toLowerCase()) {
+          reason = "username TG: @" + a.telegram_username.replace(/^@/,"");
+        }
+        // 3. Même nom exact (case insensitive), non vide
+        else if (a.name && b.name && a.name !== "?" && b.name !== "?" &&
+          a.name.toLowerCase() === b.name.toLowerCase() &&
+          !a.name.startsWith("tg_") && !b.name.startsWith("tg_")) {
+          reason = "nom: " + a.name;
+        }
+
+        if (reason) { seen.add(key); pairs.push({ a, b, reason }); }
+      }
+    }
+    return pairs;
+  }, [dbSpenders]);
+
+  const handleMerge = async () => {
+    if (!mergeModal || !masterId) return;
+    const { a, b } = mergeModal;
+    const slave = masterId === a.id ? b : a;
+    const master = masterId === a.id ? a : b;
+    setReassignLoading(true);
+    try {
+      // 1. Réassigner toutes les TX de la fiche esclave vers la fiche maître
+      await sb.from("transactions").update({ spender_id: master.id, spender_handle: master.handle || master.name }).eq("spender_id", slave.id);
+      // 2. Réassigner les TX par handle si spender_id null
+      if (slave.handle) {
+        await sb.from("transactions").update({ spender_id: master.id }).eq("spender_handle", slave.handle).is("spender_id", null);
+      }
+      // 3. Enrichir la fiche maître avec les données de l'esclave (tg_user_id, telegram_username si manquants)
+      const patch = {};
+      if (!master.tg_user_id && slave.tg_user_id) patch.tg_user_id = slave.tg_user_id;
+      if (!master.telegram_username && slave.telegram_username) patch.telegram_username = slave.telegram_username;
+      if (!master.first_name && slave.first_name) patch.first_name = slave.first_name;
+      if (Object.keys(patch).length > 0) await sb.from("spenders").update(patch).eq("id", master.id);
+      // 4. Supprimer la fiche esclave
+      await sb.from("spenders").delete().eq("id", slave.id);
+      setMergeModal(null); setMasterId(null);
+      await onRefresh();
+    } catch (e) {
+      alert("Erreur merge: " + e.message);
+    }
+    setReassignLoading(false);
+  };
+
+  const autoReassignSection = (
+    <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:16,marginBottom:20}}>
+      <div style={{fontSize:14,fontWeight:700,marginBottom:6}}>🔧 {fr?"Réassignation TX orphelines (@tg_XXXXXXX)":"Reassign orphan TX (@tg_XXXXXXX)"}</div>
+      <div style={{fontSize:12,color:"var(--text-secondary)",marginBottom:12}}>{fr?"Retrouve toutes les TX avec un handle de type tg_XXXXXXX et les réassigne à la bonne fiche spender via tg_user_id.":"Finds all TX with a tg_XXXXXXX handle and reassigns them to the correct spender via tg_user_id."}</div>
+      <button onClick={handleAutoReassign} disabled={autoReassignLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--accent)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:autoReassignLoading?0.5:1}}>
+        {autoReassignLoading?"⏳ ...":(fr?"🔀 Réassigner":"🔀 Reassign")}
+      </button>
+      {autoReassignResult&&(
+        <div style={{marginTop:10,fontSize:12,color:autoReassignResult.errors>0?"var(--warning)":"var(--success)"}}>
+          ✅ {autoReassignResult.fixed} {fr?"TX réassignées":"TX reassigned"} {autoReassignResult.errors>0?`— ⚠️ ${autoReassignResult.errors} erreur(s)`:""} {autoReassignResult.msg||""}
+        </div>
+      )}
+    </div>
+  );
+
+  if (duplicates.length === 0) {
+    return (
+      <div>
+        {autoReassignSection}
+        <div style={{padding:24,textAlign:"center",color:"var(--text-secondary)"}}>
+          <div style={{fontSize:32,marginBottom:8}}>✅</div>
+          <div style={{fontWeight:700,fontSize:15}}>{fr?"Aucun doublon détecté":"No duplicates detected"}</div>
+          <div style={{fontSize:13,marginTop:4}}>{fr?"Tous les spenders sont uniques.":"All spenders are unique."}</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {autoReassignSection}
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+        <div style={{fontSize:16,fontWeight:800,color:"var(--danger)"}}>⚠️ {duplicates.length} {fr?"doublon(s) détecté(s)":"duplicate(s) detected"}</div>
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {duplicates.map(({a,b,reason},i)=>(
+          <div key={i} style={{background:"var(--surface)",border:"1px solid var(--danger)",borderRadius:12,padding:16}}>
+            <div style={{fontSize:11,color:"var(--danger)",fontWeight:700,marginBottom:10}}>🔁 {fr?"Raison":"Reason"}: {reason}</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+              {[a,b].map(sp=>(
+                <div key={sp.id} style={{background:"var(--bg-overlay)",borderRadius:8,padding:12,fontSize:12}}>
+                  <div style={{fontWeight:700,marginBottom:4}}>{sp.handle||sp.name||"?"}</div>
+                  <div style={{color:"var(--text-secondary)"}}>ID: {sp.id?.slice(0,8)}...</div>
+                  {sp.tg_user_id&&<div style={{color:"var(--text-secondary)"}}>TG ID: {sp.tg_user_id}</div>}
+                  {sp.telegram_username&&<div style={{color:"var(--text-secondary)"}}>@{sp.telegram_username}</div>}
+                  {sp.first_name&&<div style={{color:"var(--text-secondary)"}}>👤 {sp.first_name}</div>}
+                </div>
+              ))}
+            </div>
+            <button onClick={()=>{setMergeModal({a,b});setMasterId(a.id);}} style={{marginTop:12,padding:"7px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+              🔀 {fr?"Fusionner":"Merge"}
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {mergeModal&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setMergeModal(null)}>
+          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:420,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:800,marginBottom:16}}>🔀 {fr?"Fusionner les doublons":"Merge duplicates"}</div>
+            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:14}}>{fr?"Choisir la fiche maître (celle qui sera conservée) :":"Choose the master record (the one to keep):"}</div>
+            {[mergeModal.a,mergeModal.b].map(sp=>(
+              <div key={sp.id} onClick={()=>setMasterId(sp.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:8,border:"2px solid "+(masterId===sp.id?"var(--accent)":"var(--border)"),background:masterId===sp.id?"rgba(139,92,246,0.1)":"var(--bg-overlay)",cursor:"pointer",marginBottom:8}}>
+                <div style={{width:16,height:16,borderRadius:"50%",border:"2px solid "+(masterId===sp.id?"var(--accent)":"var(--border)"),background:masterId===sp.id?"var(--accent)":"transparent",flexShrink:0}}/>
+                <div>
+                  <div style={{fontWeight:700,fontSize:13}}>{sp.handle||sp.name}</div>
+                  <div style={{fontSize:11,color:"var(--text-secondary)"}}>ID: {sp.id?.slice(0,8)}... {sp.tg_user_id?"| TG: "+sp.tg_user_id:""}</div>
+                </div>
+              </div>
+            ))}
+            <div style={{fontSize:11,color:"var(--warning)",background:"var(--warning-muted)",borderRadius:6,padding:"8px 10px",marginTop:8,marginBottom:16}}>
+              ⚠️ {fr?"Toutes les TX de la fiche supprimée seront réassignées à la fiche maître. Cette action est irréversible.":"All TX from the deleted record will be reassigned to the master. This is irreversible."}
+            </div>
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button onClick={()=>setMergeModal(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+              <button onClick={handleMerge} disabled={!masterId||reassignLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:(!masterId||reassignLoading)?0.5:1}}>
+                {reassignLoading?"...":(fr?"✅ Fusionner":"✅ Merge")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -31787,7 +32109,7 @@ const App = () => {
       case "ia-insights":
         return <IAInsightsPage user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} lang={lang} onNavigate={navigateTo} />;
       case "admin":
-        return <AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} />;
+        return <AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} dbSpenders={dbSpenders} />;
       default:
         return <DashboardTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} alerts={alerts} botStats={botStats} onDismissAlert={dismissAlert} onAlertNavigate={handleAlertNavigate} providerPaymentMethods={providerPaymentMethods} spenders={spenders} navigateTo={navigateTo} navigateToSpender={navigateToSpender} providerPayouts={providerPayouts} chatterLogs={chatterLogs} />;
     }
@@ -32171,7 +32493,7 @@ const App = () => {
           {/* ── GÉRANT CONTENT (new tab system) ── */}
           {isGerant && renderGerantContent()}
           {/* ── AD1: Admin/CEO content (accès Admin uniquement) ── */}
-          {isAdminUser(user)&&!isGerant&&tab==="admin"&&<AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} />}
+          {isAdminUser(user)&&!isGerant&&tab==="admin"&&<AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} dbSpenders={dbSpenders} />}
           {/* ── Modele-only pages — UNCHANGED ── */}
           {tab==="model_checklist"&&user.role==="modele"&&<ModelChecklistTab user={user} lang={lang} checklistInstances={checklistInstances} onRefresh={onRefresh} />}
           {tab==="model_tasks"&&user.role==="modele"&&<ModelTasksTab user={user} lang={lang} modelTasks={modelTasks} onRefresh={onRefresh} />}
