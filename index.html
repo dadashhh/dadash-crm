@@ -3936,12 +3936,24 @@ const safeUpsertSpender = async (spenderData) => {
 // Retourne { id, handle, isNew }
 // ─────────────────────────────────────────────────────────────────────────────
 const resolveOrCreateSpender = async ({ tg_user_id, tg_username, phone, name, handle, extra = {} } = {}) => {
+  // Détecter si handle/name ressemble à "@TG_XXXXXXX" ou "tg_XXXXXXX" → extraire le tg_user_id
+  const TG_NUMERIC_PATTERN = /^@?tg_(\d+)$/i;
+  const handleStr = handle ? String(handle).trim() : "";
+  const nameStr = name ? String(name).trim() : "";
+  const tgFromHandle = TG_NUMERIC_PATTERN.exec(handleStr)?.[1] || TG_NUMERIC_PATTERN.exec(nameStr)?.[1] || null;
+
+  // Si le handle EST un @TG_XXXXXXX, on l'utilise comme tg_user_id et on efface le handle
+  let effectiveTgId = tg_user_id || tgFromHandle || null;
+  let effectiveHandle = tgFromHandle ? null : handle; // ne pas créer de handle "@TG_XXXXXXX"
+  let effectiveName = tgFromHandle ? null : name;
+
   // Normalise le tg_user_id en string numérique pure
-  const normTgId = tg_user_id ? String(tg_user_id).replace(/\D/g, "") : null;
+  const normTgId = effectiveTgId ? String(effectiveTgId).replace(/\D/g, "") : null;
   // Normalise le username sans @
   const normUsername = tg_username ? String(tg_username).replace(/^@/, "").trim() : null;
   // Normalise le handle sans @ pour la recherche
-  const normHandle = handle ? String(handle).replace(/^@/, "").trim() : null;
+  const normHandle = effectiveHandle ? String(effectiveHandle).replace(/^@/, "").trim() : null;
+  const normName = effectiveName;
 
   let existing = null;
 
@@ -3974,9 +3986,9 @@ const resolveOrCreateSpender = async ({ tg_user_id, tg_username, phone, name, ha
     if (data) existing = data;
   }
 
-  // 5. Match par nom exact (fallback)
-  if (!existing && name && name !== "?" && !name.startsWith("tg_") && !name.startsWith("@TG_")) {
-    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username").ilike("name", name).maybeSingle();
+  // 5. Match par nom exact (fallback — jamais sur les handles @TG_XXXXXXX)
+  if (!existing && normName && normName !== "?" && !normName.match(/^@?tg_\d+$/i)) {
+    const { data } = await sb.from("spenders").select("id,handle,name,tg_user_id,telegram_username").ilike("name", normName).maybeSingle();
     if (data) existing = data;
   }
 
@@ -3992,15 +4004,15 @@ const resolveOrCreateSpender = async ({ tg_user_id, tg_username, phone, name, ha
   }
 
   // Pas trouvé → créer un nouveau spender
-  // Construire un handle propre (jamais de doublon @TG_ si tg_user_id connu)
-  let newHandle = normUsername ? normUsername : (normHandle || (normTgId ? "tg_" + normTgId : null) || name || "unknown");
+  // Handle propre : username TG > handle fourni > tg_XXXXXXX (jamais @TG_XXXXXXX en majuscules)
+  let newHandle = normUsername || normHandle || (normTgId ? "tg_" + normTgId : null) || normName || "unknown";
   // Déduplique le handle si déjà pris
   const { data: handleCheck } = await sb.from("spenders").select("id").eq("handle", newHandle).maybeSingle();
   if (handleCheck) newHandle = newHandle + "_" + Date.now().toString().slice(-4);
 
   const insertData = {
     handle: newHandle,
-    name: name || newHandle,
+    name: normName || newHandle,
     status: "active",
     last_seen_at: new Date().toISOString(),
     ...extra,
@@ -7831,33 +7843,33 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     if(!form.amount||isNaN(parseFloat(form.amount))||parseFloat(form.amount)<=0) { addToast(t(lang,"invalid_amount"),"error"); return; }
     setSaving(true);
     try {
-      // Step 1: UPSERT le Spender en DB
+      // Step 1: Résolution anti-doublon via resolveOrCreateSpender
       const handle = trimmedHandle;
-      // FIX 3 — Dedup: warn if telegram_id already linked to a different handle
-      if (form.telegram_id && form.telegram_id.trim()) {
-        const tgVal = form.telegram_id.trim().replace(/^@/, "");
-        const dup = (dbSpenders||[]).find(s => {
-          const h = s.handle || s.name;
-          if (h === handle) return false;
-          return String(s.telegram_id) === tgVal || (s.telegram_username && s.telegram_username.replace(/^@/,"") === tgVal);
-        });
-        if (dup) { addToast(`⚠️ Spender déjà existant : @${dup.handle||dup.name}`, "warning"); setSaving(false); return; }
-      }
-      try {
-        await safeUpsertSpender({handle, name: handle, status: "active", last_seen: new Date().toISOString()});
-      } catch(e) { /* Spender upsert best-effort */ }
+      const tgIdRaw = form.telegram_id ? form.telegram_id.trim().replace(/^@/, "") : null;
+      const tgIdNum = tgIdRaw && /^\d+$/.test(tgIdRaw) ? tgIdRaw : null;
+      const tgUsername = tgIdRaw && !/^\d+$/.test(tgIdRaw) ? tgIdRaw : null;
 
-      // Step 2: INSERT transaction — only include FK fields if they look like valid UUIDs
-      // TZ2 — Stocker date en UTC ISO (created_at est posé par Supabase, date = référence UTC propre)
+      const resolved = await resolveOrCreateSpender({
+        tg_user_id: tgIdNum || null,
+        tg_username: tgUsername || null,
+        handle: handle,
+        name: handle,
+        extra: { status: "active", last_seen_at: new Date().toISOString() },
+      });
+      const resolvedSpenderId = resolved.id;
+      const resolvedHandle = resolved.handle || handle;
+
+      // Step 2: INSERT transaction
       const now = new Date();
       const isUUID = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
       const txRow = {
         date: now.toISOString(),
-        spender_handle: handle,
+        spender_handle: resolvedHandle,
         amount: parseFloat(form.amount),
         status: "pending",
         notes: form.notes || null,
       };
+      if(isUUID(resolvedSpenderId)) txRow.spender_id = resolvedSpenderId;
       if(isUUID(form.model_id)) txRow.model_id = form.model_id;
       if(isUUID(form.provider_id)) txRow.provider_id = form.provider_id;
       if(isUUID(form.chatter_id)) txRow.chatter_id = form.chatter_id;
@@ -7870,7 +7882,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
       if(isUUID(form.product_tag_id)) txRow.product_tag_id = form.product_tag_id;
       if(form.payment_method) txRow.payment_method = form.payment_method;
       if(form.product_contents&&form.product_contents.length>0) txRow.product_contents = form.product_contents;
-      if(form.telegram_id&&form.telegram_id.trim()) txRow.telegram_id = form.telegram_id.trim();
+      if(tgIdRaw) txRow.telegram_id = tgIdRaw;
       const res = await safeInsertTx(txRow);
 
       if(!res.error) {
@@ -8780,21 +8792,28 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     } catch (e) { setSpSavingProfile(false); addToast("Erreur: " + e.message, "error"); }
   };
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep"); // "keep" | "delete"
+  const [deleteLoading, setDeleteLoading] = React.useState(false);
   const handleDeleteSpender = async (sp) => {
+    if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
+    setDeleteLoading(true);
     try {
       if (deleteConfirmTxAction === "delete") {
         // Supprimer aussi les TX associées
         await sb.from("transactions").delete().eq("spender_id", sp.dbId);
-        if (sp.handle) await sb.from("transactions").delete().eq("spender_handle", sp.handle).is("spender_id", null);
+        if (sp.handle && sp.handle !== "unknown") {
+          await sb.from("transactions").delete().eq("spender_handle", sp.handle).is("spender_id", null);
+        }
       } else {
         // Garder les TX mais orpheliner le spender_id
         await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
       }
       const {error} = await sb.from("spenders").delete().eq("id", sp.dbId);
-      if (error) { addToast("Erreur: " + error.message, "error"); return; }
-      addToast(fr ? "Spender supprimé" : "Spender deleted", "success");
-      setSelected(null); setDeleteConfirm(null); setDeleteConfirmTxAction("keep"); await onRefresh();
-    } catch (e) { addToast("Erreur: " + e.message, "error"); }
+      if (error) { addToast("Erreur: " + error.message, "error"); setDeleteLoading(false); return; }
+      addToast(fr ? "Spender supprimé ✓" : "Spender deleted ✓", "success");
+      setSelected(null); setDeleteConfirm(null); setDeleteConfirmTxAction("keep");
+      setDeleteLoading(false);
+      await onRefresh();
+    } catch (e) { addToast("Erreur: " + e.message, "error"); setDeleteLoading(false); }
   };
   const handleCreateSpender = async () => {
     if (!newSpForm.handle.trim()) { addToast(fr ? "Handle requis" : "Handle required", "error"); return; }
@@ -9690,7 +9709,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             ))}
             <div style={{display:"flex",gap:8,justifyContent:"flex-end",marginTop:16}}>
               <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
-              <button onClick={()=>{handleDeleteSpender(deleteConfirm);}} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>🗑️ {fr?"Supprimer":"Delete"}</button>
+              <button onClick={()=>{handleDeleteSpender(deleteConfirm);}} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
+                {deleteLoading ? "⏳ ..." : `🗑️ ${fr?"Supprimer":"Delete"}`}
+              </button>
             </div>
           </div>
         </div>
@@ -20278,25 +20299,42 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
   const [autoReassignResult, setAutoReassignResult] = React.useState(null);
   const [autoReassignLoading, setAutoReassignLoading] = React.useState(false);
 
-  // Réassignation automatique des TX orphelines @tg_XXXXXXX
+  // Réassignation automatique des TX orphelines @tg_XXXXXXX / @TG_XXXXXXX / tg_XXXXXXX
   const handleAutoReassign = async () => {
     setAutoReassignLoading(true);
     setAutoReassignResult(null);
-    let fixed = 0, errors = 0;
+    let fixed = 0, created = 0, errors = 0;
     try {
-      // Récupérer toutes les TX avec handle de type tg_XXXXXXX ou @tg_XXXXXXX
-      const { data: orphanTxs } = await sb.from("transactions")
+      // Récupérer toutes les TX avec handle de type tg_XXXXXXX, @tg_XXXXXXX, @TG_XXXXXXX
+      const { data: allTxs } = await sb.from("transactions")
         .select("id,spender_handle,spender_id")
-        .or("spender_handle.like.tg_%,spender_handle.like.@tg_%")
-        .limit(500);
+        .limit(2000);
 
-      for (const tx of (orphanTxs || [])) {
-        const raw = (tx.spender_handle || "").replace(/^@/, "").replace(/^tg_/, "");
+      // Filtrer côté JS pour couvrir toutes les variantes (case insensitive)
+      const TG_PATTERN = /^@?tg_\d+$/i;
+      const orphanTxs = (allTxs || []).filter(tx =>
+        tx.spender_handle && TG_PATTERN.test(tx.spender_handle.trim())
+      );
+
+      for (const tx of orphanTxs) {
+        const raw = tx.spender_handle.trim().replace(/^@/i, "").replace(/^tg_/i, "");
         const numId = raw.replace(/\D/g, "");
         if (!numId) continue;
+
         // Chercher le spender par tg_user_id
-        const { data: sp } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", numId).maybeSingle();
-        if (!sp) continue;
+        let { data: sp } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", numId).maybeSingle();
+
+        if (!sp) {
+          // Pas trouvé → créer une fiche propre avec ce tg_user_id
+          const newHandle = "tg_" + numId;
+          const { data: created_sp, error: createErr } = await sb.from("spenders")
+            .insert({ handle: newHandle, name: newHandle, tg_user_id: numId, status: "active" })
+            .select("id,handle,name").maybeSingle();
+          if (createErr || !created_sp) { errors++; continue; }
+          sp = created_sp;
+          created++;
+        }
+
         if (tx.spender_id === sp.id) continue; // déjà correct
         const { error } = await sb.from("transactions").update({
           spender_id: sp.id,
@@ -20305,10 +20343,10 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
         if (error) errors++;
         else fixed++;
       }
-      setAutoReassignResult({ fixed, errors });
-      if (fixed > 0) await onRefresh();
+      setAutoReassignResult({ fixed, created, errors, total: orphanTxs.length });
+      if (fixed > 0 || created > 0) await onRefresh();
     } catch (e) {
-      setAutoReassignResult({ fixed, errors: errors + 1, msg: e.message });
+      setAutoReassignResult({ fixed, created, errors: errors + 1, msg: e.message });
     }
     setAutoReassignLoading(false);
   };
@@ -20348,6 +20386,20 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
     return pairs;
   }, [dbSpenders]);
 
+  const [txCounts, setTxCounts] = React.useState({}); // { spenderId: count }
+
+  // Charger le comptage TX pour les doublons détectés
+  React.useEffect(() => {
+    if (duplicates.length === 0) return;
+    const ids = [...new Set(duplicates.flatMap(d => [d.a.id, d.b.id]))];
+    Promise.all(ids.map(id =>
+      sb.from("transactions").select("id", { count: "exact", head: true }).eq("spender_id", id)
+        .then(({ count }) => [id, count || 0])
+    )).then(results => {
+      setTxCounts(Object.fromEntries(results));
+    });
+  }, [duplicates]);
+
   const handleMerge = async () => {
     if (!mergeModal || !masterId) return;
     const { a, b } = mergeModal;
@@ -20361,11 +20413,13 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
       if (slave.handle) {
         await sb.from("transactions").update({ spender_id: master.id }).eq("spender_handle", slave.handle).is("spender_id", null);
       }
-      // 3. Enrichir la fiche maître avec les données de l'esclave (tg_user_id, telegram_username si manquants)
+      // 3. Enrichir la fiche maître avec les données de l'esclave (tg_user_id, telegram_username, first_name si manquants)
       const patch = {};
       if (!master.tg_user_id && slave.tg_user_id) patch.tg_user_id = slave.tg_user_id;
       if (!master.telegram_username && slave.telegram_username) patch.telegram_username = slave.telegram_username;
       if (!master.first_name && slave.first_name) patch.first_name = slave.first_name;
+      if (!master.age && slave.age) patch.age = slave.age;
+      if (!master.city && slave.city) patch.city = slave.city;
       if (Object.keys(patch).length > 0) await sb.from("spenders").update(patch).eq("id", master.id);
       // 4. Supprimer la fiche esclave
       await sb.from("spenders").delete().eq("id", slave.id);
@@ -20385,8 +20439,16 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
         {autoReassignLoading?"⏳ ...":(fr?"🔀 Réassigner":"🔀 Reassign")}
       </button>
       {autoReassignResult&&(
-        <div style={{marginTop:10,fontSize:12,color:autoReassignResult.errors>0?"var(--warning)":"var(--success)"}}>
-          ✅ {autoReassignResult.fixed} {fr?"TX réassignées":"TX reassigned"} {autoReassignResult.errors>0?`— ⚠️ ${autoReassignResult.errors} erreur(s)`:""} {autoReassignResult.msg||""}
+        <div style={{marginTop:10,fontSize:12,color:autoReassignResult.errors>0?"var(--warning)":"var(--success)",background:autoReassignResult.errors>0?"var(--warning-muted)":"var(--success-muted)",borderRadius:6,padding:"8px 10px"}}>
+          {autoReassignResult.total === 0
+            ? (fr ? "✅ Aucune TX @TG_XXXXXXX trouvée." : "✅ No @TG_XXXXXXX TX found.")
+            : <>
+                ✅ {autoReassignResult.fixed} {fr?"TX réassignées":"TX reassigned"}
+                {autoReassignResult.created > 0 && ` · ${autoReassignResult.created} ${fr?"fiche(s) créée(s)":"spender(s) created"}`}
+                {autoReassignResult.errors > 0 && ` · ⚠️ ${autoReassignResult.errors} ${fr?"erreur(s)":"error(s)"}`}
+                {autoReassignResult.msg && ` — ${autoReassignResult.msg}`}
+              </>
+          }
         </div>
       )}
     </div>
@@ -20418,11 +20480,14 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
               {[a,b].map(sp=>(
                 <div key={sp.id} style={{background:"var(--bg-overlay)",borderRadius:8,padding:12,fontSize:12}}>
-                  <div style={{fontWeight:700,marginBottom:4}}>{sp.handle||sp.name||"?"}</div>
-                  <div style={{color:"var(--text-secondary)"}}>ID: {sp.id?.slice(0,8)}...</div>
-                  {sp.tg_user_id&&<div style={{color:"var(--text-secondary)"}}>TG ID: {sp.tg_user_id}</div>}
-                  {sp.telegram_username&&<div style={{color:"var(--text-secondary)"}}>@{sp.telegram_username}</div>}
+                  <div style={{fontWeight:700,marginBottom:4,fontSize:13}}>{sp.handle||sp.name||"?"}</div>
+                  <div style={{color:"var(--text-tertiary)",fontSize:10}}>ID: {sp.id?.slice(0,8)}...</div>
+                  {sp.tg_user_id&&<div style={{color:"var(--text-secondary)"}}>📱 TG: {sp.tg_user_id}</div>}
+                  {sp.telegram_username&&<div style={{color:"var(--text-secondary)"}}>✈️ @{sp.telegram_username.replace(/^@/,"")}</div>}
                   {sp.first_name&&<div style={{color:"var(--text-secondary)"}}>👤 {sp.first_name}</div>}
+                  <div style={{marginTop:6,padding:"3px 8px",borderRadius:6,background:"var(--surface)",display:"inline-block",fontSize:11,fontWeight:700,color:txCounts[sp.id]>0?"var(--accent)":"var(--text-quaternary)"}}>
+                    💳 {txCounts[sp.id] ?? "…"} TX
+                  </div>
                 </div>
               ))}
             </div>
@@ -20441,9 +20506,16 @@ const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
             {[mergeModal.a,mergeModal.b].map(sp=>(
               <div key={sp.id} onClick={()=>setMasterId(sp.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:8,border:"2px solid "+(masterId===sp.id?"var(--accent)":"var(--border)"),background:masterId===sp.id?"rgba(139,92,246,0.1)":"var(--bg-overlay)",cursor:"pointer",marginBottom:8}}>
                 <div style={{width:16,height:16,borderRadius:"50%",border:"2px solid "+(masterId===sp.id?"var(--accent)":"var(--border)"),background:masterId===sp.id?"var(--accent)":"transparent",flexShrink:0}}/>
-                <div>
+                <div style={{flex:1}}>
                   <div style={{fontWeight:700,fontSize:13}}>{sp.handle||sp.name}</div>
-                  <div style={{fontSize:11,color:"var(--text-secondary)"}}>ID: {sp.id?.slice(0,8)}... {sp.tg_user_id?"| TG: "+sp.tg_user_id:""}</div>
+                  <div style={{fontSize:11,color:"var(--text-secondary)"}}>
+                    ID: {sp.id?.slice(0,8)}...
+                    {sp.tg_user_id && " · TG: "+sp.tg_user_id}
+                    {sp.first_name && " · 👤 "+sp.first_name}
+                  </div>
+                </div>
+                <div style={{fontSize:11,fontWeight:700,color:txCounts[sp.id]>0?"var(--accent)":"var(--text-quaternary)",background:"var(--surface)",padding:"2px 8px",borderRadius:6,flexShrink:0}}>
+                  💳 {txCounts[sp.id] ?? "…"}
                 </div>
               </div>
             ))}
