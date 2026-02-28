@@ -26,9 +26,16 @@ export interface IncomingMessage {
 export async function handleIncomingMessage(msg: IncomingMessage): Promise<void> {
   const chatId = String(msg.chatId);
 
-  // 1. Upsert conversation
+  // 1. Upsert conversation (with username/tg_user_id/display_name)
+  const convUsername = msg.username?.replace(/^@/, '') || null;
+  const convTgUserId = msg.tgUserId != null ? String(msg.tgUserId).replace(/\D/g, '') || null : null;
+  const convDisplayName = [msg.firstName, msg.lastName].filter(Boolean).join(' ') || null;
+
   const { data: convId, error: convErr } = await db.rpc('upsert_tg_conversation', {
     p_tg_chat_id: chatId,
+    p_username: convUsername,
+    p_tg_user_id: convTgUserId,
+    p_display_name: convDisplayName,
   });
 
   if (convErr || !convId) {
@@ -37,6 +44,19 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
       error: convErr?.message ?? 'null returned',
     });
     return;
+  }
+
+  // Fallback: if RPC doesn't support new params yet, patch directly
+  if (convUsername || convTgUserId || convDisplayName) {
+    const convPatch: Record<string, unknown> = {};
+    if (convUsername) convPatch.username = convUsername;
+    if (convTgUserId) convPatch.tg_user_id = convTgUserId;
+    if (convDisplayName) convPatch.display_name = convDisplayName;
+    try {
+      await db.from('tg_conversations').update(convPatch).eq('id', convId);
+    } catch {
+      // Best-effort: RPC may already handle this
+    }
   }
 
   // 2. Upsert message (idempotent)
