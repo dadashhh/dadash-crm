@@ -99,95 +99,93 @@ SELECT
   mc.spender_id,
   mc.tg_user_id,
 
-  -- Age extraction
-  (regexp_match(mc.corpus, '(?:j[''']?ai|i[''']?m|i am)\s+(\d{2})\s*(?:ans|yo|y\.o|years?\s*old)', 'i'))[1]::int AS age_extracted,
-  CASE WHEN (regexp_match(mc.corpus, '(\d{2})\s*ans', 'i'))[1] IS NOT NULL
-    THEN (regexp_match(mc.corpus, '(\d{2})\s*ans', 'i'))[1]::int
-    ELSE NULL
-  END AS age_fallback,
+  -- Age: "j'ai 25 ans", "i'm 30", "25 ans", "30 yo"
+  (SELECT x[1]::int FROM regexp_match(mc.corpus, E'(?:j.?ai|i.?m|i am)\\s+(\\d{2})\\s*(?:ans|yo|y\\.o|years?\\s*old)', 'i') AS x WHERE x[1]::int BETWEEN 16 AND 99 LIMIT 1) AS age_extracted,
+  (SELECT x[1]::int FROM regexp_match(mc.corpus, E'(\\d{2})\\s*ans', 'i') AS x WHERE x[1]::int BETWEEN 16 AND 99 LIMIT 1) AS age_fallback,
 
-  -- City extraction
+  -- City: "je vis à Paris", "i live in Zurich", or known city names
   COALESCE(
-    (regexp_match(mc.corpus, '(?:je\s+(?:suis|vis|habite)\s+(?:à|a|de|en))\s+([A-ZÀ-Ü][a-zà-ü]{2,}(?:\s+[A-ZÀ-Ü][a-zà-ü]{2,})?)', 'i'))[1],
-    (regexp_match(mc.corpus, '(?:i\s+(?:live|am)\s+(?:in|from|at))\s+([A-Za-z]{3,}(?:\s+[A-Za-z]{3,})?)', 'i'))[1],
-    (regexp_match(mc.corpus, '(?:basé|based)\s+(?:à|a|in)\s+([A-ZÀ-Ü][a-zà-ü]{2,})', 'i'))[1],
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:je\\s+(?:suis|vis|habite)\\s+(?:à|a|de|en))\\s+([A-ZÀ-Ü][a-zà-ü]{2,}(?:\\s+[A-ZÀ-Ü][a-zà-ü]{2,})?)', 'i') AS x),
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:i\\s+(?:live|am)\\s+(?:in|from|at))\\s+([A-Za-z]{3,}(?:\\s+[A-Za-z]{3,})?)', 'i') AS x),
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:basé|based)\\s+(?:à|a|in)\\s+([A-ZÀ-Ü][a-zà-ü]{2,})', 'i') AS x),
     CASE
-      WHEN mc.corpus ~* '\mparis\M' THEN 'Paris'
-      WHEN mc.corpus ~* '\mlyon\M' THEN 'Lyon'
-      WHEN mc.corpus ~* '\mmarseille\M' THEN 'Marseille'
-      WHEN mc.corpus ~* '\mtoulouse\M' THEN 'Toulouse'
-      WHEN mc.corpus ~* '\mnice\M' THEN 'Nice'
-      WHEN mc.corpus ~* '\mbordeaux\M' THEN 'Bordeaux'
-      WHEN mc.corpus ~* '\mlille\M' THEN 'Lille'
-      WHEN mc.corpus ~* '\mzurich\M' OR mc.corpus ~* '\mzürich\M' THEN 'Zurich'
-      WHEN mc.corpus ~* '\mgen[eè]ve\M' THEN 'Genève'
-      WHEN mc.corpus ~* '\mberne\M' THEN 'Berne'
-      WHEN mc.corpus ~* '\mlausanne\M' THEN 'Lausanne'
-      WHEN mc.corpus ~* '\mb[aâ]le\M' OR mc.corpus ~* '\mbasel\M' THEN 'Bâle'
-      WHEN mc.corpus ~* '\mlondon\M' THEN 'London'
-      WHEN mc.corpus ~* '\mberlin\M' THEN 'Berlin'
-      WHEN mc.corpus ~* '\mmunich\M' OR mc.corpus ~* '\mmünchen\M' THEN 'Munich'
-      WHEN mc.corpus ~* '\mdubai\M' OR mc.corpus ~* '\mdubaï\M' THEN 'Dubai'
-      WHEN mc.corpus ~* '\mmonaco\M' THEN 'Monaco'
-      WHEN mc.corpus ~* '\mbruxelles\M' OR mc.corpus ~* '\mbrussels\M' THEN 'Bruxelles'
+      WHEN mc.corpus ~* E'\\mparis\\M' THEN 'Paris'
+      WHEN mc.corpus ~* E'\\mlyon\\M' THEN 'Lyon'
+      WHEN mc.corpus ~* E'\\mmarseille\\M' THEN 'Marseille'
+      WHEN mc.corpus ~* E'\\mtoulouse\\M' THEN 'Toulouse'
+      WHEN mc.corpus ~* E'\\mnice\\M' THEN 'Nice'
+      WHEN mc.corpus ~* E'\\mbordeaux\\M' THEN 'Bordeaux'
+      WHEN mc.corpus ~* E'\\mlille\\M' THEN 'Lille'
+      WHEN mc.corpus ~* E'\\mzurich\\M' OR mc.corpus ~* E'\\mzürich\\M' THEN 'Zurich'
+      WHEN mc.corpus ~* E'\\mgen[eè]ve\\M' THEN 'Genève'
+      WHEN mc.corpus ~* E'\\mberne\\M' THEN 'Berne'
+      WHEN mc.corpus ~* E'\\mlausanne\\M' THEN 'Lausanne'
+      WHEN mc.corpus ~* E'\\mb[aâ]le\\M' OR mc.corpus ~* E'\\mbasel\\M' THEN 'Bâle'
+      WHEN mc.corpus ~* E'\\mlondon\\M' THEN 'London'
+      WHEN mc.corpus ~* E'\\mberlin\\M' THEN 'Berlin'
+      WHEN mc.corpus ~* E'\\mmunich\\M' OR mc.corpus ~* E'\\mmünchen\\M' THEN 'Munich'
+      WHEN mc.corpus ~* E'\\mdubai\\M' OR mc.corpus ~* E'\\mdubaï\\M' THEN 'Dubai'
+      WHEN mc.corpus ~* E'\\mmonaco\\M' THEN 'Monaco'
+      WHEN mc.corpus ~* E'\\mbruxelles\\M' OR mc.corpus ~* E'\\mbrussels\\M' THEN 'Bruxelles'
       ELSE NULL
     END
   ) AS city_extracted,
 
-  -- Country extraction
+  -- Country
   COALESCE(
-    (regexp_match(mc.corpus, '(?:je\s+(?:suis|vis|habite)\s+(?:en|au|aux))\s+([A-ZÀ-Ü][a-zà-ü]{3,})', 'i'))[1],
-    (regexp_match(mc.corpus, '(?:i[''']?m?\s+from)\s+([A-Za-z]{3,})', 'i'))[1],
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:je\\s+(?:suis|vis|habite)\\s+(?:en|au|aux))\\s+([A-ZÀ-Ü][a-zà-ü]{3,})', 'i') AS x),
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:i.?m?\\s+from)\\s+([A-Za-z]{3,})', 'i') AS x),
     CASE
-      WHEN mc.corpus ~* '\mfrance\M' THEN 'France'
-      WHEN mc.corpus ~* '\msuisse\M' OR mc.corpus ~* '\mswitzerland\M' THEN 'Suisse'
-      WHEN mc.corpus ~* '\mbelgique\M' OR mc.corpus ~* '\mbelgium\M' THEN 'Belgique'
-      WHEN mc.corpus ~* '\mallemagne\M' OR mc.corpus ~* '\mgermany\M' THEN 'Allemagne'
-      WHEN mc.corpus ~* '\mitalie\M' OR mc.corpus ~* '\mitaly\M' THEN 'Italie'
-      WHEN mc.corpus ~* '\mespagne\M' OR mc.corpus ~* '\mspain\M' THEN 'Espagne'
-      WHEN mc.corpus ~* '\mangleterre\M' OR mc.corpus ~* '\mengland\M' OR mc.corpus ~* '\muk\M' THEN 'Angleterre'
+      WHEN mc.corpus ~* E'\\mfrance\\M' THEN 'France'
+      WHEN mc.corpus ~* E'\\msuisse\\M' OR mc.corpus ~* E'\\mswitzerland\\M' THEN 'Suisse'
+      WHEN mc.corpus ~* E'\\mbelgique\\M' OR mc.corpus ~* E'\\mbelgium\\M' THEN 'Belgique'
+      WHEN mc.corpus ~* E'\\mallemagne\\M' OR mc.corpus ~* E'\\mgermany\\M' THEN 'Allemagne'
+      WHEN mc.corpus ~* E'\\mitalie\\M' OR mc.corpus ~* E'\\mitaly\\M' THEN 'Italie'
+      WHEN mc.corpus ~* E'\\mespagne\\M' OR mc.corpus ~* E'\\mspain\\M' THEN 'Espagne'
+      WHEN mc.corpus ~* E'\\mangleterre\\M' OR mc.corpus ~* E'\\mengland\\M' OR mc.corpus ~* E'\\muk\\M' THEN 'Angleterre'
       ELSE NULL
     END
   ) AS country_extracted,
 
-  -- Job extraction
+  -- Job: "je suis ingénieur", "i'm a developer"
   COALESCE(
-    (regexp_match(mc.corpus, '(?:je\s+(?:suis|travaille\s+comme|bosse\s+comme))\s+([a-zà-ü\s]{3,30})', 'i'))[1],
-    (regexp_match(mc.corpus, '(?:i(?:[''']m|\s+am)\s+(?:a|an)\s+)([a-z\s]{3,30})', 'i'))[1],
-    (regexp_match(mc.corpus, '(?:métier|job|travail|profession)\s*[:=]?\s*([a-zà-ü\s]{3,30})', 'i'))[1]
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:je\\s+(?:suis|travaille\\s+comme|bosse\\s+comme))\\s+([a-zà-ü\\s]{3,30})', 'i') AS x),
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:i(?:.m|\\s+am)\\s+(?:a|an)\\s+)([a-z\\s]{3,30})', 'i') AS x),
+    (SELECT x[1] FROM regexp_match(mc.corpus, E'(?:métier|job|travail|profession)\\s*[:=]?\\s*([a-zà-ü\\s]{3,30})', 'i') AS x)
   ) AS job_extracted,
 
-  -- Language detection
+  -- Language
   CASE
-    WHEN mc.corpus ~* '(?:français|french|je\s+parle\s+fran)' THEN 'FR'
-    WHEN mc.corpus ~* '(?:anglais|english|i\s+speak\s+eng)' THEN 'EN'
-    WHEN mc.corpus ~* '(?:allemand|german|deutsch)' THEN 'DE'
-    WHEN mc.corpus ~* '(?:italien|italian|italiano)' THEN 'IT'
-    WHEN mc.corpus ~* '(?:espagnol|spanish|español)' THEN 'ES'
-    WHEN mc.corpus ~* '(?:arabe|arabic)' THEN 'AR'
+    WHEN mc.corpus ~* 'français|french' THEN 'FR'
+    WHEN mc.corpus ~* 'anglais|english' THEN 'EN'
+    WHEN mc.corpus ~* 'allemand|german|deutsch' THEN 'DE'
+    WHEN mc.corpus ~* 'italien|italian|italiano' THEN 'IT'
+    WHEN mc.corpus ~* 'espagnol|spanish' THEN 'ES'
+    WHEN mc.corpus ~* 'arabe|arabic' THEN 'AR'
     ELSE NULL
   END AS langue_extracted,
 
-  -- Relationship status
+  -- Relationship
   CASE
-    WHEN mc.corpus ~* '(?:célibataire|single)' THEN 'single'
-    WHEN mc.corpus ~* '(?:marié|married|mariée)' THEN 'married'
-    WHEN mc.corpus ~* '(?:divorcé|divorced|divorcée)' THEN 'divorced'
-    WHEN mc.corpus ~* '(?:en\s+couple|in\s+a?\s*relationship)' THEN 'in_relationship'
+    WHEN mc.corpus ~* 'célibataire|single' THEN 'single'
+    WHEN mc.corpus ~* 'marié|married|mariée' THEN 'married'
+    WHEN mc.corpus ~* 'divorcé|divorced|divorcée' THEN 'divorced'
+    WHEN mc.corpus ~* 'en couple|in a? ?relationship' THEN 'in_relationship'
     ELSE NULL
   END AS relationship_extracted,
 
   -- Budget
-  CASE
-    WHEN (regexp_match(mc.corpus, '(\d{2,6})\s*(?:€|eur|chf|usd|\$)', 'i'))[1] IS NOT NULL THEN
-      CASE
-        WHEN (regexp_match(mc.corpus, '(\d{2,6})\s*(?:€|eur|chf|usd|\$)', 'i'))[1]::int < 100 THEN 'low'
-        WHEN (regexp_match(mc.corpus, '(\d{2,6})\s*(?:€|eur|chf|usd|\$)', 'i'))[1]::int < 500 THEN 'medium'
-        WHEN (regexp_match(mc.corpus, '(\d{2,6})\s*(?:€|eur|chf|usd|\$)', 'i'))[1]::int < 2000 THEN 'high'
-        ELSE 'whale'
-      END
-    ELSE NULL
-  END AS budget_extracted
+  (SELECT
+    CASE
+      WHEN x[1]::int < 100 THEN 'low'
+      WHEN x[1]::int < 500 THEN 'medium'
+      WHEN x[1]::int < 2000 THEN 'high'
+      ELSE 'whale'
+    END
+   FROM regexp_match(mc.corpus, E'(\\d{2,6})\\s*(?:€|eur|chf|usd|\\$)', 'i') AS x
+   WHERE x[1] IS NOT NULL
+   LIMIT 1
+  ) AS budget_extracted
 
 FROM msg_corpus mc;
 
