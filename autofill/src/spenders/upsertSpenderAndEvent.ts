@@ -55,7 +55,11 @@ function buildProfileMeta(extracted: Record<string, unknown>): Record<string, un
   if (extracted.first_name != null && extracted.first_name !== '') identity.first_name = extracted.first_name;
   if (extracted.age != null && extracted.age !== '') identity.age = extracted.age;
   if (extracted.job != null && extracted.job !== '') profile.job = extracted.job;
-  if (extracted.relationship_status != null && extracted.relationship_status !== '') status.relationship_status = extracted.relationship_status;
+  if (extracted.relationship_status != null && extracted.relationship_status !== '') {
+    status.relationship_status = extracted.relationship_status;
+    status.relation = extracted.relationship_status;
+    profile.relationship_status = extracted.relationship_status;
+  }
   if (extracted.langue != null && extracted.langue !== '') profile.language = extracted.langue;
   if (extracted.language != null && extracted.language !== '') profile.language = extracted.language;
   if (extracted.notes_chatter != null && extracted.notes_chatter !== '') profile.notes_chatter = extracted.notes_chatter;
@@ -104,6 +108,28 @@ function buildEnrichLast(
 }
 
 /**
+ * Build top-level column updates from extracted_fields.
+ * Uses COALESCE-style logic: only returns non-empty values,
+ * caller should merge with existing values to avoid overwrites.
+ */
+function buildTopLevelColumns(extracted: Record<string, unknown>): Record<string, unknown> {
+  const cols: Record<string, unknown> = {};
+  if (extracted.first_name && extracted.first_name !== '') cols.first_name = extracted.first_name;
+  if (extracted.age != null && extracted.age !== '') cols.age = typeof extracted.age === 'string' ? parseInt(extracted.age as string, 10) : extracted.age;
+  if (extracted.job && extracted.job !== '') cols.job = extracted.job;
+  if (extracted.city && extracted.city !== '') cols.city = extracted.city;
+  if (extracted.country && extracted.country !== '') cols.country = extracted.country;
+  if (extracted.language && extracted.language !== '') cols.langue = extracted.language;
+  if (extracted.langue && extracted.langue !== '') cols.langue = extracted.langue;
+  if (extracted.notes && extracted.notes !== '') cols.notes = extracted.notes;
+  if (extracted.notes_chatter && extracted.notes_chatter !== '') cols.notes = extracted.notes_chatter;
+  if (extracted.relationship_status && extracted.relationship_status !== '') cols.relationship_status = extracted.relationship_status;
+  if (extracted.budget_range && extracted.budget_range !== '') cols.budget_range = extracted.budget_range;
+  if (extracted.whatsapp_phone && extracted.whatsapp_phone !== '') cols.whatsapp_phone = extracted.whatsapp_phone;
+  return cols;
+}
+
+/**
  * Try to find an existing spender created manually by username/handle.
  * Only matches spenders that don't already have a tg_user_id set.
  */
@@ -116,6 +142,7 @@ async function findManualSpender(
   const clean = username.replace(/^@/, '').toLowerCase();
   if (!clean) return null;
 
+  // Try NULL tg_user_id first (standard manual spender)
   const { data } = await supabase
     .from('spenders')
     .select('id, meta')
@@ -124,7 +151,18 @@ async function findManualSpender(
     .limit(1)
     .maybeSingle();
 
-  return data ? { id: data.id, meta: (data.meta as Record<string, unknown>) || {} } : null;
+  if (data) return { id: data.id, meta: (data.meta as Record<string, unknown>) || {} };
+
+  // Fallback: tg_user_id might be '0' or '' instead of NULL
+  const { data: fallback } = await supabase
+    .from('spenders')
+    .select('id, meta, tg_user_id')
+    .or(`telegram_username.ilike.${clean},handle.ilike.${clean},handle.ilike.@${clean}`)
+    .in('tg_user_id', ['0', ''])
+    .limit(1)
+    .maybeSingle();
+
+  return fallback ? { id: fallback.id, meta: (fallback.meta as Record<string, unknown>) || {} } : null;
 }
 
 export async function upsertSpenderAndEvent(
@@ -185,23 +223,31 @@ export async function upsertSpenderAndEvent(
     // --- Primary lookup: tg_user_id ---
     const { data: existing } = await supabase
       .from('spenders')
-      .select('id, meta')
+      .select('id, meta, display_name, first_name')
       .eq('tg_user_id', tgNorm)
       .maybeSingle();
 
     if (existing) {
       const currentMeta = (existing.meta as Record<string, unknown>) || {};
       const merged = deepMergeNoNull(currentMeta, newMeta);
+      const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
+      const updatePayload: Record<string, unknown> = {
+        handle,
+        meta: merged,
+        last_seen_at: now,
+        updated_at: now,
+        ...topLevelCols,
+      };
+      if (!(existing as { display_name?: string }).display_name && displayName) {
+        updatePayload.display_name = displayName;
+        updatePayload.name = name;
+      }
+      if (!(existing as { first_name?: string }).first_name && displayName) {
+        updatePayload.first_name = displayName.split(' ')[0];
+      }
       const { error } = await supabase
         .from('spenders')
-        .update({
-          handle,
-          display_name: displayName || null,
-          name,
-          meta: merged,
-          last_seen_at: now,
-          updated_at: now,
-        })
+        .update(updatePayload)
         .eq('id', existing.id);
       if (error) throw new Error(`upsertSpender update: ${error.message}`);
       spenderId = existing.id;
@@ -210,6 +256,7 @@ export async function upsertSpenderAndEvent(
       const manual = await findManualSpender(supabase, username);
       if (manual) {
         const merged = deepMergeNoNull(manual.meta, newMeta);
+        const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
         const { error } = await supabase
           .from('spenders')
           .update({
@@ -221,12 +268,15 @@ export async function upsertSpenderAndEvent(
             meta: merged,
             last_seen_at: now,
             updated_at: now,
+            ...topLevelCols,
           })
           .eq('id', manual.id);
         if (error) throw new Error(`upsertSpender link-manual: ${error.message}`);
         spenderId = manual.id;
         log.info('SPENDER', 'linked_manual', { spender_id: spenderId, tg_user_id: tgNorm, username });
       } else {
+        const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
+        const firstName = displayName ? displayName.split(' ')[0] : null;
         const { data: inserted, error } = await supabase
           .from('spenders')
           .insert({
@@ -234,11 +284,13 @@ export async function upsertSpenderAndEvent(
             handle,
             display_name: displayName || null,
             name,
+            first_name: firstName,
             meta: newMeta,
             last_seen_at: now,
             updated_at: now,
             status: 'active',
             telegram_username: username,
+            ...topLevelCols,
           })
           .select('id')
           .single();
@@ -267,18 +319,24 @@ export async function upsertSpenderAndEvent(
       const currentMeta = (existing.meta as Record<string, unknown>) || {};
       const merged = deepMergeNoNull(currentMeta, newMeta);
       const existingDisplayName = (existing as { display_name?: string }).display_name;
+      const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
+      const updatePayload: Record<string, unknown> = {
+        meta: merged,
+        last_seen_at: now,
+        updated_at: now,
+        ...topLevelCols,
+      };
+      if (!existingDisplayName && displayName) {
+        updatePayload.display_name = displayName;
+      }
       const { error } = await supabase
         .from('spenders')
-        .update({
-          display_name: displayName || existingDisplayName,
-          meta: merged,
-          last_seen_at: now,
-          updated_at: now,
-        })
+        .update(updatePayload)
         .eq('id', existing.id);
       if (error) throw new Error(`upsertSpender update: ${error.message}`);
       spenderId = existing.id;
     } else {
+      const topLevelCols = hasExtracted ? buildTopLevelColumns(payload.extracted_fields!) : {};
       const { data: inserted, error } = await supabase
         .from('spenders')
         .insert({
@@ -290,6 +348,7 @@ export async function upsertSpenderAndEvent(
           updated_at: now,
           status: 'active',
           telegram_username: username,
+          ...topLevelCols,
         })
         .select('id')
         .single();
@@ -305,14 +364,17 @@ export async function upsertSpenderAndEvent(
     }
   }
 
-  // ── Link spender_id to tg_conversations ──
+  // ── Link spender_id to tg_conversations + populate username/tg_user_id ──
   if (payload.conversation_id) {
     try {
+      const convPatch: Record<string, unknown> = { spender_id: spenderId };
+      if (username) convPatch.username = username;
+      if (tgNorm) convPatch.tg_user_id = tgNorm;
+      if (displayName) convPatch.display_name = displayName;
       await supabase
         .from('tg_conversations')
-        .update({ spender_id: spenderId })
-        .eq('id', payload.conversation_id)
-        .is('spender_id', null);
+        .update(convPatch)
+        .eq('id', payload.conversation_id);
     } catch (err) {
       log.warn('SPENDER', 'conv_link_failed', {
         conv_id: payload.conversation_id,
