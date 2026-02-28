@@ -79,6 +79,7 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
       tg_user_id: msg.tgUserId ?? chatId,
       username: msg.username || null,
       display_name: displayName || null,
+      first_name: msg.firstName || null,
     },
   };
 
