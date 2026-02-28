@@ -1088,6 +1088,11 @@
     /* DB FIX — retry button on loading error */
     .loading-retry-btn { background: var(--accent); color: #fff; border: none; padding: 10px 28px; border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 8px; transition: opacity 0.2s; }
     .loading-retry-btn:hover { opacity: 0.85; }
+    @keyframes auth-pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+    .auth-reconnect-overlay { position: fixed; inset: 0; z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--bg-base); gap: 16px; }
+    .auth-reconnect-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); display: inline-block; animation: auth-pulse 1.2s ease-in-out infinite; }
+    .auth-reconnect-dot:nth-child(2) { animation-delay: 0.2s; }
+    .auth-reconnect-dot:nth-child(3) { animation-delay: 0.4s; }
     /* DB FIX — empty state for sections with no data */
     .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 48px 20px; color: var(--text-tertiary); text-align: center; }
     .empty-state-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
@@ -1899,6 +1904,158 @@
     window.TELEGRAM_BOT_URL = window.TELEGRAM_BOT_URL || "";
     window.BOT_CAM_URL = window.BOT_CAM_URL || "https://dadash-telegram-bot-production.up.railway.app";
     window.DADASH_INTERNAL_API_KEY = window.DADASH_INTERNAL_API_KEY || "";
+
+    // ═══ RESILIENT AUTH LOCK — prevents navigator.locks deadlock (lock:dadash-auth) ═══
+    (function() {
+      var AUTH_LOCK = 'lock:dadash-auth';
+      var LOCK_TIMEOUT = 2000;
+      var WATCHDOG_MS = 8000;
+      var tabId = Math.random().toString(36).slice(2, 8);
+      window.__authTabId = tabId;
+      window.__authLogs = [];
+
+      function log(evt, d) {
+        var entry = { t: Date.now(), e: evt, d: d || null, tab: tabId };
+        window.__authLogs.push(entry);
+        if (window.__authLogs.length > 100) window.__authLogs.shift();
+        console.log('[AUTH]', evt, d ? JSON.stringify(d) : '');
+      }
+      window.__authLog = log;
+
+      // ── BroadcastChannel: multi-tab auth state coordination ──
+      var bc = null;
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          bc = new BroadcastChannel('dadash-auth');
+          bc.onmessage = function(ev) {
+            if (!ev.data || ev.data.tab === tabId) return;
+            log('AUTH_BROADCAST_RECV', ev.data);
+            if (ev.data.state === 'done' && window.__authWaitResolve) {
+              window.__authWaitResolve();
+              window.__authWaitResolve = null;
+            }
+          };
+        }
+      } catch (e) { log('AUTH_BROADCAST_UNAVAILABLE'); }
+
+      window.__authBroadcast = function(state, extra) {
+        if (!bc) return;
+        try {
+          var msg = { state: state, at: Date.now(), tab: tabId };
+          if (extra) for (var k in extra) msg[k] = extra[k];
+          bc.postMessage(msg);
+          log('AUTH_BROADCAST_SEND', { state: state });
+        } catch (e) {}
+      };
+
+      // ── Monkey-patch navigator.locks.request: timeout + fallback for auth lock ──
+      if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) {
+        var _origLockRequest = navigator.locks.request.bind(navigator.locks);
+
+        navigator.locks.request = function(name, a, b) {
+          if (name !== AUTH_LOCK) return _origLockRequest(name, a, b);
+
+          var opts, cb;
+          if (typeof a === 'function') { cb = a; opts = {}; }
+          else { opts = a || {}; cb = b; }
+
+          if (opts.ifAvailable) return _origLockRequest(name, opts, cb);
+
+          log('AUTH_LOCK_REQUEST');
+
+          return new Promise(function(resolve, reject) {
+            var settled = false;
+
+            function runCb(lock, mode) {
+              if (settled) return;
+              settled = true;
+              log('AUTH_LOCK_ACQUIRED', { mode: mode });
+              try {
+                var result = cb(lock);
+                if (result && typeof result.then === 'function') {
+                  result.then(resolve, reject);
+                } else {
+                  resolve(result);
+                }
+                return result;
+              } catch (e) {
+                reject(e);
+              }
+            }
+
+            _origLockRequest(name, opts, function(lock) {
+              if (settled) { log('AUTH_LOCK_LATE_ACQUIRE'); return; }
+              clearTimeout(timer);
+              return runCb(lock, 'normal');
+            }).catch(function(e) {
+              if (!settled) log('AUTH_LOCK_ERR_NORMAL', { err: e.message });
+            });
+
+            var timer = setTimeout(function() {
+              if (settled) return;
+              log('AUTH_LOCK_TIMEOUT', { ms: LOCK_TIMEOUT });
+              _origLockRequest(name, { ifAvailable: true }, function(lock) {
+                if (lock) return runCb(lock, 'ifAvailable_fallback');
+                return runCb(null, 'bypass');
+              }).catch(function() {
+                runCb(null, 'forced_bypass');
+              });
+            }, LOCK_TIMEOUT);
+          });
+        };
+        log('AUTH_LOCK_PATCH_OK');
+      } else {
+        log('AUTH_LOCK_NO_NAVIGATOR_LOCKS');
+      }
+
+      // ── Singleton auth init promise + watchdog ──
+      window.__authInitPromise = null;
+      window.__authInitAbort = null;
+
+      window.__resilientAuthInit = function(fn) {
+        if (window.__authInitPromise) {
+          log('AUTH_INIT_REUSE');
+          return window.__authInitPromise;
+        }
+        log('AUTH_INIT_START');
+        window.__authBroadcast('refreshing');
+
+        var ac = typeof AbortController !== 'undefined' ? new AbortController() : { signal: { aborted: false }, abort: function() { this.signal.aborted = true; } };
+        window.__authInitAbort = ac;
+
+        var wd = setTimeout(function() {
+          log('AUTH_INIT_WATCHDOG', { timeout: WATCHDOG_MS });
+          ac.abort();
+        }, WATCHDOG_MS);
+
+        var p = fn(ac.signal)
+          .then(function(r) {
+            log('AUTH_INIT_OK');
+            window.__authBroadcast('done');
+            return r;
+          })
+          .catch(function(e) {
+            log('AUTH_INIT_ERR', { err: (e && e.message) || String(e) });
+            window.__authBroadcast('error', { err: (e && e.message) || String(e) });
+            throw e;
+          })
+          .finally(function() {
+            clearTimeout(wd);
+            window.__authInitPromise = null;
+            window.__authInitAbort = null;
+          });
+
+        window.__authInitPromise = p;
+        return p;
+      };
+
+      window.__cancelAuthInit = function() {
+        log('AUTH_INIT_CANCEL');
+        if (window.__authInitAbort) window.__authInitAbort.abort();
+        window.__authInitPromise = null;
+        window.__authInitAbort = null;
+      };
+    })();
 
     // ═══ SUPABASE CLIENT — robust init with LockManager guard ═══
     window.__sbReady = false;
@@ -16368,9 +16525,11 @@ const LoginPage = ({onLogin, lang, setLang}) => {
   const [pass, setPass] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [retryCount, setRetryCount] = useState(0);
   const handleLogin = async () => {
     setError("");
     setLoading(true);
+    if (window.__authLog) window.__authLog('AUTH_LOGIN_START', { email: email });
     try {
       if (window.__sbError) {
         setError("Supabase non connecté: " + window.__sbError);
@@ -16379,6 +16538,20 @@ const LoginPage = ({onLogin, lang, setLang}) => {
       }
       const {data, error: authErr} = await sb.auth.signInWithPassword({email, password: pass});
       if(authErr) {
+        const isLockErr = /lock/i.test(authErr.message) || /LockManager/i.test(authErr.message);
+        if (isLockErr) {
+          if (window.__authLog) window.__authLog('AUTH_LOGIN_LOCK_ERR', { msg: authErr.message });
+          console.warn("[DADASH] Lock error on login — retrying...");
+          const retry = await sb.auth.signInWithPassword({email, password: pass});
+          if (retry.error) {
+            setError(retry.error.message || t(lang,"login_error"));
+            setLoading(false);
+            return;
+          }
+          const {data: profile} = await sb.from("profiles").select("*").eq("id", retry.data.user.id).single();
+          setLoading(false);
+          if (profile) { onLogin({...profile, email: retry.data.user.email}); return; }
+        }
         console.error("[DADASH] Login error:", authErr.message);
         setError(authErr.message || t(lang,"login_error"));
         setLoading(false);
@@ -16392,13 +16565,26 @@ const LoginPage = ({onLogin, lang, setLang}) => {
         return;
       }
       if(profile) {
+        if (window.__authLog) window.__authLog('AUTH_LOGIN_OK');
         onLogin({...profile, email: data.user.email});
       } else {
         setError("Profil non trouvé. Contacte l'admin.");
       }
     } catch(e) {
-      console.error("[DADASH] Login crash:", e.message || e);
-      setError("Erreur connexion: " + (e.message || "impossible de joindre le serveur"));
+      const msg = e.message || "impossible de joindre le serveur";
+      const isLockErr = /lock/i.test(msg) || /LockManager/i.test(msg);
+      const isNetErr = /fetch/i.test(msg) || /network/i.test(msg) || /Failed to fetch/i.test(msg);
+      console.error("[DADASH] Login crash:", msg);
+      if (isLockErr) {
+        setError("Session en cours de synchronisation. Réessayez dans quelques secondes.");
+      } else if (isNetErr && retryCount < 3) {
+        setRetryCount(c => c + 1);
+        const delay = Math.min(2000 * Math.pow(2, retryCount), 16000);
+        setError("Connexion impossible — nouvelle tentative dans " + Math.round(delay/1000) + "s...");
+        setTimeout(() => handleLogin(), delay);
+      } else {
+        setError("Erreur connexion: " + msg);
+      }
       setLoading(false);
     }
   };
@@ -28084,23 +28270,26 @@ const App = () => {
     }
   };
 
-  /* DB FIX — init with retry support */
+  /* RESILIENT AUTH — init with lock-safe singleton, timeout, retry, broadcast */
+  const [authState, setAuthState] = useState('idle');
   useEffect(()=>{
-    const init = async () => {
+    const doInit = async (signal) => {
       setLoadError(null);
       setLoadTimeout(false);
-      // ── Connection health check ──
+      setAuthState('refreshing');
       if (window.__sbError) {
         console.error("[DADASH] Supabase not available:", window.__sbError);
         setLoadError("Supabase non connecté: " + window.__sbError);
+        setAuthState('error');
         setLoading(false);
         return;
       }
       try {
-        /* DB FIX — 8s timeout on getSession to avoid indefinite hang */
+        if (signal && signal.aborted) throw new Error("Auth init annulé");
         const sessionPromise = sb.auth.getSession();
         const sessionTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout: impossible de joindre Supabase")), 8000));
         const {data:{session}} = await Promise.race([sessionPromise, sessionTimeout]);
+        if (signal && signal.aborted) throw new Error("Auth init annulé");
         if(session) {
           const {data:profile, error:profileErr} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
           if (profileErr) {
@@ -28118,19 +28307,61 @@ const App = () => {
             await loadData(fullUser);
           }
         }
+        setAuthState('done');
       } catch(e) {
-        console.error("[DADASH] Init failed:", e.message || e);
-        setLoadError(e.message || "Connexion impossible");
+        const msg = e.message || "Connexion impossible";
+        const isLockErr = /lock/i.test(msg) || /LockManager/i.test(msg) || /timed out/i.test(msg);
+        if (isLockErr) {
+          if (window.__authLog) window.__authLog('AUTH_LOCK_ERROR_CAUGHT', { msg: msg });
+          console.warn("[DADASH] Lock error caught — auto-retrying without lock:", msg);
+          try {
+            const {data:{session}} = await sb.auth.getSession();
+            if (session) {
+              const {data:profile} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
+              if (profile) {
+                const fullUser = {...profile, email:session.user.email};
+                setUser(fullUser);
+                if(fullUser.role === "provider") setTab("transactions");
+                if(fullUser.role === "modele") setTab("model_checklist");
+                await loadData(fullUser);
+              }
+            }
+            setAuthState('done');
+            setLoading(false);
+            return;
+          } catch(retryErr) {
+            console.error("[DADASH] Lock error retry failed:", retryErr.message);
+          }
+        }
+        console.error("[DADASH] Init failed:", msg);
+        const isNetErr = /fetch/i.test(msg) || /network/i.test(msg) || /Failed to fetch/i.test(msg) || /impossible de joindre/i.test(msg);
+        if (isNetErr && retryCount < 4) {
+          const delay = Math.min(2000 * Math.pow(2, retryCount), 16000);
+          if (window.__authLog) window.__authLog('AUTH_INIT_NET_RETRY', { delay: delay, attempt: retryCount });
+          setLoadError("Connexion impossible — nouvelle tentative dans " + Math.round(delay/1000) + "s...");
+          setAuthState('error');
+          setLoading(false);
+          setTimeout(() => { setRetryCount(c => c + 1); }, delay);
+          return;
+        }
+        setLoadError(msg);
+        setAuthState('error');
       }
       setLoading(false);
     };
-    init();
+    if (window.__resilientAuthInit) {
+      window.__resilientAuthInit(doInit).catch(function() {});
+    } else {
+      doInit(null);
+    }
   },[retryCount]);
 
-  /* DB FIX — retry function: resets state and re-triggers init */
+  /* RESILIENT AUTH — retry: cancel any in-flight init, reset, re-trigger */
   const retryInit = () => {
+    if (window.__cancelAuthInit) window.__cancelAuthInit();
     setLoadTimeout(false);
     setLoadError(null);
+    setAuthState('idle');
     setLoading(true);
     setRetryCount(c => c + 1);
   };
@@ -28431,39 +28662,58 @@ const App = () => {
     }
   };
 
-  /* DB FIX — loading screen with timeout, error feedback, and retry button */
-  if(loading) return (
-    <div className="loading-wrap">
-      {!loadTimeout && <div className="spinner"></div>}
-      {!loadTimeout && <div style={{color:"var(--text-tertiary)",fontSize:13,marginTop:4}}>Chargement des données...</div>}
-      {loadTimeout && (
+  /* RESILIENT AUTH — reconnection overlay (never a hard error screen) */
+  if(loading || (!user && loadError)) {
+    const isErr = !!loadError;
+    const isLockRelated = isErr && (/lock/i.test(loadError) || /LockManager/i.test(loadError) || /timed out/i.test(loadError));
+    return (
+      <div className="auth-reconnect-overlay">
         <div style={{textAlign:"center",maxWidth:400,padding:"0 20px"}}>
-          <div className="spinner" style={{margin:"0 auto 16px",borderTopColor:"#EF4444"}}></div>
-          <div style={{fontSize:36,marginBottom:8}}>{"⚠️"}</div>
-          <div style={{color:"#EF4444",fontSize:15,fontWeight:600,marginBottom:8}}>
-            Le chargement prend trop de temps...
-          </div>
-          <div style={{color:"var(--text-tertiary)",fontSize:13,marginBottom:16}}>
-            Vérifiez votre connexion internet et réessayez.
-          </div>
-          <button className="loading-retry-btn" onClick={retryInit}>
-            {"\u{1F504}"} Réessayer
-          </button>
+          {!isErr && !loadTimeout && (<>
+            <div className="spinner" style={{margin:"0 auto 16px"}}></div>
+            <div style={{color:"var(--text-tertiary)",fontSize:13}}>Chargement des données...</div>
+          </>)}
+          {!isErr && loadTimeout && (<>
+            <div style={{display:"flex",gap:6,justifyContent:"center",marginBottom:20}}>
+              <span className="auth-reconnect-dot"></span>
+              <span className="auth-reconnect-dot"></span>
+              <span className="auth-reconnect-dot"></span>
+            </div>
+            <div style={{fontSize:15,fontWeight:600,color:"var(--text-secondary)",marginBottom:6}}>
+              Reconnexion en cours...
+            </div>
+            <div style={{color:"var(--text-tertiary)",fontSize:13,marginBottom:16}}>
+              Vérification de la session — veuillez patienter.
+            </div>
+            <button className="loading-retry-btn" onClick={retryInit}>
+              {"\u{1F504}"} Réessayer
+            </button>
+          </>)}
+          {isErr && (<>
+            <div style={{display:"flex",gap:6,justifyContent:"center",marginBottom:20}}>
+              <span className="auth-reconnect-dot"></span>
+              <span className="auth-reconnect-dot"></span>
+              <span className="auth-reconnect-dot"></span>
+            </div>
+            <div style={{fontSize:15,fontWeight:600,color:"var(--warning)",marginBottom:6}}>
+              {isLockRelated ? "Session en cours de synchronisation..." : "Reconnexion..."}
+            </div>
+            <div style={{color:"var(--text-tertiary)",fontSize:13,marginBottom:6}}>
+              {isLockRelated
+                ? "Un autre onglet gère la session. Tentative de reprise automatique."
+                : loadError}
+            </div>
+            <div style={{color:"var(--text-tertiary)",fontSize:11,marginBottom:16,opacity:0.7}}>
+              Si le problème persiste, cliquez sur Réessayer.
+            </div>
+            <button className="loading-retry-btn" onClick={retryInit}>
+              {"\u{1F504}"} Réessayer
+            </button>
+          </>)}
         </div>
-      )}
-    </div>
-  );
-  /* DB FIX — if no user but we have a loadError, show error screen with retry */
-  if(!user && loadError) return (
-    <div className="loading-wrap">
-      <div style={{textAlign:"center",maxWidth:400,padding:"0 20px"}}>
-        <div style={{fontSize:36,marginBottom:8}}>{"❌"}</div>
-        <div style={{color:"#EF4444",fontSize:15,fontWeight:600,marginBottom:8}}>{loadError}</div>
-        <div style={{color:"var(--text-tertiary)",fontSize:13,marginBottom:16}}>Impossible de se connecter au serveur.</div>
-        <button className="loading-retry-btn" onClick={retryInit}>{"\u{1F504}"} Réessayer</button>
       </div>
-    </div>
-  );
+    );
+  }
   const hash = (typeof window !== "undefined" ? window.location.hash.replace(/^#/, "").split("/")[0] : "") || "";
   const showLoginRoute = hash === "login";
   if (!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
