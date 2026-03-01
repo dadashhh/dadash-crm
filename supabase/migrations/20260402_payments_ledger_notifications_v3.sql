@@ -204,8 +204,7 @@ CREATE POLICY notif_update_own ON public.notifications
 CREATE OR REPLACE VIEW public.v_user_balances AS
 SELECT
   le.owner_user_id AS user_id,
-  COALESCE(p.name, p.username) AS display_name,
-  p.username,
+  p.name AS display_name,
   p.role,
   le.currency,
   SUM(CASE WHEN le.entry_type = 'receiver_credit' THEN le.amount ELSE 0 END)
@@ -216,7 +215,7 @@ SELECT
   COUNT(*) AS entry_count
 FROM public.ledger_entries le
 JOIN public.profiles p ON p.id = le.owner_user_id
-GROUP BY le.owner_user_id, p.name, p.username, p.role, le.currency;
+GROUP BY le.owner_user_id, p.name, p.role, le.currency;
 
 GRANT SELECT ON public.v_user_balances TO authenticated;
 
@@ -240,7 +239,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(name, username, 'Inconnu')
+  SELECT COALESCE(name, 'Inconnu')
     INTO v_creator_name
     FROM profiles
    WHERE id = NEW.created_by_user_id;
@@ -298,11 +297,11 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(name, username, 'Inconnu')
+  SELECT COALESCE(name, 'Inconnu')
     INTO v_payer_name
     FROM profiles WHERE id = NEW.payer_user_id;
 
-  SELECT COALESCE(name, username, 'Inconnu')
+  SELECT COALESCE(name, 'Inconnu')
     INTO v_receiver_name
     FROM profiles WHERE id = NEW.receiver_user_id;
 
@@ -724,7 +723,7 @@ SELECT owner_user_id, counterparty_user_id, entry_type, amount, currency
 --   owner=CHATTER  entry_type=receiver_credit  amount=500
 
 -- Etape 5 : verifier les soldes
-SELECT user_id, username, role, currency, balance, total_received, total_paid
+SELECT user_id, display_name, role, currency, balance, total_received, total_paid
   FROM v_user_balances
  WHERE user_id IN ('<MANAGER_UUID>', '<CHATTER_UUID>');
 

@@ -183,7 +183,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(name, username, 'Inconnu')
+  SELECT COALESCE(name, 'Inconnu')
     INTO v_from_name
     FROM profiles WHERE id = NEW.from_user_id;
 
@@ -245,9 +245,9 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(name, username, 'Inconnu')
+  SELECT COALESCE(name, 'Inconnu')
     INTO v_from_name FROM profiles WHERE id = NEW.from_user_id;
-  SELECT COALESCE(name, username, 'Inconnu')
+  SELECT COALESCE(name, 'Inconnu')
     INTO v_to_name   FROM profiles WHERE id = NEW.to_user_id;
 
   v_label := CASE NEW.kind
@@ -624,8 +624,7 @@ GRANT  EXECUTE ON FUNCTION public.rpc_my_payment_kpis() TO authenticated;
 CREATE OR REPLACE VIEW public.v_user_balances AS
 SELECT
   le.owner_user_id AS user_id,
-  COALESCE(p.name, p.username) AS display_name,
-  p.username,
+  p.name AS display_name,
   p.role,
   le.currency,
   SUM(CASE WHEN le.entry_type = 'receiver_credit' THEN le.amount ELSE 0 END)
@@ -636,7 +635,7 @@ SELECT
   COUNT(*) AS entry_count
 FROM public.ledger_entries le
 JOIN public.profiles p ON p.id = le.owner_user_id
-GROUP BY le.owner_user_id, p.name, p.username, p.role, le.currency;
+GROUP BY le.owner_user_id, p.name, p.role, le.currency;
 
 GRANT SELECT ON public.v_user_balances TO authenticated;
 
