@@ -36,7 +36,7 @@ CREATE OR REPLACE FUNCTION public._get_my_role()
 RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public
-AS $$ SELECT role FROM profiles WHERE id = auth.uid() $$;
+AS $func$ SELECT role FROM profiles WHERE id = auth.uid() $func$;
 
 GRANT EXECUTE ON FUNCTION public._get_my_role() TO authenticated;
 
@@ -78,12 +78,12 @@ CREATE TABLE IF NOT EXISTS public.payments (
 );
 
 CREATE OR REPLACE FUNCTION public.fn_set_payments_updated_at()
-RETURNS trigger LANGUAGE plpgsql AS $$
+RETURNS trigger LANGUAGE plpgsql AS $func$
 BEGIN
   NEW.updated_at = now();
   RETURN NEW;
 END;
-$$;
+$func$;
 
 DROP TRIGGER IF EXISTS trg_payments_updated_at ON public.payments;
 CREATE TRIGGER trg_payments_updated_at
@@ -202,20 +202,27 @@ CREATE POLICY notif_update_own ON public.notifications
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW public.v_user_balances AS
+WITH agg AS (
+  SELECT
+    le.owner_user_id,
+    le.currency,
+    SUM(CASE WHEN le.entry_type = 'receiver_credit' THEN le.amount ELSE 0 END) AS total_received,
+    SUM(CASE WHEN le.entry_type = 'payer_debit'     THEN le.amount ELSE 0 END) AS total_paid,
+    COUNT(*) AS entry_count
+  FROM public.ledger_entries le
+  GROUP BY le.owner_user_id, le.currency
+)
 SELECT
-  le.owner_user_id AS user_id,
-  p.name AS display_name,
+  agg.owner_user_id                  AS user_id,
+  p.name                             AS display_name,
   p.role,
-  le.currency,
-  SUM(CASE WHEN le.entry_type = 'receiver_credit' THEN le.amount ELSE 0 END)
-    - SUM(CASE WHEN le.entry_type = 'payer_debit' THEN le.amount ELSE 0 END)
-    AS balance,
-  SUM(CASE WHEN le.entry_type = 'receiver_credit' THEN le.amount ELSE 0 END) AS total_received,
-  SUM(CASE WHEN le.entry_type = 'payer_debit' THEN le.amount ELSE 0 END) AS total_paid,
-  COUNT(*) AS entry_count
-FROM public.ledger_entries le
-JOIN public.profiles p ON p.id = le.owner_user_id
-GROUP BY le.owner_user_id, p.name, p.role, le.currency;
+  agg.currency,
+  agg.total_received - agg.total_paid AS balance,
+  agg.total_received,
+  agg.total_paid,
+  agg.entry_count
+FROM agg
+JOIN public.profiles p ON p.id = agg.owner_user_id;
 
 GRANT SELECT ON public.v_user_balances TO authenticated;
 
@@ -229,7 +236,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $func$
 DECLARE
   v_creator_name text;
   v_title        text;
@@ -264,7 +271,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$$;
+$func$;
 
 DROP TRIGGER IF EXISTS trg_payments_on_insert ON public.payments;
 CREATE TRIGGER trg_payments_on_insert
@@ -286,7 +293,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $func$
 DECLARE
   v_existing      int;
   v_payer_name    text;
@@ -407,7 +414,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$$;
+$func$;
 
 DROP TRIGGER IF EXISTS trg_payments_on_status_change ON public.payments;
 CREATE TRIGGER trg_payments_on_status_change
@@ -442,7 +449,7 @@ RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $func$
 DECLARE
   v_me         uuid := auth.uid();
   v_me_role    text;
@@ -518,7 +525,7 @@ BEGIN
 
   RETURN v_payment_id;
 END;
-$$;
+$func$;
 
 REVOKE ALL ON FUNCTION public.rpc_create_payment(text, uuid, numeric, text, text, text)
   FROM PUBLIC;
@@ -541,7 +548,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $func$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -578,7 +585,7 @@ BEGIN
          confirmed_at = now()
    WHERE id = p_payment_id;
 END;
-$$;
+$func$;
 
 REVOKE ALL ON FUNCTION public.rpc_confirm_payment(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_confirm_payment(uuid) TO authenticated;
@@ -595,7 +602,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $func$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -628,7 +635,7 @@ BEGIN
          refused_reason = COALESCE(p_reason, '')
    WHERE id = p_payment_id;
 END;
-$$;
+$func$;
 
 REVOKE ALL ON FUNCTION public.rpc_refuse_payment(uuid, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_refuse_payment(uuid, text) TO authenticated;
@@ -644,7 +651,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $$
+AS $func$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -676,7 +683,7 @@ BEGIN
          cancelled_at = now()
    WHERE id = p_payment_id;
 END;
-$$;
+$func$;
 
 REVOKE ALL ON FUNCTION public.rpc_cancel_payment(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_cancel_payment(uuid) TO authenticated;
