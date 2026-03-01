@@ -36,7 +36,6 @@ const supabase = createClient(
 interface UserProfile {
   id: string;
   name: string | null;
-  username: string | null;
   role: string;
   timezone: string | null;
 }
@@ -247,7 +246,7 @@ export function ComptaTab() {
 
       const { data: profileData } = await supabase
         .from('profiles')
-        .select('id, name, username, role, timezone')
+        .select('id, name, role, timezone')
         .eq('id', uid)
         .single();
 
@@ -261,7 +260,7 @@ export function ComptaTab() {
         if (p.role === 'provider') {
           const { data: gerants } = await supabase
             .from('profiles')
-            .select('id, name, username, role, timezone')
+            .select('id, name, role, timezone')
             .in('role', ['gerant','admin','ceo']);
           setGerantProfiles((gerants ?? []) as UserProfile[]);
         }
@@ -504,7 +503,7 @@ export function ComptaTab() {
                       <option value="">Selectionnez...</option>
                       {gerantProfiles.map((g) => (
                         <option key={g.id} value={g.id}>
-                          {g.name ?? g.username ?? g.id} ({g.role})
+                          {g.name ?? g.id} ({g.role})
                         </option>
                       ))}
                     </select>
