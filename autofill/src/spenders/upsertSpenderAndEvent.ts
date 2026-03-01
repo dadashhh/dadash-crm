@@ -220,7 +220,7 @@ export async function upsertSpenderAndEvent(
   let created = false;
 
   if (tgNorm) {
-    // --- Primary lookup: tg_user_id ---
+    // --- Primary lookup: tg_user_id (inclut fiches modifiées manuellement avec tg_id) ---
     const { data: existing } = await supabase
       .from('spenders')
       .select('id, meta, display_name, first_name')
