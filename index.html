@@ -7824,7 +7824,6 @@ const UnifiedSpenderModal = React.memo(({
   const [deleteConfirm, setDeleteConfirm] = React.useState(null);
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep");
   const [deleteLoading, setDeleteLoading] = React.useState(false);
-  const [mergeConfirm, setMergeConfirm] = React.useState(null);
 
   // Badge state (local)
   const [dbBadges, setDbBadges] = React.useState({});
@@ -8008,79 +8007,23 @@ const UnifiedSpenderModal = React.memo(({
         if (isNumericTg) { updates.tg_user_id = tgNorm; updates.telegram_username = null; }
         else if (rawTg) { updates.telegram_username = rawTg; updates.tg_user_id = null; }
         else { updates.telegram_username = null; updates.tg_user_id = null; }
-        if (isNumericTg && tgNorm) {
-          const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
-          if (existing) {
-            setMergeConfirm({ existing, tgId: tgNorm, updates });
-            setSpSavingProfile(false);
-            return;
-          }
-        }
-        const { data: updateData, error, count: updateCount, status: updateStatus } = await sb.from("spenders").update(updates).eq("id", selected.dbId).select();
-        console.log("[SAVE_PROFILE] update result:", { updateData, error, updateCount, updateStatus, dbId: selected.dbId });
-        if (error) {
-          if (error.message && (error.message.includes("uq_spenders_tg_user_id") || error.message.includes("duplicate key"))) {
-            const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
-            if (existing) { setMergeConfirm({ existing, tgId: tgNorm, updates }); setSpSavingProfile(false); return; }
-          }
-          throw new Error(error.message);
-        }
-        if (!updateData || updateData.length === 0) {
-          addToast(fr ? "Erreur: aucune ligne modifiée (RLS ou ID invalide)" : "Error: no row updated (RLS or invalid ID)", "error");
-          console.error("[SAVE_PROFILE] 0 rows updated — dbId:", selected.dbId, "| status:", updateStatus);
-          setSpSavingProfile(false);
-          return;
-        }
+        const { error } = await sb.from("spenders").update(updates).eq("id", selected.dbId);
+        if (error) throw new Error(error.message);
       }
       addToast(fr ? "Sauvegardé ✓" : "Saved ✓", "success");
       setSpEditMode(false);
-      setMergeConfirm(null);
       if (onRefresh) await onRefresh();
-      const targetId = selected.dbId;
+      // Rafraîchir le modal avec les données fraîches
+      const _tid = selected.dbId;
       try {
-        // Toujours privilégier les données fraîches du fetch (pas buildSpenderVM qui utilise dbSpenders potentiellement stale)
-        const { data: uiData } = await sb.from("v_spenders_ui").select("*").eq("id", targetId).maybeSingle();
-        if (uiData) {
-          const fresh = mapUiToSpender(uiData);
-          const merged = { ...selected, ...fresh, dbId: targetId };
-          const vm = spenderVM(merged);
-          setSelected(vm);
-          initForm(vm);
-        } else {
-          const { data: canonData } = await sb.from("v_spenders_canon").select("*").eq("spender_id", targetId).maybeSingle();
-          if (canonData) {
-            const fresh = mapCanonToSpender(canonData);
-            const merged = { ...selected, ...fresh, dbId: targetId };
-            const vm = spenderVM(merged);
-            setSelected(vm);
-            initForm(vm);
-          } else {
-            const { data } = await sb.from("v_spenders").select("*").eq("id", targetId).maybeSingle();
-            if (data) {
-              const merged = { ...selected, ...data, dbId: targetId };
-              const vm = spenderVM(merged);
-              setSelected(vm);
-              initForm(vm);
-            }
-          }
+        const { data: _fresh } = await sb.from("spenders").select("*").eq("id", _tid).maybeSingle();
+        if (_fresh) {
+          const _vm = spenderVM({ ...selected, ..._fresh, dbId: _tid, telegramId: _fresh.tg_user_id ?? _fresh.telegram_id ?? null, tg_user_id: _fresh.tg_user_id || null, telegram_username: _fresh.telegram_username || null });
+          setSelected(_vm);
+          initForm(_vm);
         }
-      } catch (_) { /* best-effort refresh */ }
+      } catch (_) { /* best-effort */ }
     } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); }
-    setSpSavingProfile(false);
-  };
-
-  const handleMergeConfirm = async () => {
-    if (!mergeConfirm || !selected?.dbId) return;
-    setSpSavingProfile(true);
-    try {
-      const { data: res, error } = await sb.rpc("fn_merge_spenders", { p_old_id: selected.dbId, p_new_id: mergeConfirm.existing.id });
-      if (error) throw new Error(error.message);
-      if (res && res.ok === false) throw new Error(res.error || "Merge failed");
-      addToast(fr ? "Fusion effectuée ✓" : "Merge completed ✓", "success");
-      setMergeConfirm(null); setSpEditMode(false);
-      if (onRefresh) await onRefresh();
-      onClose();
-    } catch (e) { addToast("Erreur fusion: " + (e?.message || e), "error"); }
     setSpSavingProfile(false);
   };
 
@@ -8179,8 +8122,7 @@ const UnifiedSpenderModal = React.memo(({
 
   // ── Copy tg_id to clipboard ──
   const copyTgId = () => {
-    const _r = (selected?.telegram_username || "").replace(/^@/, "");
-    const tgId = selected?.tg_user_id || selected?.telegramId || (/^\d+$/.test(_r) ? _r : "");
+    const tgId = selected?.tg_user_id || selected?.telegramId || "";
     if (!tgId) return;
     try { navigator.clipboard.writeText(String(tgId)); addToast(fr ? "tg_id copié ✓" : "tg_id copied ✓", "success"); }
     catch (e) { addToast("Erreur copie", "error"); }
@@ -8213,11 +8155,11 @@ const UnifiedSpenderModal = React.memo(({
   const _badges = _badgeList.length > 0 ? _badgeList : computeSpenderBadges(selected).map(b => b.label);
   const _vipScore = computeVIPScore(selected);
 
-  // ── TG tag display ── (officiel = tg_id renseigné → badge bleu "TG [id]")
-  const _rawTg = (selected.telegram_username || "").replace(/^@/, "");
-  const _isNumTg = _rawTg && /^\d+$/.test(_rawTg);
-  const tgId = selected.tg_user_id || selected.telegramId || (_isNumTg ? _rawTg : null);
-  const tgTagLabel = tgId ? ("TG " + tgId) : (selected.telegram_username ? ("@" + selected.telegram_username) : null);
+  // ── TG tag display — badge bleu si tg_user_id renseigné ──
+  const _rawTgDisp = (selected.telegram_username || "").replace(/^@/, "");
+  const _isNumTgDisp = _rawTgDisp && /^\d+$/.test(_rawTgDisp);
+  const tgId = selected.tg_user_id || selected.telegramId || (_isNumTgDisp ? _rawTgDisp : null);
+  const tgTagLabel = tgId ? ("TG " + tgId) : (_rawTgDisp && !_isNumTgDisp ? ("@" + _rawTgDisp) : null);
 
   // ── Header buttons helper ──
   const canEdit = !readOnly || chatterMode;
@@ -8251,7 +8193,7 @@ const UnifiedSpenderModal = React.memo(({
               setEditingTx({ status:"pending", spender_handle:cleanHandle, _spender_id:selected.dbId||selected.id||null, amount:"", currency:"CHF", date:new Date().toISOString().slice(0,10), model_id:selected.model_id||"", chatter_id:user?.id||"" });
             }} className="ui-btn-primary" style={{fontSize:10,padding:"5px 10px"}}>{"\u2795"} {fr?"Créer TX":"Create TX"}</button>}
             {canEdit && <button onClick={()=>{setSpEditMode(!spEditMode);if(!spEditMode)initForm(selected);}} className="ui-btn-secondary" style={{fontSize:10,padding:"5px 12px"}}>{spEditMode?(fr?"Annuler":"Cancel"):(fr?"Modifier":"Edit")}</button>}
-            {canEdit && selected.dbId && (selected.tg_user_id||selected.telegramId||(/^\d+$/.test((selected.telegram_username||"").replace(/^@/,"")))) && (
+            {canEdit && selected.dbId && (selected.tg_user_id||selected.telegramId) && (
               <button onClick={async()=>{
                 try {
                   const{data,error}=await sb.rpc("fn_refresh_spender_from_tg",{p_spender_id:selected.dbId});
@@ -8476,23 +8418,6 @@ const UnifiedSpenderModal = React.memo(({
             <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
             <button onClick={()=>handleDeleteSpender(deleteConfirm)} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
               {deleteLoading ? "\u23F3 ..." : `\u{1F5D1}\uFE0F ${fr?"Supprimer":"Delete"}`}
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
-    {mergeConfirm && (
-      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:1000010,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>!spSavingProfile&&setMergeConfirm(null)}>
-        <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:420,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
-          <div style={{fontSize:16,fontWeight:800,color:"#0088cc",marginBottom:8}}>{"\u2139\uFE0F"} {fr?"ID Telegram déjà utilisé":"Telegram ID already in use"}</div>
-          <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:16}}>
-            {fr?"L'ID":"The ID"} <strong>{mergeConfirm.tgId}</strong> {fr?"est déjà attribué à":"is already assigned to"} <strong>@{mergeConfirm.existing.handle||mergeConfirm.existing.name||"?"}</strong>.
-            {fr ? ` Fusionner cette fiche (${getSpenderDisplayName(selected)}) dans la fiche existante ?` : ` Merge this card (${getSpenderDisplayName(selected)}) into the existing one?`}
-          </div>
-          <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-            <button onClick={()=>setMergeConfirm(null)} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
-            <button onClick={handleMergeConfirm} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,background:"#0088cc",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:spSavingProfile?0.6:1}}>
-              {spSavingProfile ? "\u23F3 ..." : (fr?"Fusionner":"Merge")}
             </button>
           </div>
         </div>
@@ -9014,20 +8939,10 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                     })()}</td>}
                     {(user.role==="gerant"||user.role==="chatter")&&<td style={{fontSize:12,whiteSpace:"nowrap",fontFamily:"monospace",color:"var(--text-secondary)"}}>
                       {(()=>{
-                        const rh=tx.spender_handle||"";
-                        const rhLow=rh.toLowerCase().replace(/^@/,"");
-                        const dbSp=(dbSpenders||[]).find(s=>{
-                          if(tx.spender_id) return s.id===tx.spender_id;
-                          if(s.handle&&s.handle.toLowerCase().replace(/^@/,"")===rhLow) return true;
-                          if(s.name&&s.name.toLowerCase()===rhLow) return true;
-                          if(s.telegram_username&&s.telegram_username.toLowerCase().replace(/^@/,"")===rhLow) return true;
-                          if(s.tg_user_id&&rh.replace(/^@?tg_/i,"")===String(s.tg_user_id)) return true;
-                          return false;
-                        });
-                        const _raw=dbSp?.telegram_username?(String(dbSp.telegram_username).replace(/^@/,"")):"";
-                        const numId=dbSp?.tg_user_id||tx.telegram_id||dbSp?.telegram_id||(/^\d+$/.test(_raw)?_raw:null);
+                        const dbSp=(dbSpenders||[]).find(s=>tx.spender_id?s.id===tx.spender_id:(s.handle||s.name)===tx.spender_handle);
+                        const numId=dbSp?.tg_user_id||tx.telegram_id||dbSp?.telegram_id;
                         const usrName=dbSp?.telegram_username;
-                        if(numId) return <span title={usrName&&!/^\d+$/.test(usrName.replace(/^@/,""))?`@${usrName}`:undefined}>{numId}</span>;
+                        if(numId) return <span title={usrName?`@${usrName}`:undefined}>{numId}</span>;
                         if(usrName) return <span style={{fontStyle:"italic",color:"var(--text-tertiary)"}}>{usrName}</span>;
                         return "—";
                       })()}
@@ -9111,7 +9026,6 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [showNewSpender, setShowNewSpender] = useState(false);
   const [newSpForm, setNewSpForm] = useState({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
   const [deleteConfirm, setDeleteConfirm] = useState(null);
-  const [mergeConfirm, setMergeConfirm] = useState(null);
   const [search, setSearch] = useState("");
   const [filterBadge, setFilterBadge] = useState("");
   const [filterLangue, setFilterLangue] = useState("");
@@ -9597,47 +9511,13 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       const profilePatch = {first_name: spForm.first_name || null, age: spForm.age ? parseInt(spForm.age) : null, city: spForm.city || null, country: spForm.country || null, job: spForm.job || null, language: spForm.langue || "FR", timezone: spForm.timezone || "Europe/Zurich", budget_range: spForm.budget_range || null, relationship_status: spForm.relationship_status || null, notes_chatter: spForm.chatter_notes || null};
       const currentMeta = selected.meta || {};
       const mergedProfile = { ...(currentMeta.profile || {}), ...profilePatch };
-      const rawTg = (spForm.telegram_username || "").trim().replace(/^@/, "");
-      const tgNorm = rawTg.replace(/\D/g, "");
-      const isNumericTg = tgNorm.length > 0 && tgNorm === rawTg;
-      const updates = {first_name: spForm.first_name || null, age: spForm.age ? parseInt(spForm.age) : null, city: spForm.city || null, country: spForm.country || null, job: spForm.job || null, langue: spForm.langue || "FR", timezone: spForm.timezone || "Europe/Zurich", budget_range: spForm.budget_range || null, whatsapp_phone: spForm.whatsapp_phone || null, relationship_status: spForm.relationship_status || null, preferences: spForm.preferences || null, personality_notes: spForm.personality_notes || null, notes: spForm.chatter_notes || null, favorite_content: spForm.favorite_content || null, best_time: spForm.best_time || null, classification: spForm.classification || "new", risk_level: spForm.risk_level || "safe", source: spForm.source || null, tags: spForm.tags || [], status: spForm.status || "active", meta: { ...currentMeta, profile: mergedProfile, last_enrich_source: "crm_manual", last_enrich_at: new Date().toISOString() }};
-      if (isNumericTg) { updates.tg_user_id = tgNorm; updates.telegram_username = null; }
-      else if (rawTg) { updates.telegram_username = rawTg; updates.tg_user_id = null; }
-      else { updates.telegram_username = null; updates.tg_user_id = null; }
-      if (isNumericTg && tgNorm) {
-        const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
-        if (existing) {
-          setMergeConfirm({ existing, tgId: tgNorm });
-          setSpSavingProfile(false);
-          return;
-        }
-      }
+      const updates = {first_name: spForm.first_name || null, age: spForm.age ? parseInt(spForm.age) : null, city: spForm.city || null, country: spForm.country || null, job: spForm.job || null, langue: spForm.langue || "FR", timezone: spForm.timezone || "Europe/Zurich", budget_range: spForm.budget_range || null, telegram_username: spForm.telegram_username || null, whatsapp_phone: spForm.whatsapp_phone || null, relationship_status: spForm.relationship_status || null, preferences: spForm.preferences || null, personality_notes: spForm.personality_notes || null, notes: spForm.chatter_notes || null, favorite_content: spForm.favorite_content || null, best_time: spForm.best_time || null, classification: spForm.classification || "new", risk_level: spForm.risk_level || "safe", source: spForm.source || null, tags: spForm.tags || [], status: spForm.status || "active", meta: { ...currentMeta, profile: mergedProfile, last_enrich_source: "crm_manual", last_enrich_at: new Date().toISOString() }};
       const {error} = await sb.from("spenders").update(updates).eq("id", selected.dbId);
-      if (error) {
-        if (error.message && (error.message.includes("uq_spenders_tg_user_id") || error.message.includes("duplicate key"))) {
-          const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
-          if (existing) { setMergeConfirm({ existing, tgId: tgNorm }); setSpSavingProfile(false); return; }
-        }
-        addToast("Erreur: " + error.message, "error"); setSpSavingProfile(false); return;
-      }
-      setSpSavingProfile(false); setSpEditMode(false); setMergeConfirm(null);
+      if (error) { addToast("Erreur: " + error.message, "error"); setSpSavingProfile(false); return; }
+      setSpSavingProfile(false); setSpEditMode(false);
       addToast(fr ? "Profil sauvegardé" : "Profile saved", "success");
       await onRefresh(); setSelected(null);
     } catch (e) { setSpSavingProfile(false); addToast("Erreur: " + e.message, "error"); }
-  };
-
-  const handleMergeConfirm = async () => {
-    if (!mergeConfirm || !selected?.dbId) return;
-    setSpSavingProfile(true);
-    try {
-      const { data: res, error } = await sb.rpc("fn_merge_spenders", { p_old_id: selected.dbId, p_new_id: mergeConfirm.existing.id });
-      if (error) throw new Error(error.message);
-      if (res && res.ok === false) throw new Error(res.error || "Merge failed");
-      addToast(fr ? "Fusion effectuée ✓" : "Merge completed ✓", "success");
-      setMergeConfirm(null); setSpEditMode(false); setSelected(null);
-      await onRefresh();
-    } catch (e) { addToast("Erreur fusion: " + (e?.message || e), "error"); }
-    setSpSavingProfile(false);
   };
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep"); // "keep" | "delete"
   const [deleteLoading, setDeleteLoading] = React.useState(false);
@@ -9671,17 +9551,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       // FIX 3 — Dedup: warn if handle or telegram_id already exists
       const existingByHandle = (dbSpenders||[]).find(s=>(s.handle||s.name)===handle);
       if (existingByHandle) { addToast(`⚠️ Spender déjà existant : @${handle}`, "warning"); setSpSavingProfile(false); return; }
-      const rawTg = (newSpForm.telegram_username || "").trim().replace(/^@/, "");
-      const tgNorm = rawTg.replace(/\D/g, "");
-      const isNumericTg = tgNorm.length > 0 && tgNorm === rawTg;
-      if (rawTg) {
-        const dupTg = (dbSpenders||[]).find(s => String(s.tg_user_id||s.telegram_id) === tgNorm || (s.telegram_username && s.telegram_username.replace(/^@/,"").toLowerCase() === rawTg.toLowerCase()));
+      if (newSpForm.telegram_username && newSpForm.telegram_username.trim()) {
+        const tgVal = newSpForm.telegram_username.trim().replace(/^@/, "");
+        const dupTg = (dbSpenders||[]).find(s => String(s.telegram_id) === tgVal || (s.telegram_username && s.telegram_username.replace(/^@/,"") === tgVal));
         if (dupTg) { addToast(`⚠️ Spender déjà existant : @${dupTg.handle||dupTg.name}`, "warning"); setSpSavingProfile(false); return; }
       }
-      const insertData = {handle, name: handle, status: newSpForm.status||"active", first_name: newSpForm.first_name||null, age: newSpForm.age?parseInt(newSpForm.age):null, city: newSpForm.city||null, country: newSpForm.country||null, job: newSpForm.job||null, source: newSpForm.source||null, langue: newSpForm.langue||"FR", timezone: newSpForm.timezone||"Europe/Zurich", budget_range: newSpForm.budget_range||null, whatsapp_phone: newSpForm.whatsapp_phone||null, classification: newSpForm.classification||"new", notes: newSpForm.chatter_notes||null};
-      if (isNumericTg) { insertData.tg_user_id = tgNorm; insertData.telegram_username = null; }
-      else if (rawTg) { insertData.telegram_username = rawTg; insertData.tg_user_id = null; }
-      const {error} = await sb.from("spenders").upsert(insertData, {onConflict: "handle"});
+      const {error} = await sb.from("spenders").upsert({handle, name: handle, status: newSpForm.status||"active", first_name: newSpForm.first_name||null, age: newSpForm.age?parseInt(newSpForm.age):null, city: newSpForm.city||null, country: newSpForm.country||null, job: newSpForm.job||null, source: newSpForm.source||null, langue: newSpForm.langue||"FR", timezone: newSpForm.timezone||"Europe/Zurich", budget_range: newSpForm.budget_range||null, telegram_username: newSpForm.telegram_username||null, whatsapp_phone: newSpForm.whatsapp_phone||null, classification: newSpForm.classification||"new", notes: newSpForm.chatter_notes||null}, {onConflict: "handle"});
       if (error) { addToast("Erreur: " + error.message, "error"); setSpSavingProfile(false); return; }
       setSpSavingProfile(false); setShowNewSpender(false); setNewSpForm({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
       addToast(fr ? "Spender créé" : "Spender created", "success"); await onRefresh();
@@ -10555,23 +10430,6 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
               <button onClick={()=>{handleDeleteSpender(deleteConfirm);}} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
                 {deleteLoading ? "⏳ ..." : `🗑️ ${fr?"Supprimer":"Delete"}`}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {mergeConfirm && (
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:1000010,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>!spSavingProfile&&setMergeConfirm(null)}>
-          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:420,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
-            <div style={{fontSize:16,fontWeight:800,color:"#0088cc",marginBottom:8}}>{"\u2139\uFE0F"} {fr?"ID Telegram déjà utilisé":"Telegram ID already in use"}</div>
-            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:16}}>
-              {fr?"L'ID":"The ID"} <strong>{mergeConfirm.tgId}</strong> {fr?"est déjà attribué à":"is already assigned to"} <strong>@{mergeConfirm.existing.handle||mergeConfirm.existing.name||"?"}</strong>.
-              {fr ? ` Fusionner cette fiche (${getSpenderDisplayName(selected)}) dans la fiche existante ?` : ` Merge this card (${getSpenderDisplayName(selected)}) into the existing one?`}
-            </div>
-            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-              <button onClick={()=>setMergeConfirm(null)} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
-              <button onClick={handleMergeConfirm} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,background:"#0088cc",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:spSavingProfile?0.6:1}}>
-                {spSavingProfile ? "⏳ ..." : (fr?"Fusionner":"Merge")}
               </button>
             </div>
           </div>
@@ -19764,20 +19622,10 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
                         return <Tag type="spender" label={displayName||rh||"?"} id={null}/>;
                       })()}</td>
                       <td style={{fontSize:12,whiteSpace:"nowrap",fontFamily:"monospace",color:"var(--text-secondary)"}}>{(()=>{
-                        const rh=tx.spender_handle||"";
-                        const rhLow=rh.toLowerCase().replace(/^@/,"");
-                        const dbSp2=(spenders||[]).find(s=>{
-                          if(tx.spender_id) return s.id===tx.spender_id;
-                          if(s.handle&&s.handle.toLowerCase().replace(/^@/,"")===rhLow) return true;
-                          if(s.name&&s.name.toLowerCase()===rhLow) return true;
-                          if(s.telegram_username&&s.telegram_username.toLowerCase().replace(/^@/,"")===rhLow) return true;
-                          if(s.tg_user_id&&rh.replace(/^@?tg_/i,"")===String(s.tg_user_id)) return true;
-                          return false;
-                        });
-                        const _raw2=dbSp2?.telegram_username?(String(dbSp2.telegram_username).replace(/^@/,"")):"";
-                        const numId=dbSp2?.tg_user_id||tx.telegram_id||dbSp2?.telegram_id||(/^\d+$/.test(_raw2)?_raw2:null);
+                        const dbSp2=(spenders||[]).find(s=>tx.spender_id?s.id===tx.spender_id:(s.handle||s.name)===tx.spender_handle);
+                        const numId=dbSp2?.tg_user_id||tx.telegram_id||dbSp2?.telegram_id;
                         const usrName=dbSp2?.telegram_username;
-                        if(numId) return <span title={usrName&&!/^\d+$/.test(usrName.replace(/^@/,""))?`@${usrName}`:undefined}>{numId}</span>;
+                        if(numId) return <span title={usrName?`@${usrName}`:undefined}>{numId}</span>;
                         if(usrName) return <span style={{fontStyle:"italic",color:"var(--text-tertiary)"}}>{usrName}</span>;
                         return "—";
                       })()}</td>
