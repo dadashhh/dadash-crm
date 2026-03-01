@@ -1,14 +1,17 @@
-// ─────────────────────────────────────────────────────────────────
-// ComptaTab — Onglet comptabilité pour chatter / provider / model
-// Affiche: solde net, en cours, historique paiements, notifications
+// ─────────────────────────────────────────────────────────────────────────────
+// ComptaTab — Onglet comptabilite pour chatter / provider / model / gerant
 //
-// Dépendances: @supabase/supabase-js (déjà dans le projet)
-// Intégration: importer et placer dans le router/tabs de l'app
-// ─────────────────────────────────────────────────────────────────
+// Affiche: solde net, en cours, historique paiements, notifications (3 types)
+// Notifications:
+//   - kind = 'tx'      => onglet TX        (transactions, mouvements)
+//   - kind = 'spender' => onglet Spenders  (alertes spenders)
+//   - kind = 'payment' => onglet Paiements (paiements internes)
+//   - kind IS NULL     => assimile a 'tx'  (backward compat)
+// ─────────────────────────────────────────────────────────────────────────────
 import { useEffect, useState, useCallback } from 'react';
 import { createClient } from '@supabase/supabase-js';
 
-// Adjust import path to your existing Supabase singleton:
+// Adjust to your existing Supabase singleton:
 // import { supabase } from '../lib/supabase';
 const supabase = createClient(
   (import.meta as Record<string, unknown> & { env: Record<string, string> }).env
@@ -17,7 +20,7 @@ const supabase = createClient(
     .VITE_SUPABASE_ANON_KEY as string,
 );
 
-// ── Types ─────────────────────────────────────
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface PaymentEvent {
   id: string;
@@ -49,10 +52,16 @@ interface Notification {
   type: string;
   title: string;
   message: string;
+  // is_read is the canonical column; read is kept for backward compat
+  is_read: boolean;
   read: boolean;
+  // kind drives the 3-tab system; NULL is treated as 'tx'
+  kind: 'tx' | 'spender' | 'payment' | null;
 }
 
-// ── Helpers ───────────────────────────────────
+type NotifCategory = 'tx' | 'spender' | 'payment';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 const fmtAmount = (amount: number, currency = 'EUR') =>
   new Intl.NumberFormat('fr-FR', { style: 'currency', currency }).format(amount);
@@ -74,7 +83,11 @@ const kindLabel: Record<string, string> = {
   payment: 'Paiement',
 };
 
-// ── Component ─────────────────────────────────
+/** Effective category for a notification (NULL => 'tx') */
+const notifEffectiveKind = (n: Notification): NotifCategory =>
+  (n.kind ?? 'tx') as NotifCategory;
+
+// ── Component ─────────────────────────────────────────────────────────────────
 
 export function ComptaTab() {
   const [userId, setUserId] = useState<string | null>(null);
@@ -86,14 +99,17 @@ export function ComptaTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'resume' | 'historique' | 'notifs'>('resume');
+  // Active category within the notifications tab
+  const [notifCategory, setNotifCategory] = useState<NotifCategory>('payment');
+
+  // ── Data loading ──────────────────────────────────────────────────────────
 
   const load = useCallback(async (uid: string) => {
     setLoading(true);
     setError(null);
 
-    // Parallel fetches
     const [ledgerRes, pendingRes, paymentsRes, notifsRes] = await Promise.all([
-      // Solde net = sum of all ledger_entries
+      // Solde net
       supabase
         .from('ledger_entries')
         .select('amount, currency, entry_type, title, created_at, counterparty_user_id, payment_event_id, id')
@@ -101,14 +117,14 @@ export function ComptaTab() {
         .order('created_at', { ascending: false })
         .limit(100),
 
-      // En cours = payment_events where I'm receiver + pending
+      // En cours (payment_events pending)
       supabase
         .from('payment_events')
         .select('amount, currency')
         .eq('to_user_id', uid)
         .eq('status', 'pending'),
 
-      // Historique paiements (sent or received)
+      // Historique paiements
       supabase
         .from('payment_events')
         .select('id, created_at, from_user_id, to_user_id, amount, currency, kind, title, note, status')
@@ -116,29 +132,40 @@ export function ComptaTab() {
         .order('created_at', { ascending: false })
         .limit(50),
 
-      // Notifications
+      // Notifications — inclut kind + is_read
       supabase
         .from('notifications')
-        .select('id, created_at, type, title, message, read')
+        .select('id, created_at, type, title, message, read, is_read, kind')
         .eq('user_id', uid)
         .order('created_at', { ascending: false })
-        .limit(30),
+        .limit(100),
     ]);
 
-    if (ledgerRes.error) { setError(ledgerRes.error.message); setLoading(false); return; }
-    if (pendingRes.error) { setError(pendingRes.error.message); setLoading(false); return; }
-    if (paymentsRes.error) { setError(paymentsRes.error.message); setLoading(false); return; }
-    if (notifsRes.error) { setError(notifsRes.error.message); setLoading(false); return; }
+    if (ledgerRes.error)    { setError(ledgerRes.error.message);    setLoading(false); return; }
+    if (pendingRes.error)   { setError(pendingRes.error.message);   setLoading(false); return; }
+    if (paymentsRes.error)  { setError(paymentsRes.error.message);  setLoading(false); return; }
+    if (notifsRes.error)    { setError(notifsRes.error.message);    setLoading(false); return; }
 
     const ledgerData = (ledgerRes.data ?? []) as LedgerEntry[];
-    const net = ledgerData.reduce((acc, e) => acc + (e.amount ?? 0), 0);
-    const pending = (pendingRes.data ?? []).reduce((acc: number, e: { amount: number }) => acc + (e.amount ?? 0), 0);
+    // Balance: receiver_credit adds, payer_debit subtracts (amounts always positive)
+    const net = ledgerData.reduce((acc, e) =>
+      acc + (e.entry_type === 'receiver_credit' ? e.amount : -e.amount), 0);
+    const pending = (pendingRes.data ?? []).reduce(
+      (acc: number, e: { amount: number }) => acc + (e.amount ?? 0), 0);
 
     setSoldeNet(net);
     setEnCours(pending);
     setLedger(ledgerData);
     setPayments((paymentsRes.data ?? []) as PaymentEvent[]);
-    setNotifications((notifsRes.data ?? []) as Notification[]);
+
+    // Normalize notifications: ensure is_read mirrors read when is_read is missing
+    const rawNotifs = (notifsRes.data ?? []) as Array<Notification & { is_read?: boolean }>;
+    const normalizedNotifs: Notification[] = rawNotifs.map((n) => ({
+      ...n,
+      is_read: n.is_read ?? n.read ?? false,
+      read:    n.read    ?? n.is_read ?? false,
+    }));
+    setNotifications(normalizedNotifs);
     setLoading(false);
   }, []);
 
@@ -150,17 +177,59 @@ export function ComptaTab() {
     });
   }, [load]);
 
+  // ── Actions ───────────────────────────────────────────────────────────────
+
+  /** Mark a single notification as read (updates both is_read and read). */
   const markRead = async (notifId: string) => {
-    await supabase.from('notifications').update({ read: true }).eq('id', notifId);
+    await supabase
+      .from('notifications')
+      .update({ is_read: true, read: true })
+      .eq('id', notifId);
     setNotifications((prev) =>
-      prev.map((n) => (n.id === notifId ? { ...n, read: true } : n)),
+      prev.map((n) => (n.id === notifId ? { ...n, is_read: true, read: true } : n)),
     );
   };
+
+  /**
+   * Mark all unread notifications of a category as read.
+   * Uses the SECURITY DEFINER RPC which handles the 'tx' / NULL equivalence.
+   */
+  const markAllRead = async (category: NotifCategory) => {
+    await supabase.rpc('rpc_mark_notifications_read', { p_kind: category });
+    setNotifications((prev) =>
+      prev.map((n) => {
+        if (n.is_read) return n;
+        if (notifEffectiveKind(n) === category) {
+          return { ...n, is_read: true, read: true };
+        }
+        return n;
+      }),
+    );
+  };
+
+  // ── Derived counts ────────────────────────────────────────────────────────
+
+  const txUnread       = notifications.filter((n) => notifEffectiveKind(n) === 'tx'      && !n.is_read).length;
+  const spenderUnread  = notifications.filter((n) => notifEffectiveKind(n) === 'spender' && !n.is_read).length;
+  const paymentUnread  = notifications.filter((n) => notifEffectiveKind(n) === 'payment' && !n.is_read).length;
+  const totalUnread    = notifications.filter((n) => !n.is_read).length;
+
+  const unreadByCat: Record<NotifCategory, number> = {
+    tx:      txUnread,
+    spender: spenderUnread,
+    payment: paymentUnread,
+  };
+
+  const filteredNotifs = notifications.filter(
+    (n) => notifEffectiveKind(n) === notifCategory,
+  );
+
+  // ── Render guards ─────────────────────────────────────────────────────────
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-48 text-zinc-400">
-        Chargement…
+        Chargement...
       </div>
     );
   }
@@ -173,7 +242,7 @@ export function ComptaTab() {
     );
   }
 
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  // ── UI ────────────────────────────────────────────────────────────────────
 
   return (
     <div className="flex flex-col gap-4 p-4 max-w-2xl mx-auto">
@@ -193,7 +262,7 @@ export function ComptaTab() {
         </div>
       </div>
 
-      {/* ── Tabs ── */}
+      {/* ── Onglets principaux ── */}
       <div className="flex gap-1 bg-zinc-900 rounded-lg p-1">
         {(['resume', 'historique', 'notifs'] as const).map((tab) => (
           <button
@@ -205,14 +274,14 @@ export function ComptaTab() {
                 : 'text-zinc-400 hover:text-white'
             }`}
           >
-            {tab === 'resume' && 'Résumé'}
+            {tab === 'resume'    && 'Resume'}
             {tab === 'historique' && 'Historique'}
             {tab === 'notifs' && (
               <span className="flex items-center justify-center gap-1">
                 Notifications
-                {unreadCount > 0 && (
+                {totalUnread > 0 && (
                   <span className="bg-red-500 text-white text-xs rounded-full px-1.5 py-0.5 leading-none">
-                    {unreadCount}
+                    {totalUnread}
                   </span>
                 )}
               </span>
@@ -221,11 +290,11 @@ export function ComptaTab() {
         ))}
       </div>
 
-      {/* ── Tab: Résumé (ledger) ── */}
+      {/* ── Tab: Resume (ledger) ── */}
       {activeTab === 'resume' && (
         <div className="flex flex-col gap-2">
           {ledger.length === 0 && (
-            <p className="text-zinc-500 text-center py-6">Aucun mouvement enregistré.</p>
+            <p className="text-zinc-500 text-center py-6">Aucun mouvement enregistre.</p>
           )}
           {ledger.map((entry) => (
             <div
@@ -240,11 +309,11 @@ export function ComptaTab() {
               </div>
               <span
                 className={`font-semibold text-sm ${
-                  entry.amount >= 0 ? 'text-emerald-400' : 'text-red-400'
+                  entry.entry_type === 'receiver_credit' ? 'text-emerald-400' : 'text-red-400'
                 }`}
               >
-                {entry.amount >= 0 ? '+' : ''}
-                {fmtAmount(entry.amount, entry.currency)}
+                {entry.entry_type === 'receiver_credit' ? '+' : '-'}
+                {fmtAmount(Math.abs(entry.amount), entry.currency)}
               </span>
             </div>
           ))}
@@ -255,7 +324,7 @@ export function ComptaTab() {
       {activeTab === 'historique' && (
         <div className="flex flex-col gap-2">
           {payments.length === 0 && (
-            <p className="text-zinc-500 text-center py-6">Aucun paiement trouvé.</p>
+            <p className="text-zinc-500 text-center py-6">Aucun paiement trouve.</p>
           )}
           {payments.map((p) => {
             const isReceiver = p.to_user_id === userId;
@@ -300,32 +369,87 @@ export function ComptaTab() {
 
       {/* ── Tab: Notifications ── */}
       {activeTab === 'notifs' && (
-        <div className="flex flex-col gap-2">
-          {notifications.length === 0 && (
-            <p className="text-zinc-500 text-center py-6">Aucune notification.</p>
-          )}
-          {notifications.map((n) => (
-            <div
-              key={n.id}
-              onClick={() => !n.read && markRead(n.id)}
-              className={`rounded-lg px-4 py-3 border cursor-pointer transition-colors ${
-                n.read
-                  ? 'bg-zinc-900 border-zinc-800 opacity-60'
-                  : 'bg-zinc-800 border-violet-700/50 hover:border-violet-600'
-              }`}
-            >
-              <div className="flex justify-between items-start">
-                <div className="flex flex-col gap-0.5">
-                  <span className="text-sm font-medium text-white">{n.title}</span>
-                  <span className="text-xs text-zinc-400">{n.message}</span>
-                  <span className="text-xs text-zinc-500 mt-1">{fmtDate(n.created_at)}</span>
+        <div className="flex flex-col gap-3">
+
+          {/* Category chips + mark-all-read */}
+          <div className="flex items-center gap-2 flex-wrap">
+            {(
+              [
+                { cat: 'payment' as const, label: 'Paiements' },
+                { cat: 'tx'      as const, label: 'TX'        },
+                { cat: 'spender' as const, label: 'Spenders'  },
+              ] as { cat: NotifCategory; label: string }[]
+            ).map(({ cat, label }) => {
+              const count = unreadByCat[cat];
+              const active = notifCategory === cat;
+              return (
+                <button
+                  key={cat}
+                  onClick={() => setNotifCategory(cat)}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                    active
+                      ? 'bg-violet-600 text-white'
+                      : 'bg-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-700'
+                  }`}
+                >
+                  {label}
+                  {count > 0 && (
+                    <span
+                      className={`min-w-[16px] h-4 flex items-center justify-center rounded-full text-[10px] font-bold px-1 ${
+                        active ? 'bg-white text-violet-600' : 'bg-red-500 text-white'
+                      }`}
+                    >
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+
+            {/* Mark all read — current category */}
+            {unreadByCat[notifCategory] > 0 && (
+              <button
+                onClick={() => markAllRead(notifCategory)}
+                className="ml-auto text-xs text-zinc-500 hover:text-zinc-200 transition-colors underline underline-offset-2"
+              >
+                Tout marquer lu
+              </button>
+            )}
+          </div>
+
+          {/* Notification feed for active category */}
+          {filteredNotifs.length === 0 ? (
+            <p className="text-zinc-500 text-center py-6">
+              Aucune notification
+              {notifCategory === 'payment' ? ' de paiement' :
+               notifCategory === 'spender' ? ' spender'     : ' TX'}.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {filteredNotifs.map((n) => (
+                <div
+                  key={n.id}
+                  onClick={() => !n.is_read && markRead(n.id)}
+                  className={`rounded-lg px-4 py-3 border transition-colors ${
+                    n.is_read
+                      ? 'bg-zinc-900 border-zinc-800 opacity-60 cursor-default'
+                      : 'bg-zinc-800 border-violet-700/50 hover:border-violet-500 cursor-pointer'
+                  }`}
+                >
+                  <div className="flex justify-between items-start gap-3">
+                    <div className="flex flex-col gap-0.5 min-w-0">
+                      <span className="text-sm font-medium text-white truncate">{n.title}</span>
+                      <span className="text-xs text-zinc-400 leading-relaxed">{n.message}</span>
+                      <span className="text-xs text-zinc-500 mt-1">{fmtDate(n.created_at)}</span>
+                    </div>
+                    {!n.is_read && (
+                      <span className="mt-1 w-2 h-2 rounded-full bg-violet-500 shrink-0" />
+                    )}
+                  </div>
                 </div>
-                {!n.read && (
-                  <span className="mt-1 w-2 h-2 rounded-full bg-violet-500 shrink-0" />
-                )}
-              </div>
+              ))}
             </div>
-          ))}
+          )}
         </div>
       )}
 
