@@ -22,39 +22,50 @@
 -- 0.  OPTION A — BACKUPS + RESET (conditionnel : IF EXISTS pour chaque table)
 -- ─────────────────────────────────────────────────────────────────────────
 
-DO $$
+DO $reset$
+DECLARE
+  v_exists boolean;
 BEGIN
-  -- Backup + truncate payment_events (et ledger_entries via CASCADE)
-  IF EXISTS (SELECT 1 FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_name = 'payment_events') THEN
-    CREATE TABLE IF NOT EXISTS public._backup_payment_events AS
-      SELECT * FROM public.payment_events;
-    TRUNCATE TABLE public.payment_events CASCADE;
+  -- payment_events
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'payment_events'
+  ) INTO v_exists;
+  IF v_exists THEN
+    EXECUTE 'CREATE TABLE IF NOT EXISTS public._backup_payment_events AS SELECT * FROM public.payment_events';
+    EXECUTE 'TRUNCATE TABLE public.payment_events CASCADE';
   END IF;
 
-  -- Backup + truncate paies
-  IF EXISTS (SELECT 1 FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_name = 'paies') THEN
-    CREATE TABLE IF NOT EXISTS public._backup_paies AS
-      SELECT * FROM public.paies;
-    TRUNCATE TABLE public.paies;
+  -- paies
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'paies'
+  ) INTO v_exists;
+  IF v_exists THEN
+    EXECUTE 'CREATE TABLE IF NOT EXISTS public._backup_paies AS SELECT * FROM public.paies';
+    EXECUTE 'TRUNCATE TABLE public.paies';
   END IF;
 
-  -- Backup + truncate payments
-  IF EXISTS (SELECT 1 FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_name = 'payments') THEN
-    CREATE TABLE IF NOT EXISTS public._backup_payments AS
-      SELECT * FROM public.payments;
-    TRUNCATE TABLE public.payments CASCADE;
+  -- payments
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'payments'
+  ) INTO v_exists;
+  IF v_exists THEN
+    EXECUTE 'CREATE TABLE IF NOT EXISTS public._backup_payments AS SELECT * FROM public.payments';
+    EXECUTE 'TRUNCATE TABLE public.payments CASCADE';
   END IF;
 
-  -- Truncate payout_requests si existante
-  IF EXISTS (SELECT 1 FROM information_schema.tables
-             WHERE table_schema = 'public' AND table_name = 'payout_requests') THEN
-    TRUNCATE TABLE public.payout_requests;
+  -- payout_requests
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'payout_requests'
+  ) INTO v_exists;
+  IF v_exists THEN
+    EXECUTE 'TRUNCATE TABLE public.payout_requests';
   END IF;
 END;
-$$;
+$reset$;
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- 1.  HELPER : _get_my_role()  (idempotent — utilisé par RLS)
@@ -131,12 +142,12 @@ CREATE INDEX IF NOT EXISTS idx_pi_created_at   ON public.paiements_internes (cre
 CREATE OR REPLACE FUNCTION public.fn_set_updated_at()
 RETURNS TRIGGER
 LANGUAGE plpgsql
-AS $$
+AS $fn$
 BEGIN
   NEW.updated_at := NOW();
   RETURN NEW;
 END;
-$$;
+$fn$;
 
 DROP TRIGGER IF EXISTS trg_pi_updated_at ON public.paiements_internes;
 CREATE TRIGGER trg_pi_updated_at
