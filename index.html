@@ -7288,6 +7288,16 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [showExpenseForm,setShowExpenseForm]=useState(false);
   const [expForm, setExpForm] = useState({model_id:"",amount:"",currency:"CHF",category:"",description:"",date:new Date().toISOString().slice(0,10)});
+  // ── paiements internes modèles ──
+  const [soldesMapM,   setSoldesMapM]   = useState({});
+  const [paiementsM,   setPaiementsM]   = useState([]);
+  const [piTabM,       setPiTabM]       = useState("pending");
+  const [piFormM,      setPiFormM]      = useState({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
+  const [piSavingM,    setPiSavingM]    = useState(false);
+  const [contestIdM,   setContestIdM]   = useState(null);
+  const [contestMsgM,  setContestMsgM]  = useState("");
+  const [paramFormM,   setParamFormM]   = useState({name:""});
+  const [paramSavingM, setParamSavingM] = useState(false);
   // Sync default category code when expense_categories load
   React.useEffect(() => {
     if (expenseCategories && expenseCategories.length > 0 && !expForm.category) {
@@ -7307,6 +7317,86 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const metricVal = { fontSize: 18, fontWeight: 800 };
   const _avatarColor = (id) => { let h=0; for(let i=0;i<(id||"").length;i++) h=(id||"").charCodeAt(i)+((h<<5)-h); return `hsl(${Math.abs(h)%360},60%,50%)`; };
   const _initial    = (name) => (name||"?").trim()[0].toUpperCase();
+
+  // ── fetch soldes + paiements_internes modèles ──
+  const refreshPIM = React.useCallback(async () => {
+    try {
+      const [{ data: soldes }, { data: piData }] = await Promise.all([
+        sb.from("vue_soldes_modeles").select("*"),
+        sb.from("paiements_internes").select("*").eq("destinataire_type","modele").order("created_at",{ascending:false}),
+      ]);
+      if (soldes) { const m={}; soldes.forEach(r=>{m[r.modele_id]=r;}); setSoldesMapM(m); }
+      if (piData) setPaiementsM(piData);
+    } catch(e) {}
+  }, []);
+  React.useEffect(() => { refreshPIM(); }, [refreshPIM]);
+
+  React.useEffect(() => {
+    if (modalModel) {
+      const m = models.find(x=>x.id===modalModel);
+      if (m) setParamFormM({name:m.name||""});
+      setPiTabM("pending");
+    }
+  }, [modalModel]);
+
+  const handleCreatePIM = async (selM) => {
+    if (!selM || !piFormM.montant) return;
+    setPiSavingM(true);
+    try {
+      const s = soldesMapM[selM.id]||{};
+      const { error } = await sb.from("paiements_internes").insert({
+        createur_role:"gerant", createur_id:user.id, createur_name:user.name||user.email,
+        destinataire_type:"modele", destinataire_id:selM.id, destinataire_name:selM.name,
+        type:piFormM.type, montant:parseFloat(piFormM.montant)||0, devise:"CHF",
+        periode_debut:piFormM.periode_debut||null, periode_fin:piFormM.periode_fin||null,
+        note:piFormM.note,
+        calcul_detail:{ca_genere:s.ca_genere||0,taux:20,brut:s.commission_brute||0,deja_verse:s.deja_verse||0,solde_du:s.solde_du||0},
+        statut:"pending",
+      });
+      if (error) throw error;
+      addToast("Paiement envoyé ✓","success");
+      setPiFormM({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
+      await refreshPIM();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPiSavingM(false);
+  };
+  const handleValidatePIM = async (piId) => {
+    setPiSavingM(true);
+    try {
+      const yr = new Date().getFullYear();
+      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
+      const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
+      const { error } = await sb.from("paiements_internes").update({statut:"validated",validated_at:new Date().toISOString(),facture_numero:facNum,facture_generated:true}).eq("id",piId);
+      if (error) throw error;
+      addToast("Validé ✓ — "+facNum,"success");
+      await refreshPIM();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPiSavingM(false);
+  };
+  const handleContestPIM = async () => {
+    if (!contestIdM) return;
+    setPiSavingM(true);
+    try {
+      const { error } = await sb.from("paiements_internes").update({statut:"contested",contested_at:new Date().toISOString(),contestation_message:contestMsgM}).eq("id",contestIdM);
+      if (error) throw error;
+      addToast("Contestation envoyée","success");
+      setContestIdM(null); setContestMsgM("");
+      await refreshPIM();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPiSavingM(false);
+  };
+  const handleSaveParamsM = async (selM) => {
+    if (!selM) return;
+    setParamSavingM(true);
+    try {
+      const { error } = await sb.from("models").update({name:paramFormM.name||selM.name}).eq("id",selM.id);
+      if (error) throw error;
+      addToast("Sauvegardé ✓","success");
+      await onRefresh();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setParamSavingM(false);
+  };
 
   // filteredTxs for the whole component
   const filteredTxs = useMemo(() => dr.filterByDate(txs, "date"), [txs, dr.startDate, dr.endDate, dr.activePreset]);
@@ -7570,6 +7660,20 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
                   <span style={{fontSize:11,color:"var(--text-quaternary)",fontWeight:600}}>{"7j"} {Math.round(m.last7dCA)}{currencySymbol}</span>
                 </div>
               )}
+              {/* Solde dû + paiements en attente */}
+              {(()=>{
+                const sd = soldesMapM[m.id];
+                const pPend = paiementsM.filter(p=>p.destinataire_id===m.id&&p.statut==="pending");
+                const soldeDu = sd?.solde_du||0;
+                return (
+                  <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--border)",display:"flex",gap:6,flexWrap:"wrap"}}>
+                    <span style={{padding:"3px 10px",borderRadius:10,fontSize:11,fontWeight:700,background:soldeDu>0?"rgba(245,158,11,0.12)":"rgba(34,211,161,0.1)",color:soldeDu>0?"var(--warning)":"var(--success)"}}>
+                      {soldeDu>0?`💰 ${Math.round(soldeDu).toLocaleString()} CHF dû`:"✅ À jour"}
+                    </span>
+                    {pPend.length>0&&<span style={{padding:"3px 10px",borderRadius:10,fontSize:11,fontWeight:700,background:"rgba(244,63,94,0.1)",color:"var(--danger)"}}>{"🔔"} {pPend.length} en attente</span>}
+                  </div>
+                );
+              })()}
             </div>
           );
         })}
@@ -7583,27 +7687,46 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:_isMobile?"flex-end":"center",justifyContent:"center",zIndex:5000}} onClick={()=>setModalModel(null)}>
           <div style={{maxWidth:820,width:"95vw",maxHeight:"90vh",overflowY:"auto",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:_isMobile?"20px 20px 0 0":14,boxShadow:"0 24px 64px rgba(0,0,0,0.6)"}} onClick={e=>e.stopPropagation()}>
 
-            {/* Modal Header (aligné Dashboard) */}
-            <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:"var(--surface)",zIndex:2}}>
-              <div style={{display:"flex",alignItems:"center",gap:12}}>
-                <div style={{width:48,height:48,borderRadius:"50%",background:_avatarColor(selM.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff"}}>{_initial(selM.name)}</div>
-                <div>
-                  <div style={{fontSize:18,fontWeight:800}}>{selM.name}</div>
-                  <div style={{display:"flex",gap:8,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>
-                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{selM.chatters.length} chatter{selM.chatters.length>1?"s":""}</span>
-                    {selM.isAgencyModel && <span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>{Math.round(selM.ca).toLocaleString()}{currencySymbol} CA</span>}
-                    {selM.ca > 0 && <span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>{Math.round(selM.ca).toLocaleString()}{currencySymbol} CA</span>}
+            {/* Modal Header */}
+            {(()=>{
+              const sd = soldesMapM[selM.id];
+              const soldeDu = sd?.solde_du||0;
+              const mPend = paiementsM.filter(p=>p.destinataire_id===selM.id&&p.statut==="pending");
+              return (
+                <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"flex-start",position:"sticky",top:0,background:"var(--surface)",zIndex:2,gap:12}}>
+                  <div style={{display:"flex",alignItems:"center",gap:12,flex:1,minWidth:0}}>
+                    <div style={{width:48,height:48,borderRadius:"50%",background:_avatarColor(selM.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff",flexShrink:0}}>{_initial(selM.name)}</div>
+                    <div style={{minWidth:0}}>
+                      <div style={{fontSize:18,fontWeight:800}}>{selM.name}</div>
+                      <div style={{display:"flex",gap:8,alignItems:"center",marginTop:2,flexWrap:"wrap"}}>
+                        <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{selM.chatters.length} chatter{selM.chatters.length>1?"s":""}</span>
+                        {selM.ca>0&&<span style={{fontSize:11,fontWeight:700,color:"var(--success)"}}>{Math.round(selM.ca).toLocaleString()}{currencySymbol} CA</span>}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Solde dû</div>
+                      <div style={{fontSize:20,fontWeight:900,color:soldeDu>0?"var(--warning)":"var(--success)"}}>{soldeDu>0?`${Math.round(soldeDu).toLocaleString()} CHF`:"✅ À jour"}</div>
+                      {mPend.length>0&&<div style={{fontSize:11,color:"var(--danger)",fontWeight:700,marginTop:2}}>{"🔔"} {mPend.length} en attente</div>}
+                    </div>
+                    <button onClick={()=>setModalModel(null)} style={{background:"var(--surface2)",border:"1px solid var(--border)",fontSize:14,cursor:"pointer",color:"var(--text-tertiary)",padding:"6px 12px",borderRadius:9}}>{"✕"}</button>
                   </div>
                 </div>
-              </div>
-              <button onClick={()=>setModalModel(null)} style={{background:"var(--surface2)",border:"1px solid var(--border)",fontSize:14,cursor:"pointer",color:"var(--text-tertiary)",padding:"6px 12px",borderRadius:9}}>{"✕"}</button>
-            </div>
+              );
+            })()}
 
-            {/* Tab bar (pills aligné Dashboard) */}
+            {/* Tab bar */}
             <div style={{display:"flex",flexWrap:"wrap",gap:8,padding:"12px 24px",borderBottom:"1px solid var(--border)"}}>
-              {[{id:"performance",label:"Performance",icon:"📊"},{id:"checklist",label:"Checklist",icon:"📋"},{id:"paiements",label:"Paiements",icon:"💳"}].map(mt => (
-                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${modalTab===mt.id?"#8b5cf6":"var(--border)"}`,background:modalTab===mt.id?"rgba(139,92,246,0.15)":"var(--surface2)",color:modalTab===mt.id?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6}}>
+              {[
+                {id:"performance",label:"Performance",icon:"📊"},
+                {id:"checklist",  label:"Checklist",  icon:"📋"},
+                {id:"paiements",  label:"Paiements",  icon:"💰", badge:paiementsM.filter(p=>p.destinataire_id===selM.id&&p.statut==="pending").length||0},
+                {id:"parametres", label:fr?"Paramètres":"Settings",icon:"⚙️"},
+              ].map(mt => (
+                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${modalTab===mt.id?"#8b5cf6":"var(--border)"}`,background:modalTab===mt.id?"rgba(139,92,246,0.15)":"var(--surface2)",color:modalTab===mt.id?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6,position:"relative"}}>
                   {mt.icon} {mt.label}
+                  {mt.badge>0&&<span style={{background:"var(--danger)",color:"#fff",borderRadius:"50%",fontSize:9,fontWeight:800,width:16,height:16,display:"flex",alignItems:"center",justifyContent:"center"}}>{mt.badge}</span>}
                 </button>
               ))}
             </div>
@@ -7727,44 +7850,120 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
                 );
               })()}
 
-              {/* ── TAB PAIEMENTS ── */}
-              {modalTab==="paiements" && (
-                <div>
-                  {selM.isAgencyModel && (
-                    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:20}}>
-                      {[
-                        {label:fr?"CA ce mois":"Revenue",   value:`${Math.round(selM.ca).toLocaleString()}${currencySymbol}`,       color:"var(--success)"},
-                        {label:fr?"Payé":"Paid",            value:`${Math.round(selM.totalExp).toLocaleString()}${currencySymbol}`,  color:"var(--accent)"},
-                        {label:fr?"Solde dû":"Balance due", value:`${Math.max(0,Math.round(selM.benefice)).toLocaleString()}${currencySymbol}`, color:selM.benefice>0?"var(--warning)":"var(--success)"},
-                      ].map((k,i) => (
+              {/* ── TAB PAIEMENTS (paiements_internes) ── */}
+              {modalTab==="paiements" && (()=>{
+                const sd = soldesMapM[selM.id]||{};
+                const mPI = paiementsM.filter(p=>p.destinataire_id===selM.id);
+                const pendingMPI = mPI.filter(p=>p.statut==="pending");
+                const PI_SC = {pending:"var(--warning)",validated:"var(--success)",contested:"var(--danger)",cancelled:"var(--muted)",draft:"var(--muted)"};
+                const PI_SL = {pending:"⏳ En attente",validated:"✅ Validé",contested:"⚠️ Contesté",cancelled:"❌ Annulé",draft:"📝 Brouillon"};
+                return (
+                  <div>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+                      {[{l:"CA Généré",v:`${Math.round(sd.ca_genere||0).toLocaleString()} CHF`,c:"var(--success)"},{l:"Commission brute",v:`${Math.round(sd.commission_brute||0).toLocaleString()} CHF`,c:"var(--accent)"},{l:"Solde dû",v:`${Math.round(sd.solde_du||0).toLocaleString()} CHF`,c:(sd.solde_du||0)>0?"var(--warning)":"var(--success)"}].map((k,i)=>(
                         <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"var(--surface2)",border:"1px solid var(--border)"}}>
-                          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>{k.label}</div>
-                          <div style={{fontSize:18,fontWeight:800,color:k.color}}>{k.value}</div>
+                          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>{k.l}</div>
+                          <div style={{fontSize:16,fontWeight:800,color:k.c}}>{k.v}</div>
                         </div>
                       ))}
                     </div>
-                  )}
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                    <div style={{fontSize:12,fontWeight:700}}>{fr?"Historique paiements":"Payment history"} ({selM.mExp.length})</div>
-                    <button onClick={()=>{const defCat=expenseCategories&&expenseCategories.length>0?expenseCategories[0].code:"";setExpForm({model_id:selM.id,amount:"",currency:"CHF",category:defCat,description:"",date:new Date().toISOString().slice(0,10)});setShowExpenseForm(true);}} style={{padding:"7px 13px",borderRadius:9,border:"1px solid var(--accent)",background:"var(--accent-muted)",color:"var(--accent)",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>
-                      {"+"} {fr?"Ajouter":"Add"}
-                    </button>
-                  </div>
-                  {selM.mExp.length === 0 && <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:24,fontSize:12}}>{fr?"Aucun paiement enregistré":"No payments recorded"}</div>}
-                  <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:320,overflowY:"auto"}}>
-                    {selM.mExp.map((e,i) => {
-                      const cat = (expenseCategories||[]).find(c=>c.code===e.category);
-                      return (
-                        <div key={e.id||i} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",borderRadius:10,background:"var(--surface2)",border:"1px solid var(--border)"}}>
-                          <span style={{fontSize:16,flexShrink:0}}>{cat?.icon||"💳"}</span>
-                          <div style={{flex:1,minWidth:0}}>
-                            <div style={{fontSize:12,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.name||e.description||cat?.label||"Paiement"}</div>
-                            <div style={{fontSize:10,color:"var(--text-quaternary)"}}>{e.date?.slice(0,10)||"—"}</div>
+                    <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+                      {[{id:"pending",label:`⏳ En attente (${pendingMPI.length})`},{id:"create",label:"📤 Créer"},{id:"history",label:`📋 Historique (${mPI.length})`}].map(st=>(
+                        <button key={st.id} onClick={()=>setPiTabM(st.id)} style={{padding:"5px 12px",borderRadius:8,border:`1px solid ${piTabM===st.id?"var(--accent)":"var(--border)"}`,background:piTabM===st.id?"var(--accent-muted)":"var(--surface2)",color:piTabM===st.id?"var(--accent)":"var(--text)",fontSize:11,fontWeight:600,cursor:"pointer"}}>
+                          {st.label}
+                        </button>
+                      ))}
+                    </div>
+                    {piTabM==="pending"&&(
+                      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                        {pendingMPI.length===0&&<div style={{textAlign:"center",padding:24,color:"var(--text-quaternary)",fontSize:13}}>{"✅"} Aucun paiement en attente</div>}
+                        {pendingMPI.map(pi=>(
+                          <div key={pi.id} style={{padding:"14px 16px",borderRadius:12,background:"var(--surface2)",border:"1px solid var(--warning)",borderLeftWidth:3}}>
+                            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                              <div>
+                                <span style={{fontSize:13,fontWeight:700}}>{pi.type} — <span style={{color:"var(--warning)",fontSize:16,fontWeight:900}}>{Number(pi.montant).toLocaleString()} {pi.devise}</span></span>
+                                {pi.note&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,fontStyle:"italic"}}>"{pi.note}"</div>}
+                              </div>
+                              <span style={{fontSize:10,color:"var(--text-quaternary)",flexShrink:0,marginLeft:8}}>{new Date(pi.created_at).toLocaleDateString("fr-FR")}</span>
+                            </div>
+                            {contestIdM===pi.id ? (
+                              <div style={{marginTop:8}}>
+                                <textarea value={contestMsgM} onChange={e=>setContestMsgM(e.target.value)} placeholder="Motif..." style={{width:"100%",boxSizing:"border-box",padding:"8px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,resize:"vertical",minHeight:56,fontFamily:"inherit"}}/>
+                                <div style={{display:"flex",gap:6,marginTop:6}}>
+                                  <button onClick={handleContestPIM} disabled={piSavingM||!contestMsgM.trim()} style={{flex:1,padding:"6px",borderRadius:8,border:"none",background:"var(--danger)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",opacity:piSavingM||!contestMsgM.trim()?0.5:1}}>{piSavingM?"...":"⚠️ Confirmer"}</button>
+                                  <button onClick={()=>{setContestIdM(null);setContestMsgM("");}} style={{flex:1,padding:"6px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>Annuler</button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div style={{display:"flex",gap:8,marginTop:8}}>
+                                <button onClick={()=>handleValidatePIM(pi.id)} disabled={piSavingM} style={{flex:1,padding:"7px",borderRadius:9,border:"none",background:"var(--success)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",opacity:piSavingM?0.5:1}}>{piSavingM?"...":"✅ Valider"}</button>
+                                <button onClick={()=>{setContestIdM(pi.id);setContestMsgM("");}} style={{flex:1,padding:"7px",borderRadius:9,border:"1px solid var(--danger)",background:"var(--danger-muted)",color:"var(--danger)",fontSize:12,fontWeight:700,cursor:"pointer"}}>{"⚠️"} Contester</button>
+                              </div>
+                            )}
                           </div>
-                          <span style={{fontSize:14,fontWeight:800,color:"var(--accent)",flexShrink:0}}>{Number(e.amount).toFixed(0)}{currencySymbol}</span>
+                        ))}
+                      </div>
+                    )}
+                    {piTabM==="create"&&(user.role==="gerant"||user.role==="admin"||user.role==="ceo")&&(
+                      <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                        {sd.solde_du!==undefined&&(
+                          <div style={{padding:"12px 16px",borderRadius:10,background:"var(--accent-muted)",border:"1px solid var(--accent)",fontSize:12}}>
+                            <div style={{fontWeight:700,marginBottom:6}}>{"🧮"} Calcul</div>
+                            <div style={{color:"var(--text-secondary)"}}>Commission brute : <b style={{color:"var(--accent)"}}>{Math.round(sd.commission_brute||0)} CHF</b></div>
+                            <div style={{color:"var(--text-secondary)"}}>Déjà versé : <b style={{color:"var(--success)"}}>{Math.round(sd.deja_verse||0)} CHF</b></div>
+                            <div style={{color:"var(--warning)",fontWeight:800,marginTop:4}}>Solde dû : {Math.round(sd.solde_du||0)} CHF</div>
+                          </div>
+                        )}
+                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                          <div><label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Type</label>
+                            <select value={piFormM.type} onChange={e=>setPiFormM({...piFormM,type:e.target.value})} style={{width:"100%",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}>
+                              <option value="commission">Commission</option><option value="bonus">Bonus</option><option value="remboursement">Remboursement</option><option value="autre">Autre</option>
+                            </select>
+                          </div>
+                          <div><label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Montant (CHF) *</label>
+                            <input type="number" value={piFormM.montant} onChange={e=>setPiFormM({...piFormM,montant:e.target.value})} style={{width:"100%",boxSizing:"border-box",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                          </div>
                         </div>
-                      );
-                    })}
+                        <div><label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Note</label>
+                          <input value={piFormM.note} onChange={e=>setPiFormM({...piFormM,note:e.target.value})} placeholder="Ex: Commission semaine" style={{width:"100%",boxSizing:"border-box",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                        </div>
+                        <button onClick={()=>handleCreatePIM(selM)} disabled={piSavingM||!piFormM.montant} style={{padding:"10px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:piSavingM||!piFormM.montant?0.5:1}}>
+                          {piSavingM?"...":"📤 Envoyer le paiement"}
+                        </button>
+                      </div>
+                    )}
+                    {piTabM==="history"&&(
+                      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                        {mPI.length===0&&<div style={{textAlign:"center",padding:24,color:"var(--text-quaternary)",fontSize:13}}>Aucun paiement</div>}
+                        {mPI.map(pi=>(
+                          <div key={pi.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",borderRadius:10,background:"var(--surface2)",border:`1px solid ${PI_SC[pi.statut]||"var(--border)"}20`}}>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontSize:12,fontWeight:700}}>{pi.type} — {Number(pi.montant).toLocaleString()} {pi.devise}</div>
+                              {pi.facture_numero&&<div style={{fontSize:10,color:"var(--accent)",marginTop:2}}>{"🧾"} {pi.facture_numero}</div>}
+                            </div>
+                            <div style={{textAlign:"right",flexShrink:0}}>
+                              <div style={{fontSize:11,fontWeight:700,color:PI_SC[pi.statut]}}>{PI_SL[pi.statut]||pi.statut}</div>
+                              <div style={{fontSize:10,color:"var(--text-quaternary)"}}>{new Date(pi.created_at).toLocaleDateString("fr-FR")}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* ── TAB PARAMÈTRES MODÈLE ── */}
+              {modalTab==="parametres" && (
+                <div style={{display:"flex",flexDirection:"column",gap:16}}>
+                  <div>
+                    <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Nom du modèle</label>
+                    <input value={paramFormM.name} onChange={e=>setParamFormM({...paramFormM,name:e.target.value})} style={{width:"100%",boxSizing:"border-box",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                  </div>
+                  <div style={{display:"flex",gap:10}}>
+                    <button onClick={()=>handleSaveParamsM(selM)} disabled={paramSavingM} style={{flex:2,padding:"9px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:paramSavingM?0.5:1}}>
+                      {paramSavingM?"...":"💾 Sauvegarder"}
+                    </button>
                   </div>
                 </div>
               )}
@@ -12584,8 +12783,114 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
   const [createModal, setCreateModal] = useState(false);
   const [createForm, setCreateForm] = useState({name:"",handle:"",commission_pct:"3",assigned_models:[]});
   const [createSaving, setCreateSaving] = useState(false);
+  // ── paiements internes ──
+  const [soldesMap, setSoldesMap]   = useState({});
+  const [paiementsPI, setPaiementsPI] = useState([]);
+  const [piTab, setPiTab]           = useState("pending");
+  const [piForm, setPiForm]         = useState({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
+  const [piSaving, setPiSaving]     = useState(false);
+  const [contestId, setContestId]   = useState(null);
+  const [contestMsg, setContestMsg] = useState("");
+  const [paramForm, setParamForm]   = useState({name:"",commission_pct:""});
+  const [paramSaving, setParamSaving] = useState(false);
+  const [shiftSaving, setShiftSaving] = useState(false);
 
   const chatters = profiles.filter(u => u.role === "chatter");
+
+  // ── fetch soldes + paiements_internes ──
+  const refreshPI = React.useCallback(async () => {
+    try {
+      const [{ data: soldes }, { data: piData }] = await Promise.all([
+        sb.from("vue_soldes_chatters").select("*"),
+        sb.from("paiements_internes").select("*").eq("destinataire_type","chatter").order("created_at",{ascending:false}),
+      ]);
+      if (soldes) { const m={}; soldes.forEach(r=>{m[r.chatter_id]=r;}); setSoldesMap(m); }
+      if (piData) setPaiementsPI(piData);
+    } catch(e) {}
+  }, []);
+  React.useEffect(() => { refreshPI(); }, [refreshPI]);
+
+  // ── pre-fill form when modal opens ──
+  React.useEffect(() => {
+    if (modalChatter) {
+      const ch = profiles.find(p => p.id === modalChatter);
+      if (ch) setParamForm({name: ch.name||"", commission_pct: String(ch.commission_pct||20)});
+      setPiTab("pending");
+      const solde = soldesMap[modalChatter];
+      if (solde && solde.solde_du > 0)
+        setPiForm(f => ({...f, type:"commission", montant: String(Math.round(solde.solde_du))}));
+    }
+  }, [modalChatter]);
+
+  // ── paiements handlers ──
+  const handleCreatePI = async () => {
+    if (!selCh || !piForm.montant) return;
+    setPiSaving(true);
+    try {
+      const s = soldesMap[selCh.id]||{};
+      const { error } = await sb.from("paiements_internes").insert({
+        createur_role:"gerant", createur_id:user.id, createur_name:user.name||user.email,
+        destinataire_type:"chatter", destinataire_id:selCh.id, destinataire_name:selCh.name,
+        type:piForm.type, montant:parseFloat(piForm.montant)||0, devise:"CHF",
+        periode_debut:piForm.periode_debut||null, periode_fin:piForm.periode_fin||null,
+        note:piForm.note,
+        calcul_detail:{ca_genere:s.ca_genere||0,taux:selCh.commission_pct||20,brut:s.commission_brute||0,deja_verse:s.deja_verse||0,solde_du:s.solde_du||0},
+        statut:"pending",
+      });
+      if (error) throw error;
+      addToast("Paiement envoyé ✓","success");
+      setPiForm({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
+      await refreshPI();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPiSaving(false);
+  };
+  const handleValidatePI = async (piId) => {
+    setPiSaving(true);
+    try {
+      const yr = new Date().getFullYear();
+      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
+      const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
+      const { error } = await sb.from("paiements_internes").update({statut:"validated",validated_at:new Date().toISOString(),facture_numero:facNum,facture_generated:true}).eq("id",piId);
+      if (error) throw error;
+      addToast("Validé ✓ — "+facNum,"success");
+      await refreshPI();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPiSaving(false);
+  };
+  const handleContestPI = async () => {
+    if (!contestId) return;
+    setPiSaving(true);
+    try {
+      const { error } = await sb.from("paiements_internes").update({statut:"contested",contested_at:new Date().toISOString(),contestation_message:contestMsg}).eq("id",contestId);
+      if (error) throw error;
+      addToast("Contestation envoyée","success");
+      setContestId(null); setContestMsg("");
+      await refreshPI();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPiSaving(false);
+  };
+  const handleShiftToggle = async (chatterId, curShift) => {
+    setShiftSaving(true);
+    try {
+      const { error } = await sb.from("profiles").update({on_shift:!curShift}).eq("id",chatterId);
+      if (error) throw error;
+      addToast(!curShift?"Shift ON ✓":"Shift OFF","success");
+      await onRefresh();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setShiftSaving(false);
+  };
+  const handleSaveParams = async () => {
+    if (!selCh) return;
+    setParamSaving(true);
+    try {
+      const { error } = await sb.from("profiles").update({name:paramForm.name||selCh.name,commission_pct:parseInt(paramForm.commission_pct)||selCh.commission_pct}).eq("id",selCh.id);
+      if (error) throw error;
+      addToast("Sauvegardé ✓","success");
+      await onRefresh();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setParamSaving(false);
+  };
 
   // ── card design system (aligné Dashboard) ──
   const cardStyle = (isHov) => ({
@@ -12700,10 +13005,13 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
 
   const selCh      = modalChatter ? chatterStats.find(c => c.id === modalChatter) : null;
   const maxWeekCA  = selCh ? Math.max(...selCh.weeklyCA.map(w => w.ca), 1) : 1;
+  const piPending = selCh ? paiementsPI.filter(p=>p.destinataire_id===selCh.id&&p.statut==="pending") : [];
   const modalTabs  = [
     {id:"performance", label:"Performance",          icon:"📊"},
     {id:"modeles",     label:fr?"Modèles assignés":"Assigned Models", icon:"👤"},
+    {id:"paiements",   label:"Paiements",            icon:"💰", badge: piPending.length||0},
     {id:"logs",        label:fr?"Messages bloqués":"Blocked Msgs",    icon:"⛔"},
+    {id:"parametres",  label:fr?"Paramètres":"Settings",              icon:"⚙️"},
   ];
 
   return (
@@ -12810,6 +13118,20 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
                 <span style={{fontSize:11,color:"var(--warning)",fontWeight:600}}>{"⏳"} {ch.pendingTx.length}</span>
                 <span style={{fontSize:11,color:"var(--danger)",fontWeight:600}}>{"❌"} {ch.refusedCount}</span>
               </div>
+              {/* Solde dû + paiements en attente */}
+              {(()=>{
+                const sd = soldesMap[ch.id];
+                const pPend = paiementsPI.filter(p=>p.destinataire_id===ch.id&&p.statut==="pending");
+                const soldeDu = sd?.solde_du||0;
+                return (
+                  <div style={{marginTop:10,paddingTop:10,borderTop:"1px solid var(--border)",display:"flex",gap:6,flexWrap:"wrap"}}>
+                    <span style={{padding:"3px 10px",borderRadius:10,fontSize:11,fontWeight:700,background:soldeDu>0?"rgba(245,158,11,0.12)":"rgba(34,211,161,0.1)",color:soldeDu>0?"var(--warning)":"var(--success)"}}>
+                      {soldeDu>0?`💰 ${Math.round(soldeDu).toLocaleString()} CHF dû`:"✅ À jour"}
+                    </span>
+                    {pPend.length>0&&<span style={{padding:"3px 10px",borderRadius:10,fontSize:11,fontWeight:700,background:"rgba(244,63,94,0.1)",color:"var(--danger)"}}>{"🔔"} {pPend.length} en attente</span>}
+                  </div>
+                );
+              })()}
             </div>
           );
         })}
@@ -12830,30 +13152,45 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:_isMobile?"flex-end":"center",justifyContent:"center",zIndex:5000}} onClick={()=>setModalChatter(null)}>
           <div style={{maxWidth:820,width:"95vw",maxHeight:"90vh",overflowY:"auto",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:_isMobile?"20px 20px 0 0":14,boxShadow:"0 24px 64px rgba(0,0,0,0.6)"}} onClick={e=>e.stopPropagation()}>
 
-            {/* Modal Header (aligné Dashboard) */}
-            <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center",position:"sticky",top:0,background:"var(--surface)",zIndex:2}}>
-              <div style={{display:"flex",alignItems:"center",gap:12}}>
-                <div style={{width:48,height:48,borderRadius:"50%",background:_avatarColor(selCh.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff"}}>{_initial(selCh.name)}</div>
-                <div>
-                  <div style={{fontSize:18,fontWeight:800}}>{selCh.name}</div>
-                  <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:2}}>
-                    <LevelBadge xp={selCh.xp}/>
-                    {selCh.streak > 0 && <StreakBadge streak={selCh.streak}/>}
-                    <span style={{fontSize:11,color:"var(--text-tertiary)"}}>Commission : {selCh.commission_pct||0}%</span>
-                    <span style={{padding:"2px 8px",borderRadius:10,background:(selCh.on_shift||selCh.is_online)?"rgba(16,185,129,0.12)":"rgba(255,255,255,0.05)",color:(selCh.on_shift||selCh.is_online)?"#10B981":"var(--text-quaternary)",fontSize:9,fontWeight:700}}>
-                      {(selCh.on_shift||selCh.is_online)?"● EN SHIFT":"○ OFF"}
-                    </span>
+            {/* Modal Header */}
+            {(()=>{
+              const sd = soldesMap[selCh.id];
+              const soldeDu = sd?.solde_du||0;
+              const isShift = selCh.on_shift||selCh.is_online||false;
+              return (
+                <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"flex-start",position:"sticky",top:0,background:"var(--surface)",zIndex:2,gap:12}}>
+                  <div style={{display:"flex",alignItems:"center",gap:12,flex:1,minWidth:0}}>
+                    <div style={{width:48,height:48,borderRadius:"50%",background:_avatarColor(selCh.id),display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,fontWeight:800,color:"#fff",flexShrink:0}}>{_initial(selCh.name)}</div>
+                    <div style={{minWidth:0}}>
+                      <div style={{fontSize:18,fontWeight:800}}>{selCh.name}</div>
+                      <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap",marginTop:2}}>
+                        <LevelBadge xp={selCh.xp}/>
+                        {selCh.streak>0&&<StreakBadge streak={selCh.streak}/>}
+                        <span style={{fontSize:11,color:"var(--text-tertiary)"}}>Commission : {selCh.commission_pct||0}%</span>
+                        <span style={{padding:"2px 8px",borderRadius:10,background:isShift?"rgba(16,185,129,0.12)":"rgba(255,255,255,0.05)",color:isShift?"#10B981":"var(--text-quaternary)",fontSize:9,fontWeight:700}}>
+                          {isShift?"● EN SHIFT":"○ OFF"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:10,flexShrink:0}}>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Solde dû</div>
+                      <div style={{fontSize:20,fontWeight:900,color:soldeDu>0?"var(--warning)":"var(--success)"}}>{soldeDu>0?`${Math.round(soldeDu).toLocaleString()} CHF`:"✅ À jour"}</div>
+                      {soldeDu>0&&<button onClick={(e)=>{e.stopPropagation();setModalTab("paiements");setPiTab("create");}} style={{marginTop:4,padding:"3px 10px",borderRadius:8,border:"none",background:"rgba(245,158,11,0.15)",color:"var(--warning)",fontSize:11,fontWeight:700,cursor:"pointer"}}>{"💰"} Payer</button>}
+                    </div>
+                    <button onClick={()=>setModalChatter(null)} style={{background:"var(--surface2)",border:"1px solid var(--border)",fontSize:14,cursor:"pointer",color:"var(--text-tertiary)",padding:"6px 12px",borderRadius:9}}>{"✕"}</button>
                   </div>
                 </div>
-              </div>
-              <button onClick={()=>setModalChatter(null)} style={{background:"var(--surface2)",border:"1px solid var(--border)",fontSize:14,cursor:"pointer",color:"var(--text-tertiary)",padding:"6px 12px",borderRadius:9}}>{"✕"}</button>
-            </div>
+              );
+            })()}
 
             {/* Tab bar (pills aligné Dashboard) */}
             <div style={{display:"flex",flexWrap:"wrap",gap:8,padding:"12px 24px",borderBottom:"1px solid var(--border)"}}>
               {modalTabs.map(mt => (
-                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${modalTab===mt.id?"#8b5cf6":"var(--border)"}`,background:modalTab===mt.id?"rgba(139,92,246,0.15)":"var(--surface2)",color:modalTab===mt.id?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6}}>
+                <button key={mt.id} onClick={()=>setModalTab(mt.id)} style={{padding:"7px 13px",borderRadius:9,border:`1px solid ${modalTab===mt.id?"#8b5cf6":"var(--border)"}`,background:modalTab===mt.id?"rgba(139,92,246,0.15)":"var(--surface2)",color:modalTab===mt.id?"#c4b5fd":"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"'DM Sans',sans-serif",display:"flex",alignItems:"center",gap:6,position:"relative"}}>
                   {mt.icon} {mt.label}
+                  {mt.badge>0 && <span style={{background:"var(--danger)",color:"#fff",borderRadius:"50%",fontSize:9,fontWeight:800,width:16,height:16,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{mt.badge}</span>}
                 </button>
               ))}
             </div>
@@ -12932,6 +13269,142 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
                 </div>
               )}
 
+              {/* ── TAB PAIEMENTS ── */}
+              {modalTab==="paiements" && (()=>{
+                const sd = soldesMap[selCh.id]||{};
+                const chPI = paiementsPI.filter(p=>p.destinataire_id===selCh.id);
+                const pendingPI = chPI.filter(p=>p.statut==="pending");
+                const PI_STATUS_COLOR = {pending:"var(--warning)",validated:"var(--success)",contested:"var(--danger)",cancelled:"var(--muted)",draft:"var(--muted)"};
+                const PI_STATUS_LABEL = {pending:"⏳ En attente",validated:"✅ Validé",contested:"⚠️ Contesté",cancelled:"❌ Annulé",draft:"📝 Brouillon"};
+                return (
+                  <div>
+                    {/* KPI row soldes */}
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
+                      {[{l:"CA Généré",v:`${Math.round(sd.ca_genere||0).toLocaleString()} CHF`,c:"var(--success)"},{l:"Commission brute",v:`${Math.round(sd.commission_brute||0).toLocaleString()} CHF`,c:"var(--accent)"},{l:"Solde dû",v:`${Math.round(sd.solde_du||0).toLocaleString()} CHF`,c:(sd.solde_du||0)>0?"var(--warning)":"var(--success)"}].map((k,i)=>(
+                        <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"var(--surface2)",border:"1px solid var(--border)"}}>
+                          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>{k.l}</div>
+                          <div style={{fontSize:16,fontWeight:800,color:k.c}}>{k.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {/* Sub-tabs */}
+                    <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+                      {[{id:"pending",label:`⏳ En attente (${pendingPI.length})`},{id:"create",label:"📤 Créer"},{id:"history",label:`📋 Historique (${chPI.length})`}].map(st=>(
+                        <button key={st.id} onClick={()=>setPiTab(st.id)} style={{padding:"5px 12px",borderRadius:8,border:`1px solid ${piTab===st.id?"var(--accent)":"var(--border)"}`,background:piTab===st.id?"var(--accent-muted)":"var(--surface2)",color:piTab===st.id?"var(--accent)":"var(--text)",fontSize:11,fontWeight:600,cursor:"pointer"}}>
+                          {st.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* PENDING */}
+                    {piTab==="pending"&&(
+                      <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                        {pendingPI.length===0&&<div style={{textAlign:"center",padding:24,color:"var(--text-quaternary)",fontSize:13}}>{"✅"} Aucun paiement en attente</div>}
+                        {pendingPI.map(pi=>(
+                          <div key={pi.id} style={{padding:"14px 16px",borderRadius:12,background:"var(--surface2)",border:"1px solid var(--warning)",borderLeftWidth:3}}>
+                            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                              <div>
+                                <span style={{fontSize:13,fontWeight:700,color:"var(--text-primary)"}}>{pi.type} — <span style={{color:"var(--warning)",fontSize:16,fontWeight:900}}>{Number(pi.montant).toLocaleString()} {pi.devise}</span></span>
+                                {pi.periode_debut&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Période : {pi.periode_debut} → {pi.periode_fin||"?"}</div>}
+                                {pi.note&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,fontStyle:"italic"}}>"{pi.note}"</div>}
+                                {pi.calcul_detail&&Object.keys(pi.calcul_detail).length>0&&<div style={{fontSize:10,color:"var(--muted)",marginTop:4}}>CA: {pi.calcul_detail.ca_genere} · Taux: {pi.calcul_detail.taux}% · Brut: {pi.calcul_detail.brut} · Déjà versé: {pi.calcul_detail.deja_verse}</div>}
+                              </div>
+                              <span style={{fontSize:10,color:"var(--text-quaternary)",flexShrink:0,marginLeft:8}}>{new Date(pi.created_at).toLocaleDateString("fr-FR")}</span>
+                            </div>
+                            {/* Contestation inline */}
+                            {contestId===pi.id ? (
+                              <div style={{marginTop:8}}>
+                                <textarea value={contestMsg} onChange={e=>setContestMsg(e.target.value)} placeholder="Motif de la contestation..." style={{width:"100%",boxSizing:"border-box",padding:"8px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,resize:"vertical",minHeight:60,fontFamily:"inherit"}}/>
+                                <div style={{display:"flex",gap:6,marginTop:6}}>
+                                  <button onClick={handleContestPI} disabled={piSaving||!contestMsg.trim()} style={{flex:1,padding:"6px",borderRadius:8,border:"none",background:"var(--danger)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",opacity:piSaving||!contestMsg.trim()?0.5:1}}>{piSaving?"...":"⚠️ Confirmer"}</button>
+                                  <button onClick={()=>{setContestId(null);setContestMsg("");}} style={{flex:1,padding:"6px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:12,fontWeight:600,cursor:"pointer"}}>Annuler</button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div style={{display:"flex",gap:8,marginTop:8}}>
+                                {user.role==="chatter"&&<button onClick={()=>handleValidatePI(pi.id)} disabled={piSaving} style={{flex:1,padding:"7px",borderRadius:9,border:"none",background:"var(--success)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",opacity:piSaving?0.5:1}}>{piSaving?"...":"✅ Valider"}</button>}
+                                {(user.role==="gerant"||user.role==="admin"||user.role==="ceo")&&<button onClick={()=>handleValidatePI(pi.id)} disabled={piSaving} style={{flex:1,padding:"7px",borderRadius:9,border:"none",background:"var(--success)",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",opacity:piSaving?0.5:1}}>{piSaving?"...":"✅ Valider"}</button>}
+                                <button onClick={()=>{setContestId(pi.id);setContestMsg("");}} style={{flex:1,padding:"7px",borderRadius:9,border:"1px solid var(--danger)",background:"var(--danger-muted)",color:"var(--danger)",fontSize:12,fontWeight:700,cursor:"pointer"}}>{"⚠️"} Contester</button>
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* CREATE (gérant only) */}
+                    {piTab==="create"&&(
+                      <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                        {user.role!=="gerant"&&user.role!=="admin"&&user.role!=="ceo"&&<div style={{textAlign:"center",padding:24,color:"var(--text-quaternary)",fontSize:13}}>{"🔒"} Réservé au gérant</div>}
+                        {(user.role==="gerant"||user.role==="admin"||user.role==="ceo")&&(
+                          <>
+                            {/* Calcul détaillé */}
+                            {sd.solde_du!==undefined&&(
+                              <div style={{padding:"12px 16px",borderRadius:10,background:"var(--accent-muted)",border:"1px solid var(--accent)",fontSize:12}}>
+                                <div style={{fontWeight:700,marginBottom:6}}>{"🧮"} Calcul automatique</div>
+                                <div style={{color:"var(--text-secondary)"}}>CA × {selCh.commission_pct||20}% = <b style={{color:"var(--accent)"}}>{Math.round(sd.commission_brute||0)} CHF</b> brut</div>
+                                <div style={{color:"var(--text-secondary)"}}>Déjà versé : <b style={{color:"var(--success)"}}>{Math.round(sd.deja_verse||0)} CHF</b></div>
+                                <div style={{color:"var(--warning)",fontWeight:800,marginTop:4}}>Solde dû : {Math.round(sd.solde_du||0)} CHF</div>
+                              </div>
+                            )}
+                            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                              <div>
+                                <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Type</label>
+                                <select value={piForm.type} onChange={e=>setPiForm({...piForm,type:e.target.value})} style={{width:"100%",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}>
+                                  <option value="commission">Commission</option>
+                                  <option value="bonus">Bonus</option>
+                                  <option value="remboursement">Remboursement</option>
+                                  <option value="autre">Autre</option>
+                                </select>
+                              </div>
+                              <div>
+                                <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Montant (CHF) *</label>
+                                <input type="number" value={piForm.montant} onChange={e=>setPiForm({...piForm,montant:e.target.value})} placeholder={String(Math.round(sd.solde_du||0))} style={{width:"100%",boxSizing:"border-box",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                              </div>
+                              <div>
+                                <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Période début</label>
+                                <input type="date" value={piForm.periode_debut} onChange={e=>setPiForm({...piForm,periode_debut:e.target.value})} style={{width:"100%",boxSizing:"border-box",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                              </div>
+                              <div>
+                                <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Période fin</label>
+                                <input type="date" value={piForm.periode_fin} onChange={e=>setPiForm({...piForm,periode_fin:e.target.value})} style={{width:"100%",boxSizing:"border-box",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                              </div>
+                            </div>
+                            <div>
+                              <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Note</label>
+                              <input value={piForm.note} onChange={e=>setPiForm({...piForm,note:e.target.value})} placeholder="Ex: Commission semaine 12" style={{width:"100%",boxSizing:"border-box",padding:"7px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                            </div>
+                            <button onClick={handleCreatePI} disabled={piSaving||!piForm.montant} style={{padding:"10px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:piSaving||!piForm.montant?0.5:1}}>
+                              {piSaving?"...":"📤 Envoyer le paiement"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* HISTORY */}
+                    {piTab==="history"&&(
+                      <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                        {chPI.length===0&&<div style={{textAlign:"center",padding:24,color:"var(--text-quaternary)",fontSize:13}}>Aucun paiement</div>}
+                        {chPI.map(pi=>(
+                          <div key={pi.id} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 14px",borderRadius:10,background:"var(--surface2)",border:`1px solid ${PI_STATUS_COLOR[pi.statut]||"var(--border)"}20`}}>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{fontSize:12,fontWeight:700}}>{pi.type} — {Number(pi.montant).toLocaleString()} {pi.devise}</div>
+                              {pi.note&&<div style={{fontSize:11,color:"var(--text-tertiary)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",fontStyle:"italic"}}>"{pi.note}"</div>}
+                              {pi.facture_numero&&<div style={{fontSize:10,color:"var(--accent)",marginTop:2}}>{"🧾"} {pi.facture_numero}</div>}
+                            </div>
+                            <div style={{textAlign:"right",flexShrink:0}}>
+                              <div style={{fontSize:11,fontWeight:700,color:PI_STATUS_COLOR[pi.statut]}}>{PI_STATUS_LABEL[pi.statut]||pi.statut}</div>
+                              <div style={{fontSize:10,color:"var(--text-quaternary)"}}>{new Date(pi.created_at).toLocaleDateString("fr-FR")}</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* ── TAB MESSAGES BLOQUÉS ── */}
               {modalTab==="logs" && (
                 <div>
@@ -12975,6 +13448,36 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
                       </div>
                     );
                   })()}
+                </div>
+              )}
+
+              {/* ── TAB PARAMÈTRES ── */}
+              {modalTab==="parametres" && (
+                <div style={{display:"flex",flexDirection:"column",gap:16}}>
+                  {/* Shift toggle */}
+                  <div style={{padding:"14px 16px",borderRadius:12,background:"var(--surface2)",border:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700}}>Shift</div>
+                      <div style={{fontSize:11,color:"var(--text-tertiary)"}}>Basculer le statut de shift actif</div>
+                    </div>
+                    <button onClick={()=>handleShiftToggle(selCh.id,selCh.on_shift||selCh.is_online||false)} disabled={shiftSaving} style={{padding:"8px 16px",borderRadius:10,border:"none",background:(selCh.on_shift||selCh.is_online)?"rgba(16,185,129,0.15)":"var(--surface)",border:"1px solid "+(selCh.on_shift||selCh.is_online?"#10B981":"var(--border)"),color:(selCh.on_shift||selCh.is_online)?"#10B981":"var(--text-tertiary)",fontSize:13,fontWeight:700,cursor:"pointer",opacity:shiftSaving?0.5:1}}>
+                      {shiftSaving?"...":(selCh.on_shift||selCh.is_online)?"● EN SHIFT — Mettre OFF":"○ OFF — Mettre ON"}
+                    </button>
+                  </div>
+                  {/* Edit name + commission */}
+                  <div>
+                    <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Nom</label>
+                    <input value={paramForm.name} onChange={e=>setParamForm({...paramForm,name:e.target.value})} style={{width:"100%",boxSizing:"border-box",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                  </div>
+                  <div>
+                    <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Commission (%)</label>
+                    <input type="number" min="0" max="100" value={paramForm.commission_pct} onChange={e=>setParamForm({...paramForm,commission_pct:e.target.value})} style={{width:"100%",boxSizing:"border-box",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+                  </div>
+                  <div style={{display:"flex",gap:10}}>
+                    <button onClick={handleSaveParams} disabled={paramSaving} style={{flex:2,padding:"9px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:paramSaving?0.5:1}}>
+                      {paramSaving?"...":"💾 Sauvegarder"}
+                    </button>
+                  </div>
                 </div>
               )}
 
