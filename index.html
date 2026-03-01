@@ -2504,8 +2504,17 @@ const _mapActivityRow = (row, tab) => {
   const isMsg = evType === "message" || evType === "new_message" || cat === "message" || tab === "messages";
   const isEnrich = ["profile_updated","enriched","spender_enriched","enrichment","classification_changed","handle_set","status_changed","spender_tier_changed"].includes(evType) || cat === "enrichment" || tab === "enrichment";
 
-  const rawTitle = row.title || row.username || row.handle || "";
-  const label = rawTitle || (tgStr ? "tg_" + tgStr : "?");
+  const rawTitle = row.title || row.username || row.handle || row.display_name || row.name || "";
+  // Try to resolve tg_ fallbacks using the realtime-maintained lookup exposed on window
+  const resolvedLabel = (() => {
+    if (rawTitle && !rawTitle.startsWith("tg_") && !/^\d{6,}$/.test(rawTitle)) return rawTitle;
+    const map = window.__spenderNameByTg;
+    if (!map) return rawTitle || (tgStr ? "tg_" + tgStr : "?");
+    const byTg = tgStr ? map.get(tgStr) : null;
+    const byId = row.spender_id ? map.get("id:" + row.spender_id) : null;
+    return byTg || byId || rawTitle || (tgStr ? "tg_" + tgStr : "?");
+  })();
+  const label = resolvedLabel;
 
   let detail = row.detail || "";
   let msgText = "";
@@ -9008,6 +9017,36 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
+
+  // Lookup map tg_user_id (string) -> display name — used to enrich activity feed
+  const spenderNameByTg = React.useMemo(() => {
+    const m = new Map();
+    (dbSpenders || []).forEach(s => {
+      const tg = String(s.tg_user_id || s.telegramId || "").replace(/\D/g, "");
+      const name = s.handle || s.name || s.first_name || s.display_name || s.username || "";
+      if (tg && name) m.set(tg, name);
+      if (s.id) m.set("id:" + s.id, name || (tg ? "tg_" + tg : "?"));
+    });
+    return m;
+  }, [dbSpenders]);
+
+  // Expose the map globally so _mapActivityRow (defined outside React) can use it
+  React.useEffect(() => {
+    window.__spenderNameByTg = spenderNameByTg;
+    return () => { delete window.__spenderNameByTg; };
+  }, [spenderNameByTg]);
+
+  // Map tg_user_id (string) -> display name for activity feed enrichment
+  const spenderNameByTgId = useMemo(() => {
+    const m = new Map();
+    (dbSpenders || []).forEach(s => {
+      const tg = String(s.tg_user_id || s.telegramId || "").replace(/\D/g, "");
+      const name = s.handle || s.name || s.first_name || s.username || s.display_name || "";
+      if (tg && name && !name.startsWith("tg_")) m.set(tg, name);
+      if (s.id) m.set(s.id, name || m.get(tg) || "");
+    });
+    return m;
+  }, [dbSpenders]);
   const dr = useDateRange("all");
   const [sortBy, setSortBy] = useState("ltv");
   const [filterModel, setFilterModel] = useState("");
@@ -10525,7 +10564,19 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 <div key={item.id || idx} className="activity-drawer-item" onClick={() => handleActivityClick(item)}>
                   <span style={{fontSize:15,flexShrink:0}}>{evIcon}</span>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label || item.title || (item.tg_user_id ? "tg_"+item.tg_user_id : "?")}</div>
+                    <div style={{fontSize:12,fontWeight:700,color:"var(--accent)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{
+                      // Resolve real name: prefer label if not a raw tg_ id, then lookup in dbSpenders
+                      (()=>{
+                        const rawLabel = item.label || item.title || "";
+                        const isTgFallback = !rawLabel || rawLabel.startsWith("tg_") || /^\d{6,}$/.test(rawLabel);
+                        if (!isTgFallback) return rawLabel;
+                        const tg = String(item.tg_user_id || "").replace(/\D/g,"");
+                        const sid = item.spender_id;
+                        const byTg = tg ? spenderNameByTg.get(tg) : null;
+                        const byId = sid ? spenderNameByTg.get("id:"+sid) : null;
+                        return byTg || byId || rawLabel || (tg ? "tg_"+tg : "?");
+                      })()
+                    }</div>
                     <div style={{fontSize:11,color:detailColor,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{detailText}</div>
                   </div>
                   <span style={{fontSize:10,color:"var(--text-quaternary)",whiteSpace:"nowrap",flexShrink:0}}>{formatRelativeTime(item.ts || item.created_at)}</span>
@@ -32808,6 +32859,19 @@ const App = () => {
         if (id && window.__onSpenderUpdated) window.__onSpenderUpdated(id);
         if (window.__softRefresh) setTimeout(window.__softRefresh, 300);
       })
+      // NEW SPENDER created by the AI bot — push immediately to state, no wait for polling
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "spenders" }, (payload) => {
+        if (user.role !== "gerant" && user.role !== "chatter") return;
+        const s = payload.new;
+        if (!s || !s.id) return;
+        // Add directly to spenders state so it appears in <1s (no need to wait for poll)
+        setSpenders(prev => {
+          if (prev.some(x => x.id === s.id)) return prev;
+          return [s, ...prev];
+        });
+        // Also trigger soft refresh so cards/stats are recalculated
+        if (window.__softRefresh) setTimeout(window.__softRefresh, 800);
+      })
       .subscribe();
     return () => { sb.removeChannel(channel); };
   }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
@@ -32897,7 +32961,7 @@ const App = () => {
           const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
           setSpenders(deduped);
         } catch (e) { console.warn("[SPENDERS] chatter periodic refresh failed:", e?.message || e); }
-      }, 20000);
+      }, 7000);  // 7s: chatter sees new AI-created spenders within 7s max
       return () => { cancelled = true; clearInterval(iv); };
     }
     (async () => {
@@ -32916,7 +32980,7 @@ const App = () => {
         const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
         setSpenders(deduped);
       } catch (e) { console.warn("[SPENDERS] periodic refresh failed:", e?.message || e); }
-    }, 20000);
+    }, 10000);  // 10s: gerant refresh
     return () => { cancelled = true; clearInterval(iv); };
   }, [user?.id, user?.role]);
 
