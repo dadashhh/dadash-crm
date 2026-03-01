@@ -7824,6 +7824,7 @@ const UnifiedSpenderModal = React.memo(({
   const [deleteConfirm, setDeleteConfirm] = React.useState(null);
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep");
   const [deleteLoading, setDeleteLoading] = React.useState(false);
+  const [mergeConfirm, setMergeConfirm] = React.useState(null);
 
   // Badge state (local)
   const [dbBadges, setDbBadges] = React.useState({});
@@ -8007,13 +8008,43 @@ const UnifiedSpenderModal = React.memo(({
         if (isNumericTg) { updates.tg_user_id = tgNorm; updates.telegram_username = null; }
         else if (rawTg) { updates.telegram_username = rawTg; updates.tg_user_id = null; }
         else { updates.telegram_username = null; updates.tg_user_id = null; }
+        if (isNumericTg && tgNorm) {
+          const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
+          if (existing) {
+            setMergeConfirm({ existing, tgId: tgNorm, updates });
+            setSpSavingProfile(false);
+            return;
+          }
+        }
         const { error } = await sb.from("spenders").update(updates).eq("id", selected.dbId);
-        if (error) throw new Error(error.message);
+        if (error) {
+          if (error.message && (error.message.includes("uq_spenders_tg_user_id") || error.message.includes("duplicate key"))) {
+            const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
+            if (existing) { setMergeConfirm({ existing, tgId: tgNorm, updates }); setSpSavingProfile(false); return; }
+          }
+          throw new Error(error.message);
+        }
       }
       addToast(fr ? "Sauvegardé ✓" : "Saved ✓", "success");
       setSpEditMode(false);
+      setMergeConfirm(null);
       if (onRefresh) await onRefresh();
     } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); }
+    setSpSavingProfile(false);
+  };
+
+  const handleMergeConfirm = async () => {
+    if (!mergeConfirm || !selected?.dbId) return;
+    setSpSavingProfile(true);
+    try {
+      const { data: res, error } = await sb.rpc("fn_merge_spenders", { p_old_id: selected.dbId, p_new_id: mergeConfirm.existing.id });
+      if (error) throw new Error(error.message);
+      if (res && res.ok === false) throw new Error(res.error || "Merge failed");
+      addToast(fr ? "Fusion effectuée ✓" : "Merge completed ✓", "success");
+      setMergeConfirm(null); setSpEditMode(false);
+      if (onRefresh) await onRefresh();
+      onClose();
+    } catch (e) { addToast("Erreur fusion: " + (e?.message || e), "error"); }
     setSpSavingProfile(false);
   };
 
@@ -8409,6 +8440,23 @@ const UnifiedSpenderModal = React.memo(({
             <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
             <button onClick={()=>handleDeleteSpender(deleteConfirm)} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
               {deleteLoading ? "\u23F3 ..." : `\u{1F5D1}\uFE0F ${fr?"Supprimer":"Delete"}`}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+    {mergeConfirm && (
+      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>!spSavingProfile&&setMergeConfirm(null)}>
+        <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:420,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:16,fontWeight:800,color:"#0088cc",marginBottom:8}}>{"\u2139\uFE0F"} {fr?"ID Telegram déjà utilisé":"Telegram ID already in use"}</div>
+          <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:16}}>
+            {fr?"L'ID":"The ID"} <strong>{mergeConfirm.tgId}</strong> {fr?"est déjà attribué à":"is already assigned to"} <strong>@{mergeConfirm.existing.handle||mergeConfirm.existing.name||"?"}</strong>.
+            {fr?" Fusionner cette fiche (":" Merge this card (")}{getSpenderDisplayName(selected)}{fr?") dans la fiche existante ?":") into the existing one?"}
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+            <button onClick={()=>setMergeConfirm(null)} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+            <button onClick={handleMergeConfirm} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,background:"#0088cc",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:spSavingProfile?0.6:1}}>
+              {spSavingProfile ? "\u23F3 ..." : (fr?"Fusionner":"Merge")}
             </button>
           </div>
         </div>
@@ -9027,6 +9075,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [showNewSpender, setShowNewSpender] = useState(false);
   const [newSpForm, setNewSpForm] = useState({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
   const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [mergeConfirm, setMergeConfirm] = useState(null);
   const [search, setSearch] = useState("");
   const [filterBadge, setFilterBadge] = useState("");
   const [filterLangue, setFilterLangue] = useState("");
@@ -9519,12 +9568,40 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       if (isNumericTg) { updates.tg_user_id = tgNorm; updates.telegram_username = null; }
       else if (rawTg) { updates.telegram_username = rawTg; updates.tg_user_id = null; }
       else { updates.telegram_username = null; updates.tg_user_id = null; }
+      if (isNumericTg && tgNorm) {
+        const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
+        if (existing) {
+          setMergeConfirm({ existing, tgId: tgNorm });
+          setSpSavingProfile(false);
+          return;
+        }
+      }
       const {error} = await sb.from("spenders").update(updates).eq("id", selected.dbId);
-      if (error) { addToast("Erreur: " + error.message, "error"); setSpSavingProfile(false); return; }
-      setSpSavingProfile(false); setSpEditMode(false);
+      if (error) {
+        if (error.message && (error.message.includes("uq_spenders_tg_user_id") || error.message.includes("duplicate key"))) {
+          const { data: existing } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", tgNorm).neq("id", selected.dbId).maybeSingle();
+          if (existing) { setMergeConfirm({ existing, tgId: tgNorm }); setSpSavingProfile(false); return; }
+        }
+        addToast("Erreur: " + error.message, "error"); setSpSavingProfile(false); return;
+      }
+      setSpSavingProfile(false); setSpEditMode(false); setMergeConfirm(null);
       addToast(fr ? "Profil sauvegardé" : "Profile saved", "success");
       await onRefresh(); setSelected(null);
     } catch (e) { setSpSavingProfile(false); addToast("Erreur: " + e.message, "error"); }
+  };
+
+  const handleMergeConfirm = async () => {
+    if (!mergeConfirm || !selected?.dbId) return;
+    setSpSavingProfile(true);
+    try {
+      const { data: res, error } = await sb.rpc("fn_merge_spenders", { p_old_id: selected.dbId, p_new_id: mergeConfirm.existing.id });
+      if (error) throw new Error(error.message);
+      if (res && res.ok === false) throw new Error(res.error || "Merge failed");
+      addToast(fr ? "Fusion effectuée ✓" : "Merge completed ✓", "success");
+      setMergeConfirm(null); setSpEditMode(false); setSelected(null);
+      await onRefresh();
+    } catch (e) { addToast("Erreur fusion: " + (e?.message || e), "error"); }
+    setSpSavingProfile(false);
   };
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep"); // "keep" | "delete"
   const [deleteLoading, setDeleteLoading] = React.useState(false);
@@ -10442,6 +10519,23 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               <button onClick={()=>setDeleteConfirm(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
               <button onClick={()=>{handleDeleteSpender(deleteConfirm);}} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
                 {deleteLoading ? "⏳ ..." : `🗑️ ${fr?"Supprimer":"Delete"}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {mergeConfirm && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>!spSavingProfile&&setMergeConfirm(null)}>
+          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:420,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:800,color:"#0088cc",marginBottom:8}}>{"\u2139\uFE0F"} {fr?"ID Telegram déjà utilisé":"Telegram ID already in use"}</div>
+            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:16}}>
+              {fr?"L'ID":"The ID"} <strong>{mergeConfirm.tgId}</strong> {fr?"est déjà attribué à":"is already assigned to"} <strong>@{mergeConfirm.existing.handle||mergeConfirm.existing.name||"?"}</strong>.
+              {fr?" Fusionner cette fiche (":" Merge this card (")}{getSpenderDisplayName(selected)}{fr?") dans la fiche existante ?":") into the existing one?"}
+            </div>
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button onClick={()=>setMergeConfirm(null)} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+              <button onClick={handleMergeConfirm} disabled={spSavingProfile} style={{padding:"8px 16px",borderRadius:8,background:"#0088cc",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:spSavingProfile?0.6:1}}>
+                {spSavingProfile ? "⏳ ..." : (fr?"Fusionner":"Merge")}
               </button>
             </div>
           </div>
