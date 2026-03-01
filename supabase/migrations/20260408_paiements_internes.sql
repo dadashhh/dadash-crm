@@ -4,13 +4,15 @@
 -- Option choisie: A — RESET PROPRE
 --
 -- Ce que fait cette migration :
---   1. Sauvegarde les anciennes tables de paiements dans _backup_*
---   2. Vide les anciennes tables (TRUNCATE CASCADE)
---   3. Crée public.paiements_internes (table unifiée)
---   4. Index, trigger updated_at, RLS
---   5. Vue vue_soldes_chatters
---   6. Vue vue_soldes_modeles
---   7. Vue vue_soldes_providers  (sens inversé : provider doit au gérant)
+--   0. Backups + TRUNCATE des anciennes tables (conditionnel IF EXISTS)
+--   1. Helper _get_my_role() (CREATE OR REPLACE — idempotent)
+--   2. Crée public.paiements_internes (table unifiée)
+--   3. Index
+--   4. Trigger updated_at
+--   5. RLS
+--   6. Vue vue_soldes_chatters
+--   7. Vue vue_soldes_modeles
+--   8. Vue vue_soldes_providers  (sens inversé : provider doit au gérant)
 --
 -- Tables nettoyées : payment_events, paies, payments, ledger_entries
 -- Tables à supprimer APRÈS validation (commentées en bas)
@@ -55,7 +57,21 @@ END;
 $$;
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 1.  TABLE paiements_internes
+-- 1.  HELPER : _get_my_role()  (idempotent — utilisé par RLS)
+-- ─────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION public._get_my_role()
+RETURNS text
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS 'SELECT role FROM public.profiles WHERE id = auth.uid()';
+
+GRANT EXECUTE ON FUNCTION public._get_my_role() TO authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 2.  TABLE paiements_internes
 -- ─────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS public.paiements_internes (
@@ -99,7 +115,7 @@ CREATE TABLE IF NOT EXISTS public.paiements_internes (
 );
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 2.  INDEX
+-- 3.  INDEX
 -- ─────────────────────────────────────────────────────────────────────────
 
 CREATE INDEX IF NOT EXISTS idx_pi_destinataire ON public.paiements_internes (destinataire_id, destinataire_type);
@@ -109,7 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_pi_periode      ON public.paiements_internes (per
 CREATE INDEX IF NOT EXISTS idx_pi_created_at   ON public.paiements_internes (created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 3.  TRIGGER updated_at automatique
+-- 4.  TRIGGER updated_at automatique
 -- ─────────────────────────────────────────────────────────────────────────
 
 CREATE OR REPLACE FUNCTION public.fn_set_updated_at()
@@ -129,7 +145,7 @@ CREATE TRIGGER trg_pi_updated_at
   EXECUTE FUNCTION public.fn_set_updated_at();
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 4.  RLS
+-- 5.  RLS
 -- ─────────────────────────────────────────────────────────────────────────
 
 ALTER TABLE public.paiements_internes ENABLE ROW LEVEL SECURITY;
@@ -175,7 +191,7 @@ CREATE POLICY pi_destinataire_contest ON public.paiements_internes
   WITH CHECK (destinataire_id = auth.uid());
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 5.  VUE : vue_soldes_chatters
+-- 6.  VUE : vue_soldes_chatters
 -- ─────────────────────────────────────────────────────────────────────────
 --
 -- Source TX valides : status IN ('valid', 'validated', 'confirmee')
@@ -235,7 +251,7 @@ WHERE p.role = 'chatter';
 GRANT SELECT ON public.vue_soldes_chatters TO authenticated;
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 6.  VUE : vue_soldes_modeles
+-- 7.  VUE : vue_soldes_modeles
 -- ─────────────────────────────────────────────────────────────────────────
 --
 -- Identique à vue_soldes_chatters mais pour les modèles :
@@ -290,7 +306,7 @@ WHERE p.role = 'modele';
 GRANT SELECT ON public.vue_soldes_modeles TO authenticated;
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 7.  VUE : vue_soldes_providers  (SENS INVERSÉ)
+-- 8.  VUE : vue_soldes_providers  (SENS INVERSÉ)
 -- ─────────────────────────────────────────────────────────────────────────
 --
 -- Le provider gère des modèles (assigned_models JSONB de UUIDs).
@@ -361,7 +377,7 @@ WHERE p.role = 'provider';
 GRANT SELECT ON public.vue_soldes_providers TO authenticated;
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 8.  VÉRIFICATION
+-- 9.  VÉRIFICATION
 -- ─────────────────────────────────────────────────────────────────────────
 
 -- Chatters attendus : Mala, Zorro, Livio, carla
@@ -375,7 +391,7 @@ GRANT SELECT ON public.vue_soldes_providers TO authenticated;
 -- FROM vue_soldes_providers;
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 9.  SUPPRESSION APRÈS VALIDATION (à exécuter manuellement)
+-- 10.  SUPPRESSION APRÈS VALIDATION (à exécuter manuellement)
 -- ─────────────────────────────────────────────────────────────────────────
 -- Attendre que la nouvelle table soit validée en prod, puis :
 --
