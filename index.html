@@ -2750,71 +2750,46 @@ const apiFetchSpenders = async ({ scope } = {}) => {
     const modelIds = s._allowedModelIds || [];
     if (modelIds.length === 0) return [];
 
-    const mapRow = (row) => ({
-      ...row,
-      handle: row.handle || row.username,
-      name: row.display_name ?? row.name ?? row.handle,
-      tg_user_id: row.tg_user_id_text ?? row.tg_user_id,
-      langue: row.langue ?? row.language,
-      notes: row.notes_chatter ?? row.notes,
-    });
-
-    // ── Step 1: primary query — spenders with model_id set ──
-    let primary = [];
-    try {
-      const { data, error } = await sb.from("spenders").select("*")
-        .in("model_id", modelIds)
-        .order("updated_at", { ascending: false }).limit(1000);
-      if (!error && data) primary = data;
-    } catch (e) { console.warn("[API_SPENDERS] primary model_id failed:", e?.message || e); }
-
-    // ── Step 2: build handle/id sets from already-loaded tx data or a lightweight query ──
-    const handleSet = new Set();
-    const idSet     = new Set();
-    const txSource  = s._chatterTxs || [];   // already available after deferred phase
+    // ── Step 1: build allowed spender handle/id sets from transaction history ──
+    // This defines "spender belongs to this chatter's models" regardless of model_id on spenders table
+    const txHandleSet = new Set();
+    const txIdSet     = new Set();
+    const txSource    = s._chatterTxs || [];
     if (txSource.length > 0) {
       txSource.forEach(tx => {
         const h = (tx.spender_handle || "").trim();
-        if (h) handleSet.add(h);
-        if (tx.spender_id) idSet.add(tx.spender_id);
+        if (h) txHandleSet.add(h.toLowerCase());
+        if (tx.spender_id) txIdSet.add(tx.spender_id);
       });
     } else {
-      // Fallback: lightweight tx query (no _chatterTxs yet — early phase)
       try {
         const { data: txRows } = await sb.from("transactions")
-          .select("spender_id, spender_handle")
+          .select("spender_id,spender_handle")
           .or(`chatter_id.eq.${s.chatter_user_id},model_id.in.(${modelIds.join(",")})`);
         (txRows || []).forEach(tx => {
           const h = (tx.spender_handle || "").trim();
-          if (h) handleSet.add(h);
-          if (tx.spender_id) idSet.add(tx.spender_id);
+          if (h) txHandleSet.add(h.toLowerCase());
+          if (tx.spender_id) txIdSet.add(tx.spender_id);
         });
-      } catch (e) { console.warn("[API_SPENDERS] tx fallback failed:", e?.message || e); }
+      } catch (e) { console.warn("[API_SPENDERS] tx lookup failed:", e?.message || e); }
     }
 
-    // ── Step 3: fetch supplemental spenders NOT already in primary (model_id=NULL gap) ──
-    const primaryIds     = new Set(primary.map(s => s.id).filter(Boolean));
-    const primaryHandles = new Set(primary.map(s => (s.handle || s.username || "").trim()).filter(Boolean));
-    const missingIds     = [...idSet].filter(id => id && !primaryIds.has(id));
-    const missingHandles = [...handleSet].filter(h => h && !primaryHandles.has(h));
+    // ── Step 2: fetch ALL spenders via same fresh view as gérant (v_spenders_ui) ──
+    const allSpenders = await _fetchSpendersGlobal();
 
-    let extra = [];
-    if (missingIds.length > 0 || missingHandles.length > 0) {
-      try {
-        const parts = [];
-        if (missingIds.length > 0)     parts.push(`id.in.(${missingIds.join(",")})`);
-        if (missingHandles.length > 0) parts.push(`handle.in.(${missingHandles.map(h => `"${h}"`).join(",")})`);
-        const { data: extraData } = await sb.from("spenders").select("*")
-          .or(parts.join(",")).limit(500);
-        extra = extraData || [];
-      } catch (e) { console.warn("[API_SPENDERS] extra fetch failed:", e?.message || e); }
-    }
+    // ── Step 3: client-side filter — keep spenders belonging to chatter's models ──
+    // A spender belongs to this chatter if:
+    //   (a) their model_id matches an assigned model, OR
+    //   (b) they appear in a transaction for an assigned model (handle or id match)
+    const filtered = allSpenders.filter(sp => {
+      if (sp.model_id && modelIds.includes(sp.model_id)) return true;
+      if (sp.id && txIdSet.has(sp.id)) return true;
+      const h = (sp.handle || sp.name || "").trim().toLowerCase();
+      return h && txHandleSet.has(h);
+    });
 
-    // ── Step 4: merge + deduplicate ──
-    const merged = [...primary, ...extra].filter((s, i, arr) => arr.findIndex(x => x.id === s.id) === i);
-    const mapped = merged.map(mapRow);
-    console.log(`[SPENDERS] chatter merged: primary=${primary.length} extra=${extra.length} total=${mapped.length}`);
-    return mapped;
+    console.log(`[SPENDERS] chatter: total_fresh=${allSpenders.length} filtered=${filtered.length} (modelIds=${modelIds.length} txHandles=${txHandleSet.size} txIds=${txIdSet.size})`);
+    return filtered;
   }
   return await _fetchSpendersGlobal();
 };
