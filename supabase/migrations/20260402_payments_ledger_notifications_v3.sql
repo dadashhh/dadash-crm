@@ -222,7 +222,7 @@ CREATE POLICY notif_update_own ON public.notifications
 CREATE OR REPLACE VIEW public.v_user_balances AS
 SELECT
   le.owner_user_id                                                      AS user_id,
-  p.full_name,
+  COALESCE(p.name, p.username, p.display_name)                         AS display_name,
   p.username,
   p.role,
   le.currency,
@@ -233,7 +233,7 @@ SELECT
   COUNT(*)                                                               AS entry_count
 FROM  public.ledger_entries le
 JOIN  public.profiles p ON p.id = le.owner_user_id
-GROUP BY le.owner_user_id, p.full_name, p.username, p.role, le.currency;
+GROUP BY le.owner_user_id, p.name, p.username, p.display_name, p.role, le.currency;
 
 GRANT SELECT ON public.v_user_balances TO authenticated;
 
@@ -258,7 +258,7 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(full_name, username, display_name, 'Inconnu')
+  SELECT COALESCE(name, username, display_name, 'Inconnu')
     INTO v_creator_name
     FROM profiles
    WHERE id = NEW.created_by_user_id;
@@ -316,10 +316,10 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  SELECT COALESCE(full_name, username, display_name, 'Inconnu')
+  SELECT COALESCE(name, username, display_name, 'Inconnu')
     INTO v_payer_name    FROM profiles WHERE id = NEW.payer_user_id;
 
-  SELECT COALESCE(full_name, username, display_name, 'Inconnu')
+  SELECT COALESCE(name, username, display_name, 'Inconnu')
     INTO v_receiver_name FROM profiles WHERE id = NEW.receiver_user_id;
 
   v_label := CASE NEW.kind
