@@ -25,8 +25,6 @@
 --   * Replaces old fn_payment_event_paid triggers with the new pair
 -- =============================================================================
 
-BEGIN;
-
 -- -----------------------------------------------------------------------------
 -- 0.  Helper: _get_my_role  (safe re-create)
 -- -----------------------------------------------------------------------------
@@ -35,7 +33,7 @@ CREATE OR REPLACE FUNCTION public._get_my_role()
 RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public
-AS $func$ SELECT role FROM profiles WHERE id = auth.uid() $func$;
+AS 'SELECT role FROM public.profiles WHERE id = auth.uid()';
 
 GRANT EXECUTE ON FUNCTION public._get_my_role() TO authenticated;
 
@@ -172,7 +170,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_from_name text;
   v_title     text;
@@ -209,7 +207,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$func$;
+$$;
 
 CREATE TRIGGER trg_pe_on_insert
   AFTER INSERT ON public.payment_events
@@ -233,7 +231,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_existing  int;
   v_from_name text;
@@ -331,7 +329,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$func$;
+$$;
 
 CREATE TRIGGER trg_pe_on_status_change
   AFTER UPDATE ON public.payment_events
@@ -356,7 +354,7 @@ RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -405,7 +403,7 @@ BEGIN
 
   RETURN v_id;
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_create_payment_event(uuid, numeric, text, text, text)
   FROM PUBLIC;
@@ -421,7 +419,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -459,7 +457,7 @@ BEGIN
    WHERE id = p_id
      AND status = 'pending';  -- extra guard against race
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_confirm_payment_event(uuid) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION public.rpc_confirm_payment_event(uuid) TO authenticated;
@@ -476,7 +474,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -508,7 +506,7 @@ BEGIN
    WHERE id = p_id
      AND status = 'pending';
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_reject_payment_event(uuid, text) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION public.rpc_reject_payment_event(uuid, text) TO authenticated;
@@ -522,7 +520,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me      uuid := auth.uid();
   v_role    text;
@@ -556,7 +554,7 @@ BEGIN
    WHERE id = p_id
      AND status = 'pending';
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_cancel_payment_event(uuid) FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION public.rpc_cancel_payment_event(uuid) TO authenticated;
@@ -579,7 +577,7 @@ LANGUAGE sql
 STABLE
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
   SELECT jsonb_build_object(
     'pending_incoming_count',
       COUNT(*) FILTER (
@@ -612,7 +610,7 @@ AS $func$
   WHERE from_user_id = auth.uid()
      OR to_user_id   = auth.uid()
      OR created_by   = auth.uid();
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_my_payment_kpis() FROM PUBLIC;
 GRANT  EXECUTE ON FUNCTION public.rpc_my_payment_kpis() TO authenticated;
@@ -646,4 +644,3 @@ JOIN public.profiles p ON p.id = agg.owner_user_id;
 
 GRANT SELECT ON public.v_user_balances TO authenticated;
 
-COMMIT;
