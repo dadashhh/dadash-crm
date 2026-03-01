@@ -17,25 +17,42 @@
 -- ═══════════════════════════════════════════════════════════════════════════
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 0.  OPTION A — BACKUPS + RESET
+-- 0.  OPTION A — BACKUPS + RESET (conditionnel : IF EXISTS pour chaque table)
 -- ─────────────────────────────────────────────────────────────────────────
 
--- Backup payment_events
-CREATE TABLE IF NOT EXISTS public._backup_payment_events AS
-  SELECT * FROM public.payment_events;
+DO $$
+BEGIN
+  -- Backup + truncate payment_events (et ledger_entries via CASCADE)
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = 'payment_events') THEN
+    CREATE TABLE IF NOT EXISTS public._backup_payment_events AS
+      SELECT * FROM public.payment_events;
+    TRUNCATE TABLE public.payment_events CASCADE;
+  END IF;
 
--- Backup paies
-CREATE TABLE IF NOT EXISTS public._backup_paies AS
-  SELECT * FROM public.paies;
+  -- Backup + truncate paies
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = 'paies') THEN
+    CREATE TABLE IF NOT EXISTS public._backup_paies AS
+      SELECT * FROM public.paies;
+    TRUNCATE TABLE public.paies;
+  END IF;
 
--- Backup payments (table créée en migration 20260402)
-CREATE TABLE IF NOT EXISTS public._backup_payments AS
-  SELECT * FROM public.payments;
+  -- Backup + truncate payments
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = 'payments') THEN
+    CREATE TABLE IF NOT EXISTS public._backup_payments AS
+      SELECT * FROM public.payments;
+    TRUNCATE TABLE public.payments CASCADE;
+  END IF;
 
--- Vider les tables — CASCADE pour nettoyer ledger_entries lié à payment_events
-TRUNCATE TABLE public.payment_events CASCADE;
-TRUNCATE TABLE public.paies;
-TRUNCATE TABLE public.payments CASCADE;
+  -- Truncate payout_requests si existante
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+             WHERE table_schema = 'public' AND table_name = 'payout_requests') THEN
+    TRUNCATE TABLE public.payout_requests;
+  END IF;
+END;
+$$;
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- 1.  TABLE paiements_internes
