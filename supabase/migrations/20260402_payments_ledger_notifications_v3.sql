@@ -26,8 +26,6 @@
 --   * Pas d'impact ledger sur refused / cancelled
 -- =============================================================================
 
-BEGIN;
-
 -- -----------------------------------------------------------------------------
 -- 0.  Helper : role du user courant (SECURITY DEFINER pour eviter le N+1 RLS)
 -- -----------------------------------------------------------------------------
@@ -36,7 +34,7 @@ CREATE OR REPLACE FUNCTION public._get_my_role()
 RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public
-AS $func$ SELECT role FROM profiles WHERE id = auth.uid() $func$;
+AS 'SELECT role FROM public.profiles WHERE id = auth.uid()';
 
 GRANT EXECUTE ON FUNCTION public._get_my_role() TO authenticated;
 
@@ -78,12 +76,12 @@ CREATE TABLE IF NOT EXISTS public.payments (
 );
 
 CREATE OR REPLACE FUNCTION public.fn_set_payments_updated_at()
-RETURNS trigger LANGUAGE plpgsql AS $func$
+RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   NEW.updated_at = now();
   RETURN NEW;
 END;
-$func$;
+$$;
 
 DROP TRIGGER IF EXISTS trg_payments_updated_at ON public.payments;
 CREATE TRIGGER trg_payments_updated_at
@@ -236,7 +234,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_creator_name text;
   v_title        text;
@@ -271,7 +269,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$func$;
+$$;
 
 DROP TRIGGER IF EXISTS trg_payments_on_insert ON public.payments;
 CREATE TRIGGER trg_payments_on_insert
@@ -293,7 +291,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_existing      int;
   v_payer_name    text;
@@ -414,7 +412,7 @@ BEGIN
 
   RETURN NEW;
 END;
-$func$;
+$$;
 
 DROP TRIGGER IF EXISTS trg_payments_on_status_change ON public.payments;
 CREATE TRIGGER trg_payments_on_status_change
@@ -449,7 +447,7 @@ RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me         uuid := auth.uid();
   v_me_role    text;
@@ -525,7 +523,7 @@ BEGIN
 
   RETURN v_payment_id;
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_create_payment(text, uuid, numeric, text, text, text)
   FROM PUBLIC;
@@ -548,7 +546,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -585,7 +583,7 @@ BEGIN
          confirmed_at = now()
    WHERE id = p_payment_id;
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_confirm_payment(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_confirm_payment(uuid) TO authenticated;
@@ -602,7 +600,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -635,7 +633,7 @@ BEGIN
          refused_reason = COALESCE(p_reason, '')
    WHERE id = p_payment_id;
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_refuse_payment(uuid, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_refuse_payment(uuid, text) TO authenticated;
@@ -651,7 +649,7 @@ RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_me   uuid := auth.uid();
   v_role text;
@@ -683,7 +681,7 @@ BEGIN
          cancelled_at = now()
    WHERE id = p_payment_id;
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_cancel_payment(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_cancel_payment(uuid) TO authenticated;
@@ -846,4 +844,3 @@ SCENARIO 5 -- Verification anti-fuite cross-role
 -- => Doit retourner UNIQUEMENT le solde du CHATTER
 */
 
-COMMIT;

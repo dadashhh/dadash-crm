@@ -17,8 +17,6 @@
 --   * La colonne read reste en place, jamais supprimee
 -- =============================================================================
 
-BEGIN;
-
 -- -----------------------------------------------------------------------------
 -- 1.  Colonne is_read  (idempotente)
 -- -----------------------------------------------------------------------------
@@ -55,7 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_notif_user_isread_kind
 CREATE OR REPLACE FUNCTION public.fn_notifications_sync_read()
 RETURNS trigger
 LANGUAGE plpgsql
-AS $func$
+AS $$
 BEGIN
   IF NEW.is_read IS DISTINCT FROM OLD.is_read THEN
     -- is_read change => aligner read
@@ -66,7 +64,7 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
-$func$;
+$$;
 
 DROP TRIGGER IF EXISTS trg_notifications_sync_read ON public.notifications;
 CREATE TRIGGER trg_notifications_sync_read
@@ -89,7 +87,7 @@ LANGUAGE sql
 STABLE
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
   SELECT jsonb_build_object(
     'tx_unread',
       COALESCE(SUM(CASE
@@ -108,7 +106,7 @@ AS $func$
   )
   FROM public.notifications
   WHERE user_id = auth.uid();
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_notifications_counts() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_notifications_counts() TO authenticated;
@@ -130,7 +128,7 @@ RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public
-AS $func$
+AS $$
 DECLARE
   v_count integer;
 BEGIN
@@ -153,7 +151,7 @@ BEGIN
   GET DIAGNOSTICS v_count = ROW_COUNT;
   RETURN v_count;
 END;
-$func$;
+$$;
 
 REVOKE ALL ON FUNCTION public.rpc_mark_notifications_read(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.rpc_mark_notifications_read(text) TO authenticated;
@@ -181,4 +179,3 @@ GRANT EXECUTE ON FUNCTION public.rpc_mark_notifications_read(text) TO authentica
 -- SELECT rpc_mark_notifications_read('payment');
 -- Attendu : integer = nombre de notifs payment marquees lues.
 
-COMMIT;
