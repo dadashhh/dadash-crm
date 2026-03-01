@@ -2749,42 +2749,72 @@ const apiFetchSpenders = async ({ scope } = {}) => {
   if (s.type === 'chatter') {
     const modelIds = s._allowedModelIds || [];
     if (modelIds.length === 0) return [];
+
+    const mapRow = (row) => ({
+      ...row,
+      handle: row.handle || row.username,
+      name: row.display_name ?? row.name ?? row.handle,
+      tg_user_id: row.tg_user_id_text ?? row.tg_user_id,
+      langue: row.langue ?? row.language,
+      notes: row.notes_chatter ?? row.notes,
+    });
+
+    // ── Step 1: primary query — spenders with model_id set ──
+    let primary = [];
     try {
-      const { data: direct, error } = await sb.from("spenders").select("*").in("model_id", modelIds).order("updated_at", { ascending: false }).limit(1000);
-      if (!error && direct && direct.length > 0) {
-        const mapped = direct.map(row => ({
-          ...row,
-          id: row.id,
-          handle: row.handle || row.username,
-          name: row.display_name ?? row.name ?? row.handle,
-          tg_user_id: row.tg_user_id_text ?? row.tg_user_id,
-          langue: row.langue ?? row.language,
-          notes: row.notes_chatter ?? row.notes,
-        }));
-        const safe = assertChatterScope(mapped, s, 'spender');
-        console.log("[SPENDERS] chatter direct model_id n=" + safe.length, "[SPENDER_DEBUG] total spenders chargés:", safe.length);
-        return safe;
-      }
-    } catch (e) { console.warn("[API_SPENDERS] chatter direct model_id failed:", e?.message || e); }
-    const allSpenders = await _fetchSpendersGlobal();
+      const { data, error } = await sb.from("spenders").select("*")
+        .in("model_id", modelIds)
+        .order("updated_at", { ascending: false }).limit(1000);
+      if (!error && data) primary = data;
+    } catch (e) { console.warn("[API_SPENDERS] primary model_id failed:", e?.message || e); }
+
+    // ── Step 2: build handle/id sets from already-loaded tx data or a lightweight query ──
     const handleSet = new Set();
-    const idSet = new Set();
-    try {
-      const { data: txRows } = await sb.from("transactions").select("spender_id, spender_handle").in("model_id", modelIds);
-      (txRows || []).forEach(tx => {
+    const idSet     = new Set();
+    const txSource  = s._chatterTxs || [];   // already available after deferred phase
+    if (txSource.length > 0) {
+      txSource.forEach(tx => {
         const h = (tx.spender_handle || "").trim();
         if (h) handleSet.add(h);
         if (tx.spender_id) idSet.add(tx.spender_id);
       });
-      const { data: convRows } = await sb.from("tg_conversations").select("spender_id").in("model_id", modelIds);
-      (convRows || []).forEach(c => { if (c.spender_id) idSet.add(c.spender_id); });
-    } catch (e) { console.warn("[API_SPENDERS] chatter fetch model spenders:", e?.message || e); }
-    const filtered = allSpenders.filter(sp => {
-      const h = (sp.handle || sp.name || "").trim();
-      return handleSet.has(h) || (sp.id && idSet.has(sp.id));
-    });
-    const scopeWithHandles = { ...s, _allowedHandles: handleSet, _allowedSpenderIds: idSet };
-    return assertChatterScope(filtered, scopeWithHandles, 'spender');
+    } else {
+      // Fallback: lightweight tx query (no _chatterTxs yet — early phase)
+      try {
+        const { data: txRows } = await sb.from("transactions")
+          .select("spender_id, spender_handle")
+          .or(`chatter_id.eq.${s.chatter_user_id},model_id.in.(${modelIds.join(",")})`);
+        (txRows || []).forEach(tx => {
+          const h = (tx.spender_handle || "").trim();
+          if (h) handleSet.add(h);
+          if (tx.spender_id) idSet.add(tx.spender_id);
+        });
+      } catch (e) { console.warn("[API_SPENDERS] tx fallback failed:", e?.message || e); }
+    }
+
+    // ── Step 3: fetch supplemental spenders NOT already in primary (model_id=NULL gap) ──
+    const primaryIds     = new Set(primary.map(s => s.id).filter(Boolean));
+    const primaryHandles = new Set(primary.map(s => (s.handle || s.username || "").trim()).filter(Boolean));
+    const missingIds     = [...idSet].filter(id => id && !primaryIds.has(id));
+    const missingHandles = [...handleSet].filter(h => h && !primaryHandles.has(h));
+
+    let extra = [];
+    if (missingIds.length > 0 || missingHandles.length > 0) {
+      try {
+        const parts = [];
+        if (missingIds.length > 0)     parts.push(`id.in.(${missingIds.join(",")})`);
+        if (missingHandles.length > 0) parts.push(`handle.in.(${missingHandles.map(h => `"${h}"`).join(",")})`);
+        const { data: extraData } = await sb.from("spenders").select("*")
+          .or(parts.join(",")).limit(500);
+        extra = extraData || [];
+      } catch (e) { console.warn("[API_SPENDERS] extra fetch failed:", e?.message || e); }
+    }
+
+    // ── Step 4: merge + deduplicate ──
+    const merged = [...primary, ...extra].filter((s, i, arr) => arr.findIndex(x => x.id === s.id) === i);
+    const mapped = merged.map(mapRow);
+    console.log(`[SPENDERS] chatter merged: primary=${primary.length} extra=${extra.length} total=${mapped.length}`);
+    return mapped;
   }
   return await _fetchSpendersGlobal();
 };
