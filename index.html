@@ -7473,7 +7473,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
     try {
       const {data:existing} = await sb.from("models").select("id").eq("name", name).maybeSingle();
       if (existing) { addToast(fr?"Une modèle avec ce nom existe déjà":"A model with this name already exists","warning"); setNewModelSaving(false); return; }
-      const {error} = await sb.from("models").insert({name, is_active: true});
+      const {error} = await sb.from("models").insert({name});
       if (error) throw error;
       addToast("👑 " + (fr?"Modèle créée ✓":"Model created ✓"),"success");
       setShowNewModel(false);
@@ -16920,7 +16920,7 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
           } else {
             // Upsert (in case models row is missing)
             const {data:existing} = await sb.from("models").select("id").eq("name", name).maybeSingle();
-            if (!existing) await sb.from("models").insert({name, is_active: true});
+            if (!existing) await sb.from("models").insert({name});
           }
         }
         addToast(fr?"Utilisateur mis à jour ✓":"User updated ✓","success");
@@ -16932,7 +16932,7 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
         if (form.role === "modele") {
           const {data:existing} = await sb.from("models").select("id").eq("name", name).maybeSingle();
           if (!existing) {
-            const {error:mErr} = await sb.from("models").insert({name, is_active: true});
+            const {error:mErr} = await sb.from("models").insert({name});
             if (mErr) console.warn("[Models] Could not create models row:", mErr.message);
           }
         }
@@ -24700,8 +24700,17 @@ const ReceiverComptaTab = ({user, lang, paymentEvents: propPayments, ledgerEntri
 };
 
 /* NotifDropdownBody — 3-category feed used inside the bell dropdown */
-const NotifDropdownBody = ({notifications, lang, user, onClickNotif, onMarkRead, setNotifications, setUnreadCount, setShowNotifs}) => {
-  const ekind = (n) => n.kind || "tx";
+const NotifDropdownBody = ({notifications, lang, user, recentSpenders, onNavigateToSpender, onClickNotif, onMarkRead, setNotifications, setUnreadCount, setShowNotifs}) => {
+  // Derive kind from type when kind column is null
+  const ekind = (n) => {
+    if (n.kind) return n.kind;
+    const t = (n.type || "").toLowerCase();
+    if (t.includes("payment") || t.includes("salary") || t.includes("bonus") ||
+        t.includes("declaration") || t.includes("ledger") || t.includes("paiement") ||
+        t.includes("adjustment") || t.includes("versement") || t.includes("reversement")) return "payment";
+    if (t.includes("spender") || t.includes("new_spender")) return "spender";
+    return "tx";
+  };
   const isRd  = (n) => n.is_read || n.read;
   const role  = user?.role || "gerant";
   // Role-based category definitions
@@ -24731,7 +24740,13 @@ const NotifDropdownBody = ({notifications, lang, user, onClickNotif, onMarkRead,
   const cats = allCats;
   // Ensure activeKind is always valid for the current role
   const safeKind = cats.find(c=>c.id===activeKind) ? activeKind : (cats[0]?.id || "payment");
-  const cntU  = (id) => (notifications||[]).filter(n=>ekind(n)===id&&!isRd(n)).length;
+  // Spenders tab: live data from recentSpenders (activity feed), not notifications table
+  const spenderList = React.useMemo(() => [...(recentSpenders||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).slice(0,25), [recentSpenders]);
+  const spenderNewCnt = React.useMemo(() => {
+    const cutoff = Date.now() - 24*60*60*1000;
+    return spenderList.filter(s=>new Date(s.created_at).getTime()>cutoff).length;
+  }, [spenderList]);
+  const cntU  = (id) => id==="spender" ? spenderNewCnt : (notifications||[]).filter(n=>ekind(n)===id&&!isRd(n)).length;
   const feed  = (notifications||[]).filter(n=>ekind(n)===safeKind).slice(0,25);
   const iconMap  = {tx_created:"\u{1F4B0}",tx_modified:"✏️",tx_validated:"✅",tx_refused:"❌",payment_pending:"\u{1F4B8}",payment_confirmed:"✅",payment_rejected:"❌",salary:"\u{1F4BC}",salary_paid:"\u{1F4BC}",scan:"\u{1F4F8}",broadcast:"\u{1F4E2}",message:"\u{1F4AC}",spender_new:"\u{1F464}",new_spender:"\u{1F464}"};
   const colorMap = {tx_created:"var(--success)",tx_validated:"var(--success)",tx_modified:"var(--warning)",tx_refused:"var(--danger)",payment_pending:"var(--warning)",payment_confirmed:"var(--success)",payment_rejected:"var(--danger)",salary:"var(--info)",salary_paid:"var(--success)",scan:"var(--warning)",broadcast:"var(--pink)",message:"var(--info)",spender_new:"var(--accent)",new_spender:"var(--accent)"};
@@ -24744,6 +24759,10 @@ const NotifDropdownBody = ({notifications, lang, user, onClickNotif, onMarkRead,
     }
     if (setShowNotifs) setShowNotifs(false);
     if (onClickNotif) onClickNotif(n);
+  };
+  const handleSpenderClick = (s) => {
+    if (setShowNotifs) setShowNotifs(false);
+    if (onNavigateToSpender) onNavigateToSpender(s.handle||s.name||s.id);
   };
   return (
     <>
@@ -24764,32 +24783,68 @@ const NotifDropdownBody = ({notifications, lang, user, onClickNotif, onMarkRead,
         })}
       </div>
       <div style={{overflowY:"auto",flex:1}}>
-        {feed.length===0&&(
-          <div style={{padding:36,textAlign:"center",color:"var(--text-quaternary)"}}>
-            <div style={{fontSize:24,marginBottom:8}}>{"\u{1F514}"}</div>
-            <div style={{fontSize:12}}>Aucune notification</div>
-          </div>
-        )}
-        {feed.map(n=>{
-          const ic=iconMap[n.type]||"\u{1F514}";
-          const cl=colorMap[n.type]||"var(--accent)";
-          const rd=isRd(n);
-          return (
-            <div key={n.id} className="notif-item-clickable"
-              style={{display:"flex",gap:12,padding:"12px 18px",borderBottom:"1px solid var(--border-subtle)",background:rd?"transparent":cl+"08",cursor:"pointer",transition:"background 0.15s"}}
-              onClick={()=>handleClick(n)}>
-              <div style={{width:34,height:34,borderRadius:10,background:cl+"18",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,flexShrink:0}}>{ic}</div>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:"flex",alignItems:"center",gap:5}}>
-                  <span style={{fontSize:13,fontWeight:rd?500:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.title}</span>
-                  {!rd&&<span style={{width:6,height:6,borderRadius:"50%",background:cl,flexShrink:0}}/>}
-                </div>
-                <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.message}</div>
-                <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:3}}>{formatRelativeTime(n.created_at)}</div>
+        {/* ── Spenders tab: live activity feed ── */}
+        {safeKind==="spender"&&(
+          spenderList.length===0
+            ? <div style={{padding:36,textAlign:"center",color:"var(--text-quaternary)"}}>
+                <div style={{fontSize:24,marginBottom:8}}>{"\u{1F464}"}</div>
+                <div style={{fontSize:12}}>Aucun spender récent</div>
               </div>
-            </div>
-          );
-        })}
+            : spenderList.map(s=>{
+                const displayName = s.first_name || s.handle || s.name || "Inconnu";
+                const handle = s.handle || s.name || "";
+                const cutoff = Date.now()-24*60*60*1000;
+                const isNew = new Date(s.created_at).getTime()>cutoff;
+                const classif = s.classification || s.tier || "";
+                return (
+                  <div key={s.id||handle} className="notif-item-clickable"
+                    style={{display:"flex",gap:12,padding:"12px 18px",borderBottom:"1px solid var(--border-subtle)",background:isNew?"var(--accent)"+"08":"transparent",cursor:"pointer",transition:"background 0.15s"}}
+                    onClick={()=>handleSpenderClick(s)}>
+                    <div style={{width:34,height:34,borderRadius:10,background:"var(--accent)18",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,flexShrink:0}}>{"\u{1F464}"}</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:5}}>
+                        <span style={{fontSize:13,fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{displayName}</span>
+                        {isNew&&<span style={{width:6,height:6,borderRadius:"50%",background:"var(--accent)",flexShrink:0}}/>}
+                      </div>
+                      <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>
+                        {handle&&handle!==displayName&&<span>@{handle.replace(/^@/,"")} · </span>}
+                        {classif&&<span style={{marginRight:4}}>{classif}</span>}
+                        <span>{formatRelativeTime(s.created_at)}</span>
+                      </div>
+                    </div>
+                    <span style={{fontSize:11,color:"var(--text-quaternary)",alignSelf:"center"}}>{"→"}</span>
+                  </div>
+                );
+              })
+        )}
+        {/* ── Payment / TX tabs: notifications table ── */}
+        {safeKind!=="spender"&&(
+          feed.length===0
+            ? <div style={{padding:36,textAlign:"center",color:"var(--text-quaternary)"}}>
+                <div style={{fontSize:24,marginBottom:8}}>{"\u{1F514}"}</div>
+                <div style={{fontSize:12}}>Aucune notification</div>
+              </div>
+            : feed.map(n=>{
+                const ic=iconMap[n.type]||"\u{1F514}";
+                const cl=colorMap[n.type]||"var(--accent)";
+                const rd=isRd(n);
+                return (
+                  <div key={n.id} className="notif-item-clickable"
+                    style={{display:"flex",gap:12,padding:"12px 18px",borderBottom:"1px solid var(--border-subtle)",background:rd?"transparent":cl+"08",cursor:"pointer",transition:"background 0.15s"}}
+                    onClick={()=>handleClick(n)}>
+                    <div style={{width:34,height:34,borderRadius:10,background:cl+"18",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,flexShrink:0}}>{ic}</div>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{display:"flex",alignItems:"center",gap:5}}>
+                        <span style={{fontSize:13,fontWeight:rd?500:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.title}</span>
+                        {!rd&&<span style={{width:6,height:6,borderRadius:"50%",background:cl,flexShrink:0}}/>}
+                      </div>
+                      <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.message}</div>
+                      <div style={{fontSize:10,color:"var(--text-quaternary)",marginTop:3}}>{formatRelativeTime(n.created_at)}</div>
+                    </div>
+                  </div>
+                );
+              })
+        )}
       </div>
     </>
   );
@@ -24801,7 +24856,15 @@ const InternalNotificationsTab = ({user, lang, notifications, unreadCount, onMar
   const role = user?.role || "chatter";
   const sorted = useMemo(()=>[...(notifications||[])].sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)),[notifications]);
   const isRead = (n) => n.is_read || n.read;
-  const effectiveKind = (n) => n.kind || "tx";
+  const effectiveKind = (n) => {
+    if (n.kind) return n.kind;
+    const t = (n.type || "").toLowerCase();
+    if (t.includes("payment") || t.includes("salary") || t.includes("bonus") ||
+        t.includes("declaration") || t.includes("ledger") || t.includes("paiement") ||
+        t.includes("adjustment") || t.includes("versement") || t.includes("reversement")) return "payment";
+    if (t.includes("spender") || t.includes("new_spender")) return "spender";
+    return "tx";
+  };
   // Role-based category list
   const categories = useMemo(() => {
     if (role === "provider") return [
@@ -33794,6 +33857,8 @@ const App = () => {
                       notifications={notifications}
                       lang={lang}
                       user={user}
+                      recentSpenders={spenders}
+                      onNavigateToSpender={(key)=>{setShowNotifs(false);navigateToSpender(key);}}
                       onClickNotif={openNotificationTarget}
                     />
                   </div>
@@ -33816,6 +33881,8 @@ const App = () => {
                     notifications={notifications}
                     lang={lang}
                     user={user}
+                    recentSpenders={spenders}
+                    onNavigateToSpender={(key)=>{setShowNotifs(false);navigateToSpender(key);}}
                     onMarkRead={markRead}
                     setNotifications={setNotifications}
                     setUnreadCount={setUnreadCount}
