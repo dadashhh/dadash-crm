@@ -3562,16 +3562,15 @@ const _drpToDate = (d) => {
   const p = new Date(d + "T00:00:00");
   return isNaN(p.getTime()) ? null : p;
 };
-const _drpToday = () => new Date();
 const _drpDaysAgo = (n) => { const d = new Date(); d.setDate(d.getDate() - n); return d; };
 const _drpStartOfMonth = () => new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 const _drpEndOfMonth = () => new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0);
 const _drpStartOfPrevMonth = () => new Date(new Date().getFullYear(), new Date().getMonth() - 1, 1);
 const _drpEndOfPrevMonth = () => new Date(new Date().getFullYear(), new Date().getMonth(), 0);
 const DRP_SHORTCUTS = [
-  { label: "Aujourd'hui", getValue: () => ({ start: _drpToISO(_drpToday()), end: _drpToISO(_drpToday()) }) },
-  { label: "7 derniers j", getValue: () => ({ start: _drpToISO(_drpDaysAgo(7)), end: _drpToISO(_drpToday()) }) },
-  { label: "30 derniers j", getValue: () => ({ start: _drpToISO(_drpDaysAgo(30)), end: _drpToISO(_drpToday()) }) },
+  { label: "Aujourd'hui", getValue: () => { const t = _drpToISO(new Date()); return { start: t, end: t }; } },
+  { label: "7 derniers j", getValue: () => ({ start: _drpToISO(_drpDaysAgo(7)), end: _drpToISO(new Date()) }) },
+  { label: "30 derniers j", getValue: () => ({ start: _drpToISO(_drpDaysAgo(30)), end: _drpToISO(new Date()) }) },
   { label: "Ce mois", getValue: () => ({ start: _drpToISO(_drpStartOfMonth()), end: _drpToISO(_drpEndOfMonth()) }) },
   { label: "Mois préc.", getValue: () => ({ start: _drpToISO(_drpStartOfPrevMonth()), end: _drpToISO(_drpEndOfPrevMonth()) }) },
   { label: "Tout", getValue: () => ({ start: null, end: null }) },
@@ -3596,7 +3595,8 @@ const _drpGetDays = (date) => {
   for (let i = 1; i <= total; i++) cells.push(new Date(y, m, i));
   return cells;
 };
-const _drpDayClass = (day, start, end, hover) => {
+// todayStr passed as arg to avoid calling new Date() 42× per render
+const _drpDayClass = (day, start, end, hover, todayStr) => {
   if (!day) return "drp-day empty";
   const cls = ["drp-day"];
   const ds = day.toDateString();
@@ -3605,49 +3605,100 @@ const _drpDayClass = (day, start, end, hover) => {
   if (ed && ds === ed.toDateString()) cls.push("end");
   if (sd && ed && day > sd && day < ed) cls.push("in-range");
   if (sd && !ed && hover && day > sd && day <= hover) cls.push("hover-range");
-  if (ds === _drpToday().toDateString()) cls.push("today");
+  if (todayStr && ds === todayStr) cls.push("today");
   return cls.join(" ");
 };
-const DateRangePicker = ({ startDate, endDate, onChange, placeholder = "Sélectionner période", mode = "range" }) => {
+const DateRangePicker = React.memo(({ startDate, endDate, onChange, placeholder = "Sélectionner période", mode = "range" }) => {
   const [open, setOpen] = useState(false);
+  // pendingStart: internal state for first click — NO parent re-render until range is complete
+  const [pendingStart, setPendingStart] = useState(null);
+  const [step, setStep] = useState("start"); // "start" | "end"
   const [hoverDate, setHoverDate] = useState(null);
-  const [selecting, setSelecting] = useState("start");
   const [viewMonth, setViewMonth] = useState(() => _drpToDate(startDate) || new Date());
   const ref = useRef(null);
+  const gridRef = useRef(null);
+  const daysRef = useRef([]);
+
+  // Close on outside click
   useEffect(() => {
     const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
-  useEffect(() => { if (open) setSelecting("start"); }, [open]);
-  const prevMonth = () => setViewMonth(d => new Date(d.getFullYear(), d.getMonth() - 1, 1));
-  const nextMonth = () => setViewMonth(d => new Date(d.getFullYear(), d.getMonth() + 1, 1));
-  const handleDayClick = (day) => {
+
+  // Reset internal state each time popup opens
+  useEffect(() => {
+    if (!open) return;
+    setStep("start");
+    setPendingStart(null);
+    setHoverDate(null);
+    const init = _drpToDate(startDate);
+    if (init) setViewMonth(init);
+  }, [open]); // eslint-disable-line
+
+  // Event delegation — single mousemove listener instead of 42+ onMouseEnter handlers
+  useEffect(() => {
+    const grid = gridRef.current;
+    if (!grid || !open) return;
+    const onMove = (e) => {
+      const cell = e.target.closest("[data-idx]");
+      if (!cell) { setHoverDate(null); return; }
+      setHoverDate(daysRef.current[+cell.dataset.idx] || null);
+    };
+    const onLeave = () => setHoverDate(null);
+    grid.addEventListener("mousemove", onMove);
+    grid.addEventListener("mouseleave", onLeave);
+    return () => { grid.removeEventListener("mousemove", onMove); grid.removeEventListener("mouseleave", onLeave); };
+  }, [open]);
+
+  // days array — recomputes only when month changes (not on hover/click)
+  const days = useMemo(() => _drpGetDays(viewMonth), [viewMonth]);
+  daysRef.current = days;
+
+  // todayStr — computed once per render, not 42× inside _drpDayClass
+  const todayStr = useMemo(() => new Date().toDateString(), []);
+
+  const prevMonth = useCallback(() => setViewMonth(d => new Date(d.getFullYear(), d.getMonth() - 1, 1)), []);
+  const nextMonth = useCallback(() => setViewMonth(d => new Date(d.getFullYear(), d.getMonth() + 1, 1)), []);
+
+  // Single click handler on grid via event delegation
+  const handleGridClick = useCallback((e) => {
+    const cell = e.target.closest("[data-idx]");
+    if (!cell) return;
+    const day = daysRef.current[+cell.dataset.idx];
     if (!day) return;
     const iso = _drpToISO(day);
     if (mode === "single") { onChange({ start: iso, end: null }); setOpen(false); return; }
-    if (selecting === "start") {
-      onChange({ start: iso, end: null });
-      setSelecting("end");
+    if (step === "start") {
+      setPendingStart(iso);
+      setStep("end");
+      // KEY: no onChange call here → parent does NOT re-render yet
     } else {
-      const sd = _drpToDate(startDate);
-      if (sd && day < sd) onChange({ start: iso, end: _drpToISO(sd) });
-      else onChange({ start: startDate || iso, end: iso });
-      setSelecting("start");
-      setOpen(false);
+      const sd = _drpToDate(pendingStart);
+      const finalStart = sd && day < sd ? iso : (pendingStart || iso);
+      const finalEnd   = sd && day < sd ? _drpToISO(sd) : iso;
+      onChange({ start: finalStart, end: finalEnd }); // ← single parent re-render
+      setOpen(false); setStep("start"); setPendingStart(null); setHoverDate(null);
     }
-  };
+  }, [mode, step, pendingStart, onChange]);
+
+  // Display: use internal pending state while selecting end date
+  const dispStart = step === "end" ? pendingStart : startDate;
+  const dispEnd   = step === "end" ? null : endDate;
+  const dispHover = step === "end" ? hoverDate : null;
+
   const hasValue = !!(startDate || endDate);
   const label = startDate && endDate
     ? `${_drpFmtShort(startDate)} → ${_drpFmtShort(endDate)}`
     : startDate ? _drpFmtShort(startDate) : placeholder;
+
   return (
     <div className="drp-wrapper" ref={ref}>
       <div className={"drp-trigger" + (hasValue ? " has-value" : "")} onClick={() => setOpen(o => !o)}>
         <span className="drp-icon">📅</span>
         <span className="drp-label">{label}</span>
         {hasValue && (
-          <span className="drp-clear" onClick={(e) => { e.stopPropagation(); onChange({ start: null, end: null }); setSelecting("start"); }}>×</span>
+          <span className="drp-clear" onClick={(e) => { e.stopPropagation(); onChange({ start: null, end: null }); }}>×</span>
         )}
       </div>
       {open && (
@@ -3655,7 +3706,10 @@ const DateRangePicker = ({ startDate, endDate, onChange, placeholder = "Sélecti
           {mode !== "single" && (
             <div className="drp-shortcuts">
               {DRP_SHORTCUTS.map(s => (
-                <div key={s.label} className="drp-shortcut" onClick={() => { onChange(s.getValue()); setOpen(false); setSelecting("start"); }}>{s.label}</div>
+                <div key={s.label} className="drp-shortcut"
+                  onClick={() => { onChange(s.getValue()); setOpen(false); setStep("start"); setPendingStart(null); }}>
+                  {s.label}
+                </div>
               ))}
             </div>
           )}
@@ -3669,30 +3723,27 @@ const DateRangePicker = ({ startDate, endDate, onChange, placeholder = "Sélecti
               <div className="drp-days-header">
                 {["Lu","Ma","Me","Je","Ve","Sa","Di"].map(d => <div key={d} className="drp-day-name">{d}</div>)}
               </div>
-              <div className="drp-days-grid">
-                {_drpGetDays(viewMonth).map((day, i) => (
-                  <div key={i} className={_drpDayClass(day, startDate, endDate, hoverDate)}
-                    onClick={() => handleDayClick(day)}
-                    onMouseEnter={() => day && setHoverDate(day)}
-                    onMouseLeave={() => setHoverDate(null)}>
+              <div className="drp-days-grid" ref={gridRef} onClick={handleGridClick}>
+                {days.map((day, i) => (
+                  <div key={i} data-idx={i} className={_drpDayClass(day, dispStart, dispEnd, dispHover, todayStr)}>
                     {day ? day.getDate() : ""}
                   </div>
                 ))}
               </div>
-              {mode !== "single" && selecting === "end" && (
+              {mode !== "single" && step === "end" && (
                 <div className="drp-hint">Cliquez la date de fin</div>
               )}
             </div>
             <div className="drp-footer">
-              <button type="button" className="drp-btn-cancel" onClick={() => { setOpen(false); setSelecting("start"); }}>Annuler</button>
-              <button type="button" className="drp-btn-apply" onClick={() => { setOpen(false); setSelecting("start"); }}>Appliquer</button>
+              <button type="button" className="drp-btn-cancel" onClick={() => { setOpen(false); setStep("start"); setPendingStart(null); }}>Annuler</button>
+              <button type="button" className="drp-btn-apply" onClick={() => { setOpen(false); setStep("start"); setPendingStart(null); }}>Appliquer</button>
             </div>
           </div>
         </div>
       )}
     </div>
   );
-};
+});
 
 // =============================================
 // CONFIRM MODAL (UX Polish PR#8)
@@ -6980,18 +7031,19 @@ const DashboardAnalytics = ({ user, lang, txs, models, profiles, spenders }) => 
 
   // Language performance
   const langPerf = useMemo(() => {
+    // Build O(1) lookup map — avoids O(spenders) .find() inside each transaction loop
+    const spMap = {};
+    (spenders || []).forEach(s => { spMap[s.id] = s; });
     const byLang = {};
     filteredTx.forEach(t => {
-      const spender = (spenders || []).find(s => s.id === t.spender_id);
-      const lg = (spender?.language || "fr").toLowerCase();
+      const lg = ((spMap[t.spender_id]?.language) || "fr").toLowerCase();
       if (!byLang[lg]) byLang[lg] = { ca: 0, spenders: new Set() };
       byLang[lg].ca += Number(t.amount || 0);
       byLang[lg].spenders.add(t.spender_id);
     });
     const prevByLang = {};
     prevTx.forEach(t => {
-      const spender = (spenders || []).find(s => s.id === t.spender_id);
-      const lg = (spender?.language || "fr").toLowerCase();
+      const lg = ((spMap[t.spender_id]?.language) || "fr").toLowerCase();
       if (!prevByLang[lg]) prevByLang[lg] = { ca: 0 };
       prevByLang[lg].ca += Number(t.amount || 0);
     });
@@ -7565,16 +7617,13 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   };
 
   const chartData = useMemo(() => {
+    // Build map directly from transactions — O(n) instead of O(days + n)
+    // Avoids up to 99999 date iterations for "All time" period
     const byDay = {};
-    const dStart = new Date(dateDebut); dStart.setHours(0, 0, 0, 0);
-    const dEnd = new Date(dateFin); dEnd.setHours(23, 59, 59, 999);
-    for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
-      const key = d.toISOString().slice(0, 10);
-      byDay[key] = { date: key, ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
-    }
     filteredTxs.forEach(tx => {
       const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
-      if (!byDay[key]) return;
+      if (!key || key.length < 10) return;
+      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
       const amt = convertAmount(Number(tx.amount || 0), tx.currency);
       const isVal = tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee";
       const isPend = tx.status === "pending";
@@ -7593,7 +7642,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
       taux_validation: (d.valid + d.pending) > 0 ? Math.round((d.valid / (d.valid + d.pending)) * 100) : 0,
     }));
-  }, [filteredTxs, dateDebut, dateFin, convertAmount]);
+  }, [filteredTxs, convertAmount]);
 
   const modelStats = useMemo(() => {
     const validFilteredTxs = filteredTxs.filter(tx => tx.status === "validated");
@@ -21457,16 +21506,12 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
   };
 
   const chartData = useMemo(() => {
+    // O(n) — build directly from transactions, no day-by-day pre-fill loop
     const byDay = {};
-    const dStart = new Date(dateDebut); dStart.setHours(0, 0, 0, 0);
-    const dEnd = new Date(dateFin); dEnd.setHours(23, 59, 59, 999);
-    for (let d = new Date(dStart); d <= dEnd; d.setDate(d.getDate() + 1)) {
-      const key = d.toISOString().slice(0, 10);
-      byDay[key] = { date: key, ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
-    }
     filteredTxs.forEach(tx => {
       const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
-      if (!byDay[key]) return;
+      if (!key || key.length < 10) return;
+      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
       const amt = convertAmount(Number(tx.amount || 0), tx.currency);
       const comm = convertAmount(Number(tx.chatter_commission || 0), tx.currency);
       const isVal = tx.status === "validated" || tx.status === "validé" || tx.status === "confirmee" || tx.status === "payee";
@@ -21486,7 +21531,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
       panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
       taux_validation: (d.valid + d.pending) > 0 ? Math.round((d.valid / (d.valid + d.pending)) * 100) : 0,
     }));
-  }, [filteredTxs, dateDebut, dateFin, convertAmount]);
+  }, [filteredTxs, convertAmount]);
 
   const modelStats = useMemo(() => {
     const now = new Date();
@@ -21690,9 +21735,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
       }, p === "all" ? "All time" : p))
     ),
     React.createElement("div", { className: "filter-sep" }),
-    React.createElement("input", { key: "d1", type: "date", value: dateStart, onChange: e => { setDateStart(e.target.value); setPeriod("custom"); }, className: "f-search", style: { minWidth: 130 } }),
-    React.createElement("span", { key: "sep2", style: { color: "var(--dim-ds)", fontSize: 12 } }, "→"),
-    React.createElement("input", { key: "d2", type: "date", value: dateEnd, onChange: e => { setDateEnd(e.target.value); setPeriod("custom"); }, className: "f-search", style: { minWidth: 130 } }),
+    React.createElement(DateRangePicker, { key: "drp", startDate: dateStart, endDate: dateEnd, onChange: ({ start, end }) => { setDateStart(start || ""); setDateEnd(end || ""); setPeriod("custom"); }, placeholder: "Période personnalisée" }),
     React.createElement("div", { className: "filter-sep" }),
     React.createElement("select", {
       key: "model",
@@ -33550,15 +33593,11 @@ const InvoicesTab = ({ user, lang, invoices, txs, profiles, providerPayouts, onR
         ),
         React.createElement("div", { className: "form-group-modal" },
           React.createElement("label", { className: "form-label" }, fr ? "Échéance" : "Due date"),
-          React.createElement("input", { className: "filter-date ui-input", type: "date", value: createForm.due_date, onChange: e => setCreateForm({ ...createForm, due_date: e.target.value }) })
+          React.createElement(DateRangePicker, { mode: "single", startDate: createForm.due_date, endDate: null, onChange: ({ start }) => setCreateForm({ ...createForm, due_date: start || "" }), placeholder: fr ? "Sélectionner date" : "Select date" })
         ),
-        React.createElement("div", { className: "form-group-modal" },
-          React.createElement("label", { className: "form-label" }, fr ? "Période du" : "Period from"),
-          React.createElement("input", { className: "filter-date ui-input", type: "date", value: createForm.period_from, onChange: e => setCreateForm({ ...createForm, period_from: e.target.value }) })
-        ),
-        React.createElement("div", { className: "form-group-modal" },
-          React.createElement("label", { className: "form-label" }, fr ? "Période au" : "Period to"),
-          React.createElement("input", { className: "filter-date ui-input", type: "date", value: createForm.period_to, onChange: e => setCreateForm({ ...createForm, period_to: e.target.value }) })
+        React.createElement("div", { className: "form-group-modal", style: { gridColumn: "1/-1" } },
+          React.createElement("label", { className: "form-label" }, fr ? "Période" : "Period"),
+          React.createElement(DateRangePicker, { startDate: createForm.period_from, endDate: createForm.period_to, onChange: ({ start, end }) => setCreateForm({ ...createForm, period_from: start || "", period_to: end || "" }), placeholder: fr ? "Sélectionner période" : "Select period" })
         ),
       ),
       // Line items
