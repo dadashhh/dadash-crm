@@ -10192,7 +10192,7 @@ const UnifiedSpenderModal = React.memo(({
   const [processingIds, setProcessingIds] = React.useState(() => new Set());
   const [confirmRefuse, setConfirmRefuse] = React.useState(null);
   const [deleteConfirm, setDeleteConfirm] = React.useState(null);
-  const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep");
+  const [deleteMode, setDeleteMode] = React.useState('soft'); // 'soft' | 'hard'
   const [deleteLoading, setDeleteLoading] = React.useState(false);
   const [fusionModal, setFusionModal] = React.useState(false);
   const [fusionSearch, setFusionSearch] = React.useState("");
@@ -10401,23 +10401,21 @@ const UnifiedSpenderModal = React.memo(({
     setSpSavingProfile(false);
   };
 
-  // ── Delete spender ──
-  const handleDeleteSpender = async (sp) => {
+  // ── Delete spender (via RPC sécurisée) ──
+  const handleDeleteSpender = async (sp, mode) => {
     if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
     setDeleteLoading(true);
+    const rpcName = (mode || 'hard') === 'hard' ? 'rpc_spenders_hard_delete' : 'rpc_spenders_soft_delete';
     try {
-      // 1. Orphan transactions (keep history, remove FK to avoid RESTRICT)
-      await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
-      // 2. Delete push_recipients (NOT NULL FK — must delete first)
-      try { await sb.from("push_recipients").delete().eq("spender_id", sp.dbId); } catch (_) {}
-      // 3. Delete spender record
-      const { error } = await sb.from("spenders").delete().eq("id", sp.dbId);
-      if (error) { addToast("Erreur: " + error.message, "error"); setDeleteLoading(false); return; }
-      addToast(fr ? "Spender supprimé ✓" : "Spender deleted ✓", "success");
-      setDeleteConfirm(null); setDeleteConfirmTxAction("keep"); setDeleteLoading(false);
+      const { data, error } = await sb.rpc(rpcName, { p_spender_id: sp.dbId });
+      if (error) { addToast('❌ Erreur: ' + error.message, 'error'); setDeleteLoading(false); return; }
+      if (!data?.ok) { addToast('❌ ' + (data?.error || 'Erreur inconnue'), 'error'); setDeleteLoading(false); return; }
+      console.log('[DELETE_OK]', rpcName, sp.dbId, data);
+      addToast(fr ? 'Spender supprimé ✓' : 'Spender deleted ✓', 'success');
+      setDeleteConfirm(null); setDeleteLoading(false);
       onClose();
-      if (onRefresh) await onRefresh();
-    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); setDeleteLoading(false); }
+      if (onRefresh) onRefresh();
+    } catch (e) { addToast('❌ Erreur: ' + (e?.message || e), 'error'); setDeleteLoading(false); }
   };
 
   // ── TX status change (optimistic update) ──
@@ -10871,17 +10869,22 @@ const UnifiedSpenderModal = React.memo(({
     <ConfirmModal open={!!confirmRefuse} title={t(lang,"refuse_tx_confirm")} message={confirmRefuse?`${confirmRefuse.spender_handle} \u2014 ${confirmRefuse.amount} ${confirmRefuse.currency||"CHF"}`:""} lang={lang} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleSpStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)}/>
 
     {deleteConfirm && (
-      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setDeleteConfirm(null)}>
-        <div style={{background:"var(--surface)",borderRadius:16,padding:28,width:380,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
-          <div style={{fontSize:16,fontWeight:800,color:"var(--danger)",marginBottom:10}}>{"\u{1F5D1}\uFE0F"} {fr?"Supprimer définitivement cette fiche ?":"Permanently delete this profile?"}</div>
-          <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:8}}><strong>{getSpenderDisplayName(deleteConfirm)}</strong></div>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:16,padding:"8px 12px",borderRadius:8,background:"rgba(239,68,68,0.06)",border:"1px solid rgba(239,68,68,0.2)"}}>
-            ⚠️ {fr?"La fiche disparaît définitivement. Les transactions associées sont conservées.":"The profile is permanently deleted. Associated transactions are kept."}
+      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>!deleteLoading&&setDeleteConfirm(null)}>
+        <div style={{background:"var(--surface)",borderRadius:18,padding:28,width:420,maxWidth:"95vw",boxShadow:"0 24px 60px rgba(0,0,0,0.5)"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)",marginBottom:10}}>🗑️ {fr?"Supprimer cette fiche ?":"Delete this profile?"}</div>
+          <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:14}}><strong>{getSpenderDisplayName(deleteConfirm)}</strong></div>
+          <div onClick={()=>!deleteLoading&&setDeleteMode('soft')} style={{padding:"12px 14px",borderRadius:12,marginBottom:8,cursor:"pointer",border:`2px solid ${deleteMode==='soft'?"var(--accent)":"var(--border-subtle)"}`,background:deleteMode==='soft'?"rgba(99,102,241,0.07)":"transparent",transition:"all .15s"}}>
+            <div style={{fontWeight:700,fontSize:13,color:"var(--text-primary)",marginBottom:3}}>💤 {fr?"Archiver (soft-delete)":"Archive (soft-delete)"}</div>
+            <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{fr?"La fiche disparaît de l'UI. Réversible. Transactions conservées.":"Profile hidden from UI. Reversible. Transactions kept."}</div>
+          </div>
+          <div onClick={()=>!deleteLoading&&setDeleteMode('hard')} style={{padding:"12px 14px",borderRadius:12,marginBottom:16,cursor:"pointer",border:`2px solid ${deleteMode==='hard'?"rgba(239,68,68,0.6)":"var(--border-subtle)"}`,background:deleteMode==='hard'?"rgba(239,68,68,0.06)":"transparent",transition:"all .15s"}}>
+            <div style={{fontWeight:700,fontSize:13,color:"var(--danger)",marginBottom:3}}>💥 {fr?"Supprimer définitivement":"Hard delete"}</div>
+            <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{fr?"Suppression irréversible. TX réassignées à __DELETED__.":"Irreversible. Transactions reassigned to __DELETED__."}</div>
           </div>
           <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-            <button onClick={()=>setDeleteConfirm(null)} style={{padding:"9px 18px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
-            <button onClick={()=>{setDeleteConfirmTxAction("keep");handleDeleteSpender(deleteConfirm);}} disabled={deleteLoading} style={{padding:"9px 18px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
-              {deleteLoading ? "\u23F3 ..." : `\u{1F5D1}\uFE0F ${fr?"Supprimer":"Delete"}`}
+            <button onClick={()=>setDeleteConfirm(null)} disabled={deleteLoading} style={{padding:"9px 18px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer",opacity:deleteLoading?0.5:1}}>{fr?"Annuler":"Cancel"}</button>
+            <button onClick={()=>handleDeleteSpender(deleteConfirm,deleteMode)} disabled={deleteLoading} style={{padding:"9px 20px",borderRadius:8,border:"none",background:deleteMode==='hard'?"var(--danger)":"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:deleteLoading?"not-allowed":"pointer",opacity:deleteLoading?0.6:1}}>
+              {deleteLoading?"⏳ ...":deleteMode==='hard'?`💥 ${fr?"Supprimer":"Delete"}`:`💤 ${fr?"Archiver":"Archive"}`}
             </button>
           </div>
         </div>
@@ -12089,24 +12092,46 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       await onRefresh(); setSelected(null);
     } catch (e) { setSpSavingProfile(false); addToast("Erreur: " + e.message, "error"); }
   };
-  const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep"); // "keep" | "delete"
+  const [deleteMode, setDeleteMode] = React.useState('soft'); // 'soft' | 'hard'
   const [deleteLoading, setDeleteLoading] = React.useState(false);
-  const handleDeleteSpender = async (sp) => {
+
+  // Optimistic: retire immédiatement la carte de la liste locale avant onRefresh
+  const [optimisticDeletedIds, setOptimisticDeletedIds] = React.useState(() => new Set());
+
+  const handleDeleteSpenderRpc = async (sp, mode) => {
     if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
     setDeleteLoading(true);
+    const rpcName = mode === 'hard' ? 'rpc_spenders_hard_delete' : 'rpc_spenders_soft_delete';
     try {
-      // 1. Orphan transactions (keep history, remove FK to avoid RESTRICT)
-      await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
-      // 2. Delete push_recipients (NOT NULL FK, cannot be nulled — must delete first)
-      try { await sb.from("push_recipients").delete().eq("spender_id", sp.dbId); } catch (_) {}
-      // 3. Delete spender record
-      const {error} = await sb.from("spenders").delete().eq("id", sp.dbId);
-      if (error) { addToast("Erreur: " + error.message, "error"); setDeleteLoading(false); return; }
-      addToast(fr ? "Spender supprimé ✓" : "Spender deleted ✓", "success");
-      setSelected(null); setDeleteConfirm(null); setDeleteConfirmTxAction("keep");
+      const { data, error } = await sb.rpc(rpcName, { p_spender_id: sp.dbId });
+      if (error) {
+        console.error('[DELETE_ERR]', rpcName, sp.dbId, error);
+        addToast('❌ Erreur suppression: ' + error.message, 'error');
+        setDeleteLoading(false);
+        return;
+      }
+      if (!data?.ok) {
+        console.error('[DELETE_ERR]', rpcName, sp.dbId, data);
+        addToast('❌ ' + (data?.error || 'Erreur inconnue'), 'error');
+        setDeleteLoading(false);
+        return;
+      }
+      console.log('[DELETE_OK]', rpcName, sp.dbId, data);
+      const label = mode === 'hard'
+        ? (fr ? 'Supprimé définitivement ✓' : 'Hard-deleted ✓')
+        : (fr ? 'Archivé ✓ (soft-delete)' : 'Archived ✓ (soft-delete)');
+      addToast(label, 'success');
+      // Retrait optimiste immédiat
+      setOptimisticDeletedIds(prev => { const n = new Set(prev); n.add(sp.dbId); return n; });
+      setSelected(null);
+      setDeleteConfirm(null);
       setDeleteLoading(false);
-      await onRefresh();
-    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); setDeleteLoading(false); }
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      console.error('[DELETE_ERR]', rpcName, sp.dbId, e);
+      addToast('❌ Erreur: ' + (e?.message || e), 'error');
+      setDeleteLoading(false);
+    }
   };
   const handleCreateSpender = async () => {
     if (!newSpForm.handle.trim()) { addToast(fr ? "Handle requis" : "Handle required", "error"); return; }
@@ -12312,8 +12337,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   });
   if (filterStatus) filtered = filtered.filter(s=>(s.dbStatus||"active")===filterStatus);
   if (filterCategory === "avec_tg") filtered = filtered.filter(s => hasTgId(s));
-  // "sans_tg" = DB-backed spenders only (dbId required to be deletable) with no TG ID
-  else if (filterCategory === "sans_tg") filtered = filtered.filter(s => !hasTgId(s) && !!s.dbId);
+  else if (filterCategory === "sans_tg") filtered = filtered.filter(s => !hasTgId(s));
 
   // Apply micro-filter NEW / UPDATED
   if (recentFilter === "new") filtered = filtered.filter(s => s.created_at && (Date.now() - new Date(s.created_at).getTime()) < _h24ms);
@@ -12322,7 +12346,10 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     return !isNew && s.updated_at && (Date.now() - new Date(s.updated_at).getTime()) < _h24ms;
   });
 
-  let sorted = [...filtered];
+  // Retrait optimiste des spenders supprimés (avant que onRefresh ne recharge)
+  let sorted = optimisticDeletedIds.size > 0
+    ? filtered.filter(s => !s.dbId || !optimisticDeletedIds.has(s.dbId))
+    : [...filtered];
   if (sortRecents) {
     sorted.sort((a, b) => {
       const tsA = Math.max(new Date(a.created_at || 0).getTime(), new Date(a.updated_at || 0).getTime());
@@ -12580,7 +12607,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         {[
           {v:"",         l:fr?"Tous":"All",      emoji:"👥", col:"var(--text-tertiary)", cnt: spenders.length},
           {v:"avec_tg",  l:fr?"Avec TG ID":"With TG ID", emoji:"📱", col:"#38bdf8", cnt: spenders.filter(s=>hasTgId(s)).length},
-          {v:"sans_tg",  l:fr?"Sans TG ID":"No TG ID",   emoji:"⚫", col:"#a78bfa", cnt: spenders.filter(s=>!hasTgId(s)&&!!s.dbId).length},
+          {v:"sans_tg",  l:fr?"Sans TG ID":"No TG ID",   emoji:"⚫", col:"#a78bfa", cnt: spenders.filter(s=>!hasTgId(s)).length},
         ].map(cat => {
           const active = filterCategory === cat.v;
           return (
@@ -12849,15 +12876,14 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
               {/* ACTIONS */}
               {(()=>{
                 const _isGerant=['gerant','admin','ceo'].includes(user?.role);
-                const _canDelete=_spId&&(_isGerant||(!readOnly&&!chatterMode));
-                const _noTg=!hasTgId(s);
+                const _canDelete=_isGerant&&!!_spId;
                 return (
                   <div className="sc-a-actions" onClick={e=>e.stopPropagation()}>
                     <button className="sc-a-act primary" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>💳 CRÉER TX</button>
                     <button className="sc-a-act" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>📋 HISTO.</button>
                     <button className="sc-a-act" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>👤 PROFIL</button>
                     {(s.telegram_username||s.tg_user_id) && <button className="sc-a-act" onClick={()=>{const tg=s.telegram_username||"";if(tg)window.open("https://t.me/"+tg.replace(/^@/,""),"_blank");}}>✈️ MSG TG</button>}
-                    {_canDelete&&<button className="sc-a-act danger" onClick={e=>{e.stopPropagation();setDeleteConfirmTxAction("keep");setDeleteConfirm(s);}} title={fr?"Supprimer définitivement cette fiche":"Permanently delete this profile"}>🗑️</button>}
+                    {_canDelete&&<button className="sc-a-act danger" onClick={e=>{e.stopPropagation();setDeleteMode('soft');setDeleteConfirm(s);}} title={fr?"Supprimer cette fiche":"Delete this profile"}>🗑️</button>}
                   </div>
                 );
               })()}
@@ -13233,17 +13259,46 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       )}
       <ConfirmModal open={!!confirmRefuse} title={t(lang,"refuse_tx_confirm")} message={confirmRefuse?`${confirmRefuse.spender_handle} — ${confirmRefuse.amount} ${confirmRefuse.currency||"EUR"}`:""} lang={lang} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleSpStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)}/>
       {deleteConfirm&&(
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setDeleteConfirm(null)}>
-          <div style={{background:"var(--surface)",borderRadius:16,padding:28,width:380,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
-            <div style={{fontSize:16,fontWeight:800,color:"var(--danger)",marginBottom:10}}>🗑️ {fr?"Supprimer définitivement cette fiche ?":"Permanently delete this profile?"}</div>
-            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:8}}><strong>{getSpenderDisplayName(deleteConfirm)}</strong></div>
-            <div style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:16,padding:"8px 12px",borderRadius:8,background:"rgba(239,68,68,0.06)",border:"1px solid rgba(239,68,68,0.2)"}}>
-              ⚠️ {fr?"La fiche disparaît définitivement. Les transactions associées sont conservées.":"The profile is permanently deleted. Associated transactions are kept."}
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.78)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>!deleteLoading&&setDeleteConfirm(null)}>
+          <div style={{background:"var(--surface)",borderRadius:18,padding:28,width:420,maxWidth:"95vw",boxShadow:"0 24px 60px rgba(0,0,0,0.5)"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:800,color:"var(--text-primary)",marginBottom:6,display:"flex",alignItems:"center",gap:8}}>
+              🗑️ {fr?"Supprimer cette fiche ?":"Delete this profile?"}
             </div>
+            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:14}}>
+              <strong>{getSpenderDisplayName(deleteConfirm)}</strong>
+              {deleteConfirm.tg_user_id && <span style={{marginLeft:8,fontSize:11,padding:"2px 7px",borderRadius:6,background:"rgba(0,136,204,0.12)",color:"#38bdf8",fontFamily:"'Space Mono',monospace"}}>TG {deleteConfirm.tg_user_id}</span>}
+            </div>
+
+            {/* Option 1 — Soft delete (archivage) */}
+            <div
+              onClick={()=>!deleteLoading&&setDeleteMode('soft')}
+              style={{padding:"12px 14px",borderRadius:12,marginBottom:8,cursor:"pointer",border:`2px solid ${deleteMode==='soft'?"var(--accent)":"var(--border-subtle)"}`,background:deleteMode==='soft'?"rgba(99,102,241,0.07)":"transparent",transition:"all .15s"}}
+            >
+              <div style={{fontWeight:700,fontSize:13,color:"var(--text-primary)",marginBottom:3}}>💤 {fr?"Archiver (soft-delete)":"Archive (soft-delete)"}</div>
+              <div style={{fontSize:11,color:"var(--text-tertiary)",lineHeight:1.5}}>
+                {fr?"La fiche disparaît de l'UI. Réversible. Transactions conservées.":"Profile hidden from UI. Reversible. Transactions kept."}
+              </div>
+            </div>
+
+            {/* Option 2 — Hard delete */}
+            <div
+              onClick={()=>!deleteLoading&&setDeleteMode('hard')}
+              style={{padding:"12px 14px",borderRadius:12,marginBottom:16,cursor:"pointer",border:`2px solid ${deleteMode==='hard'?"rgba(239,68,68,0.6)":"var(--border-subtle)"}`,background:deleteMode==='hard'?"rgba(239,68,68,0.06)":"transparent",transition:"all .15s"}}
+            >
+              <div style={{fontWeight:700,fontSize:13,color:"var(--danger)",marginBottom:3}}>💥 {fr?"Supprimer définitivement":"Hard delete"}</div>
+              <div style={{fontSize:11,color:"var(--text-tertiary)",lineHeight:1.5}}>
+                {fr?"Suppression irréversible. Les TX sont réassignées au spender __DELETED__ (conservées).":"Irreversible. Transactions reassigned to __DELETED__ fallback (kept)."}
+              </div>
+            </div>
+
             <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-              <button onClick={()=>setDeleteConfirm(null)} style={{padding:"9px 18px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
-              <button onClick={()=>{setDeleteConfirmTxAction("keep");handleDeleteSpender(deleteConfirm);}} disabled={deleteLoading} style={{padding:"9px 18px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
-                {deleteLoading ? "⏳ ..." : `🗑️ ${fr?"Supprimer":"Delete"}`}
+              <button onClick={()=>setDeleteConfirm(null)} disabled={deleteLoading} style={{padding:"9px 18px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer",opacity:deleteLoading?0.5:1}}>{fr?"Annuler":"Cancel"}</button>
+              <button
+                onClick={()=>handleDeleteSpenderRpc(deleteConfirm, deleteMode)}
+                disabled={deleteLoading}
+                style={{padding:"9px 20px",borderRadius:8,border:"none",background:deleteMode==='hard'?"var(--danger)":"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:deleteLoading?"not-allowed":"pointer",opacity:deleteLoading?0.6:1}}
+              >
+                {deleteLoading ? "⏳ ..." : deleteMode==='hard' ? `💥 ${fr?"Supprimer définitivement":"Hard delete"}` : `💤 ${fr?"Archiver":"Archive"}`}
               </button>
             </div>
           </div>
