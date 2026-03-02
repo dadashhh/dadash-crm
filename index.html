@@ -10406,19 +10406,18 @@ const UnifiedSpenderModal = React.memo(({
     if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
     setDeleteLoading(true);
     try {
-      if (deleteConfirmTxAction === "delete") {
-        await sb.from("transactions").delete().eq("spender_id", sp.dbId);
-        if (sp.handle && sp.handle !== "unknown") await sb.from("transactions").delete().eq("spender_handle", sp.handle).is("spender_id", null);
-      } else {
-        await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
-      }
+      // 1. Orphan transactions (keep history, remove FK to avoid RESTRICT)
+      await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
+      // 2. Delete push_recipients (NOT NULL FK — must delete first)
+      try { await sb.from("push_recipients").delete().eq("spender_id", sp.dbId); } catch (_) {}
+      // 3. Delete spender record
       const { error } = await sb.from("spenders").delete().eq("id", sp.dbId);
       if (error) { addToast("Erreur: " + error.message, "error"); setDeleteLoading(false); return; }
       addToast(fr ? "Spender supprimé ✓" : "Spender deleted ✓", "success");
       setDeleteConfirm(null); setDeleteConfirmTxAction("keep"); setDeleteLoading(false);
       onClose();
       if (onRefresh) await onRefresh();
-    } catch (e) { addToast("Erreur: " + e.message, "error"); setDeleteLoading(false); }
+    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); setDeleteLoading(false); }
   };
 
   // ── TX status change (optimistic update) ──
@@ -12096,23 +12095,18 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
     setDeleteLoading(true);
     try {
-      if (deleteConfirmTxAction === "delete") {
-        // Supprimer aussi les TX associées
-        await sb.from("transactions").delete().eq("spender_id", sp.dbId);
-        if (sp.handle && sp.handle !== "unknown") {
-          await sb.from("transactions").delete().eq("spender_handle", sp.handle).is("spender_id", null);
-        }
-      } else {
-        // Garder les TX mais orpheliner le spender_id
-        await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
-      }
+      // 1. Orphan transactions (keep history, remove FK to avoid RESTRICT)
+      await sb.from("transactions").update({ spender_id: null }).eq("spender_id", sp.dbId);
+      // 2. Delete push_recipients (NOT NULL FK, cannot be nulled — must delete first)
+      try { await sb.from("push_recipients").delete().eq("spender_id", sp.dbId); } catch (_) {}
+      // 3. Delete spender record
       const {error} = await sb.from("spenders").delete().eq("id", sp.dbId);
       if (error) { addToast("Erreur: " + error.message, "error"); setDeleteLoading(false); return; }
       addToast(fr ? "Spender supprimé ✓" : "Spender deleted ✓", "success");
       setSelected(null); setDeleteConfirm(null); setDeleteConfirmTxAction("keep");
       setDeleteLoading(false);
       await onRefresh();
-    } catch (e) { addToast("Erreur: " + e.message, "error"); setDeleteLoading(false); }
+    } catch (e) { addToast("Erreur: " + (e?.message || e), "error"); setDeleteLoading(false); }
   };
   const handleCreateSpender = async () => {
     if (!newSpForm.handle.trim()) { addToast(fr ? "Handle requis" : "Handle required", "error"); return; }
@@ -12318,7 +12312,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   });
   if (filterStatus) filtered = filtered.filter(s=>(s.dbStatus||"active")===filterStatus);
   if (filterCategory === "avec_tg") filtered = filtered.filter(s => hasTgId(s));
-  else if (filterCategory === "sans_tg") filtered = filtered.filter(s => !hasTgId(s));
+  // "sans_tg" = DB-backed spenders only (dbId required to be deletable) with no TG ID
+  else if (filterCategory === "sans_tg") filtered = filtered.filter(s => !hasTgId(s) && !!s.dbId);
 
   // Apply micro-filter NEW / UPDATED
   if (recentFilter === "new") filtered = filtered.filter(s => s.created_at && (Date.now() - new Date(s.created_at).getTime()) < _h24ms);
@@ -12585,7 +12580,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         {[
           {v:"",         l:fr?"Tous":"All",      emoji:"👥", col:"var(--text-tertiary)", cnt: spenders.length},
           {v:"avec_tg",  l:fr?"Avec TG ID":"With TG ID", emoji:"📱", col:"#38bdf8", cnt: spenders.filter(s=>hasTgId(s)).length},
-          {v:"sans_tg",  l:fr?"Sans TG ID":"No TG ID",   emoji:"⚫", col:"#a78bfa", cnt: spenders.filter(s=>!hasTgId(s)).length},
+          {v:"sans_tg",  l:fr?"Sans TG ID":"No TG ID",   emoji:"⚫", col:"#a78bfa", cnt: spenders.filter(s=>!hasTgId(s)&&!!s.dbId).length},
         ].map(cat => {
           const active = filterCategory === cat.v;
           return (
@@ -12669,6 +12664,31 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           {recentFilter==="updated" && <span style={{fontSize:11,fontWeight:700,color:"#a78bfa",padding:"3px 10px",borderRadius:7,background:"rgba(139,92,246,0.12)"}}>✏️ UPDATED {"<"} 24h</span>}
         </div>
       )}
+      {filterCategory === "sans_tg" && (()=>{
+        const _isGerant=['gerant','admin','ceo'].includes(user?.role);
+        const _sansTgCount = filtered.length;
+        const _noTxCount = filtered.filter(s => !(s.cnt > 0 || s.ltv > 0)).length;
+        return (
+          <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderRadius:12,marginBottom:10,background:"rgba(239,68,68,0.06)",border:"1px solid rgba(239,68,68,0.18)",flexWrap:"wrap"}}>
+            <span style={{fontSize:13}}>⚫</span>
+            <div style={{flex:1,minWidth:0}}>
+              <span style={{fontSize:12,fontWeight:700,color:"var(--danger)"}}>
+                {_sansTgCount} fiche{_sansTgCount>1?"s":""} sans TG ID
+              </span>
+              {_noTxCount > 0 && (
+                <span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>
+                  dont {_noTxCount} sans transaction — candidates à la purge
+                </span>
+              )}
+            </div>
+            {_isGerant && (
+              <span style={{fontSize:10,color:"var(--text-tertiary)",fontFamily:"'Space Mono',monospace"}}>
+                {fr?"Cliquer 🗑️ sur chaque carte pour supprimer":"Click 🗑️ on each card to delete"}
+              </span>
+            )}
+          </div>
+        );
+      })()}
       <div className={_isMobile?"":"spender-grid"} style={_isMobile?{display:"grid",gridTemplateColumns:"1fr",gap:10,marginBottom:18}:{marginBottom:18}}>
           {(sortRecents ? spCardSorted : spPag.paginatedData).map(s=>{
             const _vipScore = computeVIPScore(s);
@@ -12827,13 +12847,20 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                 </div>
               </div>
               {/* ACTIONS */}
-              <div className="sc-a-actions" onClick={e=>e.stopPropagation()}>
-                <button className="sc-a-act primary" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>💳 CRÉER TX</button>
-                <button className="sc-a-act" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>📋 HISTO.</button>
-                <button className="sc-a-act" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>👤 PROFIL</button>
-                {(s.telegram_username||s.tg_user_id) && <button className="sc-a-act" onClick={()=>{const tg=s.telegram_username||"";if(tg)window.open("https://t.me/"+tg.replace(/^@/,""),"_blank");}}>✈️ MSG TG</button>}
-                {!readOnly&&!chatterMode&&_spId&&<button className="sc-a-act danger" onClick={e=>{e.stopPropagation();setDeleteConfirmTxAction("keep");setDeleteConfirm(s);}} title={fr?"Supprimer définitivement cette fiche":"Permanently delete this profile"}>🗑️</button>}
-              </div>
+              {(()=>{
+                const _isGerant=['gerant','admin','ceo'].includes(user?.role);
+                const _canDelete=_spId&&(_isGerant||(!readOnly&&!chatterMode));
+                const _noTg=!hasTgId(s);
+                return (
+                  <div className="sc-a-actions" onClick={e=>e.stopPropagation()}>
+                    <button className="sc-a-act primary" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>💳 CRÉER TX</button>
+                    <button className="sc-a-act" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>📋 HISTO.</button>
+                    <button className="sc-a-act" onClick={()=>{if(_spId)setUnifiedSpenderId(_spId);}}>👤 PROFIL</button>
+                    {(s.telegram_username||s.tg_user_id) && <button className="sc-a-act" onClick={()=>{const tg=s.telegram_username||"";if(tg)window.open("https://t.me/"+tg.replace(/^@/,""),"_blank");}}>✈️ MSG TG</button>}
+                    {_canDelete&&<button className="sc-a-act danger" onClick={e=>{e.stopPropagation();setDeleteConfirmTxAction("keep");setDeleteConfirm(s);}} title={fr?"Supprimer définitivement cette fiche":"Permanently delete this profile"}>🗑️</button>}
+                  </div>
+                );
+              })()}
             </div>
           )})}
       </div>
