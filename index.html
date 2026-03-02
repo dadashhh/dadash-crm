@@ -3106,6 +3106,19 @@
     .solde-detail-row .sr { color: #ef4444; }
     .solde-detail-row .sa { color: #f59e0b; }
     .solde-footer { font-size: 9px; color: var(--muted); margin-top: auto; }
+    .tg-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(42, 171, 238, 0.15);
+      color: #2AABEE;
+      border: 1px solid rgba(42, 171, 238, 0.3);
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: 'Space Mono', monospace;
+    }
   </style>
 </head>
 <body>
@@ -9675,6 +9688,9 @@ const UnifiedSpenderModal = React.memo(({
   const [deleteConfirm, setDeleteConfirm] = React.useState(null);
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep");
   const [deleteLoading, setDeleteLoading] = React.useState(false);
+  const [fusionModal, setFusionModal] = React.useState(false);
+  const [fusionSearch, setFusionSearch] = React.useState("");
+  const [fusionLoading, setFusionLoading] = React.useState(false);
 
   // Badge state (local)
   const [dbBadges, setDbBadges] = React.useState({});
@@ -9988,6 +10004,44 @@ const UnifiedSpenderModal = React.memo(({
     } catch (e) { setSpSaving(false); addToast("Erreur: " + (e.message || e), "error"); }
   };
 
+  // ── Merge spenders ──
+  const handleMergeSpenders = async (source, targetRaw) => {
+    if (!source?.dbId || !targetRaw?.id) { addToast("IDs manquants pour la fusion", "error"); return; }
+    if (source.dbId === targetRaw.id) { addToast("Impossible de fusionner une fiche avec elle-même", "error"); return; }
+    setFusionLoading(true);
+    try {
+      const targetUpdates = {};
+      if (!targetRaw.tg_user_id && !targetRaw.telegram_id && source.tg_user_id) targetUpdates.tg_user_id = source.tg_user_id;
+      if (!targetRaw.telegram_id && source.telegramId) targetUpdates.telegram_id = source.telegramId;
+      if (!targetRaw.telegram_username && source.telegram_username) targetUpdates.telegram_username = source.telegram_username;
+      if (!targetRaw.langue && source.langue) targetUpdates.langue = source.langue;
+      if (!targetRaw.timezone && source.timezone) targetUpdates.timezone = source.timezone;
+      const srcMeta = source.meta || {};
+      const srcProfile = srcMeta.profile || {};
+      if (srcProfile.notes_chatter) {
+        const tgtRawMeta = targetRaw.meta || {};
+        const tgtProfile = tgtRawMeta.profile || {};
+        if (!tgtProfile.notes_chatter) {
+          targetUpdates.meta = { ...tgtRawMeta, profile: { ...tgtProfile, notes_chatter: srcProfile.notes_chatter } };
+        }
+      }
+      targetUpdates.total_spent = (Number(targetRaw.total_spent) || 0) + (Number(source.ltv) || 0);
+      targetUpdates.tx_count = (Number(targetRaw.tx_count) || 0) + (Number(source.cnt) || 0);
+      if (Object.keys(targetUpdates).length > 0) {
+        const { error: updErr } = await sb.from("spenders").update(targetUpdates).eq("id", targetRaw.id);
+        if (updErr) throw new Error(updErr.message);
+      }
+      await sb.from("transactions").update({ spender_id: targetRaw.id }).eq("spender_id", source.dbId);
+      const { error: delErr } = await sb.from("spenders").delete().eq("id", source.dbId);
+      if (delErr) throw new Error(delErr.message);
+      addToast(fr ? "Fusion réussie ✓" : "Merge successful ✓", "success");
+      setFusionModal(false); setFusionSearch("");
+      onClose();
+      if (onRefresh) await onRefresh();
+    } catch (e) { addToast("Erreur fusion: " + (e?.message || e), "error"); }
+    setFusionLoading(false);
+  };
+
   // ── Copy tg_id to clipboard ──
   const copyTgId = () => {
     const tgId = selected?.tg_user_id || selected?.telegramId || "";
@@ -10031,7 +10085,8 @@ const UnifiedSpenderModal = React.memo(({
 
   // ── Header buttons helper ──
   const canEdit = !readOnly || chatterMode;
-  const canDelete = !readOnly && !chatterMode && selected.dbId;
+  const isGerant = user?.role === 'gerant';
+  const canDelete = !readOnly && !chatterMode && selected.dbId && isGerant;
 
   return (
     <>
@@ -10049,7 +10104,7 @@ const UnifiedSpenderModal = React.memo(({
                 {spenderJustUpdated && <span style={{fontSize:9,padding:"2px 8px",borderRadius:8,background:"var(--success-muted)",color:"var(--success)",fontWeight:700}}>UPDATED</span>}
               </div>
               <div style={{display:"flex",gap:6,marginTop:4,alignItems:"center",flexWrap:"wrap"}}>
-                {tgTagLabel && <span onClick={copyTgId} title={fr?"Cliquer pour copier tg_id":"Click to copy tg_id"} style={{fontSize:10,padding:"2px 8px",borderRadius:6,background:"rgba(0,136,204,0.12)",color:"#0088cc",fontWeight:700,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.7"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>{tgTagLabel}</span>}
+                {tgId && <span className="tg-badge" onClick={copyTgId} title={fr?"Cliquer pour copier tg_id":"Click to copy tg_id"} style={{cursor:"pointer"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.7"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.024 9.531c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L8.132 14.4l-2.895-.9c-.63-.196-.643-.63.131-.933l11.29-4.352c.524-.192.984.131.904.933z"/></svg> TG {tgId}</span>}}
                 {selected.whatsapp_phone && <span style={{fontSize:10,padding:"2px 8px",borderRadius:6,background:"rgba(37,211,102,0.08)",color:"var(--brand-whatsapp,#25d366)",fontWeight:700}}>WA</span>}
               </div>
             </div>
@@ -10071,6 +10126,7 @@ const UnifiedSpenderModal = React.memo(({
                 }catch(e){addToast("Erreur: "+(e?.message||e),"error");}
               }} style={{padding:"5px 10px",borderRadius:10,background:"rgba(0,136,204,0.12)",border:"1px solid rgba(0,136,204,0.3)",color:"#0088cc",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"\u{1F504}"} Sync TG</button>
             )}
+            {isGerant && selected.dbId && <button onClick={()=>{setFusionModal(true);setFusionSearch("");}} style={{padding:"5px 10px",borderRadius:10,background:"rgba(99,102,241,0.12)",border:"1px solid rgba(99,102,241,0.3)",color:"var(--accent)",fontSize:10,fontWeight:700,cursor:"pointer"}}>⊕ {fr?"Fusionner":"Merge"}</button>}
             {canDelete && <button onClick={()=>setDeleteConfirm(selected)} style={{padding:"5px 10px",borderRadius:10,background:"var(--danger-muted)",border:"none",color:"var(--danger)",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"\u{1F5D1}"}</button>}
             <button onClick={onClose} style={{width:28,height:28,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border-default)",color:"var(--text-tertiary)",fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"\u2715"}</button>
           </div>
@@ -10287,6 +10343,54 @@ const UnifiedSpenderModal = React.memo(({
             <button onClick={()=>handleDeleteSpender(deleteConfirm)} disabled={deleteLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:deleteLoading?0.6:1}}>
               {deleteLoading ? "\u23F3 ..." : `\u{1F5D1}\uFE0F ${fr?"Supprimer":"Delete"}`}
             </button>
+          </div>
+        </div>
+      </div>
+    )}
+    {fusionModal && selected && (
+      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:10001,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>{setFusionModal(false);setFusionSearch("");}}>
+        <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:480,maxWidth:"95vw",maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+          <div style={{fontSize:15,fontWeight:800,marginBottom:16,display:"flex",alignItems:"center",gap:8}}>
+            <span>⊕</span> <span>{fr?"Fusionner avec une autre fiche":"Merge with another profile"}</span>
+            <button onClick={()=>{setFusionModal(false);setFusionSearch("");}} style={{marginLeft:"auto",background:"none",border:"none",color:"var(--text-tertiary)",fontSize:18,cursor:"pointer",lineHeight:1}}>✕</button>
+          </div>
+          <div style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:12,padding:"8px 12px",background:"rgba(99,102,241,0.08)",borderRadius:8,border:"1px solid rgba(99,102,241,0.2)"}}>
+            {fr?"Fiche source":"Source"}: <strong>{getSpenderDisplayName(selected)}</strong>
+            {tgId && <span className="tg-badge" style={{marginLeft:8,fontSize:10}}>TG {tgId}</span>}
+          </div>
+          <input autoFocus className="filter-select" style={{width:"100%",marginBottom:12,boxSizing:"border-box"}} value={fusionSearch} onChange={e=>setFusionSearch(e.target.value)} placeholder={fr?"Rechercher par nom ou @username…":"Search by name or @username…"}/>
+          <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:280,overflowY:"auto"}}>
+            {(()=>{
+              const q = fusionSearch.trim().toLowerCase();
+              const results = (dbSpenders||[]).filter(sp => {
+                if (sp.id === selected.dbId) return false;
+                if (!q) return true;
+                const n = (sp.handle||sp.name||"").toLowerCase();
+                const u = (sp.telegram_username||"").toLowerCase().replace(/^@/,"");
+                return n.includes(q) || u.includes(q);
+              }).slice(0,20);
+              if (!q && results.length === 0) return React.createElement("div",{style:{fontSize:12,color:"var(--text-quaternary)",textAlign:"center",padding:16}},fr?"Tapez un nom pour chercher":"Type a name to search");
+              if (results.length === 0) return React.createElement("div",{style:{fontSize:12,color:"var(--text-quaternary)",textAlign:"center",padding:16}},fr?"Aucun résultat":"No results");
+              return results.map(sp => {
+                const tgD = sp.tg_user_id || sp.telegram_id;
+                const vip = computeVIPScore({tg_user_id:sp.tg_user_id,telegramId:sp.telegram_id,totalSpentDb:Number(sp.total_spent)||0,ltv:Number(sp.total_spent)||0,cnt:Number(sp.tx_count)||0});
+                return (
+                  <div key={sp.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:10,border:"1px solid var(--border-subtle)",background:"var(--bg-overlay)",cursor:"pointer",transition:"border-color .15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor="var(--accent)"} onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border-subtle)"}>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontWeight:700,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{sp.handle||sp.name||"?"}</div>
+                      <div style={{display:"flex",gap:6,alignItems:"center",marginTop:3,flexWrap:"wrap"}}>
+                        {tgD && <span className="tg-badge" style={{fontSize:10,padding:"2px 6px"}}>TG {tgD}</span>}
+                        <span style={{fontSize:10,color:"var(--text-tertiary)"}}>VIP {vip}/100</span>
+                        <span style={{fontSize:10,color:"var(--success)",fontWeight:700}}>{(Number(sp.total_spent)||0).toFixed(0)} CHF</span>
+                      </div>
+                    </div>
+                    <button onClick={()=>{ if(!fusionLoading) handleMergeSpenders(selected, sp); }} disabled={fusionLoading} style={{padding:"5px 12px",borderRadius:8,background:"var(--accent)",border:"none",color:"#fff",fontSize:11,fontWeight:700,cursor:fusionLoading?"not-allowed":"pointer",opacity:fusionLoading?0.6:1,flexShrink:0}}>
+                      {fusionLoading ? "⏳" : (fr?"Fusionner":"Merge")}
+                    </button>
+                  </div>
+                );
+              });
+            })()}
           </div>
         </div>
       </div>
@@ -10929,6 +11033,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [showNewSpender, setShowNewSpender] = useState(false);
   const [newSpForm, setNewSpForm] = useState({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
   const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [fusionModal, setFusionModal] = useState(null);
+  const [fusionSearch, setFusionSearch] = useState("");
+  const [fusionLoading, setFusionLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [filterBadge, setFilterBadge] = useState("");
   const [filterLangue, setFilterLangue] = useState("");
@@ -11449,6 +11556,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   };
   const handleCreateSpender = async () => {
     if (!newSpForm.handle.trim()) { addToast(fr ? "Handle requis" : "Handle required", "error"); return; }
+    if (!(newSpForm.telegram_username||"").trim()) { addToast(fr ? "Le Telegram ID est obligatoire" : "Telegram ID is required", "error"); return; }
     setSpSavingProfile(true);
     try {
       const handle = newSpForm.handle.trim().replace(/^@/, "");
@@ -11465,6 +11573,42 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       setSpSavingProfile(false); setShowNewSpender(false); setNewSpForm({handle:"",first_name:"",age:"",city:"",country:"",job:"",source:"",status:"active",langue:"FR",timezone:"Europe/Zurich",budget_range:"",telegram_username:"",whatsapp_phone:"",classification:"new",chatter_notes:""});
       addToast(fr ? "Spender créé" : "Spender created", "success"); await onRefresh();
     } catch (e) { setSpSavingProfile(false); addToast("Erreur: " + e.message, "error"); }
+  };
+
+  const handleMergeSpenders = async (source, targetRaw) => {
+    if (!source?.dbId || !targetRaw?.id) { addToast("IDs manquants pour la fusion", "error"); return; }
+    if (source.dbId === targetRaw.id) { addToast("Impossible de fusionner une fiche avec elle-même", "error"); return; }
+    setFusionLoading(true);
+    try {
+      const targetUpdates = {};
+      if (!targetRaw.tg_user_id && !targetRaw.telegram_id && source.tg_user_id) targetUpdates.tg_user_id = source.tg_user_id;
+      if (!targetRaw.telegram_id && source.telegramId) targetUpdates.telegram_id = source.telegramId;
+      if (!targetRaw.telegram_username && source.telegram_username) targetUpdates.telegram_username = source.telegram_username;
+      if (!targetRaw.handle && source.handle) targetUpdates.handle = source.handle;
+      if (!targetRaw.langue && source.langue) targetUpdates.langue = source.langue;
+      if (!targetRaw.timezone && source.timezone) targetUpdates.timezone = source.timezone;
+      const srcMeta = source.meta || {};
+      const srcProfile = srcMeta.profile || {};
+      if (srcProfile.notes_chatter) {
+        const tgtProfile = (targetRaw.meta?.profile || {});
+        if (!tgtProfile.notes_chatter) {
+          targetUpdates.meta = { ...(targetRaw.meta || {}), profile: { ...tgtProfile, notes_chatter: srcProfile.notes_chatter } };
+        }
+      }
+      targetUpdates.total_spent = (Number(targetRaw.total_spent) || 0) + (Number(source.ltv) || 0);
+      targetUpdates.tx_count = (Number(targetRaw.tx_count) || 0) + (Number(source.cnt) || 0);
+      if (Object.keys(targetUpdates).length > 0) {
+        const { error: updErr } = await sb.from("spenders").update(targetUpdates).eq("id", targetRaw.id);
+        if (updErr) throw new Error(updErr.message);
+      }
+      await sb.from("transactions").update({ spender_id: targetRaw.id }).eq("spender_id", source.dbId);
+      const { error: delErr } = await sb.from("spenders").delete().eq("id", source.dbId);
+      if (delErr) throw new Error(delErr.message);
+      addToast(fr ? "Fusion réussie ✓" : "Merge successful ✓", "success");
+      setFusionModal(null); setFusionSearch(""); setSelected(null);
+      await onRefresh();
+    } catch (e) { addToast("Erreur fusion: " + (e?.message || e), "error"); }
+    setFusionLoading(false);
   };
 
   // Build spender data: merge DB spenders + transactions + breakdowns
@@ -12003,6 +12147,15 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                   })}
                 </div>
               )}
+              {/* TG BADGE */}
+              {(s.tg_user_id || s.telegramId) && (
+                <div style={{marginBottom:4}}>
+                  <span className="tg-badge">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.024 9.531c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L8.132 14.4l-2.895-.9c-.63-.196-.643-.63.131-.933l11.29-4.352c.524-.192.984.131.904.933z"/></svg>
+                    TG {s.tg_user_id || s.telegramId}
+                  </span>
+                </div>
+              )}
               {/* MODÈLES RELIÉS */}
               {(s.modelBreakdown||[]).length > 0 && (
                 <div className="sc-a-models-row">
@@ -12086,7 +12239,12 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                       return badgesToShow.map(b=>{const bs=getBadgeStyle(b);return <span key={b} onClick={e=>{e.stopPropagation();if(spId)toggleBadge(spId,b);}} title={spId?"Cliquer pour retirer":""} style={{fontSize:8,padding:"1px 6px",borderRadius:6,background:bs.bg,color:bs.c,fontWeight:700,cursor:spId?"pointer":"default"}} onMouseEnter={e=>{if(spId)e.currentTarget.style.opacity="0.6";}} onMouseLeave={e=>{e.currentTarget.style.opacity="1";}}>{bs.icon} {b}</span>});
                     })()}
                     {selected.meta?.enrich?.last && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"rgba(34,211,161,0.15)",color:"var(--success)",fontWeight:700}}>AUTO</span>}
-                    {(selected.telegramId||selected.tg_user_id||(/^\d+$/.test((selected.telegram_username||"").replace(/^@/,"")))) && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-telegram-muted)",color:"var(--brand-telegram)",fontWeight:700}}>TG</span>}
+                    {(selected.telegramId||selected.tg_user_id) && (
+                      <span className="tg-badge" style={{fontSize:9,padding:"2px 7px"}} onClick={()=>{const tgId=selected.tg_user_id||selected.telegramId;if(tgId)try{navigator.clipboard.writeText(String(tgId));addToast("tg_id copié ✓","success");}catch(e){}}} title="Cliquer pour copier tg_id" onMouseEnter={e=>e.currentTarget.style.opacity="0.7"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>
+                        <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248l-2.024 9.531c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L8.132 14.4l-2.895-.9c-.63-.196-.643-.63.131-.933l11.29-4.352c.524-.192.984.131.904.933z"/></svg>
+                        TG {selected.tg_user_id||selected.telegramId}
+                      </span>
+                    )}
                     {selected.whatsapp_phone && <span style={{fontSize:8,padding:"1px 5px",borderRadius:4,background:"var(--brand-whatsapp-muted)",color:"var(--brand-whatsapp)",fontWeight:700}}>WA</span>}
                   </div>
                 </div>
@@ -12117,7 +12275,8 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                     } catch(e){ addToast("Erreur: "+(e?.message||e),"error"); }
                   }} style={{padding:"5px 10px",borderRadius:10,background:"rgba(0,136,204,0.12)",border:"1px solid rgba(0,136,204,0.3)",color:"#0088cc",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"🔄"} {fr?"Sync TG":"Sync TG"}</button>
                 )}
-                {!readOnly&&!chatterMode&&selected.dbId && <button onClick={()=>setDeleteConfirm(selected)} style={{padding:"5px 10px",borderRadius:10,background:"var(--danger-muted)",border:"none",color:"var(--danger)",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"\u{1F5D1}"}</button>}
+                {!readOnly&&!chatterMode&&selected.dbId&&user?.role==='gerant' && <button onClick={()=>{setFusionModal(selected);setFusionSearch("");}} style={{padding:"5px 10px",borderRadius:10,background:"rgba(99,102,241,0.12)",border:"1px solid rgba(99,102,241,0.3)",color:"var(--accent)",fontSize:10,fontWeight:700,cursor:"pointer"}}>⊕ {fr?"Fusionner":"Merge"}</button>}
+                {!readOnly&&!chatterMode&&selected.dbId&&user?.role==='gerant' && <button onClick={()=>setDeleteConfirm(selected)} style={{padding:"5px 10px",borderRadius:10,background:"var(--danger-muted)",border:"none",color:"var(--danger)",fontSize:10,fontWeight:700,cursor:"pointer"}}>{"\u{1F5D1}"}</button>}
                 <button onClick={()=>setSelected(null)} style={{width:28,height:28,borderRadius:8,background:"var(--bg-overlay)",border:"1px solid var(--border-default)",color:"var(--text-tertiary)",fontSize:14,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>{"✕"}</button>
               </div>
             </div>
@@ -12376,6 +12535,55 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           </div>
         </div>
       )}
+      {/* ═══ FUSION MINI-MODAL ═══ */}
+      {fusionModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:10001,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>{setFusionModal(null);setFusionSearch("");}}>
+          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:480,maxWidth:"95vw",maxHeight:"80vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:15,fontWeight:800,marginBottom:16,display:"flex",alignItems:"center",gap:8}}>
+              <span>⊕</span> <span>{fr?"Fusionner avec une autre fiche":"Merge with another profile"}</span>
+              <button onClick={()=>{setFusionModal(null);setFusionSearch("");}} style={{marginLeft:"auto",background:"none",border:"none",color:"var(--text-tertiary)",fontSize:18,cursor:"pointer",lineHeight:1}}>✕</button>
+            </div>
+            <div style={{fontSize:12,color:"var(--text-tertiary)",marginBottom:12,padding:"8px 12px",background:"rgba(99,102,241,0.08)",borderRadius:8,border:"1px solid rgba(99,102,241,0.2)"}}>
+              {fr?"Fiche source":"Source"}: <strong>{getSpenderDisplayName(fusionModal)}</strong>
+              {(fusionModal.tg_user_id||fusionModal.telegramId) && <span className="tg-badge" style={{marginLeft:8,fontSize:10}}>TG {fusionModal.tg_user_id||fusionModal.telegramId}</span>}
+            </div>
+            <input autoFocus className="filter-select" style={{width:"100%",marginBottom:12,boxSizing:"border-box"}} value={fusionSearch} onChange={e=>setFusionSearch(e.target.value)} placeholder={fr?"Rechercher par nom ou @username…":"Search by name or @username…"}/>
+            <div style={{display:"flex",flexDirection:"column",gap:6,maxHeight:280,overflowY:"auto"}}>
+              {(()=>{
+                const q = fusionSearch.trim().toLowerCase();
+                const results = (dbSpenders||[]).filter(sp => {
+                  if (sp.id === fusionModal.dbId) return false;
+                  if (!q) return true;
+                  const n = (sp.handle||sp.name||"").toLowerCase();
+                  const u = (sp.telegram_username||"").toLowerCase().replace(/^@/,"");
+                  return n.includes(q) || u.includes(q);
+                }).slice(0,20);
+                if (!q && results.length === 0) return <div style={{fontSize:12,color:"var(--text-quaternary)",textAlign:"center",padding:16}}>{fr?"Tapez un nom pour chercher":"Type a name to search"}</div>;
+                if (results.length === 0) return <div style={{fontSize:12,color:"var(--text-quaternary)",textAlign:"center",padding:16}}>{fr?"Aucun résultat":"No results"}</div>;
+                return results.map(sp => {
+                  const tgDisp = sp.tg_user_id || sp.telegram_id;
+                  const vip = computeVIPScore({tg_user_id:sp.tg_user_id,telegramId:sp.telegram_id,totalSpentDb:Number(sp.total_spent)||0,ltv:Number(sp.total_spent)||0,cnt:Number(sp.tx_count)||0});
+                  return (
+                    <div key={sp.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:10,border:"1px solid var(--border-subtle)",background:"var(--bg-overlay)",cursor:"pointer",transition:"border-color .15s"}} onMouseEnter={e=>e.currentTarget.style.borderColor="var(--accent)"} onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border-subtle)"}>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontWeight:700,fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{sp.handle||sp.name||"?"}</div>
+                        <div style={{display:"flex",gap:6,alignItems:"center",marginTop:3,flexWrap:"wrap"}}>
+                          {tgDisp && <span className="tg-badge" style={{fontSize:10,padding:"2px 6px"}}>TG {tgDisp}</span>}
+                          <span style={{fontSize:10,color:"var(--text-tertiary)"}}>VIP {vip}/100</span>
+                          <span style={{fontSize:10,color:"var(--success)",fontWeight:700}}>{(Number(sp.total_spent)||0).toFixed(0)} CHF</span>
+                        </div>
+                      </div>
+                      <button onClick={()=>{ if(!fusionLoading) handleMergeSpenders(fusionModal, sp); }} disabled={fusionLoading} style={{padding:"5px 12px",borderRadius:8,background:"var(--accent)",border:"none",color:"#fff",fontSize:11,fontWeight:700,cursor:fusionLoading?"not-allowed":"pointer",opacity:fusionLoading?0.6:1,flexShrink:0}}>
+                        {fusionLoading ? "⏳" : (fr?"Fusionner":"Merge")}
+                      </button>
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
       {/* New Spender Modal — form complet */}
       <ModalShell open={showNewSpender} onClose={()=>setShowNewSpender(false)} closeOnBackdrop={true} closeOnEsc={true}>
           <div className="ui-panel" style={{maxWidth:560,width:"94vw",maxHeight:"90vh",overflowY:"auto",borderRadius:20,padding:_isMobile?16:28}}>
@@ -12385,7 +12593,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
             </div>
             <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:14,marginBottom:14}}>
               <div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--accent)",marginBottom:4,textTransform:"uppercase",fontWeight:700}}>Spender *</div><input className="filter-select ui-input" style={{width:"100%"}} value={newSpForm.handle} onChange={e=>setNewSpForm(p=>({...p,handle:e.target.value}))} placeholder="@spender" autoFocus/></div>
-              <div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>ID Telegram</div><input className="filter-select ui-input" style={{width:"100%"}} value={newSpForm.telegram_username||""} onChange={e=>setNewSpForm(p=>({...p,telegram_username:e.target.value}))} placeholder="@username ou 123456789"/></div>
+              <div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--accent)",marginBottom:4,textTransform:"uppercase",fontWeight:700}}>ID Telegram * <span style={{fontSize:9,color:"var(--danger)",fontWeight:700}}>OBLIGATOIRE</span></div><input className="filter-select ui-input" style={{width:"100%",borderColor:!(newSpForm.telegram_username||"").trim()?"rgba(239,68,68,0.5)":undefined}} value={newSpForm.telegram_username||""} onChange={e=>setNewSpForm(p=>({...p,telegram_username:e.target.value}))} placeholder="@username ou 123456789" required/></div>
               {[{l:fr?"Prénom":"First name",f:"first_name",t:"text",ph:""},{l:fr?"Âge":"Age",f:"age",t:"number",ph:""},{l:fr?"Ville":"City",f:"city",t:"text",ph:""},{l:fr?"Pays":"Country",f:"country",t:"text",ph:""},{l:fr?"Métier":"Job",f:"job",t:"text",ph:""},{l:"Source (TG, Insta…)",f:"source",t:"text",ph:""}].map(fd=>(
                 <div key={fd.f}><div style={{fontSize:10,color:"var(--text-tertiary)",marginBottom:4,textTransform:"uppercase"}}>{fd.l}</div><input type={fd.t} className="filter-select ui-input" style={{width:"100%"}} value={newSpForm[fd.f]||""} onChange={e=>setNewSpForm(p=>({...p,[fd.f]:e.target.value}))}/></div>
               ))}
@@ -37194,6 +37402,7 @@ const App = () => {
   const openPaymentModal = (prefill) => { setPaymentModalPrefill(prefill||null); setShowPaymentModal(true); };
   const handleFabCreateSpender = async () => {
     if (!fabSpForm.handle.trim()) return addToast("Handle requis","error");
+    if (!(fabSpForm.telegram_username||"").trim()) return addToast("Le Telegram ID est obligatoire","error");
     setFabSaving(true);
     const handle = fabSpForm.handle.trim().replace(/^@/,"");
     const { error } = await sb.from("spenders").upsert({ handle, name: handle, status: fabSpForm.status||"active", first_name: fabSpForm.first_name||null, age: fabSpForm.age?parseInt(fabSpForm.age):null, city: fabSpForm.city||null, country: fabSpForm.country||null, job: fabSpForm.job||null, source: fabSpForm.source||null, langue: fabSpForm.langue||"FR", timezone: fabSpForm.timezone||"Europe/Zurich", budget_range: fabSpForm.budget_range||null, telegram_username: fabSpForm.telegram_username||null, whatsapp_phone: fabSpForm.whatsapp_phone||null, classification: fabSpForm.classification||"new", notes: fabSpForm.chatter_notes||null }, {onConflict:"handle"});
@@ -37749,8 +37958,8 @@ const App = () => {
                 <input value={fabSpForm.handle} onChange={e=>setFabSpForm(p=>({...p,handle:e.target.value}))} placeholder="@spender" autoFocus style={{width:"100%",padding:"10px 14px",borderRadius:12,border:"1px solid rgba(139,92,246,0.4)",background:"#0D0D1A",color:"#fff",fontSize:13,fontFamily:"'DM Sans',sans-serif",outline:"none",boxSizing:"border-box"}}/>
               </div>
               <div style={{gridColumn:"1/-1"}}>
-                <div style={{fontSize:10,color:"#9CA3AF",textTransform:"uppercase",fontWeight:700,marginBottom:6}}>ID Telegram</div>
-                <input value={fabSpForm.telegram_username||""} onChange={e=>setFabSpForm(p=>({...p,telegram_username:e.target.value}))} placeholder="@username ou 123456789" style={{width:"100%",padding:"10px 14px",borderRadius:12,border:"1px solid rgba(255,255,255,0.06)",background:"#0D0D1A",color:"#fff",fontSize:13,fontFamily:"'DM Sans',sans-serif",outline:"none",boxSizing:"border-box"}}/>
+                <div style={{fontSize:10,color:"#8b5cf6",textTransform:"uppercase",fontWeight:700,marginBottom:6}}>ID Telegram * <span style={{fontSize:9,color:"#ef4444"}}>OBLIGATOIRE</span></div>
+                <input value={fabSpForm.telegram_username||""} onChange={e=>setFabSpForm(p=>({...p,telegram_username:e.target.value}))} placeholder="@username ou 123456789" required style={{width:"100%",padding:"10px 14px",borderRadius:12,border:`1px solid ${!(fabSpForm.telegram_username||"").trim()?"rgba(239,68,68,0.5)":"rgba(255,255,255,0.06)"}`,background:"#0D0D1A",color:"#fff",fontSize:13,fontFamily:"'DM Sans',sans-serif",outline:"none",boxSizing:"border-box"}}/>
               </div>
               {[{l:"Prénom",f:"first_name",t:"text"},{l:"Âge",f:"age",t:"number"},{l:"Ville",f:"city",t:"text"},{l:"Pays",f:"country",t:"text"},{l:"Métier",f:"job",t:"text"},{l:"Source (TG, Insta…)",f:"source",t:"text"}].map(fd=>(
                 <div key={fd.f}>
