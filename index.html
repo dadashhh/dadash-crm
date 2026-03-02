@@ -8338,7 +8338,7 @@ const EXPENSE_CATS = [
   {id:"autre",label:"Autre",icon:"📦"},
 ];
 
-const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, expenseCategories, onRefresh, onNotify, providerPaymentMethods, modelTasks, contentList, checklistTemplates, checklistInstances, products, productTags, modelPrices}) => {
+const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, expenseCategories, onRefresh, onNotify, providerPaymentMethods, modelTasks, contentList, checklistTemplates, checklistInstances, products, productTags, modelPrices, piRefreshKey}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const cardModal = useCardModal();
@@ -8400,13 +8400,19 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
       if (piData) setPaiementsM(piData);
     } catch(e) {}
   }, []);
-  React.useEffect(() => { refreshPIM(); }, [refreshPIM]);
+  React.useEffect(() => { refreshPIM(); }, [refreshPIM, piRefreshKey]);
 
   React.useEffect(() => {
     if (modalModel) {
       const m = models.find(x=>x.id===modalModel);
       if (m) setParamFormM({name:m.name||""});
-      setPiTabM("pending");
+      const solde = soldesMapM[modalModel];
+      if (solde && solde.solde_du > 0) {
+        setPiTabM("create");
+        setPiFormM(f => ({...f, type:"commission", montant: String(Math.round(solde.solde_du))}));
+      } else {
+        setPiTabM("pending");
+      }
     }
   }, [modalModel]);
 
@@ -8734,6 +8740,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
                   <button className="ma-act primary" onClick={()=>{setModalModel(m.id);setModalTab("performance");}}>📊 Stats</button>
                   <button className="ma-act" onClick={()=>{setModalModel(m.id);setModalTab("parametres");}}>✏️ Éditer</button>
                   <button className="ma-act" onClick={()=>{setModalModel(m.id);setModalTab("performance");}}>👥 Chatters</button>
+                  <button className="ma-act" style={{borderColor:"rgba(16,185,129,0.4)",color:"#10b981"}} onClick={()=>{setModalModel(m.id);setModalTab("paiements");setPiTabM("create");}}>💰 Payer</button>
                 </div>
               </div>
             </div>
@@ -13904,7 +13911,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
 // =============================================
 // CHATTERS TAB (gerant only)
 // =============================================
-const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}) => {
+const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh, piRefreshKey}) => {
   const { convertAmount, currencySymbol } = useCurrency();
   const cardModal = useCardModal();
   const fr = lang === "fr";
@@ -13943,17 +13950,20 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh}
       if (piData) setPaiementsPI(piData);
     } catch(e) {}
   }, []);
-  React.useEffect(() => { refreshPI(); }, [refreshPI]);
+  React.useEffect(() => { refreshPI(); }, [refreshPI, piRefreshKey]);
 
   // ── pre-fill form when modal opens ──
   React.useEffect(() => {
     if (modalChatter) {
       const ch = profiles.find(p => p.id === modalChatter);
       if (ch) setParamForm({name: ch.name||"", commission_pct: String(ch.commission_pct||20)});
-      setPiTab("pending");
       const solde = soldesMap[modalChatter];
-      if (solde && solde.solde_du > 0)
+      if (solde && solde.solde_du > 0) {
+        setPiTab("create");
         setPiForm(f => ({...f, type:"commission", montant: String(Math.round(solde.solde_du))}));
+      } else {
+        setPiTab("pending");
+      }
     }
   }, [modalChatter]);
 
@@ -25938,52 +25948,98 @@ const DeclarePaymentModal = ({ user, profiles, onClose, onSaved, lang }) => {
   );
 };
 
-/* CreatePaymentModal — modal to create a payment_event (status: pending) */
-const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
-  const fr = lang === "fr";
+/* CreatePaymentModal — paiement rapide via paiements_internes (Batch 2) */
+const CreatePaymentModal = ({user, profiles, models, prefill, onClose, onSaved, lang}) => {
   const addToast = useToast();
-  const [form, setForm] = useState({from_user_id:user.id,to_user_id:"",amount:"",currency:"EUR",kind:"salary",title:"",note:"",method:""});
-  const [screenshotUrl, setScreenshotUrl] = useState("");
-  const [saving, setSaving] = useState(false);
-  const set = (k,v) => setForm(prev=>({...prev,[k]:v}));
   const inpStyle = {...UI.input,marginBottom:0};
-  const allUsers = (profiles||[]).filter(p=>p.id&&p.role&&!["admin","ceo"].includes(p.role));
+
+  const [destinataireType, setDestinataireType] = useState(prefill?.destinataireType || "chatter");
+  const [destinataireId,   setDestinataireId]   = useState(prefill?.destinataireId   || "");
+  const [paymentType,      setPaymentType]      = useState("commission");
+  const [montant,          setMontant]          = useState(prefill?.soldeDu ? String(Math.round((prefill.soldeDu)*100)/100) : "");
+  const [devise,           setDevise]           = useState("CHF");
+  const [periodeDebut,     setPeriodeDebut]     = useState("");
+  const [periodeFin,       setPeriodeFin]       = useState("");
+  const [note,             setNote]             = useState("");
+  const [saving,           setSaving]           = useState(false);
+  const [soldesMap,        setSoldesMap]        = useState({});
+  const [loadingSoldes,    setLoadingSoldes]    = useState(false);
+
+  const chatters    = (profiles||[]).filter(p=>p.role==="chatter");
+  const modelsList  = models||[];
+  const currentList = destinataireType==="chatter" ? chatters : modelsList;
+
+  const fetchSoldes = React.useCallback(async (type) => {
+    setLoadingSoldes(true);
+    try {
+      const vueName = type==="chatter" ? "vue_soldes_chatters" : "vue_soldes_modeles";
+      const idField = type==="chatter" ? "chatter_id"         : "modele_id";
+      const { data, error } = await sb.from(vueName).select("*");
+      if (!error && data) {
+        const map = {};
+        data.forEach(r => { map[r[idField]] = r.solde_du||0; });
+        setSoldesMap(map);
+      } else {
+        // Fallback : calculer depuis paiements_internes
+        const { data: piData } = await sb.from("paiements_internes")
+          .select("destinataire_id,montant,statut")
+          .eq("destinataire_type", type);
+        if (piData) {
+          const map = {};
+          piData.filter(p=>p.statut==="validated").forEach(p=>{
+            map[p.destinataire_id] = (map[p.destinataire_id]||0) + (p.montant||0);
+          });
+          setSoldesMap(map);
+        }
+      }
+    } catch(_) {}
+    setLoadingSoldes(false);
+  }, []);
+
+  React.useEffect(() => { fetchSoldes(destinataireType); }, [destinataireType]);
+
+  const handleTypeChange = (type) => {
+    setDestinataireType(type);
+    setDestinataireId("");
+    setMontant("");
+  };
+
+  const handleDestinataire = (id) => {
+    setDestinataireId(id);
+    const solde = soldesMap[id]||0;
+    if (solde>0) setMontant(String(Math.round(solde*100)/100));
+  };
+
+  const getOptionLabel = (item) => {
+    const name  = item.name||item.email||item.id;
+    const solde = soldesMap[item.id]||0;
+    return solde>0 ? `${name} (solde: ${Math.round(solde)} CHF)` : name;
+  };
 
   const handleCreate = async () => {
-    if (!form.from_user_id) return addToast(fr?"Payeur requis":"Payer required","error");
-    if (!form.to_user_id) return addToast(fr?"Receveur requis":"Receiver required","error");
-    if (!form.amount||isNaN(Number(form.amount))||Number(form.amount)<=0) return addToast(fr?"Montant invalide":"Invalid amount","error");
-    if (form.from_user_id===form.to_user_id) return addToast(fr?"Payeur et receveur identiques":"Payer = Receiver","error");
+    if (!destinataireId) return addToast("Destinataire requis","error");
+    if (!montant||isNaN(Number(montant))||Number(montant)<=0) return addToast("Montant invalide","error");
     setSaving(true);
-    const toProfile = allUsers.find(u=>u.id===form.to_user_id);
-    const toName = toProfile?.name || toProfile?.email || "";
-    const {error} = await sb.from("payment_events").insert({
-      created_by:user.id,
-      from_user_id:form.from_user_id,
-      to_user_id:form.to_user_id,
-      amount:Number(form.amount),
-      currency:form.currency||"EUR",
-      kind:form.kind||"salary",
-      title:form.title.trim()||form.kind,
-      note:form.note.trim()||null,
-      method:form.method||null,
-      screenshot_url:screenshotUrl||null,
-      status:"pending"
+    const dest = currentList.find(x=>x.id===destinataireId);
+    const destName = dest?.name||dest?.email||"";
+    const { error } = await sb.from("paiements_internes").insert({
+      createur_role:  "gerant",
+      createur_id:    user.id,
+      createur_name:  user.name||user.email,
+      destinataire_type: destinataireType,
+      destinataire_id:   destinataireId,
+      destinataire_name: destName,
+      type:     paymentType,
+      montant:  Number(montant),
+      devise:   devise,
+      periode_debut: periodeDebut||null,
+      periode_fin:   periodeFin||null,
+      note:     note.trim()||null,
+      statut:   "pending",
     });
     setSaving(false);
     if (error) return addToast("Erreur: "+error.message,"error");
-    // Notif destinataire
-    try {
-      const senderName = user.name || user.email || "Le gérant";
-      const amt = `${Number(form.amount).toLocaleString("fr-CH",{minimumFractionDigits:2})} ${form.currency||"EUR"}`;
-      await sb.from("notifications").insert({
-        user_id:form.to_user_id, type:"payment_pending",
-        title:`💰 Nouveau paiement reçu — ${amt}`,
-        message:`${senderName} vous a envoyé ${amt}${form.title?" — "+form.title:""}. Confirmer la réception ?`,
-        read:false,
-      });
-    } catch(_){}
-    addToast("\u{1F4B8} Paiement créé — notif envoyée au destinataire","success");
+    addToast(`💸 Paiement envoyé à ${destName} — en attente de validation`,"success");
     onSaved();
   };
 
@@ -25991,73 +26047,84 @@ const CreatePaymentModal = ({user, profiles, onClose, onSaved, lang}) => {
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
       <div style={{background:"var(--bg-modal)",border:"1px solid var(--border-strong)",borderRadius:16,padding:24,width:"100%",maxWidth:480,maxHeight:"90vh",overflowY:"auto",boxShadow:"var(--shadow-lg)"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
-          <h3 style={{fontSize:16,fontWeight:800,color:"var(--text-primary)",margin:0}}>{"\u{1F4B8}"} {fr?"Créer un paiement interne":"Create internal payment"}</h3>
+          <h3 style={{fontSize:16,fontWeight:800,color:"var(--text-primary)",margin:0}}>💸 Paiement interne</h3>
           <button onClick={onClose} style={{background:"none",border:"none",color:"var(--text-tertiary)",fontSize:20,cursor:"pointer",padding:"2px 6px",borderRadius:6}}>×</button>
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:12}}>
+          {/* Destinataire type */}
           <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Type de paiement":"Payment kind"}</label>
-            <select value={form.kind} onChange={e=>set("kind",e.target.value)} style={inpStyle}>
-              <option value="salary">{fr?"Salaire":"Salary"}</option>
-              <option value="bonus">{fr?"Prime / Bonus":"Bonus"}</option>
-              <option value="adjustment">{fr?"Ajustement":"Adjustment"}</option>
-              <option value="provider_payment">{fr?"Paiement Provider":"Provider payment"}</option>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:6,fontWeight:600}}>DESTINATAIRE TYPE</label>
+            <div style={{display:"flex",gap:8}}>
+              {[["chatter","💬 Chatter"],["modele","✈️ Modèle"]].map(([val,lbl])=>(
+                <button key={val} onClick={()=>handleTypeChange(val)} style={{flex:1,padding:"8px 12px",borderRadius:10,border:`2px solid ${destinataireType===val?"#8b5cf6":"var(--border)"}`,background:destinataireType===val?"rgba(139,92,246,0.12)":"transparent",color:destinataireType===val?"#c4b5fd":"var(--text-secondary)",fontWeight:700,fontSize:13,cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>
+                  {lbl}
+                </button>
+              ))}
+            </div>
+          </div>
+          {/* Destinataire dropdown */}
+          <div>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>
+              DESTINATAIRE {loadingSoldes&&<span style={{color:"var(--text-tertiary)"}}>⏳</span>}
+            </label>
+            <select value={destinataireId} onChange={e=>handleDestinataire(e.target.value)} style={inpStyle}>
+              <option value="">— Choisir —</option>
+              {currentList.map(item=>(
+                <option key={item.id} value={item.id}>{getOptionLabel(item)}</option>
+              ))}
             </select>
           </div>
+          {/* Type de paiement */}
           <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Payeur (from_user_id)":"Payer (from_user_id)"}</label>
-            <select value={form.from_user_id} onChange={e=>set("from_user_id",e.target.value)} style={inpStyle}>
-              <option value="">— {fr?"Choisir":"Select"} —</option>
-              {allUsers.map(u=><option key={u.id} value={u.id}>{displayUserName(u)} ({u.role})</option>)}
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>TYPE DE PAIEMENT</label>
+            <select value={paymentType} onChange={e=>setPaymentType(e.target.value)} style={inpStyle}>
+              <option value="commission">Commission</option>
+              <option value="bonus">Bonus</option>
+              <option value="remboursement">Remboursement</option>
+              <option value="autre">Autre</option>
             </select>
           </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Receveur (to_user_id)":"Receiver (to_user_id)"}</label>
-            <select value={form.to_user_id} onChange={e=>set("to_user_id",e.target.value)} style={inpStyle}>
-              <option value="">— {fr?"Choisir":"Select"} —</option>
-              {allUsers.filter(u=>u.id!==form.from_user_id).map(u=><option key={u.id} value={u.id}>{displayUserName(u)} ({u.role})</option>)}
-            </select>
-          </div>
+          {/* Montant + Devise */}
           <div style={{display:"flex",gap:10}}>
             <div style={{flex:1}}>
-              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Montant":"Amount"}</label>
-              <input type="number" min="0.01" step="0.01" value={form.amount} onChange={e=>set("amount",e.target.value)} style={inpStyle} placeholder="0.00" />
+              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>MONTANT</label>
+              <input type="number" min="0.01" step="0.01" value={montant} onChange={e=>setMontant(e.target.value)} style={inpStyle} placeholder="0.00" />
             </div>
             <div style={{width:90}}>
-              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Devise":"Currency"}</label>
-              <select value={form.currency} onChange={e=>set("currency",e.target.value)} style={inpStyle}>
-                <option value="EUR">EUR</option>
+              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>DEVISE</label>
+              <select value={devise} onChange={e=>setDevise(e.target.value)} style={inpStyle}>
                 <option value="CHF">CHF</option>
-                <option value="USD">USD</option>
+                <option value="EUR">EUR</option>
               </select>
             </div>
           </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>Titre</label>
-            <input type="text" value={form.title} onChange={e=>set("title",e.target.value)} style={inpStyle} placeholder={fr?"Ex: Salaire Janvier 2026":"E.g. January 2026 salary"} />
+          {/* Période */}
+          <div style={{display:"flex",gap:10}}>
+            <div style={{flex:1}}>
+              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>PÉRIODE DÉBUT</label>
+              <input type="date" value={periodeDebut} onChange={e=>setPeriodeDebut(e.target.value)} style={inpStyle} />
+            </div>
+            <div style={{flex:1}}>
+              <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>PÉRIODE FIN</label>
+              <input type="date" value={periodeFin} onChange={e=>setPeriodeFin(e.target.value)} style={inpStyle} />
+            </div>
           </div>
+          {/* Note */}
           <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Méthode de paiement":"Payment method"}</label>
-            <select value={form.method} onChange={e=>set("method",e.target.value)} style={inpStyle}>
-              <option value="">— {fr?"Choisir":"Select"} —</option>
-              {["Twint","Revolut","Virement bancaire","PayPal","Cash","Crypto","Autre"].map(m=><option key={m} value={m}>{m}</option>)}
-            </select>
+            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4,fontWeight:600}}>NOTE (OPTIONNEL)</label>
+            <textarea value={note} onChange={e=>setNote(e.target.value)} style={{...inpStyle,height:58,resize:"vertical"}} placeholder="Note interne..." />
           </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:4}}>{fr?"Note (optionnel)":"Note (optional)"}</label>
-            <textarea value={form.note} onChange={e=>set("note",e.target.value)} style={{...inpStyle,height:58,resize:"vertical"}} placeholder={fr?"Note interne...":"Internal note..."} />
-          </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--text-secondary)",display:"block",marginBottom:6}}>📎 {fr?"Screenshot preuve de paiement (optionnel)":"Payment proof screenshot (optional)"}</label>
-            <UploadProofButton user={user} paymentId="new" lang={lang}
-              label={fr?"Uploader screenshot":"Upload screenshot"}
-              onUploaded={url=>setScreenshotUrl(url)} />
-            {screenshotUrl&&<div style={{fontSize:11,color:"var(--success)",marginTop:4}}>✓ {fr?"Screenshot uploadé":"Screenshot uploaded"}</div>}
-          </div>
+          {/* Solde dû affiché */}
+          {destinataireId && soldesMap[destinataireId]>0 && (
+            <div style={{background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.3)",borderRadius:10,padding:"8px 12px",fontSize:12,color:"var(--warning)",fontWeight:700}}>
+              💰 Solde dû : {Math.round(soldesMap[destinataireId]).toLocaleString()} CHF
+            </div>
+          )}
+          {/* Boutons */}
           <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:4}}>
-            <button onClick={onClose} style={UI.btnSecondary}>{fr?"Annuler":"Cancel"}</button>
+            <button onClick={onClose} style={UI.btnSecondary}>Annuler</button>
             <button onClick={handleCreate} disabled={saving} style={{...UI.btnPrimary,opacity:saving?0.6:1}}>
-              {saving?"...":(fr?"Créer (en attente)":"Create (pending)")}
+              {saving?"...":"💸 Envoyer le paiement (pending)"}
             </button>
           </div>
         </div>
@@ -34745,6 +34812,8 @@ const App = () => {
   const [paymentEvents, setPaymentEvents] = useState([]);
   const [ledgerEntries, setLedgerEntries] = useState([]);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [paymentModalPrefill, setPaymentModalPrefill] = useState(null);
+  const [piRefreshKey, setPiRefreshKey] = useState(0);
   // ── SERVER PAGINATION STATE ──
   const [txSummary, setTxSummary] = useState([]);
   const [txTotal, setTxTotal] = useState(0);
@@ -35487,7 +35556,7 @@ const App = () => {
     return () => { cancelled = true; clearInterval(iv); };
   }, [user?.id, user?.role]);
 
-  /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications */
+  /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications + paiements_internes */
   const afterMutationRefresh = useCallback(async () => {
     if (!user) return;
     try {
@@ -35502,6 +35571,8 @@ const App = () => {
         setNotifications(nRes.data||[]);
         setUnreadCount((nRes.data||[]).filter(n=>!n.read).length);
       }
+      // Trigger refresh of paiements_internes in ChattersTab + ModelesTab
+      setPiRefreshKey(k => k + 1);
     } catch(e) {
       console.error("[DADASH] afterMutationRefresh failed:", e.message||e);
     }
@@ -35669,8 +35740,8 @@ const App = () => {
         </>);
       case "equipe":
         return (<>{renderGerantTabBar("equipe")}
-          {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txSummary} profiles={profiles} models={models} chatterLogs={chatterLogs} onRefresh={onRefresh} />}
-          {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} expenses={expenses} expenseCategories={expenseCategories} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} />}
+          {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txSummary} profiles={profiles} models={models} chatterLogs={chatterLogs} onRefresh={onRefresh} piRefreshKey={piRefreshKey} />}
+          {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} expenses={expenses} expenseCategories={expenseCategories} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} piRefreshKey={piRefreshKey} />}
           {subTab==="providers"&&<PrestatairesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} />}
           {subTab==="catalogue"&&<ProductCatalogTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} onRefresh={onRefresh} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} onNotify={createNotification} />}
         </>);
@@ -35766,8 +35837,9 @@ const App = () => {
     else if (actionId === "create_push") { navigateTo("messagerie","push"); }
     else if (actionId === "create_todo") { setFabTodoForm({ title: "" }); setFabTodoModal(true); }
     else if (actionId === "create_depense") { setFabDepenseEditId(null); const defCat=expenseCategories&&expenseCategories.length>0?expenseCategories[0].code:""; setFabDepenseForm({ amount: "", type: "autre", category: defCat, description: "", date: new Date().toISOString().split("T")[0], currency: "EUR", assigned_to_id: "", assigned_to_type: "" }); setFabDepenseModal(true); }
-    else if (actionId === "create_payment") { setShowPaymentModal(true); }
+    else if (actionId === "create_payment") { setPaymentModalPrefill(null); setShowPaymentModal(true); }
   };
+  const openPaymentModal = (prefill) => { setPaymentModalPrefill(prefill||null); setShowPaymentModal(true); };
   const handleFabCreateSpender = async () => {
     if (!fabSpForm.handle.trim()) return addToast("Handle requis","error");
     setFabSaving(true);
@@ -36297,9 +36369,11 @@ const App = () => {
         <CreatePaymentModal
           user={user}
           profiles={profiles}
+          models={models}
+          prefill={paymentModalPrefill}
           lang={lang}
-          onClose={()=>setShowPaymentModal(false)}
-          onSaved={()=>{setShowPaymentModal(false);afterMutationRefresh();navigateTo("compta","paiements_internes");}}
+          onClose={()=>{setShowPaymentModal(false);setPaymentModalPrefill(null);}}
+          onSaved={()=>{setShowPaymentModal(false);setPaymentModalPrefill(null);afterMutationRefresh();navigateTo("compta","paiements_internes");}}
         />
       )}
       {/* ═══ FAB MODALS ═══ */}
