@@ -7580,14 +7580,29 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const [equipeOwed, setEquipeOwed] = useState(0);
   const refreshEquipeOwed = useCallback(async () => {
     try {
-      const [r1, r2] = await Promise.allSettled([
-        sb.from('vue_soldes_chatters').select('solde_du'),
-        sb.from('vue_soldes_modeles').select('solde_du'),
+      // Calcul direct depuis tables brutes — vues potentiellement stales
+      const [txRes, piRes] = await Promise.allSettled([
+        sb.from('transactions')
+          .select('chatter_commission, amount, currency')
+          .in('status', ['validated', 'confirmee', 'payee', 'validé']),
+        sb.from('paiements_internes')
+          .select('montant, statut')
+          .eq('createur_role', 'gerant')
+          .neq('statut', 'cancelled'),
       ]);
-      const cs = r1.status === 'fulfilled' ? (r1.value.data || []) : [];
-      const ms = r2.status === 'fulfilled' ? (r2.value.data || []) : [];
-      setEquipeOwed([...cs, ...ms].reduce((s, r) => s + Number(r.solde_du || 0), 0));
-    } catch {}
+      const allTx   = txRes.status === 'fulfilled' ? (txRes.value.data || []) : [];
+      const allPi   = piRes.status === 'fulfilled' ? (piRes.value.data || []) : [];
+      // Commission totale gagnée par l'équipe
+      // Fallback 20% si chatter_commission absent (cohérent avec chatterStats.commDue)
+      const DEFAULT_RATE = 0.20;
+      const totalComm = allTx.reduce((s, t) => {
+        const explicit = Number(t.chatter_commission || 0);
+        return s + (explicit > 0 ? explicit : Number(t.amount || 0) * DEFAULT_RATE);
+      }, 0);
+      // Total déjà payé par le gérant (paiements validés uniquement)
+      const totalPaye = allPi.filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
+      setEquipeOwed(Math.max(0, totalComm - totalPaye));
+    } catch (e) { console.warn('[EquipeOwed]', e?.message); }
   }, []);
   useEffect(() => {
     refreshEquipeOwed();
@@ -14623,7 +14638,12 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
       const refusedCount = chTx.filter(tx=>tx.status==="refused").length;
       const convRate = chTx.length>0?Math.round((validTx.length/chTx.length)*100):0;
       const avgTicket = validTx.length>0?Math.round(validCA/validTx.length):0;
-      const commDue = validTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
+      const commRate = Number(ch.commission_rate || 20) / 100;
+      // commDue = chatter_commission explicite si renseigné, sinon amount * taux
+      const commDue = validTx.reduce((s,tx)=>{
+        const explicit = Number(tx.chatter_commission || 0);
+        return s + convertAmount(explicit > 0 ? explicit : Number(tx.amount||0) * commRate, tx.currency);
+      }, 0);
       const spenders = [...new Set(chTx.map(tx=>tx.spender_handle).filter(Boolean))];
       const assignedModels = (ch.assigned_models||[]).map(mid=>models.find(m=>m.id===mid)).filter(Boolean);
       const xp = calculateXP(ch.id,txs,convertAmount);
@@ -14781,9 +14801,10 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
           const isOnShift= ch.on_shift || ch.is_online || false;
           const _chAvatarColors = {M:"#f59e0b",Z:"#ef4444",L:"#3b82f6",C:"#8b5cf6"};
           const _chAColor = _chAvatarColors[(_initial(ch.name)||"?")[0]] || "#6366f1";
-          const sd = soldesMap[ch.id];
           const pPend = paiementsPI.filter(p=>p.destinataire_id===ch.id&&p.statut==="pending");
-          const soldeDu = sd?.solde_du||0;
+          // Calcul live: commDue (issu de chatterStats, basé sur amount * rate) - déjà versé
+          const _dejaVerseChatter = paiementsPI.filter(p=>p.destinataire_id===ch.id&&p.statut==="validated").reduce((s,p)=>s+Number(p.montant||0),0);
+          const soldeDu = Math.max(0, Math.round(ch.commDue - _dejaVerseChatter));
           return (
             <div key={ch.id} className={`chatter-a${(!isOnShift&&ch.chTx.length===0)?" inactive":""}`}
               onClick={()=>{setModalChatter(ch.id);setModalTab("performance");}}
@@ -14899,8 +14920,9 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
 
             {/* Modal Header */}
             {(()=>{
-              const sd = soldesMap[selCh.id];
-              const soldeDu = sd?.solde_du||0;
+              // Calcul live: commDue - déjà versé validé (même logique que les cartes)
+              const _selDejaVerse = paiementsPI.filter(p=>p.destinataire_id===selCh.id&&p.statut==="validated").reduce((s,p)=>s+Number(p.montant||0),0);
+              const soldeDu = Math.max(0, Math.round(selCh.commDue - _selDejaVerse));
               const isShift = selCh.on_shift||selCh.is_online||false;
               return (
                 <div style={{padding:"20px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"flex-start",position:"sticky",top:0,background:"var(--surface)",zIndex:2,gap:12}}>
@@ -15016,16 +15038,18 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
 
               {/* ── TAB PAIEMENTS ── */}
               {modalTab==="paiements" && (()=>{
-                const sd = soldesMap[selCh.id]||{};
                 const chPI = paiementsPI.filter(p=>p.destinataire_id===selCh.id);
                 const pendingPI = chPI.filter(p=>p.statut==="pending");
+                // Calcul live depuis chatterStats + paiementsPI (pas de dépendance à vue_soldes_chatters)
+                const _paiDejaVerse = chPI.filter(p=>p.statut==="validated").reduce((s,p)=>s+Number(p.montant||0),0);
+                const _soldeDuModal = Math.max(0, Math.round(selCh.commDue - _paiDejaVerse));
                 const PI_STATUS_COLOR = {pending:"var(--warning)",validated:"var(--success)",contested:"var(--danger)",cancelled:"var(--muted)",draft:"var(--muted)"};
                 const PI_STATUS_LABEL = {pending:"⏳ En attente",validated:"✅ Validé",contested:"⚠️ Contesté",cancelled:"❌ Annulé",draft:"📝 Brouillon"};
                 return (
                   <div>
                     {/* KPI row soldes */}
                     <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}}>
-                      {[{l:"CA Généré",v:`${Math.round(sd.ca_genere||0).toLocaleString()} CHF`,c:"var(--success)"},{l:"Commission brute",v:`${Math.round(sd.commission_brute||0).toLocaleString()} CHF`,c:"var(--accent)"},{l:"Solde dû",v:`${Math.round(sd.solde_du||0).toLocaleString()} CHF`,c:(sd.solde_du||0)>0?"var(--warning)":"var(--success)"}].map((k,i)=>(
+                      {[{l:"CA Généré",v:`${Math.round(selCh.validCA||0).toLocaleString()} CHF`,c:"var(--success)"},{l:"Commission brute",v:`${Math.round(selCh.commDue||0).toLocaleString()} CHF`,c:"var(--accent)"},{l:"Solde dû",v:`${_soldeDuModal.toLocaleString()} CHF`,c:_soldeDuModal>0?"var(--warning)":"var(--success)"}].map((k,i)=>(
                         <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"var(--surface2)",border:"1px solid var(--border)"}}>
                           <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>{k.l}</div>
                           <div style={{fontSize:16,fontWeight:800,color:k.c}}>{k.v}</div>
@@ -21501,22 +21525,34 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
   const [soldeChatter, setSoldeChatter] = useState(null);
   const refreshSoldeChatter = useCallback(async () => {
     try {
-      const { data } = await sb.from('vue_soldes_chatters').select('*').eq('chatter_id', user.id).single();
-      if (data) {
-        setSoldeChatter({ solde: Number(data.solde_du || 0), commission_brute: Number(data.commission_brute || 0), deja_verse: Number(data.deja_verse || 0) });
-      } else {
-        const [{ data: pays }, { data: profile }] = await Promise.all([
-          sb.from('paiements_internes').select('montant, statut').eq('destinataire_id', user.id),
-          sb.from('profiles').select('commission_rate').eq('id', user.id).single(),
-        ]);
-        const rate = Number(profile?.commission_rate || 20) / 100;
-        const validTxAmt = (txs || []).filter(t => (t.chatter_id === user.id) && (t.status === 'validated' || t.status === 'confirmee')).reduce((s, t) => s + Number(t.amount || 0), 0);
-        const commBrute = validTxAmt * rate;
-        const dejaVerse = (pays || []).filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
-        setSoldeChatter({ solde: Math.max(0, commBrute - dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
-      }
-    } catch {}
-  }, [user?.id, txs]);
+      // Calcul direct depuis les tables brutes — vue_soldes_chatters peut être stale/incorrecte
+      const [txRes, piRes, profRes] = await Promise.allSettled([
+        sb.from('transactions')
+          .select('amount, currency, chatter_commission')
+          .eq('chatter_id', user.id)
+          .in('status', ['validated', 'confirmee', 'payee', 'validé']),
+        sb.from('paiements_internes')
+          .select('montant, statut')
+          .eq('destinataire_id', user.id),
+        sb.from('profiles')
+          .select('commission_rate')
+          .eq('id', user.id)
+          .maybeSingle(),
+      ]);
+      const allTxData = txRes.status === 'fulfilled' ? (txRes.value.data || []) : [];
+      const piData    = piRes.status === 'fulfilled' ? (piRes.value.data || []) : [];
+      const profile   = profRes.status === 'fulfilled' ? profRes.value.data : null;
+
+      const rate = Number(profile?.commission_rate || 20) / 100;
+      // Utiliser chatter_commission si disponible, sinon amount * rate
+      const commBrute = allTxData.reduce((s, t) => {
+        const explicit = Number(t.chatter_commission || 0);
+        return s + (explicit > 0 ? explicit : Number(t.amount || 0) * rate);
+      }, 0);
+      const dejaVerse = piData.filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
+      setSoldeChatter({ solde: Math.max(0, commBrute - dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
+    } catch (e) { console.warn('[SoldeChatter]', e?.message); }
+  }, [user?.id]);
   useEffect(() => {
     refreshSoldeChatter();
     window.__refreshSolde = refreshSoldeChatter;
