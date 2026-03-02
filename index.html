@@ -24372,244 +24372,325 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
 };
 
 // =============================================
-// SPENDER DUPLICATES PANEL — Détection & merge doublons (gérant uniquement)
+// SPENDER DUPLICATES PANEL v3 — Merge automatique complet
+// Union-find N-way · KEEP=TG ID prioritaire · Toutes FK · Batch log
 // =============================================
 const SpenderDuplicatesPanel = ({ lang, dbSpenders, onRefresh, user }) => {
   const fr = lang === "fr";
-  const [merging, setMerging] = React.useState(false);
-  const [mergeModal, setMergeModal] = React.useState(null); // { a, b }
+  const addToast = useToast();
+  const [mergeModal, setMergeModal] = React.useState(null);
   const [masterId, setMasterId] = React.useState(null);
   const [reassignLoading, setReassignLoading] = React.useState(false);
   const [autoReassignResult, setAutoReassignResult] = React.useState(null);
   const [autoReassignLoading, setAutoReassignLoading] = React.useState(false);
+  const [batchMerging, setBatchMerging] = React.useState(false);
+  const [batchLog, setBatchLog] = React.useState(null);
+  const [txCounts, setTxCounts] = React.useState({});
 
-  // Réassignation automatique des TX orphelines @tg_XXXXXXX / @TG_XXXXXXX / tg_XXXXXXX
-  const handleAutoReassign = async () => {
-    setAutoReassignLoading(true);
-    setAutoReassignResult(null);
-    let fixed = 0, created = 0, errors = 0;
-    try {
-      // Récupérer toutes les TX avec handle de type tg_XXXXXXX, @tg_XXXXXXX, @TG_XXXXXXX
-      const { data: allTxs } = await sb.from("transactions")
-        .select("id,spender_handle,spender_id")
-        .limit(2000);
+  // ── Helpers ──────────────────────────────────────────
+  // Normalise un handle: supprime @, lowercase, prend le premier mot alphanumérique
+  const normH = (h) => h ? h.replace(/^@/,'').toLowerCase().trim().split(/[\s,;.]+/)[0].replace(/[^a-z0-9_]/g,'') : '';
 
-      // Filtrer côté JS pour couvrir toutes les variantes (case insensitive)
-      const TG_PATTERN = /^@?tg_\d+$/i;
-      const orphanTxs = (allTxs || []).filter(tx =>
-        tx.spender_handle && TG_PATTERN.test(tx.spender_handle.trim())
-      );
+  // Score de richesse d'une fiche (nb de champs non-nuls)
+  const richness = (s) => ['tg_user_id','telegram_username','first_name','age','city','country',
+    'langue','notes','job','timezone','budget_range','whatsapp_phone']
+    .filter(f => s[f] != null && s[f] !== '').length;
 
-      for (const tx of orphanTxs) {
-        const raw = tx.spender_handle.trim().replace(/^@/i, "").replace(/^tg_/i, "");
-        const numId = raw.replace(/\D/g, "");
-        if (!numId) continue;
-
-        // Chercher le spender par tg_user_id
-        let { data: sp } = await sb.from("spenders").select("id,handle,name").eq("tg_user_id", numId).maybeSingle();
-
-        if (!sp) {
-          // Pas trouvé → créer une fiche propre avec ce tg_user_id
-          const newHandle = "tg_" + numId;
-          const { data: created_sp, error: createErr } = await sb.from("spenders")
-            .insert({ handle: newHandle, name: newHandle, tg_user_id: numId, status: "active" })
-            .select("id,handle,name").maybeSingle();
-          if (createErr || !created_sp) { errors++; continue; }
-          sp = created_sp;
-          created++;
-        }
-
-        if (tx.spender_id === sp.id) continue; // déjà correct
-        const { error } = await sb.from("transactions").update({
-          spender_id: sp.id,
-          spender_handle: sp.handle || sp.name || tx.spender_handle,
-        }).eq("id", tx.id);
-        if (error) errors++;
-        else fixed++;
-      }
-      setAutoReassignResult({ fixed, created, errors, total: orphanTxs.length });
-      if (fixed > 0 || created > 0) await onRefresh();
-    } catch (e) {
-      setAutoReassignResult({ fixed, created, errors: errors + 1, msg: e.message });
-    }
-    setAutoReassignLoading(false);
+  // Sélectionne le KEEP d'un groupe: 1) tg_user_id digits-only 2) richesse 3) updated_at
+  const selectKeep = (grp) => {
+    const withTg = grp.filter(s => s.tg_user_id && /^\d+$/.test(String(s.tg_user_id).trim()));
+    const pool = withTg.length ? withTg : grp;
+    return [...pool].sort((a, b) => {
+      const dr = richness(b) - richness(a);
+      return dr !== 0 ? dr : new Date(b.updated_at||0) - new Date(a.updated_at||0);
+    })[0];
   };
 
-  // Détection des doublons
-  const duplicates = React.useMemo(() => {
-    const pairs = [];
-    const seen = new Set();
-    const spenders = (dbSpenders || []).filter(Boolean);
-
-    for (let i = 0; i < spenders.length; i++) {
-      for (let j = i + 1; j < spenders.length; j++) {
-        const a = spenders[i], b = spenders[j];
-        const key = [a.id, b.id].sort().join("|");
-        if (seen.has(key)) continue;
-
-        let reason = null;
-        // 1. Même tg_user_id
-        if (a.tg_user_id && b.tg_user_id && String(a.tg_user_id) === String(b.tg_user_id)) {
-          reason = "tg_id: " + a.tg_user_id;
-        }
-        // 2. Même telegram_username (sans @, case insensitive)
-        else if (a.telegram_username && b.telegram_username &&
-          a.telegram_username.replace(/^@/,"").toLowerCase() === b.telegram_username.replace(/^@/,"").toLowerCase()) {
-          reason = "username TG: @" + a.telegram_username.replace(/^@/,"");
-        }
-        // 3. Même nom exact (case insensitive), non vide
-        else if (a.name && b.name && a.name !== "?" && b.name !== "?" &&
-          a.name.toLowerCase() === b.name.toLowerCase() &&
-          !a.name.startsWith("tg_") && !b.name.startsWith("tg_")) {
-          reason = "nom: " + a.name;
-        }
-
-        if (reason) { seen.add(key); pairs.push({ a, b, reason }); }
+  // Construit le patch pour enrichir KEEP avec les données des drops (sans jamais écraser)
+  const buildPatch = (keep, drops) => {
+    const FIELDS = ['tg_user_id','telegram_username','first_name','name','age','city','country',
+      'langue','timezone','budget_range','source','job','whatsapp_phone','classification',
+      'risk_level','relationship_status','preferences','personality_notes','favorite_content',
+      'best_time','notes','scam_flag','scam_count'];
+    const patch = {};
+    for (const drop of drops) {
+      FIELDS.forEach(f => {
+        if (patch[f] == null && !keep[f] && drop[f] != null && drop[f] !== '') patch[f] = drop[f];
+      });
+      // Tags: union + dédup
+      const kt = Array.isArray(keep.tags) ? keep.tags : [];
+      const dt = Array.isArray(drop.tags) ? drop.tags : [];
+      const merged = [...new Set([...kt, ...dt])];
+      if (merged.length > kt.length) patch.tags = merged;
+      // Meta JSONB: drop apporte les clés manquantes, keep gagne sur les conflits
+      if (drop.meta && typeof drop.meta === 'object') {
+        patch.meta = { ...(drop.meta), ...(patch.meta || keep.meta || {}) };
       }
     }
-    return pairs;
+    return patch;
+  };
+
+  // Exécute le merge pour un groupe: keep ← drops[]
+  const execMerge = async (keep, drops) => {
+    const FK_TABLES = [
+      ['transactions',     'spender_id'],
+      ['model_spenders',   'spender_id'],
+      ['spender_badges',   'spender_id'],
+      ['push_recipients',  'spender_id'],
+      ['push_campaigns',   'spender_id'],
+      ['tg_conversations', 'spender_id'],
+    ];
+    let txMoved = 0;
+    for (const drop of drops) {
+      // Repoint toutes les FK connues
+      for (const [tbl, col] of FK_TABLES) {
+        try { await sb.from(tbl).update({ [col]: keep.id }).eq(col, drop.id); } catch(_) {}
+      }
+      // Repoint TX orphelines (spender_id null) via handle/username
+      for (const h of [drop.handle, drop.name, drop.telegram_username].filter(Boolean)) {
+        const raw = h.replace(/^@/,'');
+        if (!raw) continue;
+        try {
+          const { count: c1 } = await sb.from('transactions').select('id',{count:'exact',head:true}).eq('spender_handle',raw).is('spender_id',null);
+          if (c1) { await sb.from('transactions').update({ spender_id: keep.id, spender_handle: keep.handle || keep.name }).eq('spender_handle',raw).is('spender_id',null); txMoved += c1; }
+          const { count: c2 } = await sb.from('transactions').select('id',{count:'exact',head:true}).eq('spender_handle','@'+raw).is('spender_id',null);
+          if (c2) { await sb.from('transactions').update({ spender_id: keep.id, spender_handle: keep.handle || keep.name }).eq('spender_handle','@'+raw).is('spender_id',null); txMoved += c2; }
+        } catch(_) {}
+      }
+      // Compter les TX réassignées par spender_id
+      try { const { count } = await sb.from('transactions').select('id',{count:'exact',head:true}).eq('spender_id',drop.id); txMoved += (count||0); } catch(_) {}
+    }
+    // Enrichir KEEP avec toutes les données des drops
+    const patch = buildPatch(keep, drops);
+    if (Object.keys(patch).length > 0) {
+      try { await sb.from('spenders').update(patch).eq('id', keep.id); } catch(_) {}
+    }
+    // Supprimer les drops
+    for (const drop of drops) {
+      try { await sb.from('spenders').delete().eq('id', drop.id); } catch(_) {}
+    }
+    return { keepHandle: keep.handle || keep.name, dropHandles: drops.map(d => d.handle || d.name), totalTx };
+  };
+
+  // ── Détection des doublons par union-find (N-way, pas juste des paires) ──────
+
+  const groups = React.useMemo(() => {
+    const sps = (dbSpenders || []).filter(Boolean);
+    if (sps.length < 2) return [];
+    const par = {};
+    sps.forEach(s => { par[s.id] = s.id; });
+    const find = (x) => { while (par[x] !== x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+    const union = (x, y) => { const px = find(x), py = find(y); if (px !== py) par[px] = py; };
+    // Grouper par tg_user_id identique
+    const byTg = {};
+    sps.forEach(s => { if (!s.tg_user_id) return; const k = String(s.tg_user_id).trim(); if (byTg[k]) union(s.id, byTg[k]); else byTg[k] = s.id; });
+    // Grouper par telegram_username normalisé
+    const byTu = {};
+    sps.forEach(s => { if (!s.telegram_username) return; const k = s.telegram_username.replace(/^@/,'').toLowerCase().trim(); if (!k || k.length < 2) return; if (byTu[k]) union(s.id, byTu[k]); else byTu[k] = s.id; });
+    // Grouper par handle normalisé (≥3 chars, pas tg_XXXX)
+    const byNh = {};
+    sps.forEach(s => { const nh = normH(s.handle || ''); if (!nh || nh.length < 3 || /^tg_?\d/.test(nh)) return; if (byNh[nh]) union(s.id, byNh[nh]); else byNh[nh] = s.id; });
+    // Grouper par name normalisé (≥3 chars, pas générique)
+    const byName = {};
+    sps.forEach(s => { const nn = normH(s.name || ''); if (!nn || nn.length < 3 || nn === '?' || /^tg_?\d/.test(nn)) return; if (byName[nn]) union(s.id, byName[nn]); else byName[nn] = s.id; });
+    // Collecter les groupes avec ≥2 membres
+    const gMap = {};
+    sps.forEach(s => { const r = find(s.id); if (!gMap[r]) gMap[r] = []; gMap[r].push(s); });
+    return Object.values(gMap).filter(g => g.length >= 2).map(grp => {
+      const reasons = [];
+      const tgIds = [...new Set(grp.map(s => s.tg_user_id).filter(Boolean).map(t => String(t).trim()))];
+      tgIds.forEach(t => { if (grp.filter(s => String(s.tg_user_id||'').trim() === t).length >= 2) reasons.push('TG ID: ' + t); });
+      const tgUs = [...new Set(grp.map(s => s.telegram_username ? s.telegram_username.replace(/^@/,'').toLowerCase().trim() : null).filter(Boolean))];
+      tgUs.forEach(t => { if (grp.filter(s => (s.telegram_username||'').replace(/^@/,'').toLowerCase().trim() === t).length >= 2) reasons.push('@' + t); });
+      const nhs = [...new Set(grp.map(s => normH(s.handle||'')).filter(h => h && h.length >= 3))];
+      nhs.forEach(nh => { if (grp.filter(s => normH(s.handle||'') === nh).length >= 2) reasons.push('handle: ' + nh); });
+      return { spenders: grp, reason: reasons.slice(0, 2).join(' + ') || 'doublon détecté', keep: selectKeep(grp) };
+    });
   }, [dbSpenders]);
 
-  const [txCounts, setTxCounts] = React.useState({}); // { spenderId: count }
-
-  // Charger le comptage TX pour les doublons détectés
+  // Charger le comptage TX pour tous les spenders des groupes
   React.useEffect(() => {
-    if (duplicates.length === 0) return;
-    const ids = [...new Set(duplicates.flatMap(d => [d.a.id, d.b.id]))];
-    Promise.all(ids.map(id =>
-      sb.from("transactions").select("id", { count: "exact", head: true }).eq("spender_id", id)
-        .then(({ count }) => [id, count || 0])
-    )).then(results => {
-      setTxCounts(Object.fromEntries(results));
-    });
-  }, [duplicates]);
+    if (groups.length === 0) return;
+    const ids = [...new Set(groups.flatMap(g => g.spenders.map(s => s.id)))];
+    Promise.all(ids.map(id => sb.from('transactions').select('id', { count: 'exact', head: true }).eq('spender_id', id).then(({ count }) => [id, count || 0]))).then(r => setTxCounts(Object.fromEntries(r)));
+  }, [groups]);
+
+  // ── Batch merge : fusionne TOUS les groupes automatiquement ────────────────
+
+  const handleBatchMerge = async () => {
+    if (!window.confirm(`${fr ? 'Fusionner automatiquement' : 'Auto-merge'} ${groups.length} ${fr ? 'groupe(s) de doublons ?' : 'duplicate group(s)?'}\n\n${fr ? 'KEEP = fiche avec TG ID (ou la plus riche). Irréversible.' : 'KEEP = fiche with TG ID (or richest). Irreversible.'}`)) return;
+    setBatchMerging(true);
+    setBatchLog(null);
+    const log = [];
+    for (const grp of groups) {
+      const keep = grp.keep;
+      const drops = grp.spenders.filter(s => s.id !== keep.id);
+      try {
+        const res = await execMerge(keep, drops);
+        log.push({ ok: true, reason: grp.reason, ...res });
+      } catch(e) {
+        log.push({ ok: false, reason: grp.reason, keepHandle: keep.handle || keep.name, error: e.message });
+      }
+    }
+    setBatchLog(log);
+    await onRefresh();
+    setBatchMerging(false);
+    const ok = log.filter(l => l.ok).length;
+    addToast(`✅ ${ok}/${log.length} ${fr ? 'groupes fusionnés' : 'groups merged'}`, ok === log.length ? 'success' : 'info');
+  };
+
+  // ── Merge manuel (un groupe à la fois) ─────────────────────────────────────
 
   const handleMerge = async () => {
     if (!mergeModal || !masterId) return;
-    const { a, b } = mergeModal;
-    const slave = masterId === a.id ? b : a;
-    const master = masterId === a.id ? a : b;
+    const keep = mergeModal.spenders.find(s => s.id === masterId);
+    const drops = mergeModal.spenders.filter(s => s.id !== masterId);
     setReassignLoading(true);
     try {
-      // 1. Réassigner toutes les TX de la fiche esclave vers la fiche maître
-      await sb.from("transactions").update({ spender_id: master.id, spender_handle: master.handle || master.name }).eq("spender_id", slave.id);
-      // 2. Réassigner les TX par handle si spender_id null
-      if (slave.handle) {
-        await sb.from("transactions").update({ spender_id: master.id }).eq("spender_handle", slave.handle).is("spender_id", null);
-      }
-      // 3. Enrichir la fiche maître avec les données de l'esclave (tg_user_id, telegram_username, first_name si manquants)
-      const patch = {};
-      if (!master.tg_user_id && slave.tg_user_id) patch.tg_user_id = slave.tg_user_id;
-      if (!master.telegram_username && slave.telegram_username) patch.telegram_username = slave.telegram_username;
-      if (!master.first_name && slave.first_name) patch.first_name = slave.first_name;
-      if (!master.age && slave.age) patch.age = slave.age;
-      if (!master.city && slave.city) patch.city = slave.city;
-      if (Object.keys(patch).length > 0) await sb.from("spenders").update(patch).eq("id", master.id);
-      // 4. Supprimer la fiche esclave
-      await sb.from("spenders").delete().eq("id", slave.id);
+      await execMerge(keep, drops);
       setMergeModal(null); setMasterId(null);
+      addToast('✅ Fusion réussie', 'success');
       await onRefresh();
-    } catch (e) {
-      alert("Erreur merge: " + e.message);
-    }
+    } catch(e) { addToast('Erreur merge: ' + e.message, 'error'); }
     setReassignLoading(false);
   };
 
-  const autoReassignSection = (
-    <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:16,marginBottom:20}}>
-      <div style={{fontSize:14,fontWeight:700,marginBottom:6}}>🔧 {fr?"Réassignation TX orphelines (@tg_XXXXXXX)":"Reassign orphan TX (@tg_XXXXXXX)"}</div>
-      <div style={{fontSize:12,color:"var(--text-secondary)",marginBottom:12}}>{fr?"Retrouve toutes les TX avec un handle de type tg_XXXXXXX et les réassigne à la bonne fiche spender via tg_user_id.":"Finds all TX with a tg_XXXXXXX handle and reassigns them to the correct spender via tg_user_id."}</div>
-      <button onClick={handleAutoReassign} disabled={autoReassignLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--accent)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:autoReassignLoading?0.5:1}}>
-        {autoReassignLoading?"⏳ ...":(fr?"🔀 Réassigner":"🔀 Reassign")}
+  // ── Render ──────────────────────────────────────────────────────────────────
+
+  const orphanSection = (
+    <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:16,marginBottom:16}}>
+      <div style={{fontSize:13,fontWeight:700,marginBottom:4}}>🔧 {fr?"TX orphelines @tg_XXXXXXX":"Orphan TX @tg_XXXXXXX"}</div>
+      <div style={{fontSize:11,color:"var(--text-secondary)",marginBottom:10}}>{fr?"Réassigne les TX dont le handle est tg_XXXXXXXXX vers la fiche spender correcte (via tg_user_id).":"Reassigns TX with tg_XXXXXXXXX handles to the correct spender (via tg_user_id)."}</div>
+      <button onClick={handleAutoReassign} disabled={autoReassignLoading} style={{padding:"7px 14px",borderRadius:8,background:"var(--accent)",border:"none",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer",opacity:autoReassignLoading?0.5:1}}>
+        {autoReassignLoading?"⏳ ...":(fr?"🔀 Réassigner TX orphelines":"🔀 Reassign orphan TX")}
       </button>
-      {autoReassignResult&&(
-        <div style={{marginTop:10,fontSize:12,color:autoReassignResult.errors>0?"var(--warning)":"var(--success)",background:autoReassignResult.errors>0?"var(--warning-muted)":"var(--success-muted)",borderRadius:6,padding:"8px 10px"}}>
-          {autoReassignResult.total === 0
-            ? (fr ? "✅ Aucune TX @TG_XXXXXXX trouvée." : "✅ No @TG_XXXXXXX TX found.")
-            : <>
-                ✅ {autoReassignResult.fixed} {fr?"TX réassignées":"TX reassigned"}
-                {autoReassignResult.created > 0 && ` · ${autoReassignResult.created} ${fr?"fiche(s) créée(s)":"spender(s) created"}`}
-                {autoReassignResult.errors > 0 && ` · ⚠️ ${autoReassignResult.errors} ${fr?"erreur(s)":"error(s)"}`}
-                {autoReassignResult.msg && ` — ${autoReassignResult.msg}`}
-              </>
-          }
+      {autoReassignResult && (
+        <div style={{marginTop:8,fontSize:11,padding:"6px 10px",borderRadius:6,background:autoReassignResult.errors>0?"var(--warning-muted)":"var(--success-muted)",color:autoReassignResult.errors>0?"var(--warning)":"var(--success)"}}>
+          {autoReassignResult.total===0 ? "✅ Aucune TX orpheline trouvée." : `✅ ${autoReassignResult.fixed} TX réassignées${autoReassignResult.created>0?` · ${autoReassignResult.created} fiche(s) créée(s)`:""}${autoReassignResult.errors>0?` · ⚠️ ${autoReassignResult.errors} erreur(s)`:""}`}
         </div>
       )}
     </div>
   );
 
-  if (duplicates.length === 0) {
-    return (
-      <div>
-        {autoReassignSection}
-        <div style={{padding:24,textAlign:"center",color:"var(--text-secondary)"}}>
-          <div style={{fontSize:32,marginBottom:8}}>✅</div>
-          <div style={{fontWeight:700,fontSize:15}}>{fr?"Aucun doublon détecté":"No duplicates detected"}</div>
-          <div style={{fontSize:13,marginTop:4}}>{fr?"Tous les spenders sont uniques.":"All spenders are unique."}</div>
-        </div>
+  if (groups.length === 0) return (
+    <div>
+      {orphanSection}
+      <div style={{padding:28,textAlign:"center",color:"var(--text-secondary)",background:"var(--surface)",borderRadius:12}}>
+        <div style={{fontSize:28,marginBottom:8}}>✅</div>
+        <div style={{fontWeight:700,fontSize:15}}>{fr?"Aucun doublon détecté":"No duplicates detected"}</div>
+        <div style={{fontSize:12,marginTop:4,color:"var(--text-tertiary)"}}>{fr?"Tous les spenders sont uniques (TG ID · handle · username).":"All spenders are unique (TG ID · handle · username)."}</div>
       </div>
-    );
-  }
+    </div>
+  );
 
   return (
     <div>
-      {autoReassignSection}
-      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
-        <div style={{fontSize:16,fontWeight:800,color:"var(--danger)"}}>⚠️ {duplicates.length} {fr?"doublon(s) détecté(s)":"duplicate(s) detected"}</div>
-      </div>
-      <div style={{display:"flex",flexDirection:"column",gap:12}}>
-        {duplicates.map(({a,b,reason},i)=>(
-          <div key={i} style={{background:"var(--surface)",border:"1px solid var(--danger)",borderRadius:12,padding:16}}>
-            <div style={{fontSize:11,color:"var(--danger)",fontWeight:700,marginBottom:10}}>🔁 {fr?"Raison":"Reason"}: {reason}</div>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              {[a,b].map(sp=>(
-                <div key={sp.id} style={{background:"var(--bg-overlay)",borderRadius:8,padding:12,fontSize:12}}>
-                  <div style={{fontWeight:700,marginBottom:4,fontSize:13}}>{sp.handle||sp.name||"?"}</div>
-                  <div style={{color:"var(--text-tertiary)",fontSize:10}}>ID: {sp.id?.slice(0,8)}...</div>
-                  {sp.tg_user_id&&<div style={{color:"var(--text-secondary)"}}>📱 TG: {sp.tg_user_id}</div>}
-                  {sp.telegram_username&&<div style={{color:"var(--text-secondary)"}}>✈️ @{sp.telegram_username.replace(/^@/,"")}</div>}
-                  {sp.first_name&&<div style={{color:"var(--text-secondary)"}}>👤 {sp.first_name}</div>}
-                  <div style={{marginTop:6,padding:"3px 8px",borderRadius:6,background:"var(--surface)",display:"inline-block",fontSize:11,fontWeight:700,color:txCounts[sp.id]>0?"var(--accent)":"var(--text-quaternary)"}}>
-                    💳 {txCounts[sp.id] ?? "…"} TX
-                  </div>
-                </div>
-              ))}
-            </div>
-            <button onClick={()=>{setMergeModal({a,b});setMasterId(a.id);}} style={{marginTop:12,padding:"7px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
-              🔀 {fr?"Fusionner":"Merge"}
-            </button>
-          </div>
-        ))}
+      {orphanSection}
+
+      {/* Bandeau groupes + batch */}
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,marginBottom:14}}>
+        <div>
+          <span style={{fontSize:15,fontWeight:800,color:"var(--danger)"}}>⚠️ {groups.length} {fr?"groupe(s) de doublons":"duplicate group(s)"}</span>
+          <span style={{fontSize:11,color:"var(--text-secondary)",marginLeft:8}}>{fr?"(détection N-way: TG ID · handle · username)":"(N-way: TG ID · handle · username)"}</span>
+        </div>
+        <button onClick={handleBatchMerge} disabled={batchMerging} style={{padding:"9px 18px",borderRadius:9,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:800,cursor:"pointer",opacity:batchMerging?0.6:1,display:"flex",alignItems:"center",gap:6}}>
+          {batchMerging ? "⏳ Fusion en cours…" : `🚀 ${fr?"TOUT MERGER":"MERGE ALL"} (${groups.length})`}
+        </button>
       </div>
 
-      {mergeModal&&(
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setMergeModal(null)}>
-          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:420,maxWidth:"95vw"}} onClick={e=>e.stopPropagation()}>
-            <div style={{fontSize:16,fontWeight:800,marginBottom:16}}>🔀 {fr?"Fusionner les doublons":"Merge duplicates"}</div>
-            <div style={{fontSize:13,color:"var(--text-secondary)",marginBottom:14}}>{fr?"Choisir la fiche maître (celle qui sera conservée) :":"Choose the master record (the one to keep):"}</div>
-            {[mergeModal.a,mergeModal.b].map(sp=>(
-              <div key={sp.id} onClick={()=>setMasterId(sp.id)} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:8,border:"2px solid "+(masterId===sp.id?"var(--accent)":"var(--border)"),background:masterId===sp.id?"rgba(139,92,246,0.1)":"var(--bg-overlay)",cursor:"pointer",marginBottom:8}}>
-                <div style={{width:16,height:16,borderRadius:"50%",border:"2px solid "+(masterId===sp.id?"var(--accent)":"var(--border)"),background:masterId===sp.id?"var(--accent)":"transparent",flexShrink:0}}/>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:700,fontSize:13}}>{sp.handle||sp.name}</div>
-                  <div style={{fontSize:11,color:"var(--text-secondary)"}}>
-                    ID: {sp.id?.slice(0,8)}...
-                    {sp.tg_user_id && " · TG: "+sp.tg_user_id}
-                    {sp.first_name && " · 👤 "+sp.first_name}
-                  </div>
+      {/* Log batch */}
+      {batchLog && (
+        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:10,padding:14,marginBottom:16,fontSize:11}}>
+          <div style={{fontWeight:700,marginBottom:8,fontSize:12}}>📋 {fr?"Rapport de fusion":"Merge report"}</div>
+          {batchLog.map((l, i) => (
+            <div key={i} style={{padding:"4px 0",borderBottom:"1px solid var(--border-subtle)",color:l.ok?"var(--success)":"var(--danger)"}}>
+              {l.ok ? `✅ ${l.keepHandle}  ← ${(l.dropHandles||[]).join(', ')} (${l.totalTx} TX)` : `❌ ${l.keepHandle} — ${l.error}`}
+              {l.reason && <span style={{color:"var(--text-tertiary)",marginLeft:6}}>· {l.reason}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Liste des groupes */}
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {groups.map((grp, i) => {
+          const keep = grp.keep;
+          return (
+            <div key={i} style={{background:"var(--surface)",border:"1px solid var(--danger)",borderRadius:12,padding:16}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+                <div>
+                  <span style={{fontSize:11,fontWeight:700,color:"var(--danger)"}}>🔁 {grp.reason}</span>
+                  <span style={{fontSize:10,color:"var(--text-tertiary)",marginLeft:8}}>{grp.spenders.length} fiches</span>
                 </div>
-                <div style={{fontSize:11,fontWeight:700,color:txCounts[sp.id]>0?"var(--accent)":"var(--text-quaternary)",background:"var(--surface)",padding:"2px 8px",borderRadius:6,flexShrink:0}}>
-                  💳 {txCounts[sp.id] ?? "…"}
-                </div>
+                <span style={{fontSize:10,background:"rgba(16,185,129,0.1)",color:"#10b981",padding:"2px 8px",borderRadius:6,fontWeight:700}}>
+                  KEEP: {keep.handle || keep.name}{keep.tg_user_id ? ` (TG: ${keep.tg_user_id})` : ''}
+                </span>
               </div>
-            ))}
-            <div style={{fontSize:11,color:"var(--warning)",background:"var(--warning-muted)",borderRadius:6,padding:"8px 10px",marginTop:8,marginBottom:16}}>
-              ⚠️ {fr?"Toutes les TX de la fiche supprimée seront réassignées à la fiche maître. Cette action est irréversible.":"All TX from the deleted record will be reassigned to the master. This is irreversible."}
+              <div style={{display:"grid",gridTemplateColumns:`repeat(${Math.min(grp.spenders.length,3)},1fr)`,gap:8,marginBottom:12}}>
+                {grp.spenders.map(sp => {
+                  const isKeep = sp.id === keep.id;
+                  return (
+                    <div key={sp.id} style={{background:isKeep?"rgba(16,185,129,0.06)":"var(--bg-overlay)",borderRadius:8,padding:10,fontSize:11,border:isKeep?"1px solid rgba(16,185,129,0.3)":"1px solid var(--border)"}}>
+                      <div style={{fontWeight:700,fontSize:12,marginBottom:2,display:"flex",alignItems:"center",gap:4}}>
+                        {isKeep && <span style={{fontSize:9,background:"#10b981",color:"#fff",padding:"1px 5px",borderRadius:4,fontWeight:700}}>KEEP</span>}
+                        {sp.handle||sp.name||"?"}
+                      </div>
+                      <div style={{color:"var(--text-tertiary)",fontSize:9,marginBottom:2}}>ID: {sp.id?.slice(0,8)}</div>
+                      {sp.tg_user_id && <div style={{color:"#818cf8"}}>📱 {sp.tg_user_id}</div>}
+                      {sp.telegram_username && <div style={{color:"var(--text-secondary)"}}>✈️ @{sp.telegram_username.replace(/^@/,"")}</div>}
+                      {sp.first_name && <div style={{color:"var(--text-secondary)"}}>👤 {sp.first_name}</div>}
+                      <div style={{marginTop:4,fontWeight:700,color:txCounts[sp.id]>0?"var(--accent)":"var(--text-quaternary)"}}>
+                        💳 {txCounts[sp.id] ?? "…"} TX
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <button onClick={() => { setMergeModal(grp); setMasterId(keep.id); }}
+                style={{padding:"6px 14px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                🔀 {fr?"Fusionner ce groupe":"Merge this group"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Modale confirmation merge manuel */}
+      {mergeModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={() => setMergeModal(null)}>
+          <div style={{background:"var(--surface)",borderRadius:16,padding:24,width:460,maxWidth:"95vw",maxHeight:"90vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:15,fontWeight:800,marginBottom:4}}>🔀 {fr?"Fusionner ce groupe":"Merge this group"}</div>
+            <div style={{fontSize:11,color:"var(--text-secondary)",marginBottom:14}}>{fr?"Choisissez la fiche KEEP (celle conservée). Toutes les FK, champs et tags seront fusionnés.":"Choose the KEEP record. All FKs, fields and tags will be merged."}</div>
+            {mergeModal.spenders.map(sp => {
+              const isSelected = masterId === sp.id;
+              const isSuggest = sp.id === mergeModal.keep?.id;
+              return (
+                <div key={sp.id} onClick={() => setMasterId(sp.id)}
+                  style={{display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:8,border:`2px solid ${isSelected?"var(--accent)":"var(--border)"}`,background:isSelected?"rgba(99,102,241,0.1)":"var(--bg-overlay)",cursor:"pointer",marginBottom:8}}>
+                  <div style={{width:14,height:14,borderRadius:"50%",border:`2px solid ${isSelected?"var(--accent)":"var(--border)"}`,background:isSelected?"var(--accent)":"transparent",flexShrink:0}}/>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontWeight:700,fontSize:12,display:"flex",alignItems:"center",gap:6}}>
+                      {sp.handle||sp.name}
+                      {isSuggest && <span style={{fontSize:9,background:"#10b981",color:"#fff",padding:"1px 5px",borderRadius:4}}>suggéré</span>}
+                    </div>
+                    <div style={{fontSize:10,color:"var(--text-secondary)"}}>
+                      {sp.tg_user_id && `TG: ${sp.tg_user_id} · `}{sp.first_name||''}{sp.city?` · ${sp.city}`:''}
+                    </div>
+                  </div>
+                  <span style={{fontSize:11,fontWeight:700,color:txCounts[sp.id]>0?"var(--accent)":"var(--text-quaternary)",background:"var(--surface)",padding:"2px 7px",borderRadius:6,flexShrink:0}}>
+                    💳 {txCounts[sp.id]??'…'}
+                  </span>
+                </div>
+              );
+            })}
+            <div style={{fontSize:10,color:"var(--warning)",background:"var(--warning-muted)",borderRadius:6,padding:"7px 10px",margin:"10px 0",lineHeight:1.5}}>
+              ⚠️ {fr?"Irréversible. Toutes les FK (transactions, model_spenders, spender_badges, tg_conversations…) seront repointed vers KEEP. Les fiches DROP sont supprimées.":"Irreversible. All FKs repointed to KEEP. DROP records deleted."}
             </div>
             <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
-              <button onClick={()=>setMergeModal(null)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:13,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
-              <button onClick={handleMerge} disabled={!masterId||reassignLoading} style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:(!masterId||reassignLoading)?0.5:1}}>
-                {reassignLoading?"...":(fr?"✅ Fusionner":"✅ Merge")}
+              <button onClick={() => setMergeModal(null)} style={{padding:"8px 14px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text)",fontSize:12,cursor:"pointer"}}>{fr?"Annuler":"Cancel"}</button>
+              <button onClick={handleMerge} disabled={!masterId||reassignLoading}
+                style={{padding:"8px 16px",borderRadius:8,background:"var(--danger)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:(!masterId||reassignLoading)?0.5:1}}>
+                {reassignLoading?"⏳ …":(fr?"✅ Fusionner":"✅ Merge")}
               </button>
             </div>
           </div>
