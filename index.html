@@ -2058,6 +2058,10 @@
     .table tr:hover { background: var(--table-row-hover); }
     .table tr.pending-row { background: var(--warning-muted); }
     .table tr.pending-row:hover { background: rgba(251,191,36,0.1); }
+    /* ── Optimistic update: transition sur ligne TX ── */
+    .table tr.tx-row { transition: background .2s ease, opacity .15s ease; }
+    .table tr.tx-row.status-changing { opacity: 0.6; }
+    .table tr.tx-row .tx-status-badge { transition: all .2s ease; }
     .progress {
       width: 100%; height: 4px;
       background: var(--bg-overlay);
@@ -6142,6 +6146,84 @@ const useDebounce = (value, delay = DEBOUNCE_DELAY) => {
 };
 
 // =============================================
+// OPTIMISTIC UPDATE — useTransactionActions
+// =============================================
+const useTransactionActions = ({ txs, setTxs, setTxSummary, setSrvData, srvData, onNotify, addToast, currencySymbol, models, profiles, lang, t, convertAmount }) => {
+  const [processingIds, setProcessingIds] = useState(() => new Set());
+  const applyOptimistic = (txId, newStatus) => {
+    const updater = (prev) => (prev || []).map(tx => tx.id === txId ? { ...tx, status: newStatus } : tx);
+    if (setSrvData && srvData) setSrvData(updater);
+    if (setTxs) setTxs(updater);
+    if (setTxSummary) setTxSummary(updater);
+  };
+  const rollback = (txId, oldStatus) => {
+    const updater = (prev) => (prev || []).map(tx => tx.id === txId ? { ...tx, status: oldStatus } : tx);
+    if (setSrvData && srvData) setSrvData(updater);
+    if (setTxs) setTxs(updater);
+    if (setTxSummary) setTxSummary(updater);
+  };
+  const validate = async (txId) => {
+    if (processingIds.has(txId)) return;
+    setProcessingIds(prev => new Set([...prev, txId]));
+    const currentTx = (txs || []).find(tx => tx.id === txId);
+    const displayTxs = srvData || txs;
+    const tx = (displayTxs || []).find(t => t.id === txId) || currentTx;
+    if (tx && tx.status !== "pending") {
+      addToast(t(lang, "tx_immutable"), "error");
+      setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+      return;
+    }
+    const oldStatus = (tx || currentTx)?.status || "pending";
+    const txAmount = convertAmount ? convertAmount(Number((tx || currentTx)?.amount || 0), (tx || currentTx)?.currency) : Number((tx || currentTx)?.amount || 0);
+    applyOptimistic(txId, "validated");
+    const updateRow = { status: "validated", validated_at: new Date().toISOString() };
+    const { error } = await sb.from("transactions").update(updateRow).eq("id", txId);
+    setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+    if (error) {
+      rollback(txId, oldStatus);
+      addToast("Erreur: " + error.message, "error");
+      return;
+    }
+    if (onNotify && (tx || currentTx)) {
+      const cur = currencySymbol || " CHF";
+      const mName = (models || []).find(m => m.id === (tx || currentTx).model_id)?.name || "";
+      if ((tx || currentTx).chatter_id) onNotify((tx || currentTx).chatter_id, "tx_validated", "TX validée ✅", `${(tx || currentTx).amount}${cur} de @${(tx || currentTx).spender_handle}`, txId);
+      (profiles || []).filter(p => p.role === "gerant").forEach(g => onNotify(g.id, "tx_validated", "TX validée", `${(tx || currentTx).amount}${cur}${mName ? " #" + mName : ""}`, txId));
+    }
+    addToast(t(lang, "tx_validated") || "Validée ✓", "success");
+  };
+  const refuse = async (txId) => {
+    if (processingIds.has(txId)) return;
+    setProcessingIds(prev => new Set([...prev, txId]));
+    const currentTx = (txs || []).find(tx => tx.id === txId);
+    const displayTxs = srvData || txs;
+    const tx = (displayTxs || []).find(t => t.id === txId) || currentTx;
+    if (tx && tx.status !== "pending") {
+      addToast(t(lang, "tx_immutable"), "error");
+      setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+      return;
+    }
+    const oldStatus = (tx || currentTx)?.status || "pending";
+    applyOptimistic(txId, "refused");
+    const { error } = await sb.from("transactions").update({ status: "refused" }).eq("id", txId);
+    setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+    if (error) {
+      rollback(txId, oldStatus);
+      addToast("Erreur: " + error.message, "error");
+      return;
+    }
+    if (onNotify && (tx || currentTx)) {
+      const cur = currencySymbol || " CHF";
+      const mName = (models || []).find(m => m.id === (tx || currentTx).model_id)?.name || "";
+      if ((tx || currentTx).chatter_id) onNotify((tx || currentTx).chatter_id, "tx_refused", "TX refusée ❌", `${(tx || currentTx).amount}${cur} de @${(tx || currentTx).spender_handle}`, txId);
+      (profiles || []).filter(p => p.role === "gerant").forEach(g => onNotify(g.id, "tx_refused", "TX refusée", `${(tx || currentTx).amount}${cur}${mName ? " #" + mName : ""}`, txId));
+    }
+    addToast(t(lang, "tx_refused") || "Refusée", "error");
+  };
+  return { validate, refuse, processingIds };
+};
+
+// =============================================
 // GAMIFICATION: BADGES
 // =============================================
 const getChatterBadges = (txs, chatterId) => {
@@ -8343,7 +8425,7 @@ const EXPENSE_CATS = [
   {id:"autre",label:"Autre",icon:"📦"},
 ];
 
-const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, expenseCategories, onRefresh, onNotify, providerPaymentMethods, modelTasks, contentList, checklistTemplates, checklistInstances, products, productTags, modelPrices, piRefreshKey}) => {
+const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, expenseCategories, onRefresh, onNotify, providerPaymentMethods, modelTasks, contentList, checklistTemplates, checklistInstances, products, productTags, modelPrices, piRefreshKey, setTxSummary}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const cardModal = useCardModal();
@@ -8360,7 +8442,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const [newModelName,    setNewModelName]    = useState("");
   const [newModelSaving,  setNewModelSaving]  = useState(false);
   const [editingTx,     setEditingTx]     = useState(null);
-  const [processingTxId,setProcessingTxId]= useState(null);
+  const [processingIds, setProcessingIds] = useState(() => new Set());
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [showExpenseForm,setShowExpenseForm]=useState(false);
   const [expForm, setExpForm] = useState({model_id:"",amount:"",currency:"CHF",category:"",description:"",date:new Date().toISOString().slice(0,10)});
@@ -8539,29 +8621,33 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const avgConvRate  = agencyStats.length>0 ? Math.round(agencyStats.reduce((s,m)=>s+m.convRate,0)/agencyStats.length) : 0;
   const topCA        = Math.max(...modelStats.map(m=>m.ca), 1);
 
-  // ── handlers ──
+  // ── handlers (optimistic update) ──
   const handleStatus = async (txId, newStatus) => {
-    if (processingTxId) return;
-    setProcessingTxId(txId);
+    if (processingIds.has(txId)) return;
     const currentTx = txs.find(tx => tx.id === txId);
-    if (currentTx && currentTx.status !== "pending") { addToast(t(lang,"tx_immutable"),"error"); setProcessingTxId(null); return; }
-    try {
-      const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
-      if (error) { addToast("Erreur: "+error.message,"error"); setProcessingTxId(null); return; }
-      if (onNotify && currentTx) {
-        const cur = currencySymbol; const mName = models.find(m=>m.id===currentTx.model_id)?.name||"";
-        if (newStatus==="validated") {
-          if (currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_validated","TX validée ✅",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
-          profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,"tx_validated","TX validée",`${currentTx.amount}${cur}${mName?" #"+mName:""}`,txId));
-        } else {
-          if (currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_refused","TX refusée ❌",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
-          profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,"tx_refused","TX refusée",`${currentTx.amount}${cur}${mName?" #"+mName:""}`,txId));
-        }
+    if (currentTx && currentTx.status !== "pending") { addToast(t(lang,"tx_immutable"),"error"); return; }
+    const oldStatus = currentTx?.status || "pending";
+    setProcessingIds(prev => new Set([...prev, txId]));
+    if (setTxSummary) setTxSummary(prev => (prev || []).map(tx => tx.id === txId ? { ...tx, status: newStatus } : tx));
+    const updateRow = newStatus === "validated" ? { status: "validated", validated_at: new Date().toISOString() } : { status: "refused" };
+    const {error} = await sb.from("transactions").update(updateRow).eq("id",txId);
+    setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+    if (error) {
+      if (setTxSummary) setTxSummary(prev => (prev || []).map(tx => tx.id === txId ? { ...tx, status: oldStatus } : tx));
+      addToast("Erreur: "+error.message,"error");
+      return;
+    }
+    if (onNotify && currentTx) {
+      const cur = currencySymbol; const mName = models.find(m=>m.id===currentTx.model_id)?.name||"";
+      if (newStatus==="validated") {
+        if (currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_validated","TX validée ✅",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
+        profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,"tx_validated","TX validée",`${currentTx.amount}${cur}${mName?" #"+mName:""}`,txId));
+      } else {
+        if (currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_refused","TX refusée ❌",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
+        profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,"tx_refused","TX refusée",`${currentTx.amount}${cur}${mName?" #"+mName:""}`,txId));
       }
-      await onRefresh();
-      addToast(newStatus==="validated"?t(lang,"tx_validated"):t(lang,"tx_refused"), newStatus==="validated"?"success":"error");
-    } catch(e) { addToast("Erreur: "+e.message,"error"); }
-    setProcessingTxId(null);
+    }
+    addToast(newStatus==="validated"?t(lang,"tx_validated"):t(lang,"tx_refused"), newStatus==="validated"?"success":"error");
   };
 
   const handleEditSave = async (updates) => {
@@ -9127,7 +9213,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
 const UnifiedSpenderModal = React.memo(({
   open, spenderId, spenderObj, onClose, user, lang, models, profiles,
   dbSpenders, txs, onRefresh, onNotify, products, productTags,
-  providerPaymentMethods, readOnly, chatterMode
+  providerPaymentMethods, readOnly, chatterMode, setTxSummary
 }) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
@@ -9143,7 +9229,7 @@ const UnifiedSpenderModal = React.memo(({
   const [spenderJustUpdated, setSpenderJustUpdated] = React.useState(false);
   const [editingTx, setEditingTx] = React.useState(null);
   const [spSaving, setSpSaving] = React.useState(false);
-  const [processingTxId, setProcessingTxId] = React.useState(null);
+  const [processingIds, setProcessingIds] = React.useState(() => new Set());
   const [confirmRefuse, setConfirmRefuse] = React.useState(null);
   const [deleteConfirm, setDeleteConfirm] = React.useState(null);
   const [deleteConfirmTxAction, setDeleteConfirmTxAction] = React.useState("keep");
@@ -9371,19 +9457,36 @@ const UnifiedSpenderModal = React.memo(({
     } catch (e) { addToast("Erreur: " + e.message, "error"); setDeleteLoading(false); }
   };
 
-  // ── TX status change ──
+  // ── TX status change (optimistic update) ──
   const handleSpStatus = async (txId, newStatus) => {
-    if (processingTxId) return;
-    setProcessingTxId(txId);
-    try {
-      const currentTx = (selected?.txs || []).find(tx => tx.id === txId);
-      if (currentTx && currentTx.status !== "pending") { addToast(t(lang, "tx_immutable"), "error"); setProcessingTxId(null); return; }
-      const { error } = await sb.from("transactions").update({ status: newStatus }).eq("id", txId);
-      if (error) { addToast("Erreur: " + error.message, "error"); setProcessingTxId(null); return; }
-      if (onRefresh) await onRefresh();
-      addToast(newStatus === "validated" ? (t(lang, "tx_validated")) : (t(lang, "tx_refused")), newStatus === "validated" ? "success" : "error");
-    } catch (e) { addToast("Erreur: " + e.message, "error"); }
-    setProcessingTxId(null);
+    if (processingIds.has(txId)) return;
+    const currentTx = (selected?.txs || []).find(tx => tx.id === txId);
+    if (currentTx && currentTx.status !== "pending") { addToast(t(lang, "tx_immutable"), "error"); return; }
+    const oldStatus = currentTx?.status || "pending";
+    setProcessingIds(prev => new Set([...prev, txId]));
+    setSelected(prev => prev ? { ...prev, txs: (prev.txs || []).map(tx => tx.id === txId ? { ...tx, status: newStatus } : tx) } : prev);
+    if (setTxSummary) setTxSummary(prev => (prev || []).map(tx => tx.id === txId ? { ...tx, status: newStatus } : tx));
+    const updateRow = newStatus === "validated" ? { status: "validated", validated_at: new Date().toISOString() } : { status: "refused" };
+    const { error } = await sb.from("transactions").update(updateRow).eq("id", txId);
+    setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+    if (error) {
+      setSelected(prev => prev ? { ...prev, txs: (prev.txs || []).map(tx => tx.id === txId ? { ...tx, status: oldStatus } : tx) } : prev);
+      if (setTxSummary) setTxSummary(prev => (prev || []).map(tx => tx.id === txId ? { ...tx, status: oldStatus } : tx));
+      addToast("Erreur: " + error.message, "error");
+      return;
+    }
+    if (onNotify && currentTx) {
+      const cur = currencySymbol || " CHF";
+      const mName = (models || []).find(m => m.id === currentTx.model_id)?.name || "";
+      if (newStatus === "validated") {
+        if (currentTx.chatter_id) onNotify(currentTx.chatter_id, "tx_validated", "TX validée ✅", `${currentTx.amount}${cur} de @${currentTx.spender_handle}`, txId);
+        (profiles || []).filter(p => p.role === "gerant").forEach(g => onNotify(g.id, "tx_validated", "TX validée", `${currentTx.amount}${cur}${mName ? " #" + mName : ""}`, txId));
+      } else {
+        if (currentTx.chatter_id) onNotify(currentTx.chatter_id, "tx_refused", "TX refusée ❌", `${currentTx.amount}${cur} de @${currentTx.spender_handle}`, txId);
+        (profiles || []).filter(p => p.role === "gerant").forEach(g => onNotify(g.id, "tx_refused", "TX refusée", `${currentTx.amount}${cur}${mName ? " #" + mName : ""}`, txId));
+      }
+    }
+    addToast(newStatus === "validated" ? (t(lang, "tx_validated")) : (t(lang, "tx_refused")), newStatus === "validated" ? "success" : "error");
   };
 
   // ── TX edit/create within modal ──
@@ -9688,7 +9791,7 @@ const UnifiedSpenderModal = React.memo(({
                           const provName=(profiles||[]).find(p=>p.id===tx.provider_id)?.name||"\u2014";
                           const canEditTx=tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id));
                           return (
-                            <tr key={tx.id||idx}>
+                            <tr key={tx.id||idx} className={`tx-row ${processingIds.has(tx.id)?"status-changing":""}`}>
                               <td style={{fontFamily:"monospace",fontSize:11,whiteSpace:"nowrap",color:"var(--text-secondary)"}}>{fmtDate(tx.date)}</td>
                               <td style={{fontWeight:800,color:"var(--success)"}}>{fmtAmount(tx.amount,tx.currency)}</td>
                               <td style={{fontSize:11}}>{tx.product||tx.tag||"\u2014"}</td>
@@ -9699,7 +9802,7 @@ const UnifiedSpenderModal = React.memo(({
                                 <td style={{whiteSpace:"nowrap"}}>
                                   {canEditTx&&<button className="btn-edit" style={{marginRight:4}} onClick={()=>setEditingTx(tx)}>{"\u270F\uFE0F"}</button>}
                                   {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
-                                    <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>handleSpStatus(tx.id,"validated")} disabled={!!processingTxId}>{processingTxId===tx.id?React.createElement(Spinner,{size:12}):"\u2713"}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>setConfirmRefuse(tx)} disabled={!!processingTxId}>{processingTxId===tx.id?React.createElement(Spinner,{size:12}):"\u2715"}</button></>
+                                    <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>!processingIds.has(tx.id)&&handleSpStatus(tx.id,"validated")} disabled={processingIds.has(tx.id)}>{processingIds.has(tx.id)?React.createElement(Spinner,{size:12}):"\u2713"}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>!processingIds.has(tx.id)&&setConfirmRefuse(tx)} disabled={processingIds.has(tx.id)}>{processingIds.has(tx.id)?React.createElement(Spinner,{size:12}):"\u2715"}</button></>
                                   )}
                                 </td>
                               )}
@@ -9754,7 +9857,7 @@ const UnifiedSpenderModal = React.memo(({
 // =============================================
 // TRANSACTIONS TAB
 // =============================================
-const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, models, profiles, dbSpenders, onRefresh, onNotify, products, productTags, modelPrices, providerPaymentMethods, navigateToSpender}) => {
+const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, models, profiles, dbSpenders, onRefresh, onNotify, products, productTags, modelPrices, providerPaymentMethods, navigateToSpender, setTxs, setTxSummary}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol, exchangeRate } = useCurrency();
   const timezone = useTimezone();
@@ -9765,9 +9868,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
   const [txProvider, setTxProvider] = useState("");
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState({spender_handle:"",telegram_id:"",amount:"",currency:"CHF",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",product_id:"",product_tag_id:"",notes:"",payment_method:"",product_contents:[]});
+  const [form, setForm] = useState({spender_handle:"",telegram_id:"",amount:"",currency:"CHF",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"",product_id":"",product_tag_id:"",notes:"",payment_method:"",product_contents:[]});
   const [editingTx, setEditingTx] = useState(null);
-  const [processingTxId, setProcessingTxId] = useState(null);
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [txCardFilter, setTxCardFilter] = useState(null);
   const [txChartMetric, setTxChartMetric] = useState("ca");
@@ -9794,6 +9896,10 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
   const srvTotalPages = Math.max(1, Math.ceil(srvTotal / TX_PAGE_SIZE));
   useEffect(() => { if (initialTotal !== undefined) setSrvTotal(initialTotal); }, [initialTotal]);
   const displayTxs = srvData || txs;
+  const { validate, refuse, processingIds } = useTransactionActions({
+    txs, setTxs, setTxSummary, setSrvData, srvData, onNotify, addToast, currencySymbol, models, profiles, lang, t, convertAmount
+  });
+  const handleStatus = (txId, newStatus) => { if (newStatus === "validated") validate(txId); else refuse(txId); };
 
   const fetchTxPage = useCallback(async (p) => {
     setSrvLoading(true);
@@ -9940,36 +10046,6 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
       // handleCreate error
       addToast("Erreur: " + e.message, "error");
     }
-  };
-  const handleStatus = async (txId, newStatus) => {
-    if (processingTxId) return; // double-click guard
-    setProcessingTxId(txId);
-    try {
-      // Immutability guard: only pending transactions can change status
-      const currentTx = txs.find(tx => tx.id === txId);
-      if (currentTx && currentTx.status !== "pending") {
-        addToast(t(lang,"tx_immutable"), "error");
-        setProcessingTxId(null);
-        return;
-      }
-      const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
-      if(error) { addToast("Erreur: " + error.message, "error"); setProcessingTxId(null); return; }
-      // ── Notify on validate/refuse ──
-      if(onNotify&&currentTx) {
-        const cur = currencySymbol;
-        const modelName = models.find(m=>m.id===currentTx.model_id)?.name||"";
-        if(newStatus==="validated") {
-          if(currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_validated","TX validée ✅",`${currentTx.amount}${cur} de @${currentTx.spender_handle} — commission ${(currentTx.chatter_commission||0).toFixed(0)}${cur}`,txId);
-          profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,"tx_validated","TX validée",`${currentTx.amount}${cur} @${currentTx.spender_handle}${modelName?" #"+modelName:""}`,txId));
-        } else {
-          if(currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_refused","TX refusée ❌",`${currentTx.amount}${cur} de @${currentTx.spender_handle} — motif à vérifier`,txId);
-          profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,"tx_refused","TX refusée",`${currentTx.amount}${cur} @${currentTx.spender_handle}${modelName?" #"+modelName:""}`,txId));
-        }
-      }
-      await onRefresh();
-      addToast(newStatus==="validated"?(t(lang,"tx_validated")||"Validée ✓"):(t(lang,"tx_refused")||"Refusée"), newStatus==="validated"?"success":"error");
-    } catch(e) { /* TX status update failed */ addToast("Erreur: " + e.message, "error"); }
-    setProcessingTxId(null);
   };
   const handleEditSave = async (updates) => {
     if (!editingTx || editingTx.status !== "pending") {
@@ -10270,7 +10346,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                 const provName = profiles.find(u=>u.id===tx.provider_id)?.name||"?";
                 const canEdit = tx.status === "pending" && (user.role === "gerant" || user.role === "chatter" || (user.role === "provider" && tx.provider_id === user.id));
                 return (
-                  <tr key={tx.id} className={tx.status==="pending"?"pending-row":""}>
+                  <tr key={tx.id} className={`tx-row ${tx.status==="pending"?"pending-row":""} ${processingIds.has(tx.id)?"status-changing":""}`}>
                     <td style={{fontFamily:"monospace",fontSize:12,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{formatTxDateTime(tx.date, timezone)}</td>
                     {user.role!=="provider"&&<td>{(()=>{
                       const rh=tx.spender_handle||"";
@@ -10320,8 +10396,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                         {canEdit&&<button className="ui-btn-ghost" style={{marginRight:4,padding:"4px 8px"}} onClick={()=>setEditingTx(tx)}>✏️</button>}
                         {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
                           <>
-                            <button style={{background:"transparent",border:"none",fontSize:16,cursor:"pointer",padding:"4px 6px",borderRadius:6,marginRight:2,opacity:processingTxId?0.5:1}} onClick={()=>handleStatus(tx.id,"validated")} disabled={!!processingTxId} title={t(lang,"validate")||"Valider"} onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,0.06)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>{processingTxId===tx.id?<Spinner/>:"✅"}</button>
-                            <button style={{background:"transparent",border:"none",fontSize:16,cursor:"pointer",padding:"4px 6px",borderRadius:6,opacity:processingTxId?0.5:1}} onClick={()=>setConfirmRefuse(tx)} disabled={!!processingTxId} title={t(lang,"refuse")||"Refuser"} onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,0.06)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>{processingTxId===tx.id?<Spinner/>:"❌"}</button>
+                            <button style={{background:"transparent",border:"none",fontSize:16,cursor:processingIds.has(tx.id)?"not-allowed":"pointer",padding:"4px 6px",borderRadius:6,marginRight:2,opacity:processingIds.has(tx.id)?0.5:1}} onClick={()=>!processingIds.has(tx.id)&&handleStatus(tx.id,"validated")} disabled={processingIds.has(tx.id)} title={t(lang,"validate")||"Valider"} onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,0.06)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>{processingIds.has(tx.id)?<Spinner/>:"✅"}</button>
+                            <button style={{background:"transparent",border:"none",fontSize:16,cursor:processingIds.has(tx.id)?"not-allowed":"pointer",padding:"4px 6px",borderRadius:6,opacity:processingIds.has(tx.id)?0.5:1}} onClick={()=>!processingIds.has(tx.id)&&setConfirmRefuse(tx)} disabled={processingIds.has(tx.id)} title={t(lang,"refuse")||"Refuser"} onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,0.06)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>{processingIds.has(tx.id)?<Spinner/>:"❌"}</button>
                           </>
                         )}
                       </td>
@@ -10347,6 +10423,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
         providerPaymentMethods={providerPaymentMethods}
         readOnly={user.role!=="gerant"&&user.role!=="chatter"}
         chatterMode={user.role==="chatter"}
+        setTxSummary={setTxSummary}
       />
     </div>
   );
@@ -10359,7 +10436,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
 // 1) login gérant -> ouvrir Spenders (pas de crash)
 // 2) click spender row (pas de crash)
 // 3) login chatter -> ouvrir Spenders (toujours OK)
-const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, selectedSpenderKey, setSelectedSpenderKey, onRefresh, onNotify, providerPaymentMethods, readOnly, chatterMode, products, productTags}) => {
+const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, selectedSpenderKey, setSelectedSpenderKey, onRefresh, onNotify, providerPaymentMethods, readOnly, chatterMode, products, productTags, setTxSummary}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
@@ -10402,7 +10479,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [detailTab, setDetailTab] = useState("models");
   const [editingTx, setEditingTx] = useState(null);
   const [spSaving, setSpSaving] = useState(false);
-  const [processingTxId, setProcessingTxId] = useState(null);
+  const [processingIds, setProcessingIds] = useState(() => new Set());
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [spModalTab, setSpModalTab] = useState("profil");
   const [spEditMode, setSpEditMode] = useState(false);
@@ -10712,28 +10789,29 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   }, [spenders, dbSpenders, openSpenderModal, openSpenderById, onRefresh, addToast]);
 
   const handleSpStatus = async (txId, newStatus) => {
-    if (processingTxId) return;
-    setProcessingTxId(txId);
-    try {
-      const currentTx = txs.find(tx=>tx.id===txId);
-      // Immutability guard: only pending transactions can change status
-      if (currentTx && currentTx.status !== "pending") {
-        addToast(t(lang,"tx_immutable"), "error");
-        setProcessingTxId(null);
-        return;
-      }
-      const {error} = await sb.from("transactions").update({status:newStatus}).eq("id",txId);
-      if(error) { addToast("Erreur: " + error.message, "error"); setProcessingTxId(null); return; }
-      if(onNotify&&currentTx) {
-        const cur=currencySymbol;
-        if(newStatus==="validated"&&currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_validated","TX validée ✅",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
-        if(newStatus==="refused"&&currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_refused","TX refusée ❌",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
-        profiles.filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,newStatus==="validated"?"tx_validated":"tx_refused",newStatus==="validated"?"TX validée":"TX refusée",`${currentTx.amount}${cur} @${currentTx.spender_handle}`,txId));
-      }
-      await onRefresh();
-      addToast(newStatus==="validated"?(t(lang,"tx_validated")):(t(lang,"tx_refused")), newStatus==="validated"?"success":"error");
-    } catch(e) { /* Spender TX status update failed */ addToast("Erreur: " + e.message, "error"); }
-    setProcessingTxId(null);
+    if (processingIds.has(txId)) return;
+    const currentTx = (selected?.txs || txs || []).find(tx=>tx.id===txId);
+    if (currentTx && currentTx.status !== "pending") { addToast(t(lang,"tx_immutable"), "error"); return; }
+    const oldStatus = currentTx?.status || "pending";
+    setProcessingIds(prev => new Set([...prev, txId]));
+    setSelected(prev => prev ? { ...prev, txs: (prev.txs || []).map(tx => tx.id === txId ? { ...tx, status: newStatus } : tx) } : prev);
+    if (setTxSummary) setTxSummary(prev => (prev || []).map(tx => tx.id === txId ? { ...tx, status: newStatus } : tx));
+    const updateRow = newStatus === "validated" ? { status: "validated", validated_at: new Date().toISOString() } : { status: "refused" };
+    const {error} = await sb.from("transactions").update(updateRow).eq("id",txId);
+    setProcessingIds(prev => { const n = new Set(prev); n.delete(txId); return n; });
+    if(error) {
+      setSelected(prev => prev ? { ...prev, txs: (prev.txs || []).map(tx => tx.id === txId ? { ...tx, status: oldStatus } : tx) } : prev);
+      if (setTxSummary) setTxSummary(prev => (prev || []).map(tx => tx.id === txId ? { ...tx, status: oldStatus } : tx));
+      addToast("Erreur: " + error.message, "error");
+      return;
+    }
+    if(onNotify&&currentTx) {
+      const cur=currencySymbol;
+      if(newStatus==="validated"&&currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_validated","TX validée ✅",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
+      if(newStatus==="refused"&&currentTx.chatter_id) onNotify(currentTx.chatter_id,"tx_refused","TX refusée ❌",`${currentTx.amount}${cur} de @${currentTx.spender_handle}`,txId);
+      (profiles||[]).filter(p=>p.role==="gerant").forEach(g=>onNotify(g.id,newStatus==="validated"?"tx_validated":"tx_refused",newStatus==="validated"?"TX validée":"TX refusée",`${currentTx.amount}${cur} @${currentTx.spender_handle}`,txId));
+    }
+    addToast(newStatus==="validated"?(t(lang,"tx_validated")):(t(lang,"tx_refused")), newStatus==="validated"?"success":"error");
   };
   const handleSpEditSave = async (updates) => {
     if (!editingTx) { return; }
@@ -11800,7 +11878,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                               const mName=models.find(m=>m.id===tx.model_id)?.name||"—";
                               const canEdit=tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id));
                               return (
-                                <tr key={tx.id||idx}>
+                                <tr key={tx.id||idx} className={`tx-row ${processingIds.has(tx.id)?"status-changing":""}`}>
                                   <td style={{fontFamily:"monospace",fontSize:11,whiteSpace:"nowrap",color:"var(--text-secondary)"}}>{fmtDate(tx.date)}</td>
                                   <td><Tag type="model" label={mName} id={tx.model_id}/></td>
                                   <td style={{fontSize:11}}>{tx.product||tx.tag||"—"}</td>
@@ -11810,7 +11888,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
                                     <td style={{whiteSpace:"nowrap"}}>
                                       {canEdit&&<button className="btn-edit" style={{marginRight:4}} onClick={()=>setEditingTx(tx)}>✏️</button>}
                                       {tx.status==="pending"&&(user.role==="gerant"||(user.role==="provider"&&tx.provider_id===user.id))&&(
-                                        <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>handleSpStatus(tx.id,"validated")} disabled={!!processingTxId}>{processingTxId===tx.id?<Spinner size={12}/>:"✓"}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>setConfirmRefuse(tx)} disabled={!!processingTxId}>{processingTxId===tx.id?<Spinner size={12}/>:"✕"}</button></>
+                                        <><button className="btn btn-success btn-small" style={{fontSize:9}} onClick={()=>!processingIds.has(tx.id)&&handleSpStatus(tx.id,"validated")} disabled={processingIds.has(tx.id)}>{processingIds.has(tx.id)?<Spinner size={12}/>:"✓"}</button>{" "}<button className="btn btn-danger btn-small" style={{fontSize:9}} onClick={()=>!processingIds.has(tx.id)&&setConfirmRefuse(tx)} disabled={processingIds.has(tx.id)}>{processingIds.has(tx.id)?<Spinner size={12}/>:"✕"}</button></>
                                       )}
                                     </td>
                                   )}
@@ -11988,6 +12066,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
         products={products} productTags={productTags}
         providerPaymentMethods={providerPaymentMethods}
         readOnly={readOnly} chatterMode={chatterMode}
+        setTxSummary={setTxSummary}
       />
     </div>
   );
@@ -21635,7 +21714,7 @@ const ChatterDashboardTab = ({user, lang, txs, spenders, models, profiles}) => {
 // =============================================
 // CHATTER ROLE — TRANSACTIONS (EC4)
 // =============================================
-const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, profiles, onRefresh, onNotify, providerPaymentMethods}) => {
+const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, profiles, onRefresh, onNotify, providerPaymentMethods, setTxSummary}) => {
   const addToast = useToast();
   const { fmtAmount, currencySymbol, exchangeRate } = useCurrency();
   const viewerTz = useTimezone();
@@ -22093,6 +22172,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
         providerPaymentMethods={providerPaymentMethods||[]}
         readOnly={false}
         chatterMode={true}
+        setTxSummary={setTxSummary}
       />
     </div>
   );
@@ -22101,7 +22181,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
 // =============================================
 // CHATTER ROLE — SPENDERS (wrapper → SpendersTab readOnly)
 // =============================================
-const ChatterSpendersTab = ({user, lang, spenders, txs, models, profiles, selectedSpenderKey, setSelectedSpenderKey, onRefresh, onNotify, providerPaymentMethods, products, productTags}) => {
+const ChatterSpendersTab = ({user, lang, spenders, txs, models, profiles, selectedSpenderKey, setSelectedSpenderKey, onRefresh, onNotify, providerPaymentMethods, products, productTags, setTxSummary}) => {
   const myTxs = React.useMemo(() => (txs || []).filter(tx => tx.chatter_id === user?.id), [txs, user?.id]);
   return React.createElement(SpendersTab, {
     user, lang, txs: myTxs, models, profiles: profiles || [], dbSpenders: spenders || [],
@@ -22109,7 +22189,7 @@ const ChatterSpendersTab = ({user, lang, spenders, txs, models, profiles, select
     onRefresh: onRefresh || (() => {}), onNotify: onNotify || (() => {}),
     providerPaymentMethods: providerPaymentMethods || [],
     products: products || [], productTags: productTags || [],
-    readOnly: false, chatterMode: true
+    readOnly: false, chatterMode: true, setTxSummary
   });
 };
 
@@ -36054,13 +36134,13 @@ const App = () => {
         // Redirect legacy business/catalogue → equipe/catalogue
         if (subTab === "catalogue") { navigateTo("equipe", "catalogue"); return null; }
         return (<>{renderGerantTabBar("business")}
-          {subTab==="transactions"&&<TransactionsTab user={user} lang={lang} txs={txs} txTotal={txTotal} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} />}
-          {subTab==="spenders"&&<ErrorBoundary name="SpenderPage"><SpendersTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} /></ErrorBoundary>}
+          {subTab==="transactions"&&<TransactionsTab user={user} lang={lang} txs={txs} txTotal={txTotal} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} />}
+          {subTab==="spenders"&&<ErrorBoundary name="SpenderPage"><SpendersTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} dbSpenders={spenders} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setTxSummary={setTxSummary} /></ErrorBoundary>}
         </>);
       case "equipe":
         return (<>{renderGerantTabBar("equipe")}
           {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txSummary} profiles={profiles} models={models} chatterLogs={chatterLogs} onRefresh={onRefresh} piRefreshKey={piRefreshKey} />}
-          {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} expenses={expenses} expenseCategories={expenseCategories} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} piRefreshKey={piRefreshKey} />}
+          {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} expenses={expenses} expenseCategories={expenseCategories} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} piRefreshKey={piRefreshKey} setTxSummary={setTxSummary} />}
           {subTab==="providers"&&<PrestatairesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} />}
           {subTab==="catalogue"&&<ProductCatalogTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} onRefresh={onRefresh} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} onNotify={createNotification} />}
         </>);
@@ -36626,8 +36706,8 @@ const App = () => {
           )}
           {/* ── Chatter-only pages — UNCHANGED ── */}
           {tab==="chatter_dashboard"&&user.role==="chatter"&&<ErrorBoundary name="ChatterPage"><ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} /></ErrorBoundary>}
-          {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} />}
-          {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} products={products} productTags={productTags} />}
+          {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setTxSummary={setTxSummary} />}
+          {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} products={products} productTags={productTags} setTxSummary={setTxSummary} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
             <div className="page-tabs-bar" style={{overflowX:"auto",flexWrap:"nowrap",scrollbarWidth:"none",paddingBottom:2}}>
               {[["telegram","✈️ Telegram"],["telegram_beta","Telegram BETA"],["whatsapp","WhatsApp"],["escalades","💥 " + (lang==="fr"?"Escalades":"Escalations")]].map(([id,lbl])=>(
@@ -36651,7 +36731,7 @@ const App = () => {
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
           {(tab==="provider_dashboard"||!["transactions","provider_compta","provider_notif"].includes(tab))&&user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
-          {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} />}
+          {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} />}
           {tab==="provider_compta"&&user.role==="provider"&&(<>
             <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
             <div style={{marginTop:24}}>
