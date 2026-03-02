@@ -17469,6 +17469,232 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
 // =============================================
 // PROVIDER COMPTA TAB — Full Provider Dashboard
 // =============================================
+// =============================================
+// PROVIDER DASHBOARD — Dashboard temps réel provider
+// Données déjà isolées (txSummary filtré par provider_id au chargement)
+// =============================================
+const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh, navigateTo }) => {
+  const { convertAmount, fmtAmount } = useCurrency();
+  const fr = lang === 'fr';
+  const [period, setPeriod] = useState('30j');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+
+  const { dateDebut, dateFin } = useMemo(() => {
+    if (period === 'custom' && customStart && customEnd) {
+      return { dateDebut: new Date(customStart + 'T00:00:00'), dateFin: new Date(customEnd + 'T23:59:59') };
+    }
+    const now = new Date();
+    const days = period === '24h' ? 1 : period === '7j' ? 7 : period === '30j' ? 30 : period === '90j' ? 90 : 0;
+    if (days === 0) return { dateDebut: new Date(0), dateFin: now };
+    return { dateDebut: new Date(now.getTime() - days * 86400000), dateFin: now };
+  }, [period, customStart, customEnd]);
+
+  const filteredTxs = useMemo(() => {
+    return (txs || []).filter(tx => {
+      const d = new Date(tx.date || tx.created_at);
+      return d >= dateDebut && d <= dateFin;
+    });
+  }, [txs, dateDebut, dateFin]);
+
+  const isVal = s => s === 'validated' || s === 'confirmee' || s === 'payee';
+  const validTxs   = filteredTxs.filter(tx => isVal(tx.status));
+  const pendingTxs = filteredTxs.filter(tx => tx.status === 'pending');
+  const totalCA      = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+  const totalPending = pendingTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+  const panierMoyen  = validTxs.length > 0 ? totalCA / validTxs.length : 0;
+  const tauxValid    = (validTxs.length + pendingTxs.length) > 0 ? Math.round(validTxs.length / (validTxs.length + pendingTxs.length) * 100) : 0;
+
+  // Solde provider (all-time pour refléter la vraie dette)
+  const allValidTxs = (txs || []).filter(tx => isVal(tx.status));
+  const caAllTime   = allValidTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+  const myPayouts   = (ppData || []).filter(p => p.provider_id === user.id || p.declared_by === user.id);
+  const totalPaid   = myPayouts.filter(p => p.status === 'validated').reduce((s, p) => s + Number(p.amount || 0), 0);
+  const soldeData   = { solde: -(caAllTime - totalPaid), caEncaisse: caAllTime, dejaReversi: totalPaid };
+
+  // Chart CA par jour
+  const chartData = useMemo(() => {
+    const byDay = {};
+    filteredTxs.forEach(tx => {
+      const key = (tx.date || tx.created_at || '').slice(0, 10);
+      if (!key || key.length < 10) return;
+      if (!byDay[key]) byDay[key] = { ca: 0, tx: 0, pending: 0 };
+      const amt = convertAmount(Number(tx.amount || 0), tx.currency);
+      if (isVal(tx.status)) { byDay[key].ca += amt; byDay[key].tx++; }
+      if (tx.status === 'pending') byDay[key].pending += amt;
+    });
+    return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
+      label: new Date(date + 'T12:00:00').toLocaleDateString('fr-CH', { day: '2-digit', month: 'short' }),
+      ca: Math.round(d.ca), tx: d.tx, pending: Math.round(d.pending),
+    }));
+  }, [filteredTxs, convertAmount]);
+
+  // Top modèles sur la période
+  const modelStats = useMemo(() => {
+    const byModel = {};
+    validTxs.forEach(tx => {
+      if (!tx.model_id) return;
+      if (!byModel[tx.model_id]) byModel[tx.model_id] = { ca: 0, count: 0 };
+      byModel[tx.model_id].ca += convertAmount(Number(tx.amount || 0), tx.currency);
+      byModel[tx.model_id].count++;
+    });
+    return Object.entries(byModel)
+      .map(([id, d]) => ({ id, ...d, model: (models || []).find(m => m.id === id) }))
+      .sort((a, b) => b.ca - a.ca).slice(0, 6);
+  }, [validTxs, models, convertAmount]);
+
+  // TX récentes (toutes périodes confondues, triées par date)
+  const recentTxs = useMemo(() => {
+    return [...(txs || [])].sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at)).slice(0, 12);
+  }, [txs]);
+
+  const { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
+  const PERIODS = [{ id: '24h', l: '24h' }, { id: '7j', l: '7j' }, { id: '30j', l: '30j' }, { id: '90j', l: '90j' }, { id: 'all', l: 'All time' }];
+
+  return (
+    <div style={{ padding: _isMobile ? '0 12px' : 0 }}>
+      {/* Filtre période */}
+      <div className="toolbar" style={{ marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
+        <div className="period-filters">
+          {PERIODS.map(p => (
+            <div key={p.id} className={`filter-pill${period === p.id ? ' active' : ''}`}
+              onClick={() => { setPeriod(p.id); setCustomStart(''); setCustomEnd(''); }}>{p.l}</div>
+          ))}
+        </div>
+        <div className="filter-sep"/>
+        <DateRangePicker
+          startDate={customStart} endDate={customEnd}
+          onChange={({ start, end }) => { setCustomStart(start || ''); setCustomEnd(end || ''); if (start && end) setPeriod('custom'); }}
+          placeholder={fr ? 'Période perso' : 'Custom range'}
+        />
+      </div>
+
+      {/* KPI strip */}
+      <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-6'} style={{ marginBottom: 18 }}>
+        <div className="kpi-card green">
+          <div className="kpi-card-label">CA BRUT</div>
+          <div className="kpi-card-value green">{fmtAmount(totalCA)}</div>
+          <div className="kpi-card-delta up">↑ {validTxs.length} TX validées</div>
+        </div>
+        <div className="kpi-card amber">
+          <div className="kpi-card-label">CA EN ATTENTE</div>
+          <div className="kpi-card-value amber">{fmtAmount(totalPending)}</div>
+          <div className={`kpi-card-delta ${pendingTxs.length > 0 ? 'warn' : 'up'}`}>{pendingTxs.length} TX pending</div>
+        </div>
+        <div className="kpi-card indigo">
+          <div className="kpi-card-label">TOTAL TX</div>
+          <div className="kpi-card-value indigo">{filteredTxs.length}</div>
+          <div className="kpi-card-hint">sur la période</div>
+        </div>
+        <div className="kpi-card white">
+          <div className="kpi-card-label">PANIER MOYEN</div>
+          <div className="kpi-card-value white">{fmtAmount(panierMoyen)}</div>
+          <div className="kpi-card-hint">par TX validée</div>
+        </div>
+        <div className={`kpi-card ${tauxValid >= 80 ? 'green' : tauxValid >= 50 ? 'amber' : 'red'}`}>
+          <div className="kpi-card-label">TAUX VALID.</div>
+          <div className={`kpi-card-value ${tauxValid >= 80 ? 'green' : tauxValid >= 50 ? 'amber' : 'red'}`}>{tauxValid}%</div>
+          <div className="kpi-card-hint">des transactions</div>
+        </div>
+        <SoldeWidget role="provider" soldeData={soldeData} onClickDetails={() => navigateTo && navigateTo('provider_compta')} />
+      </div>
+
+      {/* Chart */}
+      {chartData.length > 0 && (
+        <div className="ui-panel" style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 14 }}>
+            📈 {fr ? 'Évolution du CA' : 'Revenue trend'}
+            <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--muted)', marginLeft: 8 }}>{chartData.length} {fr ? 'jours' : 'days'}</span>
+          </div>
+          <ResponsiveContainer width="100%" height={160}>
+            <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="prov-grad-ca" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#6366f1" stopOpacity={0.25}/>
+                  <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false}/>
+              <XAxis dataKey="label" tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+              <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false} width={48}/>
+              <Tooltip contentStyle={{ background: '#0b1020', border: '1px solid rgba(99,102,241,0.2)', borderRadius: 10, fontSize: 12 }}
+                formatter={(v, n) => [`${Math.round(v).toLocaleString()} CHF`, n === 'ca' ? 'CA validé' : 'En attente']}/>
+              <Area type="monotone" dataKey="ca" stroke="#6366f1" strokeWidth={2} fill="url(#prov-grad-ca)" name="ca"/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      {/* Bottom grid: Top modèles + TX récentes */}
+      <div style={{ display: 'grid', gridTemplateColumns: _isMobile ? '1fr' : '1fr 1fr', gap: 16, marginBottom: 16 }}>
+        {/* Top modèles */}
+        <div className="ui-panel">
+          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 14 }}>🔥 {fr ? 'Mes modèles' : 'My models'}</div>
+          {modelStats.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>{fr ? 'Aucune donnée sur cette période' : 'No data for this period'}</div>
+          ) : (
+            <div>
+              {modelStats.map((ms, i) => {
+                const pct = totalCA > 0 ? (ms.ca / totalCA) * 100 : 0;
+                const initials = (ms.model?.name || ms.id || '?')[0].toUpperCase();
+                return (
+                  <div key={ms.id} style={{ marginBottom: i < modelStats.length - 1 ? 10 : 0 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div style={{ width: 26, height: 26, borderRadius: 7, background: 'var(--accent-muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 800, color: 'var(--accent)', flexShrink: 0 }}>{initials}</div>
+                        <div>
+                          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{ms.model?.name || ms.id.slice(0, 8)}</div>
+                          <div style={{ fontSize: 10, color: 'var(--muted)' }}>{ms.count} TX · {Math.round(pct)}%</div>
+                        </div>
+                      </div>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: '#10b981' }}>{fmtAmount(ms.ca)}</div>
+                    </div>
+                    <div style={{ height: 3, background: 'var(--border)', borderRadius: 2 }}>
+                      <div style={{ height: '100%', width: `${Math.round(pct)}%`, background: 'var(--accent)', borderRadius: 2, transition: 'width .4s' }}/>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* TX récentes */}
+        <div className="ui-panel">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>💳 {fr ? 'TX récentes' : 'Recent TX'}</div>
+            <button onClick={() => navigateTo && navigateTo('transactions')} style={{ fontSize: 11, fontWeight: 600, color: 'var(--accent)', background: 'var(--accent-muted)', border: 'none', borderRadius: 8, padding: '4px 10px', cursor: 'pointer' }}>
+              {fr ? 'Voir tout →' : 'See all →'}
+            </button>
+          </div>
+          <div>
+            {recentTxs.map((tx, i) => {
+              const v = isVal(tx.status), pend = tx.status === 'pending';
+              const clr = v ? '#10b981' : pend ? '#f59e0b' : '#ef4444';
+              const ico = v ? '✅' : pend ? '⏳' : '❌';
+              const m = (models || []).find(mo => mo.id === tx.model_id);
+              return (
+                <div key={tx.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: i < recentTxs.length - 1 ? '1px solid var(--border)' : 'none' }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      @{tx.spender_handle || '?'}{m ? ` · ${m.name}` : ''}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.date || tx.created_at || '').slice(0, 10)}</div>
+                  </div>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: clr, flexShrink: 0, marginLeft: 8 }}>{ico} {fmtAmount(convertAmount(Number(tx.amount || 0), tx.currency))}</div>
+                </div>
+              );
+            })}
+            {recentTxs.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>{fr ? 'Aucune transaction' : 'No transactions yet'}</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, onRefresh, onNotify, invoices, providerPaymentMethods}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
@@ -36162,7 +36388,7 @@ const App = () => {
               console.debug("[DADASH EC2] Chatter sans assignation — source: profiles.assigned_models");
             }
             setUser(fullUser);
-            if(fullUser.role === "provider") setTab("transactions");
+            if(fullUser.role === "provider") setTab("provider_dashboard");
             if(fullUser.role === "modele") setTab("model_checklist");
             await loadData(fullUser);
           }
@@ -36181,7 +36407,7 @@ const App = () => {
               if (profile) {
                 const fullUser = {...profile, email:session.user.email};
                 setUser(fullUser);
-                if(fullUser.role === "provider") setTab("transactions");
+                if(fullUser.role === "provider") setTab("provider_dashboard");
                 if(fullUser.role === "modele") setTab("model_checklist");
                 await loadData(fullUser);
               }
@@ -36391,7 +36617,7 @@ const App = () => {
   /* DB FIX — handleLogin with error resilience */
   const handleLogin = async (u) => {
     setUser(u);
-    if(u.role === "provider") setTab("transactions");
+    if(u.role === "provider") setTab("provider_dashboard");
     if(u.role === "modele") setTab("model_checklist");
     if(u.role === "chatter") setTab("chatter_dashboard");
     setLoading(true);
@@ -37271,7 +37497,8 @@ const App = () => {
           {tab==="chatter_competition"&&user.role==="chatter"&&<ChatterCompetitionTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} />}
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Provider pages ── */}
-          {(tab==="provider_dashboard"||!["transactions","provider_compta","provider_notif"].includes(tab))&&user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
+          {tab==="provider_dashboard"&&user.role==="provider"&&<ProviderDashboardTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} navigateTo={(t)=>setTab(t)} />}
+          {(!["provider_dashboard","transactions","provider_compta","provider_notif"].includes(tab))&&user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} />}
           {tab==="provider_compta"&&user.role==="provider"&&(<>
             <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
