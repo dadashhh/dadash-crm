@@ -14514,6 +14514,12 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
   }, []);
   React.useEffect(() => { refreshPI(); }, [refreshPI, piRefreshKey]);
 
+  // Expose refreshPI globally pour le realtime paiements_internes
+  React.useEffect(() => {
+    window.__refreshPI = refreshPI;
+    return () => { if (window.__refreshPI === refreshPI) window.__refreshPI = null; };
+  }, [refreshPI]);
+
   // ── pre-fill form when modal opens ──
   React.useEffect(() => {
     if (modalChatter) {
@@ -14559,6 +14565,7 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
       addToast("Paiement envoyé ✓","success");
       setPiForm({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
       await refreshPI();
+      setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 400);
     } catch(e) { addToast("Erreur: "+e.message,"error"); }
     setPiSaving(false);
   };
@@ -14572,6 +14579,18 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
       const { error } = await sb.from("paiements_internes").update({statut:"validated",validated_at:new Date().toISOString(),facture_numero:facNum,facture_generated:true}).eq("id",piId);
       if (error) throw error;
       addToast("Validé ✓ — "+facNum,"success");
+      // Notifier le chatter que son paiement est validé et la facture générée
+      try {
+        const pi = paiementsPI.find(p => p.id === piId);
+        if (pi?.destinataire_id) {
+          await sb.from("notifications").insert({
+            user_id: pi.destinataire_id, type: "payment_pi_validated",
+            title: `💰 Paiement validé — ${facNum}`,
+            message: `Votre ${pi.type||"paiement"} de ${pi.montant||0} ${pi.devise||"CHF"} a été validé. Facture : ${facNum}`,
+            read: false,
+          });
+        }
+      } catch(_) {}
       await refreshPI();
       setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 400);
     } catch(e) { addToast("Erreur: "+e.message,"error"); }
@@ -17691,6 +17710,40 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
           </div>
         </div>
       </div>
+
+      {/* Mes déclarations de paiement — trace complète */}
+      {(()=>{
+        const myPayouts = (ppData||[]).filter(p=>p.provider_id===user.id||p.declared_by===user.id)
+          .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).slice(0,10);
+        const STATUS_C = {pending:{bg:'rgba(245,158,11,0.12)',c:'#f59e0b',lbl:'⏳ En attente'},validated:{bg:'rgba(16,185,129,0.1)',c:'#10b981',lbl:'✅ Validé'},rejected:{bg:'rgba(239,68,68,0.1)',c:'#ef4444',lbl:'❌ Refusé'}};
+        return (
+          <div className="ui-panel" style={{marginTop:16}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+              <div style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>💳 {fr?'Mes déclarations de paiement':'My payment declarations'}</div>
+              <button onClick={()=>navigateTo&&navigateTo('provider_compta')} style={{fontSize:11,fontWeight:600,color:'var(--accent)',background:'var(--accent-muted)',border:'none',borderRadius:8,padding:'4px 10px',cursor:'pointer'}}>
+                {myPayouts.length>0?(fr?'Tout voir →':'See all →'):(fr?'+ Déclarer':'+ Declare')}
+              </button>
+            </div>
+            {myPayouts.length===0&&<div style={{textAlign:'center',padding:'18px 0',color:'var(--muted)',fontSize:12}}>{fr?'Aucune déclaration. Allez dans "Mes Paiements" pour déclarer un versement.':'No declarations yet. Go to "My Payments" to declare a transfer.'}</div>}
+            {myPayouts.map((p,i)=>{
+              const st=STATUS_C[p.status]||STATUS_C.pending;
+              return (
+                <div key={p.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:i<myPayouts.length-1?'1px solid var(--border)':'none'}}>
+                  <div>
+                    <div style={{fontSize:12,fontWeight:600,color:'var(--text)'}}>
+                      {Number(p.amount||0).toLocaleString()} {p.currency||'CHF'} — {p.payment_method||'virement'}
+                    </div>
+                    <div style={{fontSize:10,color:'var(--muted)'}}>{(p.period_from||'').slice(0,10)} → {(p.period_to||'').slice(0,10)} · {(p.created_at||'').slice(0,10)}</div>
+                    {p.reference&&<div style={{fontSize:10,color:'var(--muted)'}}>Réf: {p.reference}</div>}
+                    {p.notes&&p.status==='rejected'&&<div style={{fontSize:10,color:'#ef4444',marginTop:2}}>⚠️ {p.notes}</div>}
+                  </div>
+                  <span style={{background:st.bg,color:st.c,padding:'3px 10px',borderRadius:8,fontSize:11,fontWeight:700,flexShrink:0,marginLeft:8}}>{st.lbl}</span>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
     </div>
   );
 };
@@ -17739,12 +17792,12 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
       // Notify gérant
       const gerants = profiles.filter(p=>p.role==="gerant");
       for(const g of gerants){
-        if(onNotify) await onNotify(g.id,"payment","\u{1F4B3} Paiement déclaré",`${user.name} a déclaré un paiement de ${form.amount}${form.currency==="EUR"?"€":"CHF"}`);
+        if(onNotify) await onNotify(g.id,"payment","\u{1F4B3} Paiement provider déclaré",`${user.name||user.email} a déclaré un reversement de ${form.amount}${form.currency==="EUR"?"€":"CHF"} (${form.payment_method||"virement"}). Période: ${form.period_from} → ${form.period_to}. À valider dans Providers.`);
       }
       setForm({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
       setShowForm(false);
+      addToast(fr?"Paiement déclaré ✓ — En attente de validation":"Payment declared ✓ — Awaiting validation","success");
       if(onRefresh) await onRefresh();
-      addToast(fr?"Paiement déclaré ✓":"Payment declared ✓","success");
     } catch(e){ /* Provider payment declaration failed */ addToast("Erreur: "+e.message,"error");}
     setSaving(false);
   };
@@ -26157,6 +26210,17 @@ const PaiementsPI_Receiver = ({user, lang, profiles}) => {
 
   useEffect(() => { if (destinataireId) fetchPaiements(); }, [fetchPaiements]);
 
+  // Subscription realtime locale — rafraîchit la liste dès qu'un paiement change
+  useEffect(() => {
+    if (!destinataireId) return;
+    const chan = sb.channel('pi-recv-' + user.id + '-' + destinataireId)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'paiements_internes',
+        filter: `destinataire_id=eq.${destinataireId}` },
+        () => { fetchPaiements(); })
+      .subscribe();
+    return () => { sb.removeChannel(chan); };
+  }, [destinataireId, fetchPaiements]);
+
   const pending   = paiements.filter(p=>p.statut==="pending");
   const history   = paiements.filter(p=>p.statut!=="pending");
   const totalPend = pending.reduce((s,p)=>s+(p.montant||0),0);
@@ -26176,6 +26240,20 @@ const PaiementsPI_Receiver = ({user, lang, profiles}) => {
       if (error) throw error;
       addToast("✅ Paiement validé — "+facNum,"success");
       await fetchPaiements();
+      // Notifier le gérant que la réception est confirmée
+      try {
+        const pi = paiements.find(p => p.id === piId);
+        if (pi?.createur_id) {
+          await sb.from("notifications").insert({
+            user_id: pi.createur_id, type: "payment_pi_confirmed",
+            title: `✅ Paiement confirmé — ${facNum}`,
+            message: `${user.name||user.email} a confirmé la réception de ${pi.montant||0} ${pi.devise||"CHF"}`,
+            read: false,
+          });
+        }
+      } catch(_) {}
+      // Rafraîchir le solde dû
+      setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 300);
     } catch(e) { addToast("Erreur: "+e.message,"error"); }
     setSaving(false);
   };
@@ -26191,6 +26269,18 @@ const PaiementsPI_Receiver = ({user, lang, profiles}) => {
       }).eq("id",contestId);
       if (error) throw error;
       addToast("⚠️ Contestation envoyée","success");
+      // Notifier le gérant de la contestation
+      try {
+        const pi = paiements.find(p => p.id === contestId);
+        if (pi?.createur_id) {
+          await sb.from("notifications").insert({
+            user_id: pi.createur_id, type: "payment_pi_contested",
+            title: `⚠️ Paiement contesté`,
+            message: `${user.name||user.email} a contesté un paiement de ${pi.montant||0} ${pi.devise||"CHF"} : ${contestMsg.trim().slice(0,80)}`,
+            read: false,
+          });
+        }
+      } catch(_) {}
       setContestId(null); setContestMsg("");
       await fetchPaiements();
     } catch(e) { addToast("Erreur: "+e.message,"error"); }
@@ -36518,9 +36608,24 @@ const App = () => {
         // Refresh solde widget on any TX status change
         if (payload.new?.status !== payload.old?.status) setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 600);
       })
-      // Paiements internes changes → refresh solde widget
-      .on("postgres_changes", { event: "*", schema: "public", table: "paiements_internes" }, () => {
-        setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 600);
+      // Paiements internes changes → refresh solde + listes paiements
+      .on("postgres_changes", { event: "*", schema: "public", table: "paiements_internes" }, (payload) => {
+        setTimeout(() => {
+          try { if (window.__refreshSolde) window.__refreshSolde(); } catch {}
+          try { if (window.__refreshPI) window.__refreshPI(); } catch {}
+        }, 400);
+      })
+      // Provider payouts changes → update state directement (pas besoin de recharger tout loadData)
+      .on("postgres_changes", { event: "*", schema: "public", table: "provider_payouts" }, (payload) => {
+        const ev = payload.eventType || payload.type;
+        if (ev === "INSERT" && payload.new) {
+          setProviderPayouts(prev => prev.some(p => p.id === payload.new.id) ? prev : [payload.new, ...prev]);
+        } else if (ev === "UPDATE" && payload.new) {
+          setProviderPayouts(prev => prev.map(p => p.id === payload.new.id ? payload.new : p));
+        } else if (ev === "DELETE" && payload.old) {
+          setProviderPayouts(prev => prev.filter(p => p.id !== payload.old.id));
+        }
+        setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 400);
       })
       // Listen for new screenshot checks
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "screenshot_checks" }, (payload) => {
