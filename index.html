@@ -8436,6 +8436,20 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
         statut:"pending",
       });
       if (error) throw error;
+      // Notifier le profil modèle (cherche par rôle + nom)
+      try {
+        const modelProf = (profiles||[]).find(p=>p.role==="modele"&&p.name?.toLowerCase()===selM.name?.toLowerCase());
+        if (modelProf) {
+          const amt = `${parseFloat(piFormM.montant)||0} CHF`;
+          await sb.from("notifications").insert({
+            user_id: modelProf.id,
+            type: "payment_pi_pending",
+            title: `💸 Nouveau paiement — ${amt}`,
+            message: `${user.name||"Le gérant"} vous a envoyé ${amt}. Confirmez la réception dans votre espace Compta.`,
+            read: false,
+          });
+        }
+      } catch(_) {}
       addToast("Paiement envoyé ✓","success");
       setPiFormM({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
       await refreshPIM();
@@ -14003,6 +14017,17 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
         statut:"pending",
       });
       if (error) throw error;
+      // Notifier le chatter destinataire
+      try {
+        const amt = `${parseFloat(piForm.montant)||0} CHF`;
+        await sb.from("notifications").insert({
+          user_id: selCh.id,
+          type: "payment_pi_pending",
+          title: `💸 Nouveau paiement — ${amt}`,
+          message: `${user.name||"Le gérant"} vous a envoyé ${amt}. Allez dans "Ma Commission" pour valider ou contester.`,
+          read: false,
+        });
+      } catch(_) {}
       addToast("Paiement envoyé ✓","success");
       setPiForm({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
       await refreshPI();
@@ -15259,16 +15284,42 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
     try {
       const dest = profiles.find(p=>p.id===createForm.destinataire_id);
       const sd = createForm.destinataire_type==="chatter" ? soldesC[createForm.destinataire_id] : soldesM[createForm.destinataire_id];
+      const destName = dest?.name||"";
       await sb.from("paiements_internes").insert({
         createur_role:"gerant", createur_id:user.id, createur_name:user.name||user.email,
         destinataire_type:createForm.destinataire_type, destinataire_id:createForm.destinataire_id,
-        destinataire_name:dest?.name||"",
+        destinataire_name:destName,
         type:createForm.type, montant:parseFloat(createForm.montant)||0, devise:"CHF",
         periode_debut:createForm.periode_debut||null, periode_fin:createForm.periode_fin||null,
         note:createForm.note,
         calcul_detail:{solde_du:sd?.solde_du||0,ca_genere:sd?.ca_genere||0},
         statut:"pending",
       });
+      // Notifier le destinataire
+      try {
+        const amt = `${parseFloat(createForm.montant)||0} CHF`;
+        const gerantName = user.name||user.email||"Le gérant";
+        if (createForm.destinataire_type==="chatter") {
+          await sb.from("notifications").insert({
+            user_id: createForm.destinataire_id,
+            type: "payment_pi_pending",
+            title: `💸 Nouveau paiement — ${amt}`,
+            message: `${gerantName} vous a envoyé ${amt}. Allez dans "Ma Commission" pour valider ou contester.`,
+            read: false,
+          });
+        } else if (createForm.destinataire_type==="modele") {
+          const modeleProfile = (profiles||[]).find(p=>p.role==="modele"&&p.name?.toLowerCase()===destName?.toLowerCase());
+          if (modeleProfile) {
+            await sb.from("notifications").insert({
+              user_id: modeleProfile.id,
+              type: "payment_pi_pending",
+              title: `💸 Nouveau paiement — ${amt}`,
+              message: `${gerantName} vous a envoyé ${amt}. Allez dans votre espace Compta pour valider ou contester.`,
+              read: false,
+            });
+          }
+        }
+      } catch(_) {}
       addToast("Paiement créé ✓","success");
       setShowCreate(false);
       setCreateForm({destinataire_id:"",destinataire_type:"chatter",type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
@@ -25248,6 +25299,173 @@ const MessagerieGerantAdminPanel = ({user, lang, profiles, models, botStats, spe
 };
 
 // =============================================
+// PAIEMENTS_INTERNES RECEIVER — vue chatter/modele des paiements en attente
+// (Valider / Contester la réception d'un paiement envoyé par le gérant)
+// =============================================
+const PaiementsPI_Receiver = ({user, lang, profiles}) => {
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const [paiements,  setPaiements]  = useState([]);
+  const [loading,    setLoading]    = useState(true);
+  const [saving,     setSaving]     = useState(false);
+  const [contestId,  setContestId]  = useState(null);
+  const [contestMsg, setContestMsg] = useState("");
+  const [modelId,    setModelId]    = useState(null);
+
+  const isModele = user.role === "modele";
+
+  /* Pour les modèles : résoudre leur models.id via leur nom de profil */
+  useEffect(() => {
+    if (!isModele) return;
+    sb.from("models").select("id").ilike("name", user.name||"").maybeSingle()
+      .then(({data}) => { if (data?.id) setModelId(data.id); else setLoading(false); });
+  }, []);
+
+  const destinataireId = isModele ? modelId : user.id;
+  const destinataireType = isModele ? "modele" : "chatter";
+
+  const fetchPaiements = React.useCallback(async () => {
+    if (!destinataireId) { setLoading(false); return; }
+    try {
+      const { data } = await sb.from("paiements_internes")
+        .select("*")
+        .eq("destinataire_type", destinataireType)
+        .eq("destinataire_id",   destinataireId)
+        .order("created_at", {ascending:false});
+      setPaiements(data||[]);
+    } catch(_) {}
+    setLoading(false);
+  }, [destinataireId, destinataireType]);
+
+  useEffect(() => { if (destinataireId) fetchPaiements(); }, [fetchPaiements]);
+
+  const pending   = paiements.filter(p=>p.statut==="pending");
+  const history   = paiements.filter(p=>p.statut!=="pending");
+  const totalPend = pending.reduce((s,p)=>s+(p.montant||0),0);
+  const totalVal  = paiements.filter(p=>p.statut==="validated").reduce((s,p)=>s+(p.montant||0),0);
+
+  const handleValidate = async (piId) => {
+    setSaving(true);
+    try {
+      const yr = new Date().getFullYear();
+      const {data:ex} = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
+      const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
+      const {error} = await sb.from("paiements_internes").update({
+        statut:"validated", validated_at:new Date().toISOString(),
+        facture_numero:facNum, facture_generated:true
+      }).eq("id",piId);
+      if (error) throw error;
+      addToast("✅ Paiement validé — "+facNum,"success");
+      await fetchPaiements();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setSaving(false);
+  };
+
+  const handleContest = async () => {
+    if (!contestId) return;
+    if (!contestMsg.trim()) return addToast("Message de contestation requis","error");
+    setSaving(true);
+    try {
+      const {error} = await sb.from("paiements_internes").update({
+        statut:"contested", contested_at:new Date().toISOString(),
+        contestation_message: contestMsg.trim()
+      }).eq("id",contestId);
+      if (error) throw error;
+      addToast("⚠️ Contestation envoyée","success");
+      setContestId(null); setContestMsg("");
+      await fetchPaiements();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setSaving(false);
+  };
+
+  const PI_STATUS = {
+    pending:   {label:"⏳ En attente", color:"var(--warning)"},
+    validated: {label:"✅ Validé",     color:"var(--success)"},
+    contested: {label:"⚠️ Contesté",  color:"var(--danger)"},
+    cancelled: {label:"❌ Annulé",    color:"var(--muted)"},
+  };
+  const TYPE_LABEL = {commission:"Commission",bonus:"Bonus",remboursement:"Remboursement",autre:"Autre"};
+
+  const renderCard = (pi) => (
+    <div key={pi.id} style={{background:"var(--surface2)",border:`1px solid ${PI_STATUS[pi.statut]?.color||"var(--border)"}33`,borderRadius:12,padding:"14px 16px",marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
+        <div style={{minWidth:0}}>
+          <div style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>
+            {TYPE_LABEL[pi.type]||pi.type} — <span style={{color:"var(--accent)"}}>{(pi.montant||0).toLocaleString()} {pi.devise||"CHF"}</span>
+          </div>
+          {(pi.periode_debut||pi.periode_fin)&&<div style={{fontSize:11,color:"var(--text-secondary)",marginTop:2}}>Période : {pi.periode_debut||"?"} → {pi.periode_fin||"?"}</div>}
+          {pi.note&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,fontStyle:"italic"}}>{pi.note}</div>}
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:4}}>
+            {pi.createur_name||"Gérant"} · {new Date(pi.created_at).toLocaleDateString("fr-CH")}
+            {pi.facture_numero&&<span style={{marginLeft:6,fontWeight:700,color:"var(--accent)"}}>{pi.facture_numero}</span>}
+          </div>
+        </div>
+        <span style={{flexShrink:0,fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:8,background:(PI_STATUS[pi.statut]?.color||"var(--border)")+"22",color:PI_STATUS[pi.statut]?.color||"var(--text-secondary)"}}>
+          {PI_STATUS[pi.statut]?.label||pi.statut}
+        </span>
+      </div>
+      {pi.statut==="pending"&&(
+        contestId===pi.id ? (
+          <div style={{marginTop:10}}>
+            <textarea value={contestMsg} onChange={e=>setContestMsg(e.target.value)}
+              placeholder="Expliquez votre contestation..."
+              style={{width:"100%",padding:"8px 10px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,resize:"vertical",minHeight:64,boxSizing:"border-box"}}/>
+            <div style={{display:"flex",gap:8,marginTop:8}}>
+              <button onClick={handleContest} disabled={saving} style={{flex:1,padding:"8px",borderRadius:8,border:"none",background:"var(--danger)",color:"#fff",fontWeight:700,fontSize:12,cursor:"pointer"}}>⚠️ Confirmer</button>
+              <button onClick={()=>{setContestId(null);setContestMsg("");}} style={{padding:"8px 14px",borderRadius:8,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:12,cursor:"pointer"}}>Annuler</button>
+            </div>
+          </div>
+        ) : (
+          <div style={{display:"flex",gap:8,marginTop:10}}>
+            <button onClick={()=>handleValidate(pi.id)} disabled={saving} style={{flex:2,padding:"9px",borderRadius:8,border:"none",background:"var(--success)",color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer"}}>✅ Valider la réception</button>
+            <button onClick={()=>{setContestId(pi.id);setContestMsg("");}} style={{flex:1,padding:"9px",borderRadius:8,border:"1px solid rgba(239,68,68,0.4)",background:"rgba(239,68,68,0.1)",color:"var(--danger)",fontWeight:700,fontSize:13,cursor:"pointer"}}>⚠️ Contester</button>
+          </div>
+        )
+      )}
+    </div>
+  );
+
+  if (loading || paiements.length===0) return null;
+
+  return (
+    <div style={{marginTop:24}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <h3 style={{fontSize:16,fontWeight:800,color:"var(--text)",margin:0}}>
+          💸 Paiements du gérant
+          {pending.length>0&&<span style={{marginLeft:8,background:"var(--warning)",color:"#000",borderRadius:20,padding:"2px 8px",fontSize:11,fontWeight:800}}>{pending.length} en attente</span>}
+        </h3>
+        <button onClick={fetchPaiements} style={{background:"none",border:"1px solid var(--border)",borderRadius:8,padding:"4px 12px",fontSize:11,color:"var(--text-secondary)",cursor:"pointer"}}>↺</button>
+      </div>
+      <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap"}}>
+        <div style={{minWidth:100,flex:1,background:"var(--surface2)",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(245,158,11,0.3)"}}>
+          <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:2}}>EN ATTENTE</div>
+          <div style={{fontSize:20,fontWeight:800,color:"var(--warning)"}}>{pending.length}</div>
+          <div style={{fontSize:11,color:"var(--text-secondary)"}}>{Math.round(totalPend).toLocaleString()} CHF</div>
+        </div>
+        <div style={{minWidth:100,flex:1,background:"var(--surface2)",borderRadius:10,padding:"10px 14px",border:"1px solid rgba(16,185,129,0.3)"}}>
+          <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:2}}>VALIDÉS</div>
+          <div style={{fontSize:20,fontWeight:800,color:"var(--success)"}}>{paiements.filter(p=>p.statut==="validated").length}</div>
+          <div style={{fontSize:11,color:"var(--text-secondary)"}}>{Math.round(totalVal).toLocaleString()} CHF</div>
+        </div>
+      </div>
+      {pending.length>0&&(
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:11,fontWeight:700,color:"var(--warning)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:10}}>⏳ À confirmer ({pending.length})</div>
+          {pending.map(renderCard)}
+        </div>
+      )}
+      {history.length>0&&(
+        <details>
+          <summary style={{fontSize:12,color:"var(--text-secondary)",cursor:"pointer",padding:"6px 0",marginBottom:8,userSelect:"none"}}>📋 Historique ({history.length})</summary>
+          {history.map(renderCard)}
+        </details>
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // CHATTER ROLE — COMPTA (EC7) Fiche de paie + historique payouts
 // =============================================
 const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayouts, txs, models}) => {
@@ -26115,6 +26333,31 @@ const CreatePaymentModal = ({user, profiles, models, prefill, onClose, onSaved, 
     });
     setSaving(false);
     if (error) return addToast("Erreur: "+error.message,"error");
+    // Notifier le destinataire
+    try {
+      const amt = `${Number(montant)} ${devise}`;
+      const gerantName = user.name||user.email||"Le gérant";
+      if (destinataireType==="chatter") {
+        await sb.from("notifications").insert({
+          user_id: destinataireId,
+          type: "payment_pi_pending",
+          title: `💸 Nouveau paiement — ${amt}`,
+          message: `${gerantName} vous a envoyé ${amt}. Allez dans "Ma Commission" pour valider ou contester.`,
+          read: false,
+        });
+      } else if (destinataireType==="modele") {
+        const modeleProfile = (profiles||[]).find(p=>p.role==="modele"&&p.name?.toLowerCase()===destName?.toLowerCase());
+        if (modeleProfile) {
+          await sb.from("notifications").insert({
+            user_id: modeleProfile.id,
+            type: "payment_pi_pending",
+            title: `💸 Nouveau paiement — ${amt}`,
+            message: `${gerantName} vous a envoyé ${amt}. Allez dans votre espace Compta pour valider ou contester.`,
+            read: false,
+          });
+        }
+      }
+    } catch(_) {}
     addToast(`💸 Paiement envoyé à ${destName} — en attente de validation`,"success");
     onSaved();
   };
@@ -35242,7 +35485,7 @@ const App = () => {
       return { mode: "navigateTo", page: "business", sub: "spenders" };
     }
     // PAYMENT SYSTEM — payment/ledger/salary/bonus notifications navigate to the appropriate compta section
-    if (type.startsWith("payment") || type === "ledger" || type === "salary" || type === "bonus" || type === "adjustment" || type === "payment_pending" || type === "payment_confirmed" || type === "payment_rejected" || type === "payment_validated" || type === "payment_cancelled") {
+    if (type.startsWith("payment") || type === "ledger" || type === "salary" || type === "bonus" || type === "adjustment" || type === "payment_pending" || type === "payment_confirmed" || type === "payment_rejected" || type === "payment_validated" || type === "payment_cancelled" || type === "payment_pi_pending") {
       if (user && user.role === "chatter")  { return { mode: "setTab", tab: "chatter_compta" }; }
       if (user && user.role === "provider") { return { mode: "setTab", tab: "provider_compta" }; }
       if (user && user.role === "modele")   { return { mode: "setTab", tab: "model_compta" }; }
@@ -36398,6 +36641,7 @@ const App = () => {
           </>)}
           {tab==="chatter_compta"&&user.role==="chatter"&&(<>
             <ChatterComptaTab user={user} lang={lang} payslips={payslips} payouts={payouts} txs={txSummary} models={models} />
+            <PaiementsPI_Receiver user={user} lang={lang} profiles={profiles} />
             <div style={{marginTop:24}}>
               <ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />
             </div>
@@ -36416,7 +36660,12 @@ const App = () => {
           </>)}
           {tab==="provider_notif"&&user.role==="provider"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />}
           {tab==="model_notif"&&user.role==="modele"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />}
-          {tab==="model_compta"&&user.role==="modele"&&<ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />}
+          {tab==="model_compta"&&user.role==="modele"&&(<>
+            <PaiementsPI_Receiver user={user} lang={lang} profiles={profiles} />
+            <div style={{marginTop:24}}>
+              <ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />
+            </div>
+          </>)}
           </>)}
         </div>
       </div>
