@@ -10591,6 +10591,58 @@ const UnifiedSpenderModal = React.memo(({
     })();
   }, [open, spenderId, spenderObj?.dbId, spenderObj?.id]);
 
+  // ── Realtime: register modal spender ID + refetch callback ──
+  React.useEffect(() => {
+    if (!open) {
+      window.__openModalSpenderId = null;
+      window.__refetchModalSpender = null;
+      return;
+    }
+    const targetId = spenderId || (spenderObj?.dbId) || (spenderObj?.id) || null;
+    if (!targetId) return;
+    window.__openModalSpenderId = targetId;
+    window.__refetchModalSpender = async (id) => {
+      if (id !== targetId) return;
+      try {
+        const { data: uiData } = await sb.from("v_spenders_ui").select("*").eq("id", id).maybeSingle();
+        const freshRow = uiData ? mapUiToSpender(uiData) : null;
+        if (freshRow) {
+          const freshVM = buildSpenderVM(id) || spenderVM(freshRow);
+          setSelected(freshVM);
+          initForm(freshVM);
+          setSpenderJustUpdated(true);
+          setTimeout(() => setSpenderJustUpdated(false), 4000);
+          return;
+        }
+        const { data: raw } = await sb.from("spenders").select("*").eq("id", id).maybeSingle();
+        if (raw) {
+          const vm = buildSpenderVM(id) || spenderVM({ ...raw, dbId: id });
+          setSelected(vm);
+          initForm(vm);
+          setSpenderJustUpdated(true);
+          setTimeout(() => setSpenderJustUpdated(false), 4000);
+        }
+      } catch (e) { console.warn("[RT modal refetch]", e?.message); }
+    };
+    return () => { window.__openModalSpenderId = null; window.__refetchModalSpender = null; };
+  }, [open, spenderId, spenderObj?.dbId, spenderObj?.id]);
+
+  // ── Realtime: rebuild VM when dbSpenders or txs change while modal is open ──
+  const prevSpenderDataRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!open) return;
+    const targetId = spenderId || (spenderObj?.dbId) || (spenderObj?.id) || null;
+    if (!targetId) return;
+    // Only re-build if the specific spender row actually changed (avoid re-render on unrelated updates)
+    const currentRow = (Array.isArray(dbSpenders) ? dbSpenders : []).find(s => s.id === targetId);
+    if (!currentRow) return;
+    const rowKey = JSON.stringify({ id: currentRow.id, updated_at: currentRow.updated_at, txCount: (Array.isArray(txs) ? txs : []).filter(t => t.spender_id === targetId).length });
+    if (rowKey === prevSpenderDataRef.current) return;
+    prevSpenderDataRef.current = rowKey;
+    const vm = buildSpenderVM(targetId);
+    if (vm) { setSelected(vm); }
+  }, [open, dbSpenders, txs, spenderId, spenderObj?.dbId, spenderObj?.id, buildSpenderVM]);
+
   const initForm = (vm) => {
     if (!vm) return;
     setSpForm({
@@ -11988,7 +12040,9 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       const sel = selectedRef.current;
       const selTg = String((sel?.tg_user_id ?? sel?.telegramId) ?? "");
       const matches = (sel && spender_id && sel.dbId === spender_id) || (tg_user_id && selTg === String(tg_user_id));
-      if (!matches) { if (onRefreshRef.current) onRefreshRef.current(); return; }
+      // If the update is not for the currently selected spender, nothing to do —
+      // the realtime channel already patched setSpenders for all other components
+      if (!matches) return;
       try {
         let row = null;
         if (spender_id) {
@@ -12028,7 +12082,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
           setTimeout(() => setSpenderJustUpdated(false), 5000);
         }
       } catch (e) { console.warn("[REALTIME] profile_updated refetch:", e?.message || e); }
-      if (onRefreshRef.current) onRefreshRef.current();
+      // No need to call onRefresh() — realtime channel already patched setSpenders
     };
     return () => { delete window.__onSpenderUpdated; delete window.__onProfileUpdated; };
   }, []);
@@ -37910,6 +37964,41 @@ const App = () => {
   // ── SUPABASE REALTIME: Notifications + TX + Scans + Broadcasts ──
   useEffect(() => {
     if (!user) return;
+
+    // ── Throttle/dedup helpers ──
+    // _rtSeen: dedup set keyed by "<table>-<event>-<id>[-<updated_at>]"
+    if (!window.__rtSeen) window.__rtSeen = new Set();
+    // _rtThrottle: last-fire timestamp per entity key (max 1 patch per entity per 800ms)
+    if (!window.__rtThrottle) window.__rtThrottle = {};
+    const rtDedup = (key) => {
+      if (window.__rtSeen.has(key)) return true; // already seen
+      window.__rtSeen.add(key);
+      if (window.__rtSeen.size > 2000) window.__rtSeen.clear();
+      return false;
+    };
+    const rtThrottle = (key) => {
+      const now = Date.now();
+      if (now - (window.__rtThrottle[key] || 0) < 800) return true; // too soon
+      window.__rtThrottle[key] = now;
+      return false;
+    };
+
+    // Helper: targeted re-fetch of a single spender from the view + patch local state
+    const patchSpender = async (spenderId) => {
+      try {
+        const { data } = await sb.from("v_spenders_ui").select("*").eq("id", spenderId).maybeSingle();
+        const row = data ? mapUiToSpender(data) : null;
+        if (row) {
+          setSpenders(prev => prev.map(x => x.id === spenderId ? { ...x, ...row } : x));
+          return row;
+        }
+        // Fallback: use raw spenders table
+        const { data: raw } = await sb.from("spenders").select("*").eq("id", spenderId).maybeSingle();
+        if (raw) setSpenders(prev => prev.map(x => x.id === spenderId ? { ...x, ...raw } : x));
+        return raw;
+      } catch (e) { console.warn("[RT] patchSpender error:", e?.message); return null; }
+    };
+
     const channel = sb.channel("dadash-realtime-notifs-" + user.id)
       // Listen for new notifications inserted for this user
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications", filter: "user_id=eq." + user.id }, (payload) => {
@@ -37918,27 +38007,47 @@ const App = () => {
           setUnreadCount(prev => prev + 1);
         }
       })
-      // Listen for new transactions (auto-generate notification for gérant)
+      // ── Transactions INSERT: patch txs state + notification ──
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "transactions" }, (payload) => {
-        if (user.role === "gerant" && payload.new) {
-          const tx = payload.new;
+        if (!payload.new) return;
+        const tx = payload.new;
+        if (rtDedup("tx-ins-" + tx.id)) return;
+        // Update local txs state immediately (no full reload needed)
+        setTxs(prev => prev.some(x => x.id === tx.id) ? prev : [tx, ...prev].slice(0, 100));
+        setTxSummary(prev => prev.some(x => x.id === tx.id) ? prev : [tx, ...prev]);
+        setTxTotal(prev => prev + 1);
+        // If the currently open modal concerns this spender, trigger a targeted re-fetch
+        if (tx.spender_id && window.__openModalSpenderId === tx.spender_id && window.__refetchModalSpender) {
+          setTimeout(() => { try { window.__refetchModalSpender(tx.spender_id); } catch {} }, 350);
+        }
+        window.__rtLastEvent = Date.now();
+        if (user.role === "gerant") {
           const amt = convertAmount(Number(tx.amount), tx.currency);
           const notif = { id: "rt-tx-" + Date.now(), type: "tx_created", title: (lang === "fr" ? "Nouvelle TX" : "New TX") + " \u{1F4B0}", message: "@" + (tx.spender_handle || "?") + " — " + fmtAmount(amt), created_at: new Date().toISOString(), read: false, _local: true };
           setNotifications(prev => [notif, ...prev].slice(0, 50));
           setUnreadCount(prev => prev + 1);
         }
       })
-      // Listen for transaction status changes (validated/refused)
+      // ── Transactions UPDATE: patch txs state in-place + notification ──
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "transactions" }, (payload) => {
-        if (user.role === "gerant" && payload.new && payload.old && payload.new.status !== payload.old.status) {
-          const tx = payload.new;
+        if (!payload.new) return;
+        const tx = payload.new;
+        if (rtDedup("tx-upd-" + tx.id + "-" + (tx.updated_at || ""))) return;
+        // Patch in-place — no full reload
+        setTxs(prev => prev.map(x => x.id === tx.id ? { ...x, ...tx } : x));
+        setTxSummary(prev => prev.map(x => x.id === tx.id ? { ...x, ...tx } : x));
+        // If modal open for this spender, trigger targeted re-fetch
+        if (tx.spender_id && window.__openModalSpenderId === tx.spender_id && window.__refetchModalSpender) {
+          setTimeout(() => { try { window.__refetchModalSpender(tx.spender_id); } catch {} }, 350);
+        }
+        window.__rtLastEvent = Date.now();
+        if (user.role === "gerant" && payload.old && tx.status !== payload.old.status) {
           const amt = convertAmount(Number(tx.amount), tx.currency);
           const icon = tx.status === "validated" ? "✅" : tx.status === "refused" ? "❌" : "✏️";
           const notif = { id: "rt-txu-" + Date.now(), type: tx.status === "validated" ? "tx_validated" : "tx_modified", title: icon + " TX " + tx.status, message: "@" + (tx.spender_handle || "?") + " — " + fmtAmount(amt), created_at: new Date().toISOString(), read: false, _local: true };
           setNotifications(prev => [notif, ...prev].slice(0, 50));
           setUnreadCount(prev => prev + 1);
         }
-        // Refresh solde widget on any TX status change
         if (payload.new?.status !== payload.old?.status) setTimeout(() => { try { if (window.__refreshSolde) window.__refreshSolde(); } catch {} }, 600);
       })
       // Paiements internes changes → refresh solde + listes paiements
@@ -37983,13 +38092,12 @@ const App = () => {
         if (payload.new) {
           setPaymentEvents(prev => prev.map(e => e.id===payload.new.id ? payload.new : e));
           if (payload.new.status === "paid" && payload.old && payload.old.status !== "paid") {
-            // Trigger afterMutationRefresh to pick up new ledger_entries + notifications
             setTimeout(() => {
               sb.from("ledger_entries").select("*").order("created_at",{ascending:false}).limit(500)
                 .then(r => { if (!r.error) setLedgerEntries(r.data||[]); });
               sb.from("notifications").select("*").eq("user_id",user.id).order("created_at",{ascending:false}).limit(PAGE_SIZE)
                 .then(r => { if (!r.error) { setNotifications(r.data||[]); setUnreadCount((r.data||[]).filter(n=>!n.read).length); } });
-            }, 1200); // slight delay to let DB trigger complete
+            }, 1200);
           }
         }
       })
@@ -38005,51 +38113,69 @@ const App = () => {
           setLedgerEntries(prev => [payload.new, ...prev].slice(0, 500));
         }
       })
-      // DADASH pipeline — spender_events, tg_messages, spenders → refresh UI (dédupliqué par event_id)
+      // ── DADASH pipeline: spender_events → targeted spender patch (no full reload) ──
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "spender_events" }, (payload) => {
         if (user.role !== "gerant" && user.role !== "chatter") return;
         const id = payload.new?.id;
-        if (id && !window.__rtSeen) window.__rtSeen = new Set();
-        if (id && window.__rtSeen.has(id)) return;
-        if (id) window.__rtSeen.add(id);
-        if (window.__rtSeen.size > 500) window.__rtSeen.clear();
+        if (rtDedup("se-" + id)) return;
         const ev = payload.new;
+        window.__rtLastEvent = Date.now();
         const isProfileUpdated = ev && ["profile_updated","enriched","spender_enriched"].includes(ev.event_type);
-        if (isProfileUpdated && window.__onProfileUpdated) {
-          window.__onProfileUpdated({ spender_id: ev.spender_id, tg_user_id: ev.tg_user_id });
+        if (isProfileUpdated) {
+          const spId = ev.spender_id;
+          if (spId && window.__onProfileUpdated) {
+            window.__onProfileUpdated({ spender_id: spId, tg_user_id: ev.tg_user_id });
+          }
+          // Targeted spender re-fetch (no full loadData)
+          if (spId && !rtThrottle("se-sp-" + spId)) {
+            setTimeout(() => patchSpender(spId), 400);
+          }
         }
-        if (window.__softRefresh) setTimeout(window.__softRefresh, 300);
       })
+      // tg_messages INSERT → only update messaging UI, never full reload
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "tg_messages" }, (payload) => {
         if (user.role !== "gerant" && user.role !== "chatter") return;
         const id = payload.new?.id;
-        if (id && !window.__rtSeen) window.__rtSeen = new Set();
-        if (id && window.__rtSeen.has(id)) return;
-        if (id) window.__rtSeen.add(id);
-        if (window.__softRefresh) setTimeout(window.__softRefresh, 300);
+        if (rtDedup("tgm-" + id)) return;
+        window.__rtLastEvent = Date.now();
+        // Notify messaging tab only (via dedicated window hook if present)
+        try { if (window.__onNewTgMessage) window.__onNewTgMessage(payload.new); } catch {}
       })
+      // ── Spenders UPDATE: patch local state in-place (no full reload) ──
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "spenders" }, (payload) => {
         if (user.role !== "gerant" && user.role !== "chatter") return;
-        const id = payload.new?.id;
-        if (id && window.__onProfileUpdated) window.__onProfileUpdated({ spender_id: id });
-        if (id && window.__onSpenderUpdated) window.__onSpenderUpdated(id);
-        if (window.__softRefresh) setTimeout(window.__softRefresh, 300);
+        const s = payload.new;
+        if (!s || !s.id) return;
+        if (rtDedup("sp-upd-" + s.id + "-" + (s.updated_at || ""))) return;
+        if (rtThrottle("sp-" + s.id)) return;
+        window.__rtLastEvent = Date.now();
+        // Patch spenders list in-place
+        setSpenders(prev => prev.map(x => x.id === s.id ? { ...x, ...s } : x));
+        // Notify card/badge highlight
+        if (window.__onSpenderUpdated) window.__onSpenderUpdated(s.id);
+        // If this spender's modal is open, do a targeted DB re-fetch for fresh enriched data
+        if (window.__openModalSpenderId === s.id && window.__refetchModalSpender) {
+          setTimeout(() => { try { window.__refetchModalSpender(s.id); } catch {} }, 400);
+        } else if (window.__onProfileUpdated) {
+          window.__onProfileUpdated({ spender_id: s.id });
+        }
       })
-      // NEW SPENDER created by the AI bot — push immediately to state, no wait for polling
+      // ── Spenders INSERT: push immediately to state ──
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "spenders" }, (payload) => {
         if (user.role !== "gerant" && user.role !== "chatter") return;
         const s = payload.new;
         if (!s || !s.id) return;
-        // Add directly to spenders state so it appears in <1s (no need to wait for poll)
+        if (rtDedup("sp-ins-" + s.id)) return;
+        window.__rtLastEvent = Date.now();
         setSpenders(prev => {
           if (prev.some(x => x.id === s.id)) return prev;
           return [s, ...prev];
         });
-        // Also trigger soft refresh so cards/stats are recalculated
-        if (window.__softRefresh) setTimeout(window.__softRefresh, 800);
       })
-      .subscribe();
-    return () => { sb.removeChannel(channel); };
+      .subscribe((status) => {
+        window.__rtChannelStatus = status;
+      });
+    return () => { sb.removeChannel(channel); window.__rtChannelStatus = "CLOSED"; };
   }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
 
   /* DB FIX — handleLogin with error resilience */
@@ -38114,50 +38240,53 @@ const App = () => {
   const onRefresh = fn_afterMutationOrImportRefresh;
   useEffect(() => { window.__softRefresh = fn_afterMutationOrImportRefresh; return () => { delete window.__softRefresh; }; }, [user?.id]);
 
-  /* Pipeline spenders — boot hydration + polling 20s */
+  /* Pipeline spenders — boot hydration + 60s fallback polling (realtime handles live updates) */
   useEffect(() => {
     if (!user) return;
     let cancelled = false;
+    let timer = null;
+
+    // Decide poll interval: 30s if realtime is DOWN, 60s if UP
+    const getPollDelay = () => {
+      const status = window.__rtChannelStatus;
+      const rtAlive = status === "SUBSCRIBED";
+      // Also check if we got a rt event in the last 90s
+      const recentEvent = Date.now() - (window.__rtLastEvent || 0) < 90000;
+      return (rtAlive || recentEvent) ? 60000 : 30000;
+    };
+
+    const fetchAndSet = async (scope) => {
+      try {
+        const data = scope ? await apiFetchSpenders({ scope }) : await apiFetchSpenders();
+        if (cancelled) return;
+        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
+        setSpenders(deduped);
+      } catch (e) { console.warn("[SPENDERS] refresh failed:", e?.message || e); }
+    };
+
+    const schedulePoll = (scope) => {
+      if (cancelled) return;
+      const delay = getPollDelay();
+      timer = setTimeout(async () => {
+        if (cancelled) return;
+        await fetchAndSet(scope);
+        schedulePoll(scope);
+      }, delay);
+    };
+
     if (user.role === "chatter") {
       const scope = getScope(user);
       scope._allowedModelIds = (user.assigned_models || []).filter(Boolean);
       if (scope._allowedModelIds.length === 0) return;
-      (async () => {
-        try {
-          const data = await apiFetchSpenders({ scope });
-          if (cancelled) return;
-          const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
-          setSpenders(deduped);
-        } catch (e) { console.warn("[SPENDERS] chatter hydration failed:", e?.message || e); }
-      })();
-      const iv = setInterval(async () => {
-        try {
-          const data = await apiFetchSpenders({ scope });
-          if (cancelled) return;
-          const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
-          setSpenders(deduped);
-        } catch (e) { console.warn("[SPENDERS] chatter periodic refresh failed:", e?.message || e); }
-      }, 7000);  // 7s: chatter sees new AI-created spenders within 7s max
-      return () => { cancelled = true; clearInterval(iv); };
+      fetchAndSet(scope).then(() => schedulePoll(scope));
+      return () => { cancelled = true; if (timer) clearTimeout(timer); };
     }
-    (async () => {
-      try {
-        const data = await apiFetchSpenders();
-        if (cancelled) return;
-        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
-        setSpenders(deduped);
-        console.info("[SPENDERS] boot hydration n=" + deduped.length);
-      } catch (e) { console.warn("[SPENDERS] boot hydration failed:", e?.message || e); }
-    })();
-    const iv = setInterval(async () => {
-      try {
-        const data = await apiFetchSpenders();
-        if (cancelled) return;
-        const deduped = Array.from(new Map((data||[]).filter(Boolean).map(s=>[s.id,s])).values());
-        setSpenders(deduped);
-      } catch (e) { console.warn("[SPENDERS] periodic refresh failed:", e?.message || e); }
-    }, 10000);  // 10s: gerant refresh
-    return () => { cancelled = true; clearInterval(iv); };
+
+    fetchAndSet(null).then(() => {
+      console.info("[SPENDERS] boot hydration done");
+      schedulePoll(null);
+    });
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, [user?.id, user?.role]);
 
   /* PAYMENT SYSTEM — afterMutationRefresh: targeted reload of payment_events + ledger_entries + notifications + paiements_internes */
