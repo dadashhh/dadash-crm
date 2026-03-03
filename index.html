@@ -4855,15 +4855,22 @@ const SINGE_TIERS = {
   shark:       { tier: "shark",       label: "Shark",       icon: "🦈", color: "#fca5a5", bg: "#7f1d1d",  border: "rgba(239,68,68,0.5)" },
 };
 
-// ── Segment canonical values (must match DB CHECK constraint) ──
-const VALID_SEGMENTS = ['timewaster','poussin','ouistiti','orang_outan','gorille','whale','shark','bronze','argent','gold','diamond','vip'];
-// Normalize any UI/legacy segment value to the canonical DB value (or null)
+// ── Segment canonical values (must match DB CHECK constraint exactly) ──
+const VALID_SEGMENTS = [
+  'timewaster','poussin','ouistiti','orang_outan','gorille','whale','shark',
+  'bronze','argent','gold','diamond','vip',
+  'nouveau','regular',  // legacy values present in DB — kept to avoid constraint errors
+];
+// Normalize any UI/legacy/capitalized segment value → canonical DB value or null
 const normalizeSegment = (v) => {
   if (!v) return null;
-  const s = String(v).toLowerCase().trim().replace(/-/g, '_');
-  return VALID_SEGMENTS.includes(s) ? s : null;
+  const s = String(v).toLowerCase().trim().replace(/-/g, '_').replace(/\s+/g, '_');
+  // Alias map for any remaining variants
+  const aliases = { 'orang-outan': 'orang_outan', 'time-waster': 'timewaster', 'time_waster': 'timewaster', 'new': 'nouveau', 'vips': 'vip' };
+  const canonical = aliases[s] || s;
+  return VALID_SEGMENTS.includes(canonical) ? canonical : null;
 };
-// Options list for segment <select> — value=canonical DB key, label=display text
+// Options list for segment <select> — value=canonical DB key (lowercase), label=display text
 const SEGMENT_OPTS = [
   ['',           '— Aucun —'],
   ['timewaster', '💩 Timewaster'],
@@ -4878,6 +4885,8 @@ const SEGMENT_OPTS = [
   ['argent',     '🥈 Argent'],
   ['gold',       '🥇 Gold'],
   ['diamond',    '💎 Diamond'],
+  ['nouveau',    '🆕 Nouveau (legacy)'],
+  ['regular',    '👤 Regular (legacy)'],
 ];
 
 // Fonction centrale : retourne le tier 100% automatique depuis le total dépensé
@@ -10081,12 +10090,14 @@ const SemField = React.memo(({ label, field, type, placeholder, hint, value, onC
     <input className="sem-input" type={type || 'text'} value={value} placeholder={placeholder || '—'} onChange={onChange} />
   </div>
 ));
-const SemSelect = React.memo(({ label, field, opts, value, onChange }) => (
+const SemSelect = React.memo(({ label, field, opts, value, onChange, error }) => (
   <div className="sem-field">
     <label className="sem-label">{label}</label>
-    <select className="sem-select" value={value} onChange={onChange}>
+    <select className="sem-select" value={value} onChange={onChange}
+      style={error ? {border:'1px solid var(--danger,#ef4444)',boxShadow:'0 0 0 2px rgba(239,68,68,0.15)'} : {}}>
       {opts.map(([v,l]) => React.createElement('option', { key: v, value: v }, l))}
     </select>
+    {error && <div style={{fontSize:11,color:'var(--danger,#ef4444)',marginTop:3,lineHeight:1.3}}>{error}</div>}
   </div>
 ));
 const SemTextarea = React.memo(({ label, field, placeholder, rows, value, onChange }) => (
@@ -10137,24 +10148,68 @@ const SpenderEditModal = ({ spender, onClose, onSaved, dbSpenders, user }) => {
   React.useEffect(() => {
     if (prevSpenderIdRef.current !== spId) {
       prevSpenderIdRef.current = spId;
+      changedFieldsRef.current = new Set();
+      initialSegmentRef.current = normalizeSegment(spender.segment) || spender.segment || null;
       setForm(_makeInitialForm(spender));
+      setFieldErrors({});
     }
   }, [spId]);
-
-  const updateField = React.useCallback((field, value) => {
-    setForm(prev => ({ ...prev, [field]: value }));
-  }, []);
 
   const [saving,  setSaving]  = React.useState(false);
   const [merging, setMerging] = React.useState(false);
   const [error,   setError]   = React.useState(null);
+  const [fieldErrors, setFieldErrors] = React.useState({}); // {fieldName: errorMsg}
   const [step,    setStep]    = React.useState('form'); // 'form' | 'merge_confirm'
   const [mergeData, setMergeData] = React.useState(null); // {tg_id, username, dupes[]}
+
+  // Track which fields the user explicitly changed (to avoid sending untouched fields)
+  const changedFieldsRef = React.useRef(new Set());
+  const updateField = React.useCallback((field, value) => {
+    changedFieldsRef.current.add(field);
+    setForm(prev => ({ ...prev, [field]: value }));
+    setFieldErrors(prev => { const n = { ...prev }; delete n[field]; return n; });
+  }, []);
+
+  // Initial normalized segment — used to detect if user actually changed it
+  const initialSegmentRef = React.useRef(normalizeSegment(spender.segment) || spender.segment || null);
+
+  // ── Parse DB error → human-readable message + optional field attribution ──
+  const parseDbError = (err) => {
+    const msg = (err && (err.message || err.details || err.hint || String(err))) || 'Erreur inconnue';
+    // Check constraint violations
+    if (msg.includes('spenders_segment_check') || (msg.includes('check') && msg.includes('segment'))) {
+      return { field: 'segment', message: `Valeur de segment invalide : "${form.segment || '(vide)'}". Choisissez dans la liste.` };
+    }
+    if (msg.includes('check constraint') || msg.includes('violates check') || err.code === '23514') {
+      const match = msg.match(/"([^"]+_check)"/);
+      const constraint = match ? match[1] : 'contrainte';
+      return { field: null, message: `Valeur rejetée par la DB (${constraint}). Vérifiez les champs en rouge.` };
+    }
+    // Unique constraint
+    if (msg.includes('unique') || msg.includes('duplicate') || err.code === '23505') {
+      return { field: null, message: `Doublon détecté : cette valeur existe déjà.` };
+    }
+    // Foreign key
+    if (msg.includes('foreign key') || err.code === '23503') {
+      return { field: null, message: `Référence invalide : vérifiez les champs liés.` };
+    }
+    return { field: null, message: msg };
+  };
 
   // ── Build Supabase update payload from form ──
   const buildUpdates = (tg_id, username) => {
     const cur = spender.meta || {};
     const curP = cur.profile || {};
+
+    // segment: only include if user explicitly changed it OR if we can normalize the existing value
+    // This prevents writing an invalid value when the user only touched other fields.
+    const segmentChanged = changedFieldsRef.current.has('segment');
+    const normalizedSeg = normalizeSegment(form.segment);
+    // If segment was NOT changed by the user, send the normalized version of what was there.
+    // If the existing value is already valid, this is a no-op. If invalid, normalizeSegment()
+    // returns null — which is safe (NULL passes the CHECK constraint).
+    const segmentPayload = normalizedSeg; // always normalize to prevent passing invalid strings
+
     return {
       name:                form.name.trim() || null,
       first_name:          form.first_name.trim() || null,
@@ -10174,7 +10229,7 @@ const SpenderEditModal = ({ spender, onClose, onSaved, dbSpenders, user }) => {
       classification:      form.classification || 'new',
       risk_level:          form.risk_level || 'safe',
       status:              form.status || 'active',
-      segment:             normalizeSegment(form.segment),
+      segment:             segmentPayload,
       notes:               form.notes_chatter || null,
       updated_at:          new Date().toISOString(),
       meta: {
@@ -10203,8 +10258,11 @@ const SpenderEditModal = ({ spender, onClose, onSaved, dbSpenders, user }) => {
 
   // ── handleSave: normalize TG → detect dupes → save or show confirm ──
   const handleSave = async () => {
-    if (!spId) { setError('ID spender manquant'); return; }
-    setSaving(true); setError(null);
+    if (!spId) {
+      setError('ID spender manquant — impossible de sauvegarder sans identifiant DB.');
+      return;
+    }
+    setSaving(true); setError(null); setFieldErrors({});
     try {
       const { tg_id, username } = normalizeTgId(form.tg_input);
       const prevTg = String(spender.tg_user_id || spender.telegram_id || '').replace(/\D/g, '');
@@ -10222,17 +10280,20 @@ const SpenderEditModal = ({ spender, onClose, onSaved, dbSpenders, user }) => {
         }
       }
       const updates = buildUpdates(tg_id, username);
-      console.log('SAVE_CLICK', spId, updates);
       const { error: dbErr } = await sb.from('spenders').update(updates).eq('id', spId);
-      if (dbErr) throw new Error(dbErr.message);
-      console.log('SAVE_OK', spId);
+      if (dbErr) {
+        const parsed = parseDbError(dbErr);
+        if (parsed.field) setFieldErrors({ [parsed.field]: parsed.message });
+        throw new Error(parsed.message);
+      }
       addToast('Enregistré ✓', 'success');
+      changedFieldsRef.current.clear();
       onSaved({ ...spender, ...updates, dbId: spId });
       onClose();
     } catch (err) {
-      console.error('SAVE_ERR', spId, err);
+      console.error('[SEM] SAVE_ERR', spId, err);
       setError(err.message);
-      addToast('❌ Erreur sauvegarde: ' + (err.message || err), 'error');
+      addToast('❌ ' + (err.message || 'Erreur sauvegarde'), 'error');
     } finally {
       setSaving(false);
     }
@@ -10407,7 +10468,7 @@ const SpenderEditModal = ({ spender, onClose, onSaved, dbSpenders, user }) => {
 
             <div className="sem-section-title">SEGMENTATION</div>
             <div className="sem-row cols-3">
-              <SemSelect label="Segment" field="segment" opts={SEGMENT_OPTS} value={form.segment} onChange={e => updateField('segment', normalizeSegment(e.target.value) || '')} />
+              <SemSelect label="Segment" field="segment" opts={SEGMENT_OPTS} value={form.segment} onChange={e => updateField('segment', normalizeSegment(e.target.value) || '')} error={fieldErrors.segment} />
               <SemSelect label="Classification" field="classification" opts={[['new','🆕 New'],['regular','👤 Regular'],['vip','⭐ VIP'],['churned','💤 Churned']]} value={form.classification} onChange={e => updateField('classification', e.target.value)} />
               <SemSelect label="Risque" field="risk_level" opts={[['safe','🟢 Safe'],['risky','🟡 Risky'],['blocked','🔴 Blocked']]} value={form.risk_level} onChange={e => updateField('risk_level', e.target.value)} />
             </div>
