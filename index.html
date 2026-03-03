@@ -10405,13 +10405,13 @@ const UnifiedSpenderModal = React.memo(({
   const handleDeleteSpender = async (sp, mode) => {
     if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
     setDeleteLoading(true);
-    const rpcName = (mode || 'hard') === 'hard' ? 'rpc_spenders_hard_delete' : 'rpc_spenders_soft_delete';
+    const rpcMode = (mode || 'soft');
     try {
-      const { data, error } = await sb.rpc(rpcName, { p_spender_id: sp.dbId });
+      const { data, error } = await sb.rpc('safe_delete_spender', { p_spender_id: sp.dbId, p_mode: rpcMode });
       if (error) { addToast('❌ Erreur: ' + error.message, 'error'); setDeleteLoading(false); return; }
       if (!data?.ok) { addToast('❌ ' + (data?.error || 'Erreur inconnue'), 'error'); setDeleteLoading(false); return; }
-      console.log('[DELETE_OK]', rpcName, sp.dbId, data);
-      addToast(fr ? 'Spender supprimé ✓' : 'Spender deleted ✓', 'success');
+      console.log('[DELETE_OK] safe_delete_spender', sp.dbId, rpcMode, data);
+      addToast(rpcMode === 'hard' ? (fr?'Supprimé définitivement ✓':'Hard-deleted ✓') : (fr?'Archivé ✓':'Archived ✓'), 'success');
       setDeleteConfirm(null); setDeleteLoading(false);
       onClose();
       if (onRefresh) onRefresh();
@@ -12099,36 +12099,41 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [optimisticDeletedIds, setOptimisticDeletedIds] = React.useState(() => new Set());
 
   const handleDeleteSpenderRpc = async (sp, mode) => {
-    if (!sp?.dbId) { addToast(fr ? "ID spender manquant" : "Missing spender ID", "error"); return; }
+    if (!sp?.dbId) {
+      addToast(fr ? "ID spender manquant — fiche non enregistrée en base" : "No DB ID — cannot delete this card", "error");
+      return;
+    }
     setDeleteLoading(true);
-    const rpcName = mode === 'hard' ? 'rpc_spenders_hard_delete' : 'rpc_spenders_soft_delete';
+    const rpcMode = mode || 'soft';
     try {
-      const { data, error } = await sb.rpc(rpcName, { p_spender_id: sp.dbId });
+      const { data, error } = await sb.rpc('safe_delete_spender', { p_spender_id: sp.dbId, p_mode: rpcMode });
       if (error) {
-        console.error('[DELETE_ERR]', rpcName, sp.dbId, error);
+        console.error('[DELETE_ERR] safe_delete_spender', sp.dbId, rpcMode, error);
         addToast('❌ Erreur suppression: ' + error.message, 'error');
         setDeleteLoading(false);
         return;
       }
       if (!data?.ok) {
-        console.error('[DELETE_ERR]', rpcName, sp.dbId, data);
+        console.error('[DELETE_ERR] safe_delete_spender', sp.dbId, rpcMode, data);
         addToast('❌ ' + (data?.error || 'Erreur inconnue'), 'error');
         setDeleteLoading(false);
         return;
       }
-      console.log('[DELETE_OK]', rpcName, sp.dbId, data);
-      const label = mode === 'hard'
-        ? (fr ? 'Supprimé définitivement ✓' : 'Hard-deleted ✓')
-        : (fr ? 'Archivé ✓ (soft-delete)' : 'Archived ✓ (soft-delete)');
-      addToast(label, 'success');
-      // Retrait optimiste immédiat
+      console.log('[DELETE_OK] safe_delete_spender', sp.dbId, rpcMode, data);
+      addToast(
+        rpcMode === 'hard'
+          ? (fr ? 'Supprimé définitivement ✓' : 'Hard-deleted ✓')
+          : (fr ? 'Archivé ✓ (soft-delete)' : 'Archived ✓ (soft-delete)'),
+        'success'
+      );
+      // Retrait optimiste immédiat — la carte disparaît sans attendre onRefresh
       setOptimisticDeletedIds(prev => { const n = new Set(prev); n.add(sp.dbId); return n; });
       setSelected(null);
       setDeleteConfirm(null);
       setDeleteLoading(false);
       if (onRefresh) onRefresh();
     } catch (e) {
-      console.error('[DELETE_ERR]', rpcName, sp.dbId, e);
+      console.error('[DELETE_ERR] safe_delete_spender', sp.dbId, rpcMode, e);
       addToast('❌ Erreur: ' + (e?.message || e), 'error');
       setDeleteLoading(false);
     }
@@ -12194,11 +12199,14 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const spFilteredTxs = useMemo(() => dr.filterByDate(txs, "date"), [txs, dr.startDate, dr.endDate, dr.activePreset]);
   const spenders = useMemo(()=>{
     const map = {};
+    // Lookup: spender DB UUID → canonical handle (to resolve TX by spender_id)
+    const idToHandle = {};
 
     // 1) Seed from DB spenders table (source of truth for metadata)
     (dbSpenders || []).filter(Boolean).forEach(dbSp => {
       const h = dbSp.handle || dbSp.name;
       if (!h) return;
+      if (dbSp.id) idToHandle[dbSp.id] = h;
       const _prof = getProfile(dbSp.meta);
       let contactInfo = {};
       try { contactInfo = typeof dbSp.contact_info === "string" ? JSON.parse(dbSp.contact_info) : (dbSp.contact_info || {}); } catch(e) {/* Contact info JSON parse fallback */}
@@ -12256,10 +12264,18 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     });
 
     // 2) Enrich with transactions
+    //    Priority: if tx.spender_id maps to a known DB spender, use that entry.
+    //    This prevents creating virtual (dbId=null) entries for DB-backed spenders
+    //    whose handle differs from spender_handle on the TX.
     spFilteredTxs.forEach(tx => {
-      const h = tx.spender_handle;
+      // Resolve canonical handle: prefer spender_id lookup, fall back to spender_handle
+      let h = (tx.spender_id && idToHandle[tx.spender_id]) ? idToHandle[tx.spender_id] : tx.spender_handle;
       if (!h) return;
-      if (!map[h]) map[h] = {name: h, dbId: null, telegramId: null, dbTags: [], dbStatus: "active", contactInfo: {}, dbNotes: "", totalSpentDb: 0, txs: [], byModel: {}, byChatter: {}, byProvider: {}};
+      if (!map[h]) {
+        // Virtual entry: only create if no DB spender matched — these have no dbId
+        // and cannot be deleted. They represent orphaned transactions.
+        map[h] = {name: h, dbId: null, telegramId: null, dbTags: [], dbStatus: "active", contactInfo: {}, dbNotes: "", totalSpentDb: 0, txs: [], byModel: {}, byChatter: {}, byProvider: {}};
+      }
       map[h].txs.push(tx);
       // Model breakdown
       const mid = tx.model_id;
@@ -12693,24 +12709,30 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
       )}
       {filterCategory === "sans_tg" && (()=>{
         const _isGerant=['gerant','admin','ceo'].includes(user?.role);
-        const _sansTgCount = filtered.length;
-        const _noTxCount = filtered.filter(s => !(s.cnt > 0 || s.ltv > 0)).length;
+        const _deletable = filtered.filter(s => !!s.dbId);
+        const _virtual = filtered.filter(s => !s.dbId);
+        const _noTxCount = _deletable.filter(s => !(s.cnt > 0 || s.ltv > 0)).length;
         return (
           <div style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderRadius:12,marginBottom:10,background:"rgba(239,68,68,0.06)",border:"1px solid rgba(239,68,68,0.18)",flexWrap:"wrap"}}>
             <span style={{fontSize:13}}>⚫</span>
             <div style={{flex:1,minWidth:0}}>
               <span style={{fontSize:12,fontWeight:700,color:"var(--danger)"}}>
-                {_sansTgCount} fiche{_sansTgCount>1?"s":""} sans TG ID
+                {_deletable.length} fiche{_deletable.length>1?"s":""} sans TG ID supprimable{_deletable.length>1?"s":""}
               </span>
               {_noTxCount > 0 && (
                 <span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>
-                  dont {_noTxCount} sans transaction — candidates à la purge
+                  dont {_noTxCount} sans TX — candidates à la purge
+                </span>
+              )}
+              {_virtual.length > 0 && (
+                <span style={{fontSize:10,color:"var(--text-quaternary)",marginLeft:8}}>
+                  +{_virtual.length} TX orphelines (sans fiche DB)
                 </span>
               )}
             </div>
             {_isGerant && (
               <span style={{fontSize:10,color:"var(--text-tertiary)",fontFamily:"'Space Mono',monospace"}}>
-                {fr?"Cliquer 🗑️ sur chaque carte pour supprimer":"Click 🗑️ on each card to delete"}
+                🗑️ {fr?"sur chaque carte":"on each card"}
               </span>
             )}
           </div>
