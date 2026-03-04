@@ -4531,8 +4531,13 @@ const mapUiToSpender = (row) => {
     telegram_username: _tgUser,
     handle: row.username || row.handle,
     name: row.display_name ?? row.username ?? row.name,
-    langue: row.language,
-    notes: row.notes_chatter,
+    // Handle both view column name variants (v_spenders_ui exports `language`, older views may use `langue`)
+    langue: row.language ?? row.langue ?? null,
+    // Notes: both column name variants (view exports `notes_chatter`, raw table uses `notes`)
+    notes: row.notes_chatter ?? row.notes ?? null,
+    // Explicit extraction so these are never undefined if view uses a different alias
+    relationship_status: row.relationship_status ?? null,
+    budget_range: row.budget_range ?? null,
     model_id: row.model_id || row.meta?.model_id || row.meta?.context?.model_id || null,
     first_name: row.first_name || row.display_name || null,
   };
@@ -4706,26 +4711,34 @@ const getSpenderDisplayName = (sp) => {
 };
 /** Helper central : lit meta.profile (schéma bot enrich) avec fallbacks ancien mapping */
 const getProfile = (meta) => {
-  const p = meta?.profile || {};
-  const e = meta?.enrich || {};
-  const fb = (meta?.profile && typeof meta.profile === "object" && Object.keys(meta.profile).length > 0) ? {} : e;
-  const src = { ...fb, ...p };
+  const p   = meta?.profile  || {};
+  const e   = meta?.enrich   || {};
+  const ctx = meta?.context  || {};
+  // enrich.last.patch contains flat extracted fields written by the bot enrichment pipeline
+  const enrichPatch = (typeof e?.last?.patch === "object" && e.last.patch) ? e.last.patch : {};
+  // Merge order (lowest → highest priority): enrichPatch < ctx < enrich-top-level < profile
+  // This ensures profile fields always win, but bot-written enrich data is surfaced when
+  // profile has only partial data (e.g. only telegram sub-key, no language/notes keys).
+  const src = { ...enrichPatch, ...ctx, ...e, ...p };
   const result = {
     first_name: src?.identity?.first_name || src?.first_name || meta?.first_name || null,
-    age: src?.identity?.age || src?.age || null,
-    city: src?.location?.city || src?.city || null,
-    country: src?.location?.country || src?.country || null,
-    job: src?.identity?.job || src?.job || null,
-    relation: src?.status?.relation || src?.relationship_status || null,
-    language: src?.language || src?.langue || null,
-    notes_chatter: src?.notes_chatter || null,
-    timezone: src?.location?.timezone || src?.timezone || null,
-    budget_chf_range: src?.budget?.chf_range || src?.budget_range || null,
+    age:        src?.identity?.age        || src?.age        || null,
+    city:       src?.location?.city       || src?.city       || null,
+    country:    src?.location?.country    || src?.country    || null,
+    job:        src?.identity?.job        || src?.job        || null,
+    // relation: bots write status.relation AND status.relationship_status — check both
+    relation:   src?.status?.relation     || src?.status?.relationship_status || src?.relationship_status || null,
+    language:   src?.language             || src?.langue     || null,
+    // notes_chatter: also check src.notes (bot may write as 'notes' key)
+    notes_chatter: src?.notes_chatter     || src?.notes      || null,
+    timezone:   src?.location?.timezone   || src?.timezone   || null,
+    // budget: bots write budget_range directly; view COALESCE checks budget_chf_range too
+    budget_chf_range: src?.budget?.chf_range || src?.budget_chf_range || src?.budget_range || null,
   };
   const hasProfile = meta?.profile && typeof meta.profile === "object" && Object.keys(meta.profile).length > 0;
   const hasAnyMapped = Object.values(result).some(v => v != null && v !== "");
   if (hasProfile && !hasAnyMapped) {
-    console.warn("[PROFILE_MAPPED_BUT_NOT_RENDERED] meta.profile exists but no mapped field extracted. Check schema:", meta?.profile);
+    console.warn("[PROFILE_MAPPED_BUT_NOT_RENDERED] meta.profile exists but no field extracted — check schema:", meta?.profile);
   }
   return result;
 };
@@ -10144,7 +10157,7 @@ const _makeInitialForm = (spender) => {
     whatsapp_phone:      spender.whatsapp_phone || '',
     budget_range:        spender.budget_range || mp.budget_range || '',
     relationship_status: spender.relationship_status || mp.relation || '',
-    langue:              spender.langue || '',
+    langue:              spender.langue || mp.language || '',
     timezone:            spender.timezone || mp.timezone || 'Europe/Zurich',
     classification:      spender.classification || 'new',
     risk_level:          spender.risk_level || 'safe',
@@ -10681,11 +10694,31 @@ const UnifiedSpenderModal = React.memo(({
     if (localVM) { setSelected(localVM); initForm(localVM); }
     else { setLoading(true); }
 
-    // Always fetch fresh from DB
+    // Always fetch fresh from DB — profile fields may be absent from stale dbSpenders cache
     (async () => {
       try {
         const { data: uiData } = await sb.from("v_spenders_ui").select("*").eq("id", targetId).maybeSingle();
-        if (uiData) { const vm = buildSpenderVM(targetId) || spenderVM(mapUiToSpender(uiData)); setSelected(vm); initForm(vm); setLoading(false); return; }
+        if (uiData) {
+          const fresh = mapUiToSpender(uiData);
+          // Build VM from cache (has TX enrichment) then overlay fresh profile fields from DB.
+          // This ensures bot-written data (langue, budget, notes, relationship_status) is always shown,
+          // even when the cached dbSpenders entry had stale or incomplete profile data.
+          const cached = buildSpenderVM(targetId);
+          let vm;
+          if (cached) {
+            vm = spenderVM({
+              ...cached,
+              meta:                fresh.meta                || cached.meta,
+              langue:              fresh.langue              || cached.langue,
+              budget_range:        fresh.budget_range        || cached.budget_range,
+              relationship_status: fresh.relationship_status || cached.relationship_status,
+              notes:               fresh.notes               || cached.notes || cached.dbNotes,
+            });
+          } else {
+            vm = spenderVM(fresh);
+          }
+          setSelected(vm); initForm(vm); setLoading(false); return;
+        }
         const { data: canonData } = await sb.from("v_spenders_canon").select("*").eq("spender_id", targetId).maybeSingle();
         if (canonData) { const vm = spenderVM(mapCanonToSpender(canonData)); setSelected(vm); initForm(vm); setLoading(false); return; }
         const { data } = await sb.from("v_spenders").select("*").eq("id", targetId).maybeSingle();
