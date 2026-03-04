@@ -26815,53 +26815,52 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   );
 
   // ══════════════════════════════════════════
-  // ── Sync IA : enrichissement + refresh fiche en direct ─────────────────────
+  // ── Sync IA : enrichissement + polling jusqu'à réception des données ────────
   const syncSpenderAnalysis = async () => {
-    if (!selectedConv) { console.log("[SYNC] No conversation selected"); return; }
     const chatId = selectedChatId;
-    const enrichId = activeSpender?.id || chatId; // UUID Supabase en priorité
-    console.log("[SYNC] Starting enrichment for:", chatId);
+    if (!chatId) return;
     setIsSyncing(true);
+    console.log("[SYNC] 🚀 Starting enrichment for chat_id:", chatId);
     try {
-      // Appel API Carlos pour déclencher l'enrichissement IA
-      await _dmsgFetch("/enrich/" + enrichId, { method: "POST" });
-      console.log("[SYNC] Enrichment triggered — polling Supabase until data is ready…");
+      // 1. Déclencher l'enrichissement IA via API Carlos
+      const enrichId = activeSpender?.id || chatId;
+      const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST" });
+      console.log("[SYNC] ✅ Enrichment API called successfully", res);
 
-      // Polling jusqu'à 10s : on vérifie chaque seconde si ai_personality est rempli
+      // 2. Polling : vérifier toutes les 1 s si ai_personality est rempli (max 15 s)
       let attempts = 0;
+      const maxAttempts = 15;
       let enrichedData = null;
-      while (attempts < 10 && !enrichedData) {
-        await new Promise(r => setTimeout(r, 1000)); // attendre 1s
-        const { data: polled } = await sb.from("spenders")
+      while (attempts < maxAttempts) {
+        await new Promise(r => setTimeout(r, 1000));
+        attempts++;
+        const { data, error } = await sb.from("spenders")
           .select("*")
           .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId},tg_chat_id.eq.${chatId}`)
           .maybeSingle();
-        // Données prêtes si au moins un champ IA est rempli
-        if (polled && (polled.ai_personality || polled.personality_notes || polled.ai_interests || polled.interest_notes)) {
-          enrichedData = polled;
-          console.log("[SYNC] Enrichment found after", attempts + 1, "second(s)");
-        } else {
-          console.log("[SYNC] Waiting for enrichment…", attempts + 1, "/ 10");
+        if (error) { console.log("[SYNC] ⚠️ Query error:", error.message); continue; }
+        if (data?.ai_personality && data.ai_personality.length > 20) {
+          enrichedData = data;
+          console.log("[SYNC] ✅ Enrichment complete after", attempts, "second(s)");
+          break;
         }
-        attempts++;
+        console.log("[SYNC] ⏳ Attempt", attempts, "/", maxAttempts, "- waiting...");
       }
+
+      // 3. Mettre à jour la fiche — toujours rafraîchir même en cas de timeout
       if (enrichedData) {
         setActiveSpender(enrichedData);
-        addToast(fr ? "Enrichissement terminé ✓" : "Enrichment done ✓", "success");
+        console.log("[SYNC] 🎉 Fiche updated with enriched data");
       } else {
-        // Timeout : Carlos a peut-être réussi mais sans champ IA (spender sans analyse)
-        // On rafraîchit quand même la fiche pour prendre tout ce qui a été écrit
+        console.log("[SYNC] ⏰ Timeout — enrichment may still be processing");
         const { data: fallback } = await sb.from("spenders")
           .select("*")
           .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId},tg_chat_id.eq.${chatId}`)
           .maybeSingle();
         if (fallback) setActiveSpender(fallback);
-        console.log("[SYNC] Timeout — enrichment not completed in 10s");
-        addToast(fr ? "Enrichissement en cours — re-clique Sync dans quelques secondes" : "Enrichment in progress — click Sync again in a few seconds", "info");
       }
     } catch (e) {
-      console.error("[SYNC] Error:", e);
-      addToast((fr ? "Erreur sync: " : "Sync error: ") + (e.message || e), "error");
+      console.error("[SYNC] ❌ Error:", e);
     } finally {
       setIsSyncing(false);
     }
