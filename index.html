@@ -25704,20 +25704,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     });
   }, [conversations, searchQuery]);
 
-  // ── Send message (optimistic update) ─────────────
+  // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
     if (!selectedConv || !msgInput.trim() || sending) return;
     const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
     if (!chatId) { addToast(fr ? "Aucun chat_id" : "Missing chat_id", "error"); return; }
 
     const text = msgInput.trim();
-    setMsgInput(""); // clear input immediately
+    // Bug 1 fix — clear textarea immediately so it feels snappy
+    setMsgInput("");
     setSending(true);
 
-    // Optimistic: inject the sent message into the list right away so it's visible instantly
-    const optimisticId = "_opt_" + Date.now();
-    const optimisticMsg = {
-      id: optimisticId,
+    // Bug 1 fix — inject the message locally right now (optimistic)
+    const localId = Date.now();
+    const optimistic = {
+      id: localId,
       text,
       direction: "out",
       is_outgoing: true,
@@ -25725,7 +25726,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       created_at: new Date().toISOString(),
     };
     shouldScrollRef.current = true;
-    setMessages(prev => [...prev, optimisticMsg]);
+    setMessages(prev => [...prev, optimistic]);
 
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
@@ -25733,18 +25734,31 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text, ...(modelId ? { model_id: modelId } : {}) }),
       });
-      // Refresh silently (poll-style: no loading state, no forced scroll)
-      // to replace the optimistic msg with the real server message
-      await loadMessagesById(chatId, false);
       addToast(fr ? "Message envoyé ✓" : "Message sent ✓", "success");
+
+      // Bug 2 fix — force a fresh fetch 2 s after send.
+      // The 2 s delay lets the server process the message before we pull.
+      // This replaces the optimistic entry with the real server data AND
+      // picks up any incoming messages from the contact.
+      // The regular 10 s poll continues independently.
+      setTimeout(async () => {
+        if (chatIdRef.current !== chatId) return; // user switched conv
+        try {
+          const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
+          const list = Array.isArray(data) ? data : (data.messages || data.data || []);
+          // Full replace — clears the optimistic entry, shows real messages
+          setMessages(list);
+        } catch (_) { /* keep optimistic visible until next poll */ }
+      }, 2000);
+
     } catch (e) {
-      // Revert: remove optimistic message and restore input
-      setMessages(prev => prev.filter(m => m.id !== optimisticId));
+      // Revert: remove optimistic entry and restore the typed text
+      setMessages(prev => prev.filter(m => m.id !== localId));
       setMsgInput(text);
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
     }
     setSending(false);
-  }, [selectedConv, msgInput, sending, selectedModelId, chatterCtx, fr, addToast, loadMessagesById]);
+  }, [selectedConv, msgInput, sending, selectedModelId, chatterCtx, fr, addToast]);
 
   // ── Apply script ─────────────────────────────────
   const applyScript = (script) => {
