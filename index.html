@@ -25419,17 +25419,34 @@ const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = "679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade";
 
 const _dmsgFetch = async (path, opts = {}) => {
-  const key = (window.CRM_API_KEY || _DMSG_KEY_FALLBACK);
+  const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
+  const url = _DMSG_API + path;
   const { headers: extraHeaders, ...restOpts } = opts;
-  const res = await fetch(_DMSG_API + path, {
-    headers: { "Content-Type": "application/json", "X-API-Key": key, ...(extraHeaders || {}) },
-    ...restOpts,
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${t}`);
+  const reqHeaders = { "Content-Type": "application/json", "X-API-Key": key, ...(extraHeaders || {}) };
+
+  console.log("[DMSG] ▶ fetch", opts.method || "GET", url);
+  console.log("[DMSG]   API:", _DMSG_API);
+  console.log("[DMSG]   Key:", key.slice(0, 8) + "…" + key.slice(-4) + " (" + key.length + " chars)");
+  if (opts.body) console.log("[DMSG]   Body:", opts.body);
+
+  let res;
+  try {
+    res = await fetch(url, { headers: reqHeaders, ...restOpts });
+  } catch (networkErr) {
+    // Network-level failure (CORS blocked, DNS, offline…)
+    const isCors = networkErr.message && (networkErr.message.toLowerCase().includes("cors") || networkErr.message.toLowerCase().includes("blocked") || networkErr.message.toLowerCase().includes("failed to fetch"));
+    const detail = isCors ? "Erreur CORS ou réseau — vérifier les origines autorisées côté serveur." : networkErr.message;
+    console.error("[DMSG] ✖ network error:", networkErr.message, "\n       URL:", url);
+    throw new Error("NETWORK:" + detail);
   }
-  return res.json().catch(() => ({}));
+
+  const text = await res.text().catch(() => "");
+  console.log("[DMSG] ◀ status:", res.status, res.statusText, "— body:", text.slice(0, 300));
+
+  if (!res.ok) {
+    throw new Error("HTTP " + res.status + " " + res.statusText + (text ? ": " + text.slice(0, 200) : ""));
+  }
+  try { return JSON.parse(text); } catch (_) { return {}; }
 };
 
 const _DMSG_SCRIPTS = [
@@ -25483,9 +25500,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [txForm, setTxForm]               = useState({ amount: "", type: "tip", note: "" });
   const [txSaving, setTxSaving]           = useState(false);
   const [selectedModelId, setSelectedModelId] = useState("");
+  const [apiError, setApiError] = useState(null); // detailed error message for UI display
   // Spender resolved for the active conversation (with Supabase fallback)
   const [activeSpender, setActiveSpender] = useState(null);
   const [spenderLoading, setSpenderLoading] = useState(false);
+  // Detailed API error for UI display
+  const [apiError, setApiError] = useState(null);
 
   const pollRef   = React.useRef(null);
   const msgEndRef = React.useRef(null);
@@ -25504,19 +25524,34 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Load conversations ───────────────────────────
   const loadConversations = useCallback(async () => {
     setConvLoading(true);
+    setApiError(null);
     try {
-      let path = "/conversations";
-      if (isManager && selectedModelId) path += "?model_id=" + encodeURIComponent(selectedModelId);
+      // Build URL — pass model_id for chatters (required by API) or manager filter
+      const params = new URLSearchParams();
+      if (isManager && selectedModelId) {
+        params.set("model_id", selectedModelId);
+      } else if (!isManager) {
+        // Chatter: always send their first assigned model_id
+        const mid = chatterCtx.assignedModelIds?.[0];
+        if (mid) params.set("model_id", mid);
+      }
+      const qs = params.toString();
+      const path = "/conversations" + (qs ? "?" + qs : "");
+
       const data = await _dmsgFetch(path);
       const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      console.log("[DMSG] conversations loaded:", list.length, "items", list[0] || "");
       setConversations(list);
       setApiOk(true);
-    } catch (_) {
+      setApiError(null);
+    } catch (err) {
+      console.error("[DMSG] loadConversations failed:", err.message);
       setApiOk(false);
       setConversations([]);
+      setApiError(err.message || "Erreur inconnue");
     }
     setConvLoading(false);
-  }, [isManager, selectedModelId]);
+  }, [isManager, selectedModelId, chatterCtx]);
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
@@ -25706,15 +25741,33 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── API error banner ─────────────────────────────
   if (apiOk === false && conversations.length === 0 && !convLoading) {
+    const isCors = apiError && apiError.startsWith("NETWORK:");
+    const displayErr = apiError ? apiError.replace(/^NETWORK:/, "") : (fr ? "Erreur réseau inconnue" : "Unknown network error");
     return (
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 300, gap: 12, padding: 32 }}>
-        <div style={{ fontSize: 36 }}>📡</div>
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 300, gap: 14, padding: 32 }}>
+        <div style={{ fontSize: 36 }}>{isCors ? "🚫" : "📡"}</div>
         <div style={{ fontSize: 15, fontWeight: 700, color: "var(--danger)" }}>
-          {fr ? "Service de messagerie indisponible" : "Messaging service unavailable"}
+          {fr ? "Erreur de connexion à l'API" : "API connection error"}
         </div>
-        <div style={{ fontSize: 12, color: "var(--text-tertiary)", textAlign: "center", maxWidth: 320 }}>
-          {fr ? "L'API de messagerie ne répond pas. Réessaie dans quelques instants." : "The messaging API is not responding. Try again in a moment."}
+        <div style={{ fontSize: 12, color: "var(--text-tertiary)", textAlign: "center", maxWidth: 400 }}>
+          {fr ? "L'API de messagerie n'a pas pu répondre." : "The messaging API could not be reached."}
         </div>
+        {/* Detailed error box */}
+        <div style={{ background: "rgba(244,63,94,0.08)", border: "1px solid rgba(244,63,94,0.3)", borderRadius: 10, padding: "12px 16px", maxWidth: 480, width: "100%", fontSize: 11, fontFamily: "monospace", color: "var(--danger)", wordBreak: "break-all", lineHeight: 1.6 }}>
+          <div style={{ fontWeight: 700, marginBottom: 6, fontFamily: "'Inter',sans-serif", fontSize: 11 }}>🔍 Détail de l'erreur :</div>
+          <div>{displayErr}</div>
+          <div style={{ marginTop: 8, color: "var(--text-tertiary)", fontFamily: "'Inter',sans-serif" }}>
+            URL : {_DMSG_API}/conversations
+          </div>
+          <div style={{ color: "var(--text-tertiary)", fontFamily: "'Inter',sans-serif" }}>
+            Header : X-API-Key: {(_DMSG_KEY_FALLBACK).slice(0, 8)}…{(_DMSG_KEY_FALLBACK).slice(-4)}
+          </div>
+        </div>
+        {isCors && (
+          <div style={{ background: "rgba(245,158,11,0.1)", border: "1px solid rgba(245,158,11,0.3)", borderRadius: 10, padding: "10px 16px", maxWidth: 480, width: "100%", fontSize: 11, color: "var(--warning)", lineHeight: 1.6 }}>
+            ⚠️ <strong>Problème CORS probable :</strong> Le serveur doit autoriser l'origine <code>{window.location.origin}</code> dans ses headers CORS.
+          </div>
+        )}
         <button onClick={loadConversations} style={{ padding: "9px 20px", borderRadius: 10, background: "var(--accent)", border: "none", color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
           🔄 {fr ? "Réessayer" : "Retry"}
         </button>
@@ -25806,15 +25859,31 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         {convLoading && (
           <div style={{ padding: 24, textAlign: "center", color: "var(--text-tertiary)", fontSize: 12 }}>
             <div style={{ marginBottom: 8, fontSize: 20 }}>⏳</div>
-            {fr ? "Chargement…" : "Loading…"}
+            {fr ? "Chargement conversations…" : "Loading conversations…"}
+            <div style={{ marginTop: 6, fontSize: 10, color: "var(--text-quaternary)", fontFamily: "monospace" }}>{_DMSG_API}/conversations</div>
           </div>
         )}
-        {!convLoading && filteredConvs.length === 0 && (
+        {/* Inline error banner (if load failed but we didn't redirect to full-page error) */}
+        {!convLoading && apiError && (
+          <div style={{ margin: "10px 10px 0", padding: "10px 12px", background: "rgba(244,63,94,0.09)", border: "1px solid rgba(244,63,94,0.3)", borderRadius: 8, fontSize: 11, color: "var(--danger)", lineHeight: 1.5 }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>⚠️ Erreur de chargement</div>
+            <div style={{ fontFamily: "monospace", wordBreak: "break-all", fontSize: 10 }}>{apiError.replace(/^NETWORK:/, "")}</div>
+            <button onClick={loadConversations} style={{ marginTop: 8, padding: "4px 10px", borderRadius: 6, border: "1px solid var(--danger)", background: "transparent", color: "var(--danger)", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>🔄 Réessayer</button>
+          </div>
+        )}
+        {!convLoading && !apiError && filteredConvs.length === 0 && (
           <div style={{ padding: 24, textAlign: "center", color: "var(--text-quaternary)", fontSize: 12 }}>
-            {searchQuery ? (fr ? "Aucun résultat" : "No results") : (fr ? "Aucune conversation" : "No conversations")}
+            {searchQuery
+              ? (fr ? "Aucun résultat" : "No results")
+              : (fr ? "Aucune conversation" : "No conversations")}
+            {!searchQuery && (
+              <div style={{ marginTop: 6, fontSize: 10, fontFamily: "monospace", color: "var(--text-quaternary)" }}>
+                GET {_DMSG_API}/conversations → 0 items
+              </div>
+            )}
           </div>
         )}
-        {!convLoading && filteredConvs.map((conv, idx) => {
+        {!convLoading && !apiError && filteredConvs.map((conv, idx) => {
           const cid = _dmsgChatId(conv);
           const isActive = selectedConv && _dmsgChatId(selectedConv) === cid;
           const name = getConvName(conv);
