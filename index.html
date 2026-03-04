@@ -25555,61 +25555,83 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
-  // ── Load messages by explicit chatId ────────────
-  const loadMessagesById = useCallback(async (chatId) => {
+  // ── Refs for smart scroll & polling ─────────────
+  // scrollRef: only scroll when a genuinely new message arrives (not every poll)
+  const shouldScrollRef = React.useRef(false);
+
+  // ── Load messages — isInitial=true on first open, false on poll ──
+  const loadMessagesById = useCallback(async (chatId, isInitial) => {
     if (!chatId) return;
-    setMsgLoading(true);
+    if (isInitial) setMsgLoading(true);
     try {
       const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
       const list = Array.isArray(data) ? data : (data.messages || data.data || []);
-      setMessages(list);
+
+      setMessages(prev => {
+        if (isInitial) {
+          // First load: show everything and scroll to bottom once
+          shouldScrollRef.current = true;
+          return list;
+        }
+        // Polling: detect genuinely new messages by count or last-item id/timestamp
+        const prevLast = prev[prev.length - 1];
+        const newLast  = list[list.length - 1];
+        const hasNew = list.length > prev.length
+          || (newLast && prevLast && (newLast.id !== prevLast.id || newLast.created_at !== prevLast.created_at));
+        if (hasNew) {
+          shouldScrollRef.current = true;
+          return list;
+        }
+        // No new messages → return prev reference unchanged (no re-render)
+        return prev;
+      });
     } catch (_) {
-      setMessages([]);
+      if (isInitial) setMessages([]);
     }
-    setMsgLoading(false);
+    if (isInitial) setMsgLoading(false);
   }, []);
 
-  // ── Resolve spender: props first, then Supabase ──
+  // ── Resolve spender: quick match from props + always hydrate from Supabase ──
   const resolveSpender = useCallback(async (conv) => {
     if (!conv) { setActiveSpender(null); return; }
     const all = spenders || [];
     const tgId = _dmsgChatId(conv);
+    const tidStr = tgId ? String(tgId) : "";
 
-    // 1) match by spender_id
-    if (conv.spender_id) {
-      const s = all.find(x => x.id === conv.spender_id);
-      if (s) { setActiveSpender(s); return; }
-    }
-    // 2) match by tg id fields
-    if (tgId) {
-      const tidStr = String(tgId);
-      const s = all.find(x =>
-        String(x.tg_user_id || x.telegram_id || x.tg_chat_id || "") === tidStr
-      );
-      if (s) { setActiveSpender(s); return; }
-    }
-    // 3) match by telegram_username
-    if (conv.tg_username) {
+    // Quick match from props for instant display (name/avatar)
+    let quick = null;
+    if (conv.spender_id) quick = all.find(x => x.id === conv.spender_id) || null;
+    if (!quick && tidStr) quick = all.find(x => String(x.tg_user_id || x.telegram_id || x.tg_chat_id || "") === tidStr) || null;
+    if (!quick && conv.tg_username) {
       const u = String(conv.tg_username).replace(/^@/, "").toLowerCase();
-      const s = all.find(x => x.telegram_username && String(x.telegram_username).replace(/^@/, "").toLowerCase() === u);
-      if (s) { setActiveSpender(s); return; }
+      quick = all.find(x => x.telegram_username && String(x.telegram_username).replace(/^@/, "").toLowerCase() === u) || null;
     }
-    // 4) Supabase fallback
-    if (!tgId) { setActiveSpender(null); return; }
-    setSpenderLoading(true);
+    if (quick) setActiveSpender(quick); // instant display while Supabase loads
+
+    // Always hydrate from Supabase for full analytical fields
+    // (props spenders may be summaries without personality/strategy notes)
+    setSpenderLoading(!quick);
     try {
-      const tidStr = String(tgId);
-      const { data, error } = await sb.from("spenders").select("*")
-        .or("tg_user_id.eq." + tidStr + ",telegram_id.eq." + tidStr)
-        .maybeSingle();
-      setActiveSpender(!error && data ? data : null);
+      let q = sb.from("spenders").select(
+        "id,first_name,handle,name,telegram_username,tg_user_id,telegram_id," +
+        "relationship_status,langue,budget_range,notes," +
+        "personality_notes,interest_notes,strategy_notes,risk_notes," +
+        "classification,age,city,country,job,source"
+      );
+      if (conv.spender_id)      q = q.eq("id", conv.spender_id);
+      else if (tidStr)           q = q.or("tg_user_id.eq." + tidStr + ",telegram_id.eq." + tidStr);
+      else if (conv.tg_username) q = q.ilike("telegram_username", String(conv.tg_username).replace(/^@/, ""));
+      else { setActiveSpender(quick); setSpenderLoading(false); return; }
+
+      const { data, error } = await q.maybeSingle();
+      setActiveSpender(!error && data ? data : (quick || null));
     } catch (_) {
-      setActiveSpender(null);
+      if (!quick) setActiveSpender(null);
     }
     setSpenderLoading(false);
   }, [spenders]);
 
-  // ── Select conversation (the critical handler) ───
+  // ── Select conversation ───────────────────────────
   const selectConv = useCallback((conv) => {
     const chatId = _dmsgChatId(conv);
     chatIdRef.current = chatId;
@@ -25617,25 +25639,27 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setMessages([]);
     setMsgInput("");
     setShowScripts(false);
-    // Load messages immediately
-    if (chatId) loadMessagesById(chatId);
-    // Resolve spender for right panel
+    shouldScrollRef.current = false; // reset before initial load sets it
+    if (chatId) loadMessagesById(chatId, true); // isInitial=true
     resolveSpender(conv);
-    // On mobile: switch to chat pane
     if (isMobile) setMobilePane("chat");
   }, [loadMessagesById, resolveSpender, isMobile]);
 
-  // ── Auto-scroll when messages update ────────────
+  // ── Auto-scroll: ONLY when shouldScrollRef is true ──
   useEffect(() => {
-    if (msgEndRef.current) msgEndRef.current.scrollIntoView({ behavior: "smooth" });
+    if (shouldScrollRef.current && msgEndRef.current) {
+      msgEndRef.current.scrollIntoView({ behavior: "smooth" });
+      shouldScrollRef.current = false;
+    }
   }, [messages]);
 
-  // ── Polling every 10s ────────────────────────────
+  // ── Polling every 10s (passes isInitial=false) ────
   useEffect(() => {
     clearInterval(pollRef.current);
-    const chatId = chatIdRef.current;
-    if (!selectedConv || !chatId) return;
-    pollRef.current = setInterval(() => { if (chatIdRef.current) loadMessagesById(chatIdRef.current); }, 10000);
+    if (!selectedConv || !chatIdRef.current) return;
+    pollRef.current = setInterval(() => {
+      if (chatIdRef.current) loadMessagesById(chatIdRef.current, false);
+    }, 10000);
     return () => clearInterval(pollRef.current);
   }, [selectedConv, loadMessagesById]);
 
@@ -25682,22 +25706,43 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     });
   }, [conversations, searchQuery]);
 
-  // ── Send message ─────────────────────────────────
+  // ── Send message (optimistic update) ─────────────
   const sendMessage = useCallback(async () => {
     if (!selectedConv || !msgInput.trim() || sending) return;
     const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
     if (!chatId) { addToast(fr ? "Aucun chat_id" : "Missing chat_id", "error"); return; }
+
+    const text = msgInput.trim();
+    setMsgInput(""); // clear input immediately
     setSending(true);
+
+    // Optimistic: inject the sent message into the list right away so it's visible instantly
+    const optimisticId = "_opt_" + Date.now();
+    const optimisticMsg = {
+      id: optimisticId,
+      text,
+      direction: "out",
+      is_outgoing: true,
+      sender_type: "chatter",
+      created_at: new Date().toISOString(),
+    };
+    shouldScrollRef.current = true;
+    setMessages(prev => [...prev, optimisticMsg]);
+
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
       await _dmsgFetch("/send-message", {
         method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text: msgInput.trim(), ...(modelId ? { model_id: modelId } : {}) }),
+        body: JSON.stringify({ chat_id: chatId, text, ...(modelId ? { model_id: modelId } : {}) }),
       });
-      setMsgInput("");
-      await loadMessagesById(chatId);
+      // Refresh silently (poll-style: no loading state, no forced scroll)
+      // to replace the optimistic msg with the real server message
+      await loadMessagesById(chatId, false);
       addToast(fr ? "Message envoyé ✓" : "Message sent ✓", "success");
     } catch (e) {
+      // Revert: remove optimistic message and restore input
+      setMessages(prev => prev.filter(m => m.id !== optimisticId));
+      setMsgInput(text);
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
     }
     setSending(false);
@@ -26070,76 +26115,106 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           </div>
         ) : (
           <>
-            {/* Identité */}
+            {/* ── Identité ── */}
             <div style={{ ...sectionStyle, display: "flex", flexDirection: "column", gap: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <SpenderAvatar sp={activeSpender} size={42} radius="50%" />
+                <SpenderAvatar sp={activeSpender} size={44} radius="50%" />
                 <div style={{ minWidth: 0, flex: 1 }}>
                   <div style={{ fontSize: 14, fontWeight: 800, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {activeSpender.first_name || activeSpender.handle || "—"}
+                    {activeSpender.first_name || activeSpender.handle || activeSpender.name || "—"}
                   </div>
-                  {(activeSpender.telegram_username || activeSpender.handle) && (
-                    <div style={{ fontSize: 11, color: "var(--brand-telegram)", marginTop: 1 }}>
-                      ✈️ @{String(activeSpender.telegram_username || activeSpender.handle).replace(/^@/, "")}
-                    </div>
-                  )}
+                  <div style={{ fontSize: 11, color: "var(--brand-telegram)", marginTop: 2 }}>
+                    {activeSpender.telegram_username
+                      ? "✈️ @" + String(activeSpender.telegram_username).replace(/^@/, "")
+                      : activeSpender.handle
+                        ? "@" + String(activeSpender.handle).replace(/^@/, "")
+                        : "TG: " + (_dmsgChatId(selectedConv) || "—")}
+                  </div>
                 </div>
               </div>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+
+              {/* Badges: relationship_status, langue, budget_range */}
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 2 }}>
                 {relBadge && (
                   <span style={{ padding: "3px 10px", borderRadius: 20, background: relBadge.bg, color: relBadge.color, fontSize: 10, fontWeight: 700 }}>
                     {relBadge.label}
                   </span>
                 )}
                 {activeSpender.langue && (
-                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 10, fontWeight: 600 }}>
+                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(99,102,241,0.13)", color: "var(--accent)", fontSize: 10, fontWeight: 600 }}>
                     🌐 {activeSpender.langue}
                   </span>
                 )}
                 {activeSpender.budget_range && (
-                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(34,211,161,0.12)", color: "var(--success)", fontSize: 10, fontWeight: 600 }}>
+                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(34,211,161,0.13)", color: "var(--success)", fontSize: 10, fontWeight: 600 }}>
                     💰 {activeSpender.budget_range}
                   </span>
                 )}
+                {activeSpender.classification && (
+                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(248,114,182,0.13)", color: "var(--pink,#f472b6)", fontSize: 10, fontWeight: 600 }}>
+                    {activeSpender.classification}
+                  </span>
+                )}
               </div>
+
+              {/* Quick info grid */}
+              {(activeSpender.age || activeSpender.city || activeSpender.country || activeSpender.job) && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 10px", marginTop: 4 }}>
+                  {[
+                    { label: fr ? "Âge" : "Age",    value: activeSpender.age ? activeSpender.age + " ans" : null },
+                    { label: fr ? "Ville" : "City",  value: activeSpender.city || activeSpender.country || null },
+                    { label: fr ? "Métier" : "Job",  value: activeSpender.job || null },
+                    { label: "Source",               value: activeSpender.source || null },
+                  ].filter(m => m.value).map(m => (
+                    <div key={m.label}>
+                      <div style={labelSt}>{m.label}</div>
+                      <div style={{ ...valueSt, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={m.value}>{m.value}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
-            {/* ANALYSE */}
-            {(activeSpender.personality_notes || activeSpender.interest_notes || activeSpender.strategy_notes || activeSpender.risk_notes) && (
-              <div style={sectionStyle}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>
-                  🧠 {fr ? "ANALYSE" : "ANALYSIS"}
+            {/* ── ANALYSE ── always shown, each sub-field conditional */}
+            <div style={sectionStyle}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>
+                🧠 {fr ? "ANALYSE" : "ANALYSIS"}
+              </div>
+              {(!activeSpender.personality_notes && !activeSpender.interest_notes && !activeSpender.strategy_notes && !activeSpender.risk_notes) ? (
+                <div style={{ fontSize: 11, color: "var(--text-quaternary)", fontStyle: "italic" }}>
+                  {fr ? "Aucune analyse disponible" : "No analysis available"}
                 </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   {activeSpender.personality_notes && (
                     <div>
                       <div style={labelSt}>🎭 {fr ? "Personnalité" : "Personality"}</div>
-                      <div style={{ ...valueSt, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{activeSpender.personality_notes}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.5 }}>{activeSpender.personality_notes}</div>
                     </div>
                   )}
                   {activeSpender.interest_notes && (
                     <div>
                       <div style={labelSt}>❤️ {fr ? "Intérêts" : "Interests"}</div>
-                      <div style={{ ...valueSt, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{activeSpender.interest_notes}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.5 }}>{activeSpender.interest_notes}</div>
                     </div>
                   )}
                   {activeSpender.strategy_notes && (
                     <div>
                       <div style={labelSt}>🎯 {fr ? "Stratégie" : "Strategy"}</div>
-                      <div style={{ ...valueSt, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{activeSpender.strategy_notes}</div>
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.5 }}>{activeSpender.strategy_notes}</div>
                     </div>
                   )}
                   {activeSpender.risk_notes && (
                     <div>
                       <div style={labelSt}>⚠️ {fr ? "Risques" : "Risks"}</div>
-                      <div style={{ ...valueSt, fontSize: 11, color: "var(--warning)", lineHeight: 1.4 }}>{activeSpender.risk_notes}</div>
+                      <div style={{ fontSize: 11, color: "var(--warning)", lineHeight: 1.5 }}>{activeSpender.risk_notes}</div>
                     </div>
                   )}
                 </div>
-              </div>
-            )}
+              )}
+            </div>
 
-            {/* Notes chatter */}
+            {/* ── Notes chatter ── */}
             <div>
               <div style={labelSt}>📝 {fr ? "Notes chatter" : "Chatter notes"}</div>
               <textarea
@@ -26150,7 +26225,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                   catch (_) { addToast(fr ? "Erreur sauvegarde note" : "Note save error", "error"); }
                 }}
                 placeholder={fr ? "Ajouter une note…" : "Add a note…"}
-                style={{ width: "100%", minHeight: 72, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-base))", color: "var(--text-primary)", fontSize: 11, resize: "vertical", fontFamily: "'Inter',sans-serif", boxSizing: "border-box", marginTop: 4, lineHeight: 1.4 }}
+                style={{ width: "100%", minHeight: 80, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-base))", color: "var(--text-primary)", fontSize: 11, resize: "vertical", fontFamily: "'Inter',sans-serif", boxSizing: "border-box", marginTop: 4, lineHeight: 1.5 }}
               />
             </div>
           </>
