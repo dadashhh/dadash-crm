@@ -24792,12 +24792,21 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
     setLoading(false);
   }, [lang]);
 
+  // Rafraîchissement silencieux (polling/realtime) — ne touche PAS setLoading
+  // selectedConv n'est jamais modifié ici, seulement par un clic utilisateur
+  const silentRefreshConversations = useCallback(async () => {
+    try {
+      const {data} = await sb.from("conversations").select("*").order("updated_at",{ascending:false});
+      if (data) setConversations(data);
+    } catch(_) {}
+  }, []);
+
   useEffect(()=>{ loadConversations(); }, [loadConversations]);
 
-  // Supabase Realtime
+  // Supabase Realtime — utilise silentRefreshConversations pour ne pas masquer le chat ouvert
   useEffect(()=>{
     const channel = sb.channel("gerant-messagerie")
-      .on("postgres_changes",{event:"*",schema:"public",table:"conversations"},()=>loadConversations())
+      .on("postgres_changes",{event:"*",schema:"public",table:"conversations"},()=>silentRefreshConversations())
       .on("postgres_changes",{event:"INSERT",schema:"public",table:"messages"},(payload)=>{
         if(selectedConv && payload.new && payload.new.conversation_id===selectedConv.id){
           setMessages(prev=>[...prev, payload.new]);
@@ -24805,7 +24814,7 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
       })
       .subscribe();
     return ()=>{ sb.removeChannel(channel); };
-  },[selectedConv?.id]);
+  },[selectedConv?.id, silentRefreshConversations]);
 
   // Auto-scroll to bottom when messages change
   useEffect(()=>{
@@ -25132,25 +25141,29 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
   const [sending, setSending] = useState(false);
+  // selectedConv ne doit être modifié QUE par un clic utilisateur (selectConv).
+  // Les rechargements de la liste ne doivent jamais réinitialiser selectedConv.
+  const convLoadedRef = React.useRef(false);
 
   const loadConversations = useCallback(async () => {
     setLoadError(null);
-    setLoading(true);
+    const isInitialLoad = !convLoadedRef.current;
+    if (isInitialLoad) setLoading(true);
     try {
       let res = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).order("updated_at", {ascending: false});
       if (res.error) throw new Error(res.error.message);
       setConversations(res.data || []);
+      convLoadedRef.current = true;
     } catch (e) {
       try {
         const fallback = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]);
-        if (!fallback.error) setConversations((fallback.data || []).sort((a,b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0)));
-        else { setConversations([]); setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error")); }
+        if (!fallback.error) { setConversations((fallback.data || []).sort((a,b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0))); convLoadedRef.current = true; }
+        else if (isInitialLoad) { setConversations([]); setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error")); }
       } catch (_) {
-        setConversations([]);
-        setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error"));
+        if (isInitialLoad) { setConversations([]); setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error")); }
       }
     }
-    setLoading(false);
+    if (isInitialLoad) setLoading(false);
   }, [user?.id, myModelIds?.length, fr]);
 
   useEffect(() => {
@@ -25869,6 +25882,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const inputRef  = React.useRef(null);
   // Keep a ref to the current chatId so the polling interval always uses fresh value
   const chatIdRef = React.useRef(null);
+  // Track if conversations have been loaded at least once — spinner only on first load
+  const convLoadedRef = React.useRef(false);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
@@ -25880,7 +25895,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Load conversations ───────────────────────────
   const loadConversations = useCallback(async () => {
-    setConvLoading(true);
+    // Spinner uniquement au premier chargement — les rechargements suivants (polling,
+    // changement de chatterCtx) sont silencieux pour ne pas masquer la conv ouverte.
+    // selectedConv n'est jamais modifié ici, uniquement par un clic utilisateur.
+    const isInitialLoad = !convLoadedRef.current;
+    if (isInitialLoad) setConvLoading(true);
     setApiError(null);
     try {
       // Build URL — pass model_id for chatters (required by API) or manager filter
@@ -25901,13 +25920,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       setConversations(list);
       setApiOk(true);
       setApiError(null);
+      convLoadedRef.current = true;
     } catch (err) {
       console.error("[DMSG] loadConversations failed:", err.message);
       setApiOk(false);
-      setConversations([]);
+      if (isInitialLoad) setConversations([]);
       setApiError(err.message || "Erreur inconnue");
     }
-    setConvLoading(false);
+    if (isInitialLoad) setConvLoading(false);
   }, [isManager, selectedModelId, chatterCtx]);
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
@@ -27736,6 +27756,8 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
   const [loadingMore, setLoadingMore] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [loadError, setLoadError] = useState(null);
+  // Spinner uniquement au premier chargement — les rechargements suivants sont silencieux
+  const convLoadedRef = React.useRef(false);
 
   const debouncedSearch = useDebounce(searchQuery, DEBOUNCE_DELAY);
 
@@ -27753,7 +27775,12 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
     const u = effectiveUser;
     if (!u) return;
     if (u.role === "provider" || u.role === "modele") { setLoading(false); return; }
-    setLoading(true);
+    // Ne montrer le spinner que si aucune conversation n'a encore été chargée.
+    // Les rechargements ultérieurs (deps instables, polling) sont silencieux
+    // pour ne pas masquer la conversation sélectionnée.
+    // selectedConv n'est jamais réinitialisé ici — uniquement par un clic utilisateur.
+    const isInitialLoad = !convLoadedRef.current;
+    if (isInitialLoad) setLoading(true);
     setLoadError(null);
     try {
       let q = sb.from("v_tg_conversations").select("*");
@@ -27774,12 +27801,13 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
       const { data, error } = await q;
       if (error) throw new Error(error.message);
       setConversations(data || []);
+      convLoadedRef.current = true;
     } catch (e) {
-      addToast((fr ? "Erreur chargement: " : "Load error: ") + (e.message || e), "error");
+      if (isInitialLoad) addToast((fr ? "Erreur chargement: " : "Load error: ") + (e.message || e), "error");
       setLoadError(e.message || (fr ? "Erreur inconnue" : "Unknown error"));
-      setConversations([]);
+      if (isInitialLoad) setConversations([]);
     }
-    setLoading(false);
+    if (isInitialLoad) setLoading(false);
   }, [effectiveUser?.id, effectiveUser?.role, effectiveUser?.assigned_models, getMessagingPerm, fr, addToast, escaladesOnly, models]);
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
