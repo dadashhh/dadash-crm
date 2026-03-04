@@ -26331,6 +26331,9 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
 
   // Refresh auto
   const refreshTimerRef = React.useRef(null);
+  const chatIdRef       = React.useRef(null);
+  const shouldScrollRef = React.useRef(false);
+  const msgEndRef       = React.useRef(null);
 
   // Charger restrictions chatter
   useEffect(() => {
@@ -26370,65 +26373,136 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
 
   // Refresh auto toutes les 10s
   useEffect(() => {
-    if (!selectedConv) return;
-    refreshTimerRef.current = setInterval(() => { loadMessages(selectedConv.id || selectedConv.chat_id); }, 10000);
+    clearInterval(refreshTimerRef.current);
+    if (!selectedConv || !chatIdRef.current) return;
+    refreshTimerRef.current = setInterval(() => {
+      if (chatIdRef.current) loadMessages(chatIdRef.current, false);
+    }, 10000);
     return () => clearInterval(refreshTimerRef.current);
-  }, [selectedConv?.id]);
+  }, [selectedConv?.id, loadMessages]);
+
+  // Auto-scroll vers le bas quand de nouveaux messages arrivent
+  useEffect(() => {
+    if (shouldScrollRef.current && msgEndRef.current) {
+      msgEndRef.current.scrollIntoView({ behavior: "smooth" });
+      shouldScrollRef.current = false;
+    }
+  }, [messages]);
 
   // Charger messages
-  const loadMessages = useCallback(async (convId) => {
+  const loadMessages = useCallback(async (convId, isInitial) => {
     if (!convId) return;
-    setMsgLoading(true);
+    if (isInitial) setMsgLoading(true);
     try {
       const data = await carlosFetch(`/conversations/${convId}/messages?limit=50`);
       const list = Array.isArray(data) ? data : (data.messages || data.data || []);
-      setMessages(list);
+      setMessages(prev => {
+        if (isInitial) { shouldScrollRef.current = true; return list; }
+        // Poll: preserve pending (optimistic) messages until the API confirms them
+        const pending = prev.filter(m => m._pending);
+        const prevConfirmed = prev.filter(m => !m._pending);
+        const prevLast = prevConfirmed[prevConfirmed.length - 1];
+        const newLast  = list[list.length - 1];
+        const hasNew = list.length > prevConfirmed.length
+          || (newLast && prevLast && (newLast.id !== prevLast.id || newLast.created_at !== prevLast.created_at));
+        if (!hasNew) return prev; // nothing new — keep optimistic messages visible
+        shouldScrollRef.current = true;
+        // Drop pending messages already confirmed in the fresh list
+        const confirmedIds = new Set(list.map(m => String(m.id)));
+        const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+        const stillPending = pending.filter(m => !confirmedIds.has(String(m.id)) && !confirmedTexts.has(m.text || ""));
+        return [...list, ...stillPending];
+      });
     } catch (e) {
-      // Fallback Supabase
-      try {
-        const { data: sbData } = await sb.from("v_tg_messages").select("*").eq("conversation_id", convId).order("created_at", { ascending: false }).limit(50);
-        setMessages((sbData || []).reverse());
-      } catch (_) { setMessages([]); }
+      if (isInitial) {
+        // Fallback Supabase
+        try {
+          const { data: sbData } = await sb.from("v_tg_messages").select("*").eq("conversation_id", convId).order("created_at", { ascending: false }).limit(50);
+          shouldScrollRef.current = true;
+          setMessages((sbData || []).reverse());
+        } catch (_) { setMessages([]); }
+      }
     }
-    setMsgLoading(false);
+    if (isInitial) setMsgLoading(false);
   }, []);
 
   const selectConv = (conv) => {
+    chatIdRef.current = conv.id || conv.chat_id;
     setSelectedConv(conv);
     setMsgInput("");
     setMessages([]);
-    loadMessages(conv.id || conv.chat_id);
+    loadMessages(conv.id || conv.chat_id, true);
     if (_isMobile) setMobilePane("chat");
   };
 
   // Envoi message
   const sendMessage = useCallback(async () => {
     if (!selectedConv || !msgInput.trim() || sending || isReadOnly) return;
+    const chatId = selectedConv.tg_chat_id || selectedConv.chat_id || selectedConv.id;
+    const convId = selectedConv.id || selectedConv.chat_id;
+    const text = msgInput.trim();
+    setMsgInput("");
     setSending(true);
+    // Optimistic insert — affiche le message immédiatement
+    const localId = Date.now();
+    const optimistic = { id: localId, text, direction: "out", is_outgoing: true, sender_type: "chatter", created_at: new Date().toISOString(), _pending: true };
+    shouldScrollRef.current = true;
+    setMessages(prev => [...prev, optimistic]);
     try {
-      const chatId = selectedConv.tg_chat_id || selectedConv.chat_id || selectedConv.id;
       await carlosFetch("/send-message", {
         method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text: msgInput.trim() }),
+        body: JSON.stringify({ chat_id: chatId, text }),
       });
-      setMsgInput("");
-      await loadMessages(selectedConv.id || selectedConv.chat_id);
       addToast(fr ? "Message envoyé" : "Message sent", "success");
+      // Réconciliation 2 s après l'envoi — remplace l'optimiste par la vraie donnée
+      setTimeout(async () => {
+        if (chatIdRef.current !== convId) return;
+        try {
+          const data = await carlosFetch(`/conversations/${convId}/messages?limit=50`);
+          const list = Array.isArray(data) ? data : (data.messages || data.data || []);
+          shouldScrollRef.current = true;
+          setMessages(list);
+        } catch (_) { /* garder l'optimiste jusqu'au prochain poll */ }
+      }, 2000);
     } catch (e) {
+      // Annuler l'optimiste et restaurer le texte
+      setMessages(prev => prev.filter(m => m.id !== localId));
+      setMsgInput(text);
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
-    } finally { setSending(false); }
-  }, [selectedConv, msgInput, sending, isReadOnly, fr, addToast, loadMessages]);
+    }
+    setSending(false);
+  }, [selectedConv, msgInput, sending, isReadOnly, fr, addToast]);
 
   // Injection script texte
   const handleScriptInject = (text) => {
     setMsgInput(text);
-    // Auto-envoyer le script texte
     if (!isReadOnly && text.trim()) {
-      setSending(true);
       const chatId = selectedConv?.tg_chat_id || selectedConv?.chat_id || selectedConv?.id;
+      const convId = selectedConv?.id || selectedConv?.chat_id;
+      setSending(true);
+      // Optimistic insert
+      const localId = Date.now();
+      const optimistic = { id: localId, text: text.trim(), direction: "out", is_outgoing: true, sender_type: "chatter", created_at: new Date().toISOString(), _pending: true };
+      shouldScrollRef.current = true;
+      setMessages(prev => [...prev, optimistic]);
+      setMsgInput("");
       carlosFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatId, text: text.trim() }) })
-        .then(() => { setMsgInput(""); loadMessages(selectedConv?.id || selectedConv?.chat_id); addToast(fr ? "Script envoyé" : "Script sent", "success"); })
-        .catch(e => addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"))
+        .then(() => {
+          addToast(fr ? "Script envoyé" : "Script sent", "success");
+          setTimeout(async () => {
+            if (chatIdRef.current !== convId) return;
+            try {
+              const data = await carlosFetch(`/conversations/${convId}/messages?limit=50`);
+              const list = Array.isArray(data) ? data : (data.messages || data.data || []);
+              shouldScrollRef.current = true;
+              setMessages(list);
+            } catch (_) {}
+          }, 2000);
+        })
+        .catch(e => {
+          setMessages(prev => prev.filter(m => m.id !== localId));
+          addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
+        })
         .finally(() => setSending(false));
     }
   };
@@ -26632,15 +26706,17 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
               return (
                 <div key={msg.id || i} style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%" }}>
                   <div style={{ padding: "9px 13px", borderRadius: isOut ? "14px 14px 2px 14px" : "14px 14px 14px 2px", fontSize: 13, lineHeight: 1.4,
-                    background: isOut ? "#3B82F6" : "rgba(255,255,255,0.07)", color: "#fff", wordBreak: "break-word" }}>
+                    background: isOut ? "#3B82F6" : "rgba(255,255,255,0.07)", color: "#fff", wordBreak: "break-word",
+                    opacity: msg._pending ? 0.65 : 1 }}>
                     {msg.text || msg.content || msg.message || "—"}
                   </div>
                   <div style={{ fontSize: 9, color: "var(--text-quaternary)", marginTop: 2, textAlign: isOut ? "right" : "left" }}>
-                    {msg.created_at ? new Date(msg.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : ""}
+                    {msg._pending ? (fr ? "Envoi…" : "Sending…") : (msg.created_at ? new Date(msg.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : "")}
                   </div>
                 </div>
               );
             })}
+            <div ref={msgEndRef} />
           </div>
 
           {/* Input */}
