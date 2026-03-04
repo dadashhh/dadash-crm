@@ -25966,19 +25966,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Load conversations ───────────────────────────
   const loadConversations = useCallback(async () => {
-    // Spinner uniquement au premier chargement — les rechargements suivants (polling,
-    // changement de chatterCtx) sont silencieux pour ne pas masquer la conv ouverte.
-    // selectedConv n'est jamais modifié ici, uniquement par un clic utilisateur.
+    // Spinner uniquement au premier chargement — les rechargements suivants (polling)
+    // sont silencieux : pas de spinner, pas de reset d'état, conv sélectionnée intacte.
     const isInitialLoad = !convLoadedRef.current;
-    if (isInitialLoad) setConvLoading(true);
-    setApiError(null);
+    if (isInitialLoad) {
+      setConvLoading(true);
+      setApiError(null);
+    }
     try {
       // Build URL — pass model_id for chatters (required by API) or manager filter
       const params = new URLSearchParams();
       if (isManager && selectedModelId) {
         params.set("model_id", selectedModelId);
       } else if (!isManager) {
-        // Chatter: always send their first assigned model_id
         const mid = chatterCtx.assignedModelIds?.[0];
         if (mid) params.set("model_id", mid);
       }
@@ -25987,16 +25987,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
       const data = await _dmsgFetch(path);
       const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      console.log("[DMSG] conversations loaded:", list.length, "items", list[0] || "");
       setConversations(list);
-      setApiOk(true);
-      setApiError(null);
+      if (isInitialLoad) {
+        setApiOk(true);
+        setApiError(null);
+      }
       convLoadedRef.current = true;
     } catch (err) {
-      console.error("[DMSG] loadConversations failed:", err.message);
-      setApiOk(false);
-      if (isInitialLoad) setConversations([]);
-      setApiError(err.message || "Erreur inconnue");
+      if (isInitialLoad) {
+        setApiOk(false);
+        setConversations([]);
+        setApiError(err.message || "Erreur inconnue");
+      }
+      // Polling silencieux : on ne perturbe pas l'UI en cas d'erreur réseau temporaire
     }
     if (isInitialLoad) setConvLoading(false);
   }, [isManager, selectedModelId, chatterCtx]);
@@ -26018,18 +26021,28 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         // Polling: preserve pending (optimistic) messages until confirmed
         const pendingMessages = prev.filter(m => m._pending === true);
         const prevConfirmed = prev.filter(m => !m._pending);
+
+        // Détection robuste de nouveaux messages :
+        // 1. Nombre de messages différent
+        // 2. Dernier message différent (id ou timestamp)
+        // 3. Un des messages serveur n'est pas encore dans prev
+        const prevIds = new Set(prevConfirmed.map(m => String(m.id)));
         const prevLast = prevConfirmed[prevConfirmed.length - 1];
         const newLast  = list[list.length - 1];
-        const hasNew = list.length > prevConfirmed.length
-          || (newLast && prevLast && (newLast.id !== prevLast.id || newLast.created_at !== prevLast.created_at));
-        if (!hasNew) return prev; // No new messages → keep prev unchanged (no re-render)
-        // Identify pending messages confirmed by server (matched by text + time window)
+        const hasNew = list.length !== prevConfirmed.length
+          || (newLast && prevLast && (String(newLast.id) !== String(prevLast.id) || newLast.created_at !== prevLast.created_at))
+          || list.some(m => !prevIds.has(String(m.id)));
+        if (!hasNew) return prev; // Aucun nouveau message → garder prev intact (no re-render)
+
+        // Identifier les pending confirmés par le serveur (texte correspondant)
         const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
         const stillPending = pendingMessages.filter(p =>
           !confirmedTexts.has(p.text || "")
         );
-        // Merge: server messages + unconfirmed pending
-        return [...list, ...stillPending];
+        // Merger : messages serveur + pending non confirmés, triés par date
+        return [...list, ...stillPending].sort((a, b) =>
+          new Date(a.created_at || 0) - new Date(b.created_at || 0)
+        );
       });
     } catch (_) {
       if (isInitial) setMessages([]);
@@ -26062,7 +26075,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         "relationship_status,langue,budget_range,notes," +
         "personality_notes,interest_notes,strategy_notes,risk_notes," +
         "classification,age,city,country,job,source,model_id";
-      console.log("[SPENDER_FETCH] colonnes chargées :", _SPENDER_COLS);
       let q = sb.from("spenders").select(_SPENDER_COLS);
       if (conv.spender_id)      q = q.eq("id", conv.spender_id);
       else if (tidStr)           q = q.or("tg_user_id.eq." + tidStr + ",telegram_id.eq." + tidStr);
@@ -26089,10 +26101,25 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setShowScripts(false);
     isUserScrollRef.current = false;
     prevMsgCountRef.current = 0;
+    // Vider immédiatement l'ancienne fiche — le useEffect ci-dessous rechargera la nouvelle
+    setActiveSpender(null);
+    setSpenderLoading(false);
     if (chatId) loadMessagesById(chatId, true); // isInitial=true
-    resolveSpender(conv);
     if (isMobile) setMobilePane("chat");
-  }, [loadMessagesById, resolveSpender, isMobile]);
+  }, [loadMessagesById, isMobile]);
+
+  // ── Fiche spender : rechargement réactif à chaque changement de conversation ──
+  // Ce useEffect est la source de vérité pour activeSpender.
+  // Il se déclenche UNIQUEMENT quand l'id de la conv change (pas au polling).
+  useEffect(() => {
+    if (!selectedConv) {
+      setActiveSpender(null);
+      setSpenderLoading(false);
+      return;
+    }
+    resolveSpender(selectedConv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedConv?.id]);
 
   // ── Détecter si l'utilisateur scrolle manuellement ──────────────────────
   useEffect(() => {
@@ -26142,13 +26169,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     return () => clearInterval(pollRef.current);
   }, [selectedConv?.id, loadMessagesById]);
 
-  // ── Polling conversations toutes les 5s ──────────────────────────────────
+  // ── Polling conversations toutes les 5s (silencieux) ────────────────────
+  // Démarre dès le montage, indépendant de la conversation sélectionnée.
   useEffect(() => {
     clearInterval(convPollRef.current);
+    // Premier tick immédiat (après le chargement initial)
+    const firstTick = setTimeout(() => loadConversations(), 3000);
     convPollRef.current = setInterval(() => {
       loadConversations();
     }, 5000);
-    return () => clearInterval(convPollRef.current);
+    return () => {
+      clearTimeout(firstTick);
+      clearInterval(convPollRef.current);
+    };
   }, [loadConversations]);
 
   // ── Helpers for display ──────────────────────────
