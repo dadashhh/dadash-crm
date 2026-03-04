@@ -1,96 +1,46 @@
 -- ═══════════════════════════════════════════════════════════════════════
 -- MIGRATION: RBAC — Role-Based Access Control columns on profiles table
 -- Date: 2026-03-04
--- Context: Required for role-based filtering in the DADASH CRM frontend.
---          Adds role, model_id, provider_id to profiles if not present.
+--
+-- ⚠️  STATUS : PROBABLEMENT DÉJÀ EN PLACE — VÉRIFIER AVANT D'EXÉCUTER
+--
+-- Ce qui EXISTE DÉJÀ en production :
+--   ✅ profiles.role          (utilisé dans toutes les RLS policies existantes)
+--   ✅ profiles.assigned_models (UUID[] — utilisé par v_chatter_models, frontend)
+--   ✅ RLS transactions       (20260228_transactions_chatter_insert_rls.sql)
+--      tx_all_gerant / tx_select_chatter / tx_select_provider / etc.
+--   ✅ RLS spenders           (20260226_spender_pipeline_005_rls.sql)
+--
+-- Ce qui POURRAIT manquer (optionnel) :
+--   ❓ profiles.model_id      (UUID — modèle principal d'un chatter, si non-array)
+--   ❓ profiles.provider_id   (UUID — auto-référence pour les providers)
+--
+-- → Le frontend n'utilise PAS profiles.model_id ni profiles.provider_id directement.
+--   Les providers sont identifiés par profiles.id = transactions.provider_id.
+--   Les chatters utilisent profiles.assigned_models (tableau).
+--
+-- CONCLUSION : Tu n'as PAS besoin d'exécuter ce fichier si la DB est déjà
+--              configurée avec les migrations existantes.
 -- ═══════════════════════════════════════════════════════════════════════
 
--- 1. Add `role` column if it doesn't exist
---    Values: 'gerant' | 'chatter' | 'provider' | 'modele' | 'admin' | 'ceo'
-ALTER TABLE profiles
-  ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'chatter';
+-- (Optionnel) Ajouter model_id et provider_id si besoin dans le futur :
 
--- 2. Add `model_id` column if it doesn't exist
---    Links a chatter (or modele) to their primary model.
---    Note: multi-model chatters use assigned_models (UUID[]) instead.
-ALTER TABLE profiles
-  ADD COLUMN IF NOT EXISTS model_id UUID REFERENCES models(id) ON DELETE SET NULL;
+-- ALTER TABLE profiles
+--   ADD COLUMN IF NOT EXISTS model_id UUID REFERENCES models(id) ON DELETE SET NULL;
 
--- 3. Add `provider_id` column if it doesn't exist
---    Self-referencing: for provider profiles this equals their own profiles.id.
---    Used to scope transaction queries to only this provider's transactions.
-ALTER TABLE profiles
-  ADD COLUMN IF NOT EXISTS provider_id UUID;
+-- ALTER TABLE profiles
+--   ADD COLUMN IF NOT EXISTS provider_id UUID;
 
--- 4. Ensure the gérant (DADA) has role = 'gerant'
---    Replace <DADA_EMAIL> with the actual gérant email before running.
--- UPDATE profiles SET role = 'gerant' WHERE email = '<DADA_EMAIL>';
+-- Mettre à jour les providers (provider_id = leur propre profiles.id) :
+-- UPDATE profiles SET provider_id = id WHERE role = 'provider' AND provider_id IS NULL;
 
--- 5. Ensure existing provider profiles have provider_id = their own id
-UPDATE profiles
-  SET provider_id = id
-  WHERE role = 'provider' AND provider_id IS NULL;
-
--- 6. RLS policies (Row Level Security) — enable for defense-in-depth
---    These complement the client-side RBAC in the frontend.
-
--- Enable RLS on transactions if not already enabled
-ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
-
--- Gérant: full access
-CREATE POLICY IF NOT EXISTS "transactions_gerant_all"
-  ON transactions FOR ALL
-  USING (
-    EXISTS (
-      SELECT 1 FROM profiles
-      WHERE profiles.id = auth.uid()
-        AND profiles.role IN ('gerant', 'admin', 'ceo')
-    )
-  );
-
--- Chatter: can only see transactions where they are the chatter
---   OR where the model is one of their assigned models
-CREATE POLICY IF NOT EXISTS "transactions_chatter_own"
-  ON transactions FOR SELECT
-  USING (
-    EXISTS (
-      SELECT 1 FROM profiles
-      WHERE profiles.id = auth.uid()
-        AND profiles.role = 'chatter'
-        AND (
-          transactions.chatter_id = auth.uid()
-          OR transactions.model_id = ANY(
-            SELECT unnest(assigned_models) FROM profiles WHERE id = auth.uid()
-          )
-        )
-    )
-  );
-
--- Provider: can only see their own transactions
-CREATE POLICY IF NOT EXISTS "transactions_provider_own"
-  ON transactions FOR SELECT
-  USING (
-    EXISTS (
-      SELECT 1 FROM profiles
-      WHERE profiles.id = auth.uid()
-        AND profiles.role = 'provider'
-        AND transactions.provider_id = auth.uid()
-    )
-  );
-
--- Enable RLS on spenders
-ALTER TABLE spenders ENABLE ROW LEVEL SECURITY;
-
--- Gérant + Chatter: full access to spenders (chatters manage spenders)
-CREATE POLICY IF NOT EXISTS "spenders_gerant_chatter"
-  ON spenders FOR ALL
-  USING (
-    EXISTS (
-      SELECT 1 FROM profiles
-      WHERE profiles.id = auth.uid()
-        AND profiles.role IN ('gerant', 'admin', 'ceo', 'chatter')
-    )
-  );
-
--- Provider: no access to spenders table
--- (no SELECT policy for providers → they see nothing)
+-- ═══════════════════════════════════════════════════════════════════════
+-- RÉFÉRENCE : RLS déjà appliquées (NE PAS RE-EXÉCUTER)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Voir : migrations/20260228_transactions_chatter_insert_rls.sql
+--   tx_all_gerant      → gérant voit tout
+--   tx_select_chatter  → chatter voit seulement chatter_id = auth.uid()
+--   tx_select_provider → provider voit seulement provider_id = auth.uid()
+--
+-- Voir : supabase/migrations/20260226_spender_pipeline_005_rls.sql
+--   spenders ENABLE ROW LEVEL SECURITY (déjà fait)
