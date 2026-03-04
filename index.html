@@ -596,6 +596,8 @@
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
     @keyframes fadeUp { from { opacity:0; transform: translateY(16px) } to { opacity:1; transform: translateY(0) } }
     @keyframes slideIn { from { opacity:0; transform: translateX(-12px) } to { opacity:1; transform: translateX(0) } }
+    @keyframes msgSlideIn { from { opacity:0; transform: translateY(10px); } to { opacity:1; transform: translateY(0); } }
+    .message-new { animation: msgSlideIn 0.2s ease-out; }
     @keyframes orb1 { 0% { transform: translate(0,0) } 33% { transform: translate(100px,-50px) } 66% { transform: translate(-50px,80px) } 100% { transform: translate(0,0) } }
     @keyframes orb2 { 0% { transform: translate(0,0) } 33% { transform: translate(-80px,60px) } 66% { transform: translate(60px,-40px) } 100% { transform: translate(0,0) } }
     @keyframes livePulse { 0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(16,185,129,0.7); } 50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(16,185,129,0); } }
@@ -25938,13 +25940,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [activeSpender, setActiveSpender] = useState(null);
   const [spenderLoading, setSpenderLoading] = useState(false);
 
-  const pollRef   = React.useRef(null);
-  const msgEndRef = React.useRef(null);
-  const inputRef  = React.useRef(null);
+  const pollRef        = React.useRef(null);
+  const convPollRef    = React.useRef(null);
+  const msgEndRef      = React.useRef(null);
+  const inputRef       = React.useRef(null);
   // Keep a ref to the current chatId so the polling interval always uses fresh value
-  const chatIdRef = React.useRef(null);
+  const chatIdRef      = React.useRef(null);
+  // Lock on selected conv — polling must NEVER call setSelectedConv
+  const selectedConvRef = React.useRef(null);
   // Track if conversations have been loaded at least once — spinner only on first load
-  const convLoadedRef = React.useRef(false);
+  const convLoadedRef  = React.useRef(false);
+  // Scroll stability refs
+  const prevMsgCountRef = React.useRef(0);
+  const isUserScrollRef = React.useRef(false);
+  // Guard against parallel polling calls
+  const isMsgPollingRef = React.useRef(false);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
@@ -25993,10 +26003,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
-  // ── Refs for smart scroll & polling ─────────────
-  // scrollRef: only scroll when a genuinely new message arrives (not every poll)
-  const shouldScrollRef = React.useRef(false);
-
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial) => {
     if (!chatId) return;
@@ -26007,28 +26013,23 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
       setMessages(prev => {
         if (isInitial) {
-          // First load: show everything and scroll to bottom once
-          shouldScrollRef.current = true;
           return list;
         }
-        // Polling: detect genuinely new messages by count or last-item id/timestamp
-        const prevLast = prev[prev.length - 1];
+        // Polling: preserve pending (optimistic) messages until confirmed
+        const pendingMessages = prev.filter(m => m._pending === true);
+        const prevConfirmed = prev.filter(m => !m._pending);
+        const prevLast = prevConfirmed[prevConfirmed.length - 1];
         const newLast  = list[list.length - 1];
-        const hasNew = list.length > prev.length
+        const hasNew = list.length > prevConfirmed.length
           || (newLast && prevLast && (newLast.id !== prevLast.id || newLast.created_at !== prevLast.created_at));
         if (!hasNew) return prev; // No new messages → keep prev unchanged (no re-render)
-        shouldScrollRef.current = true;
-        // Merge: preserve optimistic/pending messages (id = number) until confirmed by DB
-        const existingIds = new Set(prev.map(m => String(m.id)));
-        const toAdd = list.filter(m => !existingIds.has(String(m.id)));
+        // Identify pending messages confirmed by server (matched by text + time window)
         const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
-        // Drop pending messages whose text has been confirmed in the fresh DB list
-        const withoutStale = prev.filter(m =>
-          typeof m.id !== 'number' || !confirmedTexts.has(m.text || "")
+        const stillPending = pendingMessages.filter(p =>
+          !confirmedTexts.has(p.text || "")
         );
-        return [...withoutStale, ...toAdd].sort((a, b) =>
-          new Date(a.created_at) - new Date(b.created_at)
-        );
+        // Merge: server messages + unconfirmed pending
+        return [...list, ...stillPending];
       });
     } catch (_) {
       if (isInitial) setMessages([]);
@@ -26080,33 +26081,75 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const selectConv = useCallback((conv) => {
     const chatId = _dmsgChatId(conv);
     chatIdRef.current = chatId;
+    // Lock the selection — polling is NEVER allowed to change selectedConv
+    selectedConvRef.current = conv;
     setSelectedConv(conv);
     setMessages([]);
     setMsgInput("");
     setShowScripts(false);
-    shouldScrollRef.current = false; // reset before initial load sets it
+    isUserScrollRef.current = false;
+    prevMsgCountRef.current = 0;
     if (chatId) loadMessagesById(chatId, true); // isInitial=true
     resolveSpender(conv);
     if (isMobile) setMobilePane("chat");
   }, [loadMessagesById, resolveSpender, isMobile]);
 
-  // ── Auto-scroll: ONLY when shouldScrollRef is true ──
+  // ── Détecter si l'utilisateur scrolle manuellement ──────────────────────
   useEffect(() => {
-    if (shouldScrollRef.current && msgEndRef.current) {
-      msgEndRef.current.scrollIntoView({ behavior: "smooth" });
-      shouldScrollRef.current = false;
+    const container = msgEndRef.current?.parentElement;
+    if (!container) return;
+    const handleScroll = () => {
+      const isAtBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 100;
+      isUserScrollRef.current = !isAtBottom;
+    };
+    container.addEventListener('scroll', handleScroll, { passive: true });
+    return () => container.removeEventListener('scroll', handleScroll);
+  // Reset listener when conv changes so the ref is re-initialized
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedConv?.id]);
+
+  // ── Scroll automatique : seulement si nouveaux messages ET user pas en train de scroller ──
+  useEffect(() => {
+    if (messages.length > prevMsgCountRef.current && !isUserScrollRef.current && msgEndRef.current) {
+      msgEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
+    prevMsgCountRef.current = messages.length;
   }, [messages]);
 
-  // ── Polling every 10s (passes isInitial=false) ────
+  // ── Scroll instant lors du changement de conversation ──
+  useEffect(() => {
+    if (msgEndRef.current) {
+      msgEndRef.current.scrollIntoView({ behavior: 'instant' });
+    }
+    prevMsgCountRef.current = messages.length;
+    isUserScrollRef.current = false;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedConv?.id]);
+
+  // ── Polling messages toutes les 2s (guard contre les appels parallèles) ──
   useEffect(() => {
     clearInterval(pollRef.current);
     if (!selectedConv || !chatIdRef.current) return;
-    pollRef.current = setInterval(() => {
-      if (chatIdRef.current) loadMessagesById(chatIdRef.current, false);
-    }, 10000);
+    pollRef.current = setInterval(async () => {
+      if (isMsgPollingRef.current || !chatIdRef.current) return;
+      isMsgPollingRef.current = true;
+      try {
+        await loadMessagesById(chatIdRef.current, false);
+      } finally {
+        isMsgPollingRef.current = false;
+      }
+    }, 2000);
     return () => clearInterval(pollRef.current);
-  }, [selectedConv, loadMessagesById]);
+  }, [selectedConv?.id, loadMessagesById]);
+
+  // ── Polling conversations toutes les 5s ──────────────────────────────────
+  useEffect(() => {
+    clearInterval(convPollRef.current);
+    convPollRef.current = setInterval(() => {
+      loadConversations();
+    }, 5000);
+    return () => clearInterval(convPollRef.current);
+  }, [loadConversations]);
 
   // ── Helpers for display ──────────────────────────
   const getConvName = (conv) => {
@@ -26162,7 +26205,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setMsgInput("");
     setSending(true);
 
-    // Bug 1 fix — inject the message locally right now (optimistic)
+    // Inject the message locally right now (optimistic update)
     const localId = Date.now();
     const optimistic = {
       id: localId,
@@ -26171,8 +26214,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       is_outgoing: true,
       sender_type: "chatter",
       created_at: new Date().toISOString(),
+      _pending: true,
     };
-    shouldScrollRef.current = true;
     setMessages(prev => [...prev, optimistic]);
 
     try {
@@ -26183,26 +26226,22 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       });
       addToast(fr ? "Message envoyé ✓" : "Message sent ✓", "success");
 
-      // Force a fresh fetch 2 s after send — confirms the optimistic entry
-      // and picks up any incoming messages from the contact.
+      // Réconciliation 2 s après l'envoi — confirme l'optimiste + capte les réponses
       setTimeout(async () => {
-        if (chatIdRef.current !== chatId) return; // user switched conv
+        if (chatIdRef.current !== chatId) return; // l'utilisateur a changé de conv
         try {
           const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
           const list = Array.isArray(data) ? data : (data.messages || data.data || []);
-          // Merge: keep pending optimistic messages (id = number) until confirmed
           setMessages(prev => {
+            const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+            // Garder les pending non encore confirmés
+            const stillPending = prev.filter(m => m._pending && !confirmedTexts.has(m.text || ""));
             const existingIds = new Set(prev.map(m => String(m.id)));
             const toAdd = list.filter(m => !existingIds.has(String(m.id)));
-            const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
-            const withoutStale = prev.filter(m =>
-              typeof m.id !== 'number' || !confirmedTexts.has(m.text || "")
-            );
-            return [...withoutStale, ...toAdd].sort((a, b) =>
-              new Date(a.created_at) - new Date(b.created_at)
-            );
+            return [...prev.filter(m => !m._pending), ...stillPending, ...toAdd]
+              .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
           });
-        } catch (_) { /* keep optimistic visible until next poll */ }
+        } catch (_) { /* garder l'optimiste jusqu'au prochain poll */ }
       }, 2000);
 
     } catch (e) {
@@ -26491,20 +26530,26 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               const isOut = msg.direction === "out" || msg.from_bot === true || msg.sender_type === "bot" || msg.sender_type === "chatter" || msg.is_outgoing === true;
               const text = msg.text || msg.content || msg.message || "";
               const ts = msg.created_at || msg.timestamp || msg.date;
+              const isPending = msg._pending === true;
+              const isNew = i >= prevMsgCountRef.current - 1 && !isPending;
               return (
-                <div key={msg.id || i} style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%", display: "flex", flexDirection: "column", gap: 2 }}>
+                <div key={msg.id || i}
+                  className={isNew ? "message-new" : undefined}
+                  style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%", display: "flex", flexDirection: "column", gap: 2, opacity: isPending ? 0.7 : 1 }}>
                   <div style={{
                     padding: "9px 13px",
                     borderRadius: isOut ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
                     background: isOut ? "var(--accent)" : "rgba(255,255,255,0.08)",
                     color: "#fff", fontSize: 13, lineHeight: 1.45, wordBreak: "break-word",
                     boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
+                    border: isPending ? "1px dashed rgba(255,255,255,0.3)" : "none",
                   }}>
                     {text || <span style={{ opacity: 0.5, fontStyle: "italic" }}>—</span>}
                   </div>
                   {ts && (
                     <div style={{ fontSize: 9, color: "var(--text-quaternary)", textAlign: isOut ? "right" : "left" }}>
                       {(() => { try { return new Date(ts).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }); } catch (_) { return ""; } })()}
+                      {isPending && <span style={{ marginLeft: 4, opacity: 0.6 }}>⏳</span>}
                     </div>
                   )}
                 </div>
