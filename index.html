@@ -25444,17 +25444,22 @@ const _DMSG_TX_TYPES = ["tip", "subscription", "ppv", "custom"];
 const _dmsgRelBadge = (rel) => {
   if (!rel) return null;
   const map = {
-    vip:        { bg: "rgba(250,204,21,0.18)", color: "#fbbf24", label: "⭐ VIP" },
-    active:     { bg: "rgba(34,211,161,0.15)", color: "#22d3a1", label: "✅ Actif" },
-    inactive:   { bg: "rgba(148,163,184,0.15)", color: "#94a3b8", label: "💤 Inactif" },
-    new:        { bg: "rgba(99,102,241,0.15)", color: "#818cf8", label: "🆕 Nouveau" },
-    warm:       { bg: "rgba(249,115,22,0.15)", color: "#fb923c", label: "🔥 Chaud" },
-    cold:       { bg: "rgba(59,130,246,0.15)", color: "#60a5fa", label: "❄️ Froid" },
-    lost:       { bg: "rgba(244,63,94,0.15)",  color: "#fb7185", label: "❌ Perdu" },
-    prospect:   { bg: "rgba(168,85,247,0.15)", color: "#c084fc", label: "👀 Prospect" },
+    vip:      { bg: "rgba(250,204,21,0.18)",  color: "#fbbf24", label: "⭐ VIP" },
+    active:   { bg: "rgba(34,211,161,0.15)",  color: "#22d3a1", label: "✅ Actif" },
+    inactive: { bg: "rgba(148,163,184,0.15)", color: "#94a3b8", label: "💤 Inactif" },
+    new:      { bg: "rgba(99,102,241,0.15)",  color: "#818cf8", label: "🆕 Nouveau" },
+    warm:     { bg: "rgba(249,115,22,0.15)",  color: "#fb923c", label: "🔥 Chaud" },
+    cold:     { bg: "rgba(59,130,246,0.15)",  color: "#60a5fa", label: "❄️ Froid" },
+    lost:     { bg: "rgba(244,63,94,0.15)",   color: "#fb7185", label: "❌ Perdu" },
+    prospect: { bg: "rgba(168,85,247,0.15)",  color: "#c084fc", label: "👀 Prospect" },
   };
-  const key = String(rel).toLowerCase();
-  return map[key] || { bg: "rgba(148,163,184,0.12)", color: "#94a3b8", label: rel };
+  return map[String(rel).toLowerCase()] || { bg: "rgba(148,163,184,0.12)", color: "#94a3b8", label: rel };
+};
+
+// Extract the Telegram chat_id from a conversation object (tries multiple field names)
+const _dmsgChatId = (conv) => {
+  if (!conv) return null;
+  return conv.tg_chat_id || conv.chat_id || conv.telegram_chat_id || conv.tg_id || conv.id || null;
 };
 
 const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) => {
@@ -25463,7 +25468,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const isMobile = useIsMobile();
 
   // ── State ──────────────────────────────────────────
-  const [apiOk, setApiOk]                 = useState(null); // null=loading, true=ok, false=error
+  const [apiOk, setApiOk]                 = useState(null);
   const [conversations, setConversations] = useState([]);
   const [convLoading, setConvLoading]     = useState(true);
   const [searchQuery, setSearchQuery]     = useState("");
@@ -25472,20 +25477,23 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [msgLoading, setMsgLoading]       = useState(false);
   const [msgInput, setMsgInput]           = useState("");
   const [sending, setSending]             = useState(false);
-  const [mobilePane, setMobilePane]       = useState("list"); // list | chat | spender
+  const [mobilePane, setMobilePane]       = useState("list");
   const [showScripts, setShowScripts]     = useState(false);
   const [showTxModal, setShowTxModal]     = useState(false);
   const [txForm, setTxForm]               = useState({ amount: "", type: "tip", note: "" });
   const [txSaving, setTxSaving]           = useState(false);
-  const [selectedModelId, setSelectedModelId] = useState(""); // manager model switcher
+  const [selectedModelId, setSelectedModelId] = useState("");
+  // Spender resolved for the active conversation (with Supabase fallback)
+  const [activeSpender, setActiveSpender] = useState(null);
+  const [spenderLoading, setSpenderLoading] = useState(false);
 
-  const pollRef    = React.useRef(null);
-  const msgEndRef  = React.useRef(null);
-  const inputRef   = React.useRef(null);
+  const pollRef   = React.useRef(null);
+  const msgEndRef = React.useRef(null);
+  const inputRef  = React.useRef(null);
+  // Keep a ref to the current chatId so the polling interval always uses fresh value
+  const chatIdRef = React.useRef(null);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
-
-  // ── Chatter context ──────────────────────────────
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
   // ── Health check ────────────────────────────────
@@ -25498,115 +25506,172 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setConvLoading(true);
     try {
       let path = "/conversations";
-      const params = [];
-      if (isManager && selectedModelId) params.push(`model_id=${encodeURIComponent(selectedModelId)}`);
-      if (params.length) path += "?" + params.join("&");
+      if (isManager && selectedModelId) path += "?model_id=" + encodeURIComponent(selectedModelId);
       const data = await _dmsgFetch(path);
       const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
       setConversations(list);
       setApiOk(true);
-    } catch (e) {
+    } catch (_) {
       setApiOk(false);
       setConversations([]);
     }
     setConvLoading(false);
-  }, [user?.id, isManager, selectedModelId]);
+  }, [isManager, selectedModelId]);
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
-  // ── Load messages ────────────────────────────────
-  const loadMessages = useCallback(async (conv) => {
-    if (!conv) return;
-    const chatId = conv.tg_chat_id || conv.chat_id || conv.id;
+  // ── Load messages by explicit chatId ────────────
+  const loadMessagesById = useCallback(async (chatId) => {
     if (!chatId) return;
     setMsgLoading(true);
     try {
-      const data = await _dmsgFetch(`/conversations/${chatId}/messages?limit=50`);
+      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
       const list = Array.isArray(data) ? data : (data.messages || data.data || []);
       setMessages(list);
-    } catch (_) { setMessages([]); }
+    } catch (_) {
+      setMessages([]);
+    }
     setMsgLoading(false);
   }, []);
 
-  // ── Select conversation ──────────────────────────
-  const selectConv = (conv) => {
-    setSelectedConv(conv);
-    setMsgInput("");
-    setMessages([]);
-    setShowScripts(false);
-    loadMessages(conv);
-    if (isMobile) setMobilePane("chat");
-  };
+  // ── Resolve spender: props first, then Supabase ──
+  const resolveSpender = useCallback(async (conv) => {
+    if (!conv) { setActiveSpender(null); return; }
+    const all = spenders || [];
+    const tgId = _dmsgChatId(conv);
 
-  // ── Auto-scroll ──────────────────────────────────
+    // 1) match by spender_id
+    if (conv.spender_id) {
+      const s = all.find(x => x.id === conv.spender_id);
+      if (s) { setActiveSpender(s); return; }
+    }
+    // 2) match by tg id fields
+    if (tgId) {
+      const tidStr = String(tgId);
+      const s = all.find(x =>
+        String(x.tg_user_id || x.telegram_id || x.tg_chat_id || "") === tidStr
+      );
+      if (s) { setActiveSpender(s); return; }
+    }
+    // 3) match by telegram_username
+    if (conv.tg_username) {
+      const u = String(conv.tg_username).replace(/^@/, "").toLowerCase();
+      const s = all.find(x => x.telegram_username && String(x.telegram_username).replace(/^@/, "").toLowerCase() === u);
+      if (s) { setActiveSpender(s); return; }
+    }
+    // 4) Supabase fallback
+    if (!tgId) { setActiveSpender(null); return; }
+    setSpenderLoading(true);
+    try {
+      const tidStr = String(tgId);
+      const { data, error } = await sb.from("spenders").select("*")
+        .or("tg_user_id.eq." + tidStr + ",telegram_id.eq." + tidStr)
+        .maybeSingle();
+      setActiveSpender(!error && data ? data : null);
+    } catch (_) {
+      setActiveSpender(null);
+    }
+    setSpenderLoading(false);
+  }, [spenders]);
+
+  // ── Select conversation (the critical handler) ───
+  const selectConv = useCallback((conv) => {
+    const chatId = _dmsgChatId(conv);
+    chatIdRef.current = chatId;
+    setSelectedConv(conv);
+    setMessages([]);
+    setMsgInput("");
+    setShowScripts(false);
+    // Load messages immediately
+    if (chatId) loadMessagesById(chatId);
+    // Resolve spender for right panel
+    resolveSpender(conv);
+    // On mobile: switch to chat pane
+    if (isMobile) setMobilePane("chat");
+  }, [loadMessagesById, resolveSpender, isMobile]);
+
+  // ── Auto-scroll when messages update ────────────
   useEffect(() => {
     if (msgEndRef.current) msgEndRef.current.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   // ── Polling every 10s ────────────────────────────
   useEffect(() => {
-    if (!selectedConv) return;
-    pollRef.current = setInterval(() => loadMessages(selectedConv), 10000);
+    clearInterval(pollRef.current);
+    const chatId = chatIdRef.current;
+    if (!selectedConv || !chatId) return;
+    pollRef.current = setInterval(() => { if (chatIdRef.current) loadMessagesById(chatIdRef.current); }, 10000);
     return () => clearInterval(pollRef.current);
-  }, [selectedConv, loadMessages]);
+  }, [selectedConv, loadMessagesById]);
 
-  // ── Resolve spender from conversation ────────────
-  const getSpender = (conv) => {
-    if (!conv) return null;
-    const all = spenders || [];
-    if (conv.spender_id) { const s = all.find(x => x.id === conv.spender_id); if (s) return s; }
-    if (conv.tg_chat_id) {
-      const s = all.find(x =>
-        String(x.telegram_id || x.tg_user_id || "") === String(conv.tg_chat_id)
-      );
-      if (s) return s;
-    }
-    if (conv.tg_username) {
-      const u = String(conv.tg_username).replace(/^@/, "").toLowerCase();
-      const s = all.find(x => x.telegram_username && String(x.telegram_username).replace(/^@/, "").toLowerCase() === u);
-      if (s) return s;
-    }
-    return null;
-  };
-
+  // ── Helpers for display ──────────────────────────
   const getConvName = (conv) => {
-    const sp = getSpender(conv);
+    if (!conv) return "—";
+    if (activeSpender && (conv === selectedConv)) return activeSpender.first_name || activeSpender.handle || activeSpender.name || "—";
+    const all = spenders || [];
+    const tgId = _dmsgChatId(conv);
+    const tidStr = String(tgId || "");
+    const sp = (conv.spender_id && all.find(x => x.id === conv.spender_id))
+      || (tgId && all.find(x => String(x.tg_user_id || x.telegram_id || "") === tidStr))
+      || null;
     if (sp) return sp.first_name || sp.handle || sp.name || "—";
-    return conv?.display_name || conv?.username || conv?.tg_username || String(conv?.tg_chat_id || conv?.chat_id || "—");
+    return conv.display_name || conv.username || conv.tg_username || String(tgId || "—");
   };
 
   const getConvHandle = (conv) => {
-    const sp = getSpender(conv);
-    const u = sp?.telegram_username || conv?.tg_username || "";
+    if (!conv) return "";
+    const u = activeSpender?.telegram_username || conv.tg_username || "";
     return u ? "@" + String(u).replace(/^@/, "") : "";
   };
 
-  // ── Send message ────────────────────────────────
+  const fmtTime = (ts) => {
+    if (!ts) return "";
+    try {
+      const d = new Date(ts);
+      if (isNaN(d.getTime())) return "";
+      const diffDays = Math.floor((Date.now() - d) / 86400000);
+      if (diffDays === 0) return d.toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" });
+      if (diffDays === 1) return fr ? "Hier" : "Yesterday";
+      return d.toLocaleDateString("fr-CH", { day: "2-digit", month: "2-digit" });
+    } catch (_) { return ""; }
+  };
+
+  // ── Filtered conversations ───────────────────────
+  const filteredConvs = React.useMemo(() => {
+    if (!searchQuery.trim()) return conversations;
+    const q = searchQuery.toLowerCase();
+    return conversations.filter(c => {
+      const name = (c.display_name || c.username || c.tg_username || String(_dmsgChatId(c) || "")).toLowerCase();
+      const last = String(c.last_message || c.last_message_text || "").toLowerCase();
+      return name.includes(q) || last.includes(q);
+    });
+  }, [conversations, searchQuery]);
+
+  // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
     if (!selectedConv || !msgInput.trim() || sending) return;
+    const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
+    if (!chatId) { addToast(fr ? "Aucun chat_id" : "Missing chat_id", "error"); return; }
     setSending(true);
     try {
-      const chatId = selectedConv.tg_chat_id || selectedConv.chat_id || selectedConv.id;
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
       await _dmsgFetch("/send-message", {
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text: msgInput.trim(), ...(modelId ? { model_id: modelId } : {}) }),
       });
       setMsgInput("");
-      await loadMessages(selectedConv);
+      await loadMessagesById(chatId);
       addToast(fr ? "Message envoyé ✓" : "Message sent ✓", "success");
     } catch (e) {
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
     }
     setSending(false);
-  }, [selectedConv, msgInput, sending, selectedModelId, chatterCtx, fr, addToast, loadMessages]);
+  }, [selectedConv, msgInput, sending, selectedModelId, chatterCtx, fr, addToast, loadMessagesById]);
 
   // ── Apply script ─────────────────────────────────
   const applyScript = (script) => {
-    const sp = getSpender(selectedConv);
-    const prenom = sp?.first_name || sp?.handle || "";
-    const text = script.text.replace(/\[prénom\]/g, prenom || "toi");
-    setMsgInput(text);
+    const prenom = activeSpender?.first_name || activeSpender?.handle || "toi";
+    setMsgInput(script.text.replace(/\[prénom\]/g, prenom));
     setShowScripts(false);
     setTimeout(() => inputRef.current?.focus(), 50);
   };
@@ -25616,12 +25681,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     if (!txForm.amount || isNaN(Number(txForm.amount))) {
       addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return;
     }
-    const sp = getSpender(selectedConv);
     const modelId = selectedConv?.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || null;
     setTxSaving(true);
     try {
-      const payload = {
-        spender_id: sp?.id || null,
+      const { error } = await sb.from("transactions").insert({
+        spender_id: activeSpender?.id || null,
         model_id:   modelId || null,
         amount:     parseFloat(txForm.amount),
         type:       txForm.type,
@@ -25629,8 +25693,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         created_at: new Date().toISOString(),
         chatter_id: user?.id || null,
         status:     "pending",
-      };
-      const { error } = await sb.from("transactions").insert(payload);
+      });
       if (error) throw new Error(error.message);
       addToast(fr ? "Transaction enregistrée ✅" : "Transaction saved ✅", "success");
       setShowTxModal(false);
@@ -25639,29 +25702,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
     }
     setTxSaving(false);
-  };
-
-  // ── Filtered conversations ───────────────────────
-  const filteredConvs = React.useMemo(() => {
-    if (!searchQuery.trim()) return conversations;
-    const q = searchQuery.toLowerCase();
-    return conversations.filter(c => {
-      const name = getConvName(c).toLowerCase();
-      const handle = getConvHandle(c).toLowerCase();
-      const last = String(c.last_message || c.last_message_text || "").toLowerCase();
-      return name.includes(q) || handle.includes(q) || last.includes(q);
-    });
-  }, [conversations, searchQuery]);
-
-  // ── Format timestamp ─────────────────────────────
-  const fmtTime = (ts) => {
-    if (!ts) return "";
-    const d = new Date(ts);
-    const now = new Date();
-    const diffDays = Math.floor((now - d) / 86400000);
-    if (diffDays === 0) return d.toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" });
-    if (diffDays === 1) return fr ? "Hier" : "Yesterday";
-    return d.toLocaleDateString("fr-CH", { day: "2-digit", month: "2-digit" });
   };
 
   // ── API error banner ─────────────────────────────
@@ -25682,23 +25722,72 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     );
   }
 
+  // ── Style helpers ────────────────────────────────
+  const sectionStyle = { marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid var(--border-subtle)" };
+  const labelSt = { fontSize: 9, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2, fontWeight: 600 };
+  const valueSt = { fontSize: 12, color: "var(--text-primary)", fontWeight: 500 };
+  const relBadge = activeSpender ? _dmsgRelBadge(activeSpender.relationship_status) : null;
+
   // ══════════════════════════════════════════
-  // COLONNE GAUCHE — Liste conversations
+  // LAYOUT WRAPPER — grid desktop, pane mobile
   // ══════════════════════════════════════════
-  const renderLeftCol = () => (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-sidebar)", borderRight: "1px solid var(--border-subtle)" }}>
+  const PANEL_H = "calc(100vh - 200px)";
+
+  // ── TX Modal ─────────────────────────────────────
+  const txModal = showTxModal && (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+      onClick={e => { if (e.target === e.currentTarget) setShowTxModal(false); }}>
+      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: 360, maxWidth: "95vw", boxShadow: "var(--shadow-lg)" }}>
+        <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)", marginBottom: 4 }}>💳 {fr ? "Créer une transaction" : "Create transaction"}</div>
+        {activeSpender && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginBottom: 18 }}>Spender: <strong>{activeSpender.first_name || activeSpender.handle || "?"}</strong></div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>{fr ? "Montant *" : "Amount *"}</label>
+            <input type="number" min="0" step="0.01" value={txForm.amount} onChange={e => setTxForm(f => ({ ...f, amount: e.target.value }))} placeholder="0.00" autoFocus
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 14, fontWeight: 700, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>Type *</label>
+            <select value={txForm.type} onChange={e => setTxForm(f => ({ ...f, type: e.target.value }))}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", boxSizing: "border-box" }}>
+              {_DMSG_TX_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>Note</label>
+            <input type="text" value={txForm.note} onChange={e => setTxForm(f => ({ ...f, note: e.target.value }))} placeholder={fr ? "Optionnel…" : "Optional…"}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
+          <button onClick={createTx} disabled={txSaving || !txForm.amount}
+            style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "none", background: txSaving || !txForm.amount ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: txSaving || !txForm.amount ? "not-allowed" : "pointer" }}>
+            {txSaving ? "⏳ …" : (fr ? "✅ Créer" : "✅ Create")}
+          </button>
+          <button onClick={() => setShowTxModal(false)}
+            style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "transparent", color: "var(--text-secondary)", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+            {fr ? "Annuler" : "Cancel"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ══════════════════════════════════════════
+  // LEFT PANEL — conversation list
+  // ══════════════════════════════════════════
+  const leftPanel = (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-sidebar)", borderRight: "1px solid var(--border-subtle)", overflow: "hidden" }}>
       {/* Header */}
       <div style={{ padding: "14px 12px 10px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <span style={{ fontSize: 13, fontWeight: 800, color: "var(--text-primary)" }}>💬 {fr ? "Messagerie" : "Messaging"}</span>
+          <span style={{ fontSize: 13, fontWeight: 800, color: "var(--text-primary)" }}>💬 {fr ? "Conversations" : "Conversations"}</span>
           <button onClick={loadConversations} disabled={convLoading}
-            style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: 4, borderRadius: 6, opacity: convLoading ? 0.5 : 1 }}
-            title={fr ? "Rafraîchir" : "Refresh"}>🔄</button>
+            style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: 4, borderRadius: 6, opacity: convLoading ? 0.5 : 1 }}>🔄</button>
         </div>
-        {/* Manager model switcher */}
         {isManager && (
           <select value={selectedModelId} onChange={e => setSelectedModelId(e.target.value)}
-            style={{ width: "100%", padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 11, fontWeight: 600, marginBottom: 8, fontFamily: "'Inter', sans-serif" }}>
+            style={{ width: "100%", padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 11, fontWeight: 600, marginBottom: 8, fontFamily: "'Inter',sans-serif" }}>
             <option value="">{fr ? "— Toutes les conversations —" : "— All conversations —"}</option>
             {(models || []).map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
           </select>
@@ -25706,18 +25795,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         {/* Search */}
         <div style={{ position: "relative" }}>
           <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-tertiary)", pointerEvents: "none" }}>🔍</span>
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
+          <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
             placeholder={fr ? "Rechercher…" : "Search…"}
-            style={{ width: "100%", padding: "7px 10px 7px 28px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 12, fontFamily: "'Inter', sans-serif", outline: "none", boxSizing: "border-box" }}
-          />
+            style={{ width: "100%", padding: "7px 10px 7px 28px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 12, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
         </div>
       </div>
 
-      {/* Conversation list */}
-      <div style={{ flex: 1, overflowY: "auto" }}>
+      {/* ── FIX SCROLL: minHeight:0 lets this flex-child shrink and scroll ── */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }}>
         {convLoading && (
           <div style={{ padding: 24, textAlign: "center", color: "var(--text-tertiary)", fontSize: 12 }}>
             <div style={{ marginBottom: 8, fontSize: 20 }}>⏳</div>
@@ -25729,30 +25814,39 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             {searchQuery ? (fr ? "Aucun résultat" : "No results") : (fr ? "Aucune conversation" : "No conversations")}
           </div>
         )}
-        {!convLoading && filteredConvs.map(conv => {
-          const sp = getSpender(conv);
-          const isActive = selectedConv && (selectedConv.id === conv.id || (selectedConv.tg_chat_id && selectedConv.tg_chat_id === conv.tg_chat_id));
+        {!convLoading && filteredConvs.map((conv, idx) => {
+          const cid = _dmsgChatId(conv);
+          const isActive = selectedConv && _dmsgChatId(selectedConv) === cid;
           const name = getConvName(conv);
           const lastMsg = conv.last_message || conv.last_message_text || "";
           const ts = fmtTime(conv.last_message_at || conv.updated_at);
+          // Find spender avatar from props (best-effort, no loading state here)
+          const all = spenders || [];
+          const cidStr = String(cid || "");
+          const sp = (conv.spender_id && all.find(x => x.id === conv.spender_id))
+            || (cid && all.find(x => String(x.tg_user_id || x.telegram_id || "") === cidStr))
+            || null;
           return (
-            <div key={conv.id || conv.tg_chat_id || conv.chat_id}
+            <div key={cid || idx}
               onClick={() => selectConv(conv)}
-              style={{ padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)", cursor: "pointer",
-                background: isActive ? "rgba(99,102,241,0.12)" : "transparent",
+              style={{
+                padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)",
+                cursor: "pointer", userSelect: "none",
+                background: isActive ? "rgba(99,102,241,0.13)" : "transparent",
                 borderLeft: isActive ? "3px solid var(--accent)" : "3px solid transparent",
-                transition: "background 0.15s" }}>
+                transition: "background 0.12s",
+              }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <SpenderAvatar sp={sp} size={36} radius="50%" fontSize={16} />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "70%" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 4 }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {name}
                     </span>
-                    <span style={{ fontSize: 9, color: "var(--text-quaternary)", flexShrink: 0, marginLeft: 4 }}>{ts}</span>
+                    <span style={{ fontSize: 9, color: "var(--text-quaternary)", flexShrink: 0 }}>{ts}</span>
                   </div>
                   <div style={{ fontSize: 11, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>
-                    {lastMsg || getConvHandle(conv) || "—"}
+                    {lastMsg || conv.tg_username || ""}
                   </div>
                 </div>
               </div>
@@ -25764,11 +25858,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   );
 
   // ══════════════════════════════════════════
-  // COLONNE CENTRE — Fenêtre de chat
+  // CENTER PANEL — chat window
   // ══════════════════════════════════════════
-  const activeSpender = getSpender(selectedConv);
-  const renderCenterCol = () => (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-base)", position: "relative" }}>
+  const centerPanel = (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-base)", overflow: "hidden" }}>
       {!selectedConv ? (
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10, color: "var(--text-quaternary)" }}>
           <div style={{ fontSize: 40 }}>💬</div>
@@ -25776,11 +25869,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         </div>
       ) : (
         <>
-          {/* Chat header */}
+          {/* Header */}
           <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-overlay)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
             {isMobile && (
-              <button onClick={() => setMobilePane("list")}
-                style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: 18, padding: "0 4px 0 0" }}>←</button>
+              <button onClick={() => setMobilePane("list")} style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: 18, padding: "0 4px 0 0" }}>←</button>
             )}
             <SpenderAvatar sp={activeSpender} size={32} radius="50%" fontSize={14} />
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -25788,23 +25880,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 {getConvName(selectedConv)}
               </div>
               <div style={{ fontSize: 10, color: "var(--brand-telegram)" }}>
-                {getConvHandle(selectedConv) || ("TG: " + (selectedConv.tg_chat_id || selectedConv.chat_id || "—"))}
+                {getConvHandle(selectedConv) || "TG: " + (_dmsgChatId(selectedConv) || "—")}
               </div>
             </div>
-            {/* + TX button */}
             <button onClick={() => { setShowTxModal(true); setTxForm({ amount: "", type: "tip", note: "" }); }}
-              style={{ padding: "5px 10px", borderRadius: 8, border: "1px solid var(--accent)", background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 11, fontWeight: 700, cursor: "pointer", flexShrink: 0, whiteSpace: "nowrap" }}>
+              style={{ padding: "5px 10px", borderRadius: 8, border: "1px solid var(--accent)", background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 11, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
               + TX
             </button>
             {isMobile && (
-              <button onClick={() => setMobilePane("spender")}
-                style={{ background: "none", border: "1px solid var(--border-subtle)", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: "5px 8px", borderRadius: 8 }}>👤</button>
+              <button onClick={() => setMobilePane("spender")} style={{ background: "none", border: "1px solid var(--border-subtle)", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: "5px 8px", borderRadius: 8 }}>👤</button>
             )}
           </div>
 
-          {/* Messages */}
-          <div style={{ flex: 1, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 6 }}>
-            {msgLoading && <div style={{ textAlign: "center", color: "var(--text-quaternary)", fontSize: 12, padding: 20 }}>{fr ? "Chargement…" : "Loading…"}</div>}
+          {/* Messages — FIX SCROLL: flex:1 + minHeight:0 */}
+          <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 6 }}>
+            {msgLoading && <div style={{ textAlign: "center", color: "var(--text-quaternary)", fontSize: 12, padding: 20 }}>⏳ {fr ? "Chargement…" : "Loading…"}</div>}
             {!msgLoading && messages.length === 0 && (
               <div style={{ textAlign: "center", color: "var(--text-quaternary)", fontSize: 12, padding: 20 }}>
                 {fr ? "Aucun message" : "No messages yet"}
@@ -25817,16 +25907,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               return (
                 <div key={msg.id || i} style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%", display: "flex", flexDirection: "column", gap: 2 }}>
                   <div style={{
-                    padding: "9px 13px", borderRadius: isOut ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
+                    padding: "9px 13px",
+                    borderRadius: isOut ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
                     background: isOut ? "var(--accent)" : "rgba(255,255,255,0.08)",
                     color: "#fff", fontSize: 13, lineHeight: 1.45, wordBreak: "break-word",
-                    boxShadow: "0 1px 4px rgba(0,0,0,0.2)"
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
                   }}>
                     {text || <span style={{ opacity: 0.5, fontStyle: "italic" }}>—</span>}
                   </div>
                   {ts && (
-                    <div style={{ fontSize: 9, color: "var(--text-quaternary)", textAlign: isOut ? "right" : "left", paddingLeft: isOut ? 0 : 4, paddingRight: isOut ? 4 : 0 }}>
-                      {new Date(ts).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" })}
+                    <div style={{ fontSize: 9, color: "var(--text-quaternary)", textAlign: isOut ? "right" : "left" }}>
+                      {(() => { try { return new Date(ts).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }); } catch (_) { return ""; } })()}
                     </div>
                   )}
                 </div>
@@ -25835,9 +25926,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             <div ref={msgEndRef} />
           </div>
 
-          {/* Scripts button + send bar */}
+          {/* Scripts + send bar */}
           <div style={{ flexShrink: 0, borderTop: "1px solid var(--border-subtle)", background: "var(--bg-overlay)" }}>
-            {/* Scripts row */}
             <div style={{ position: "relative" }}>
               <div style={{ padding: "8px 14px 0" }}>
                 <button onClick={() => setShowScripts(s => !s)}
@@ -25845,15 +25935,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                   📋 Scripts
                 </button>
               </div>
-              {/* Scripts dropdown */}
               {showScripts && (
-                <div style={{ position: "absolute", bottom: "100%", left: 14, background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 12, boxShadow: "var(--shadow-lg)", zIndex: 100, minWidth: 280, padding: 6 }}>
+                <div style={{ position: "absolute", bottom: "100%", left: 14, background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 12, boxShadow: "var(--shadow-lg)", zIndex: 200, minWidth: 280, padding: 6 }}>
                   <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-tertiary)", textTransform: "uppercase", padding: "4px 8px 6px", letterSpacing: "0.05em" }}>
                     {fr ? "Scripts rapides" : "Quick scripts"}
                   </div>
                   {_DMSG_SCRIPTS.map(s => (
                     <button key={s.id} onClick={() => applyScript(s)}
-                      style={{ display: "block", width: "100%", padding: "8px 12px", borderRadius: 8, border: "none", background: "transparent", color: "var(--text-primary)", fontSize: 12, cursor: "pointer", textAlign: "left", transition: "background 0.1s" }}
+                      style={{ display: "block", width: "100%", padding: "8px 12px", borderRadius: 8, border: "none", background: "transparent", color: "var(--text-primary)", fontSize: 12, cursor: "pointer", textAlign: "left" }}
                       onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.1)"}
                       onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                       <span style={{ fontWeight: 700, color: "var(--accent)", marginRight: 6 }}>{s.label}</span>
@@ -25863,21 +25952,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 </div>
               )}
             </div>
-            {/* Send row */}
             <div style={{ display: "flex", gap: 8, padding: "8px 14px 12px", alignItems: "flex-end" }}>
-              <textarea
-                ref={inputRef}
-                value={msgInput}
-                onChange={e => setMsgInput(e.target.value)}
+              <textarea ref={inputRef} value={msgInput} onChange={e => setMsgInput(e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendMessage(); } }}
                 placeholder={fr ? "Écrire un message… (⌘+Entrée)" : "Write a message… (⌘+Enter)"}
-                disabled={sending}
-                rows={2}
-                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-raised))", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter', sans-serif", outline: "none", lineHeight: 1.4 }}
+                disabled={sending} rows={2}
+                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-raised))", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4 }}
               />
-              <button
-                onClick={sendMessage}
-                disabled={sending || !msgInput.trim()}
+              <button onClick={sendMessage} disabled={sending || !msgInput.trim()}
                 style={{ alignSelf: "flex-end", padding: "10px 18px", borderRadius: 10, border: "none", background: sending || !msgInput.trim() ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: sending || !msgInput.trim() ? "not-allowed" : "pointer", flexShrink: 0, transition: "background 0.2s" }}>
                 {sending ? "⏳" : (fr ? "Envoyer" : "Send")}
               </button>
@@ -25889,204 +25971,147 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   );
 
   // ══════════════════════════════════════════
-  // COLONNE DROITE — Fiche Spender live
+  // RIGHT PANEL — Spender fiche
   // ══════════════════════════════════════════
-  const renderRightCol = () => {
-    const sp = activeSpender;
-    const sectionStyle = { marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid var(--border-subtle)" };
-    const labelStyle = { fontSize: 9, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2, fontWeight: 600 };
-    const valueStyle = { fontSize: 12, color: "var(--text-primary)", fontWeight: 500 };
-    const relBadge = sp ? _dmsgRelBadge(sp.relationship_status) : null;
+  const rightPanel = (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-raised)", borderLeft: "1px solid var(--border-subtle)", overflow: "hidden" }}>
+      <div style={{ padding: "12px 14px 10px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          👤 {fr ? "Fiche Spender" : "Spender Profile"}
+        </span>
+        {isMobile && (
+          <button onClick={() => setMobilePane("chat")} style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 16 }}>✕</button>
+        )}
+      </div>
 
-    return (
-      <div style={{ height: "100%", background: "var(--bg-raised)", borderLeft: "1px solid var(--border-subtle)", display: "flex", flexDirection: "column" }}>
-        <div style={{ padding: "12px 14px 10px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-            👤 {fr ? "Fiche Spender" : "Spender Profile"}
-          </span>
-          {isMobile && (
-            <button onClick={() => setMobilePane("chat")} style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 16 }}>✕</button>
-          )}
-        </div>
-        <div style={{ flex: 1, overflowY: "auto", padding: "14px" }}>
-          {!selectedConv ? (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: 120, gap: 8, color: "var(--text-quaternary)" }}>
-              <div style={{ fontSize: 28 }}>👤</div>
-              <div style={{ fontSize: 12 }}>{fr ? "Sélectionne une conversation" : "Select a conversation"}</div>
-            </div>
-          ) : !sp ? (
-            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 20, color: "var(--text-tertiary)", textAlign: "center" }}>
-              <div style={{ fontSize: 28 }}>🔍</div>
-              <div style={{ fontSize: 12 }}>{fr ? "Spender non trouvé dans le CRM" : "Spender not found in CRM"}</div>
-              <div style={{ fontSize: 10, color: "var(--text-quaternary)" }}>TG: {selectedConv.tg_chat_id || selectedConv.chat_id || "—"}</div>
-            </div>
-          ) : (
-            <>
-              {/* Identité */}
-              <div style={{ ...sectionStyle, display: "flex", flexDirection: "column", gap: 8 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                  <SpenderAvatar sp={sp} size={42} radius="50%" />
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <div style={{ fontSize: 14, fontWeight: 800, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {sp.first_name || sp.handle || "—"}
+      {/* FIX SCROLL: flex:1 + minHeight:0 */}
+      <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "14px" }}>
+        {!selectedConv ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 8, color: "var(--text-quaternary)" }}>
+            <div style={{ fontSize: 28 }}>👤</div>
+            <div style={{ fontSize: 12 }}>{fr ? "Sélectionne une conversation" : "Select a conversation"}</div>
+          </div>
+        ) : spenderLoading ? (
+          <div style={{ textAlign: "center", padding: 24, color: "var(--text-tertiary)", fontSize: 12 }}>⏳ {fr ? "Chargement fiche…" : "Loading profile…"}</div>
+        ) : !activeSpender ? (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, padding: 20, color: "var(--text-tertiary)", textAlign: "center" }}>
+            <div style={{ fontSize: 28 }}>🔍</div>
+            <div style={{ fontSize: 12 }}>{fr ? "Aucune fiche trouvée" : "No profile found"}</div>
+            <div style={{ fontSize: 10, color: "var(--text-quaternary)" }}>TG ID: {_dmsgChatId(selectedConv) || "—"}</div>
+          </div>
+        ) : (
+          <>
+            {/* Identité */}
+            <div style={{ ...sectionStyle, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <SpenderAvatar sp={activeSpender} size={42} radius="50%" />
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 14, fontWeight: 800, color: "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {activeSpender.first_name || activeSpender.handle || "—"}
+                  </div>
+                  {(activeSpender.telegram_username || activeSpender.handle) && (
+                    <div style={{ fontSize: 11, color: "var(--brand-telegram)", marginTop: 1 }}>
+                      ✈️ @{String(activeSpender.telegram_username || activeSpender.handle).replace(/^@/, "")}
                     </div>
-                    {(sp.telegram_username || sp.handle) && (
-                      <div style={{ fontSize: 11, color: "var(--brand-telegram)", marginTop: 1 }}>
-                        ✈️ @{String(sp.telegram_username || sp.handle).replace(/^@/, "")}
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {/* Badges */}
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {relBadge && (
-                    <span style={{ padding: "3px 10px", borderRadius: 20, background: relBadge.bg, color: relBadge.color, fontSize: 10, fontWeight: 700 }}>
-                      {relBadge.label}
-                    </span>
-                  )}
-                  {sp.langue && (
-                    <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 10, fontWeight: 600 }}>
-                      🌐 {sp.langue}
-                    </span>
-                  )}
-                  {sp.budget_range && (
-                    <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(34,211,161,0.12)", color: "var(--success)", fontSize: 10, fontWeight: 600 }}>
-                      💰 {sp.budget_range}
-                    </span>
                   )}
                 </div>
               </div>
-
-              {/* ANALYSE */}
-              {(sp.personality_notes || sp.interest_notes || sp.strategy_notes || sp.risk_notes) && (
-                <div style={sectionStyle}>
-                  <div style={{ fontSize: 10, fontWeight: 700, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>
-                    🧠 {fr ? "ANALYSE" : "ANALYSIS"}
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    {sp.personality_notes && (
-                      <div>
-                        <div style={labelStyle}>🎭 {fr ? "Personnalité" : "Personality"}</div>
-                        <div style={{ ...valueStyle, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{sp.personality_notes}</div>
-                      </div>
-                    )}
-                    {sp.interest_notes && (
-                      <div>
-                        <div style={labelStyle}>❤️ {fr ? "Intérêts" : "Interests"}</div>
-                        <div style={{ ...valueStyle, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{sp.interest_notes}</div>
-                      </div>
-                    )}
-                    {sp.strategy_notes && (
-                      <div>
-                        <div style={labelStyle}>🎯 {fr ? "Stratégie" : "Strategy"}</div>
-                        <div style={{ ...valueStyle, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{sp.strategy_notes}</div>
-                      </div>
-                    )}
-                    {sp.risk_notes && (
-                      <div>
-                        <div style={labelStyle}>⚠️ {fr ? "Risques" : "Risks"}</div>
-                        <div style={{ ...valueStyle, fontSize: 11, color: "var(--warning)", lineHeight: 1.4 }}>{sp.risk_notes}</div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {/* Notes chatter */}
-              <div>
-                <div style={labelStyle}>📝 {fr ? "Notes chatter" : "Chatter notes"}</div>
-                <textarea
-                  defaultValue={sp.notes || ""}
-                  onBlur={async e => {
-                    const val = e.target.value;
-                    try { await sb.from("spenders").update({ notes: val }).eq("id", sp.id); }
-                    catch (_) { addToast(fr ? "Erreur sauvegarde note" : "Note save error", "error"); }
-                  }}
-                  placeholder={fr ? "Ajouter une note…" : "Add a note…"}
-                  style={{ width: "100%", minHeight: 72, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-base))", color: "var(--text-primary)", fontSize: 11, resize: "vertical", fontFamily: "'Inter', sans-serif", boxSizing: "border-box", marginTop: 4, lineHeight: 1.4 }}
-                />
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {relBadge && (
+                  <span style={{ padding: "3px 10px", borderRadius: 20, background: relBadge.bg, color: relBadge.color, fontSize: 10, fontWeight: 700 }}>
+                    {relBadge.label}
+                  </span>
+                )}
+                {activeSpender.langue && (
+                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 10, fontWeight: 600 }}>
+                    🌐 {activeSpender.langue}
+                  </span>
+                )}
+                {activeSpender.budget_range && (
+                  <span style={{ padding: "3px 8px", borderRadius: 20, background: "rgba(34,211,161,0.12)", color: "var(--success)", fontSize: 10, fontWeight: 600 }}>
+                    💰 {activeSpender.budget_range}
+                  </span>
+                )}
               </div>
-            </>
-          )}
-        </div>
+            </div>
+
+            {/* ANALYSE */}
+            {(activeSpender.personality_notes || activeSpender.interest_notes || activeSpender.strategy_notes || activeSpender.risk_notes) && (
+              <div style={sectionStyle}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 8 }}>
+                  🧠 {fr ? "ANALYSE" : "ANALYSIS"}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {activeSpender.personality_notes && (
+                    <div>
+                      <div style={labelSt}>🎭 {fr ? "Personnalité" : "Personality"}</div>
+                      <div style={{ ...valueSt, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{activeSpender.personality_notes}</div>
+                    </div>
+                  )}
+                  {activeSpender.interest_notes && (
+                    <div>
+                      <div style={labelSt}>❤️ {fr ? "Intérêts" : "Interests"}</div>
+                      <div style={{ ...valueSt, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{activeSpender.interest_notes}</div>
+                    </div>
+                  )}
+                  {activeSpender.strategy_notes && (
+                    <div>
+                      <div style={labelSt}>🎯 {fr ? "Stratégie" : "Strategy"}</div>
+                      <div style={{ ...valueSt, fontSize: 11, color: "var(--text-secondary)", lineHeight: 1.4 }}>{activeSpender.strategy_notes}</div>
+                    </div>
+                  )}
+                  {activeSpender.risk_notes && (
+                    <div>
+                      <div style={labelSt}>⚠️ {fr ? "Risques" : "Risks"}</div>
+                      <div style={{ ...valueSt, fontSize: 11, color: "var(--warning)", lineHeight: 1.4 }}>{activeSpender.risk_notes}</div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Notes chatter */}
+            <div>
+              <div style={labelSt}>📝 {fr ? "Notes chatter" : "Chatter notes"}</div>
+              <textarea
+                key={activeSpender.id}
+                defaultValue={activeSpender.notes || ""}
+                onBlur={async e => {
+                  try { await sb.from("spenders").update({ notes: e.target.value }).eq("id", activeSpender.id); }
+                  catch (_) { addToast(fr ? "Erreur sauvegarde note" : "Note save error", "error"); }
+                }}
+                placeholder={fr ? "Ajouter une note…" : "Add a note…"}
+                style={{ width: "100%", minHeight: 72, padding: "8px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-base))", color: "var(--text-primary)", fontSize: 11, resize: "vertical", fontFamily: "'Inter',sans-serif", boxSizing: "border-box", marginTop: 4, lineHeight: 1.4 }}
+              />
+            </div>
+          </>
+        )}
       </div>
-    );
-  };
+    </div>
+  );
 
   // ══════════════════════════════════════════
-  // + TX MODAL
+  // RENDER — Desktop grid / Mobile pane
   // ══════════════════════════════════════════
-  const renderTxModal = () => {
-    if (!showTxModal) return null;
-    const sp = activeSpender;
-    return (
-      <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
-        onClick={e => { if (e.target === e.currentTarget) setShowTxModal(false); }}>
-        <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: 360, maxWidth: "95vw", boxShadow: "var(--shadow-lg)" }}>
-          <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)", marginBottom: 4 }}>💳 {fr ? "Créer une transaction" : "Create transaction"}</div>
-          {sp && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginBottom: 18 }}>Spender: <strong>{sp.first_name || sp.handle || "?"}</strong></div>}
-          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-            <div>
-              <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>{fr ? "Montant *" : "Amount *"}</label>
-              <input type="number" min="0" step="0.01" value={txForm.amount} onChange={e => setTxForm(f => ({ ...f, amount: e.target.value }))}
-                placeholder="0.00" autoFocus
-                style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 14, fontWeight: 700, fontFamily: "'Inter', sans-serif", outline: "none", boxSizing: "border-box" }} />
-            </div>
-            <div>
-              <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>Type *</label>
-              <select value={txForm.type} onChange={e => setTxForm(f => ({ ...f, type: e.target.value }))}
-                style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter', sans-serif", boxSizing: "border-box" }}>
-                {_DMSG_TX_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </div>
-            <div>
-              <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>Note</label>
-              <input type="text" value={txForm.note} onChange={e => setTxForm(f => ({ ...f, note: e.target.value }))}
-                placeholder={fr ? "Optionnel…" : "Optional…"}
-                style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter', sans-serif", outline: "none", boxSizing: "border-box" }} />
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
-            <button onClick={createTx} disabled={txSaving || !txForm.amount}
-              style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "none", background: txSaving || !txForm.amount ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: txSaving || !txForm.amount ? "not-allowed" : "pointer" }}>
-              {txSaving ? "⏳ …" : (fr ? "✅ Créer" : "✅ Create")}
-            </button>
-            <button onClick={() => setShowTxModal(false)}
-              style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "transparent", color: "var(--text-secondary)", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
-              {fr ? "Annuler" : "Cancel"}
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  };
-
-  // ══════════════════════════════════════════
-  // LAYOUT
-  // ══════════════════════════════════════════
-  const gridCols = "25% 45% 30%";
-
   if (!isMobile) {
     return (
       <>
-        {renderTxModal()}
-        <div style={{ display: "grid", gridTemplateColumns: gridCols, height: "calc(100vh - 200px)", minHeight: 520, border: "1px solid var(--border-subtle)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow-md)" }}>
-          {renderLeftCol()}
-          {renderCenterCol()}
-          {renderRightCol()}
+        {txModal}
+        <div style={{ display: "grid", gridTemplateColumns: "25% 45% 30%", height: PANEL_H, minHeight: 520, border: "1px solid var(--border-subtle)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow-md)" }}>
+          {leftPanel}
+          {centerPanel}
+          {rightPanel}
         </div>
       </>
     );
   }
-
-  // Mobile: single pane at a time
   return (
     <>
-      {renderTxModal()}
-      <div style={{ height: "calc(100vh - 160px)", minHeight: 420, border: "1px solid var(--border-subtle)", borderRadius: 12, overflow: "hidden", position: "relative" }}>
-        {mobilePane === "list"    && renderLeftCol()}
-        {mobilePane === "chat"    && renderCenterCol()}
-        {mobilePane === "spender" && renderRightCol()}
+      {txModal}
+      <div style={{ height: "calc(100vh - 160px)", minHeight: 420, border: "1px solid var(--border-subtle)", borderRadius: 12, overflow: "hidden" }}>
+        {mobilePane === "list"    && leftPanel}
+        {mobilePane === "chat"    && centerPanel}
+        {mobilePane === "spender" && rightPanel}
       </div>
     </>
   );
@@ -39322,8 +39347,6 @@ const App = () => {
           <div style={{overflowX:"auto",overflowY:"hidden",WebkitOverflowScrolling:"touch",marginBottom:24,borderBottom:"1px solid var(--border-subtle)"}}>
             <div style={{display:"flex",gap:8,flexWrap:"nowrap",minWidth:"min-content",alignItems:"center",paddingBottom:4}}>
               <button onClick={()=>setMessagerieSubTab("dadash_live")} style={msgTabStyle("dadash_live")}>💬 Messagerie</button>
-              <button onClick={()=>setMessagerieSubTab("telegram")} style={msgTabStyle("telegram")}>✈️ Telegram</button>
-              <button onClick={()=>setMessagerieSubTab("telegram_beta")} style={msgTabStyle("telegram_beta")}>Telegram BETA</button>
               <button onClick={()=>setMessagerieSubTab("whatsapp")} style={msgTabStyle("whatsapp")}>WhatsApp</button>
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("push")} style={msgTabStyle("push")}>{"\u{1F4AC}"} Push</button>}
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("admin_panel")} style={msgTabStyle("admin_panel")}>{"\u{1F6E0}"} Admin Panel</button>}
@@ -39331,7 +39354,7 @@ const App = () => {
             </div>
           </div>
           {messagerieSubTab==="dadash_live"&&<DadashMessagerieTab user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />}
-          {user?.role==="gerant"&&messagerieSubTab!=="telegram"&&messagerieSubTab!=="dadash_live"&&(
+          {user?.role==="gerant"&&messagerieSubTab!=="dadash_live"&&(
             <div style={{marginBottom:20,padding:14,background:"var(--card-bg)",borderRadius:12,border:"1px solid var(--border-subtle)",fontSize:12,fontFamily:"'Inter', sans-serif"}}>
               <span style={{fontWeight:600,color:"var(--text-secondary)",marginRight:12}}>{"\u{1F4DD}"} Mode test UI (local)</span>
               <label style={{display:"inline-flex",alignItems:"center",gap:8,cursor:"pointer",marginRight:12}}>
@@ -39351,9 +39374,7 @@ const App = () => {
               )}
             </div>
           )}
-          {messagerieSubTab==="telegram"&&<TgCarlosMessagerieTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} txs={txSummary} />}
           {messagerieSubTab==="whatsapp"&&<GerantMessagerieTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
-          {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} simuOverride={simuOverride} />}
           {messagerieSubTab==="push"&&<PushPageV1 user={user} lang={lang} models={models} spenders={spenders} botStats={botStats} onRefresh={onRefresh} />}
           {messagerieSubTab==="admin_panel"&&user?.role==="gerant"&&<MessagerieGerantAdminPanel user={user} lang={lang} profiles={profiles} models={models} botStats={botStats} spenders={spenders} onRefresh={onRefresh} />}
         </>);
@@ -39882,14 +39903,12 @@ const App = () => {
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} products={products} productTags={productTags} setTxSummary={setTxSummary} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
             <div className="page-tabs-bar" style={{overflowX:"auto",flexWrap:"nowrap",scrollbarWidth:"none",paddingBottom:2}}>
-              {[["dadash_live","💬 Messagerie"],["telegram","✈️ Telegram"],["telegram_beta","Telegram BETA"],["whatsapp","WhatsApp"],["escalades","💥 " + (lang==="fr"?"Escalades":"Escalations")]].map(([id,lbl])=>(
+              {[["dadash_live","💬 Messagerie"],["whatsapp","WhatsApp"],["escalades","💥 " + (lang==="fr"?"Escalades":"Escalations")]].map(([id,lbl])=>(
                 <div key={id} className={`filter-pill${messagerieSubTab===id?" active":""}`} style={{flexShrink:0}} onClick={()=>setMessagerieSubTab(id)}>{lbl}</div>
               ))}
             </div>
             {messagerieSubTab==="dadash_live"&&<DadashMessagerieTab user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />}
-            {messagerieSubTab==="telegram"&&<TgCarlosMessagerieTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} txs={txSummary} />}
             {messagerieSubTab==="whatsapp"&&<ChatterMessagerieTab user={user} lang={lang} spenders={spenders} models={models} />}
-            {messagerieSubTab==="telegram_beta"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} />}
             {messagerieSubTab==="escalades"&&<TgMessagerieBetaTab user={user} lang={lang} spenders={spenders} profiles={profiles} models={models} escaladesOnly />}
           </>)}
           {tab==="chatter_compta"&&user.role==="chatter"&&(<>
