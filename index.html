@@ -25914,6 +25914,36 @@ const _dmsgChatId = (conv) => {
   return conv.tg_chat_id || conv.chat_id || conv.telegram_chat_id || conv.tg_id || conv.id || null;
 };
 
+// Objet minimal quand un spender n'existe pas encore en DB
+// Permet d'afficher au moins le nom/handle/TG ID dans la fiche
+const _dmsgMinimalSpender = (conv) => {
+  if (!conv) return null;
+  const tgId = _dmsgChatId(conv);
+  return {
+    first_name:          conv.first_name || conv.display_name || null,
+    handle:              conv.tg_username || (tgId ? "tg_" + tgId : null),
+    name:                conv.display_name || conv.username || null,
+    telegram_username:   conv.tg_username || null,
+    tg_user_id:          tgId ? String(tgId) : null,
+    telegram_id:         tgId ? String(tgId) : null,
+    total_spent:         Number(conv.total_spent || 0),
+    badge:               "LEAD",
+    relationship_status: "new",
+    // Champs analyses IA vides — seront remplis après enrichissement
+    personality_notes:   null,
+    interest_notes:      null,
+    strategy_notes:      null,
+    risk_notes:          null,
+    ai_personality:      null,
+    ai_interests:        null,
+    ai_strategy:         null,
+    ai_risks:            null,
+    notes:               null,
+    chatter_notes:       null,
+    ai_model_used:       null,
+  };
+};
+
 const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) => {
   const fr = lang === "fr";
   const addToast = useToast();
@@ -26090,24 +26120,40 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     }
     if (quick) setActiveSpender(quick); // instant display while Supabase loads
 
-    // Always hydrate from Supabase for full analytical fields
-    // (props spenders may be summaries without personality/strategy notes)
+    // Hydrate depuis Supabase — select('*') garantit tous les champs IA
+    // (personality_notes, interest_notes, strategy_notes, risk_notes,
+    //  ai_personality, ai_interests, ai_strategy, ai_risks, chatter_notes, ai_model_used…)
     setSpenderLoading(!quick);
     try {
-      const _SPENDER_COLS = "id,first_name,handle,name,telegram_username,tg_user_id,telegram_id," +
-        "relationship_status,langue,budget_range,notes," +
-        "personality_notes,interest_notes,strategy_notes,risk_notes," +
-        "classification,age,city,country,job,source,model_id";
-      let q = sb.from("spenders").select(_SPENDER_COLS);
-      if (conv.spender_id)      q = q.eq("id", conv.spender_id);
-      else if (tidStr)           q = q.or("tg_user_id.eq." + tidStr + ",telegram_id.eq." + tidStr);
-      else if (conv.tg_username) q = q.ilike("telegram_username", String(conv.tg_username).replace(/^@/, ""));
-      else { setActiveSpender(quick); setSpenderLoading(false); return; }
+      let q = sb.from("spenders").select("*");
+      if (conv.spender_id) {
+        q = q.eq("id", conv.spender_id);
+      } else if (tidStr) {
+        // Tenter les trois champs possibles pour le Telegram ID
+        q = q.or(
+          "tg_user_id.eq." + tidStr +
+          ",telegram_id.eq." + tidStr +
+          ",tg_chat_id.eq."  + tidStr
+        );
+      } else if (conv.tg_username) {
+        q = q.ilike("telegram_username", String(conv.tg_username).replace(/^@/, ""));
+      } else {
+        // Aucun identifiant disponible → fallback minimal depuis conv
+        setActiveSpender(quick || _dmsgMinimalSpender(conv));
+        setSpenderLoading(false);
+        return;
+      }
 
       const { data, error } = await q.maybeSingle();
-      setActiveSpender(!error && data ? data : (quick || null));
+      if (!error && data) {
+        // Spender trouvé avec toutes ses données enrichies
+        setActiveSpender(data);
+      } else {
+        // Non trouvé en DB → objet minimal pour afficher au moins le nom
+        setActiveSpender(quick || _dmsgMinimalSpender(conv));
+      }
     } catch (_) {
-      if (!quick) setActiveSpender(null);
+      setActiveSpender(quick || _dmsgMinimalSpender(conv) || null);
     }
     setSpenderLoading(false);
   }, [spenders]);
