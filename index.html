@@ -4673,6 +4673,19 @@ const apiFetchTransactions = async ({ scope, filters } = {}) => {
     const rows = assertChatterScope(data || [], s, 'tx');
     return { data: rows, count: rows.length };
   }
+  // ── RBAC: Provider — server-side filter by provider_id ──
+  if (s.type === 'provider') {
+    let q = sb.from("transactions")
+      .select("*")
+      .order("date", { ascending: false })
+      .eq("provider_id", s.provider_user_id);
+    if (filters?.startISO) q = q.gte("created_at", filters.startISO);
+    if (filters?.endISO) q = q.lte("created_at", filters.endISO);
+    const { data, error } = await q;
+    if (error) { console.warn("[API_TX] provider fetch error:", error.message); return { data: [], count: 0 }; }
+    const rows = (data || []).filter(tx => tx.provider_id === s.provider_user_id);
+    return { data: rows, count: rows.length };
+  }
   const full = sb.from("transactions").select("*").order("date", { ascending: false });
   const paged = sb.from("transactions").select("*", { count: "exact" }).order("date", { ascending: false }).range(0, 99);
   const [fullR, pagedR] = await Promise.all([full, paged]);
@@ -5295,7 +5308,31 @@ const getScope = (user) => {
   if (!user) return { type: 'global' };
   if (['gerant', 'ceo', 'admin'].includes(user.role)) return { type: 'global' };
   if (user.role === 'chatter') return { type: 'chatter', chatter_user_id: user.id, email: user.email };
+  if (user.role === 'provider') return { type: 'provider', provider_user_id: user.id, email: user.email };
   return { type: 'global' };
+};
+
+// ═══ RBAC — Sections logiques visibles par rôle ═══
+// Utilisé pour canSeeSection(section, role) — noms sémantiques côté spec
+const RBAC_SECTION_ACCESS = {
+  gerant:   true, // voit tout
+  admin:    true,
+  ceo:      true,
+  chatter:  ['mes_spenders', 'mes_tx', 'mon_solde', 'messagerie'],
+  provider: ['mes_tx'],
+};
+
+/**
+ * canSeeSection(section, role)
+ * Sections : 'mes_spenders' | 'mes_tx' | 'mon_solde' | 'messagerie'
+ * Roles    : 'gerant' | 'chatter' | 'provider' | 'admin' | 'ceo'
+ */
+const canSeeSection = (section, role) => {
+  if (!role) return false;
+  const access = RBAC_SECTION_ACCESS[role];
+  if (access === true) return true;
+  if (!access) return false;
+  return access.includes(section);
 };
 
 const assertChatterScope = (rows, scope, type = 'tx') => {
@@ -5363,7 +5400,7 @@ const ChatterDebugDump = React.memo(({user, models, txs, spenders, lang}) => {
           sw_active: !!window.__swActive,
           queries: {
             kpi: "apiFetchKpis — computed client-side from txs (scope=" + scope.type + ")",
-            transactions: "apiFetchTransactions — table:transactions, scope=" + scope.type + (scope.type==="chatter" ? " filter:chatter_id.eq."+user.id+" OR model_id.in.("+ctx.assignedModelIds.join(",")+")" : " (global)"),
+            transactions: "apiFetchTransactions — table:transactions, scope=" + scope.type + (scope.type==="chatter" ? " filter:chatter_id.eq."+user.id+" OR model_id.in.("+ctx.assignedModelIds.join(",")+")" : scope.type==="provider" ? " filter:provider_id.eq."+user.id : " (global)"),
             spenders: "apiFetchSpenders — views:v_spenders_ui→v_spenders_canon→v_spenders, scope=" + scope.type,
             activity: "apiFetchActivityScoped — views:v_activity_feed/v_activity_feed_unified"
           },
@@ -39176,6 +39213,7 @@ const App = () => {
     const thisVersion = ++_loadVersion.current;
     const scope = getScope(currentUser);
     const isChatter = scope.type === 'chatter';
+    const isProvider = scope.type === 'provider';
     const assignedModelIds = isChatter ? (Array.isArray(currentUser?.assigned_models) ? currentUser.assigned_models : []).filter(Boolean) : [];
     if (isChatter) { scope._allowedModelIds = assignedModelIds; }
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR;
@@ -39184,16 +39222,22 @@ const App = () => {
       /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 12 secondes")), 12000));
 
-      // PR1: chatter uses centralized API — no global transaction/spender fetch
+      // RBAC: chatter/provider use scoped API — no global transaction/spender fetch
       const txPromise = isChatter
         ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_chatter")
+        : isProvider
+        ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_provider")
         : safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}).range(0,99), "transactions");
       const txSumPromise = isChatter
         ? safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_chatter")
+        : isProvider
+        ? safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_provider")
         : safe(sb.from("transactions").select("*").order("date",{ascending:false}), "tx_summary");
-      // Spenders: deferred for chatter (needs TX first)
+      // Spenders: deferred for chatter (needs TX first) — providers never see spenders
       const spPromise = isChatter
         ? safe((async () => ({ data: [], error: null }))(), "spenders_chatter_deferred")
+        : isProvider
+        ? safe((async () => ({ data: [], error: null }))(), "spenders_provider_empty")
         : safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders");
 
       [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
@@ -39201,9 +39245,9 @@ const App = () => {
         spPromise,
         safe(sb.from("profiles").select("*"), "profiles"),
         safe(sb.from("models").select("*"), "models"),
-        isChatter ? safe(sb.from("payouts").select("*").eq("user_id", currentUser.id).order("date",{ascending:false}), "payouts") : safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
-        isChatter ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("*"), "expenses"),
-        isChatter ? Promise.resolve({data:[]}) : safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
+        (isChatter || isProvider) ? safe(sb.from("payouts").select("*").eq("user_id", currentUser.id).order("date",{ascending:false}), "payouts") : safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
+        (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("*"), "expenses"),
+        (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
         safe(sb.from("products").select("*").order("sort_order"), "products"),
         safe(sb.from("product_tags").select("*").order("sort_order"), "product_tags"),
         safe(sb.from("model_prices").select("*"), "model_prices"),
@@ -39233,8 +39277,8 @@ const App = () => {
     if (thisVersion !== _loadVersion.current) return;
 
     let txData = txR.data||[];
-    // PR1: for chatter, txSumData = same as txData (already server-filtered, no global fetch)
-    let txSumData = isChatter ? txData : (txSumR.data||[]);
+    // RBAC: for chatter/provider, txSumData = same as txData (already server-filtered)
+    let txSumData = (isChatter || isProvider) ? txData : (txSumR.data||[]);
     let modelData = moR.data||[];
 
     // PR1: chatter spender fetch (deferred — needs txData to build scope)
@@ -39246,14 +39290,15 @@ const App = () => {
       } catch (e) { console.warn("[SPENDERS] chatter fetch failed:", e?.message || e); spR = { data: [], error: e }; }
     }
 
-    // Filter data based on user role
+    // Filter data based on user role (defense-in-depth — server queries already scoped)
     if(currentUser) {
       if(isChatter) {
-        // PR1: txData is already server-filtered by apiFetchTransactions — defense-in-depth filter
+        // txData already server-filtered by apiFetchTransactions — extra defense-in-depth
         txData = txData.filter(tx=>tx.chatter_id===currentUser.id);
         txSumData = txSumData.filter(tx=>tx.chatter_id===currentUser.id);
         modelData = modelData.filter(m=>assignedModelIds.includes(m.id));
-      } else if(currentUser.role==="provider") {
+      } else if(isProvider) {
+        // txData already server-filtered by apiFetchTransactions(provider scope) — extra defense-in-depth
         txData = txData.filter(tx=>tx.provider_id===currentUser.id);
         txSumData = txSumData.filter(tx=>tx.provider_id===currentUser.id);
         const modelIds = new Set(txSumData.map(tx=>tx.model_id));
@@ -39273,13 +39318,14 @@ const App = () => {
     let ppData = ppR.data||[];
     if(currentUser) {
       if(isChatter) {
-        // Chatter sees all spenders (RLS: role IN ('gerant','chatter') → full access)
-        // No spenderData filter — same data as gérant
+        // Chatter sees spenders scoped to their assigned models (fetched via apiFetchSpenders)
         profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter"||p.role==="provider");
         payoutData = payoutData.filter(p=>p.user_id===currentUser.id);
         expenseData = [];
         ppData = [];
-      } else if(currentUser.role==="provider") {
+      } else if(isProvider) {
+        // Provider: no spenders, only own profile + gérant, only own provider_payouts
+        spenderData = [];
         profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
         payoutData = [];
         expenseData = [];
