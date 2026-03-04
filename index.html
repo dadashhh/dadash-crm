@@ -25955,12 +25955,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         const newLast  = list[list.length - 1];
         const hasNew = list.length > prev.length
           || (newLast && prevLast && (newLast.id !== prevLast.id || newLast.created_at !== prevLast.created_at));
-        if (hasNew) {
-          shouldScrollRef.current = true;
-          return list;
-        }
-        // No new messages → return prev reference unchanged (no re-render)
-        return prev;
+        if (!hasNew) return prev; // No new messages → keep prev unchanged (no re-render)
+        shouldScrollRef.current = true;
+        // Merge: preserve optimistic/pending messages (id = number) until confirmed by DB
+        const existingIds = new Set(prev.map(m => String(m.id)));
+        const toAdd = list.filter(m => !existingIds.has(String(m.id)));
+        const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+        // Drop pending messages whose text has been confirmed in the fresh DB list
+        const withoutStale = prev.filter(m =>
+          typeof m.id !== 'number' || !confirmedTexts.has(m.text || "")
+        );
+        return [...withoutStale, ...toAdd].sort((a, b) =>
+          new Date(a.created_at) - new Date(b.created_at)
+        );
       });
     } catch (_) {
       if (isInitial) setMessages([]);
@@ -26115,18 +26122,25 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       });
       addToast(fr ? "Message envoyé ✓" : "Message sent ✓", "success");
 
-      // Bug 2 fix — force a fresh fetch 2 s after send.
-      // The 2 s delay lets the server process the message before we pull.
-      // This replaces the optimistic entry with the real server data AND
-      // picks up any incoming messages from the contact.
-      // The regular 10 s poll continues independently.
+      // Force a fresh fetch 2 s after send — confirms the optimistic entry
+      // and picks up any incoming messages from the contact.
       setTimeout(async () => {
         if (chatIdRef.current !== chatId) return; // user switched conv
         try {
           const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
           const list = Array.isArray(data) ? data : (data.messages || data.data || []);
-          // Full replace — clears the optimistic entry, shows real messages
-          setMessages(list);
+          // Merge: keep pending optimistic messages (id = number) until confirmed
+          setMessages(prev => {
+            const existingIds = new Set(prev.map(m => String(m.id)));
+            const toAdd = list.filter(m => !existingIds.has(String(m.id)));
+            const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+            const withoutStale = prev.filter(m =>
+              typeof m.id !== 'number' || !confirmedTexts.has(m.text || "")
+            );
+            return [...withoutStale, ...toAdd].sort((a, b) =>
+              new Date(a.created_at) - new Date(b.created_at)
+            );
+          });
         } catch (_) { /* keep optimistic visible until next poll */ }
       }, 2000);
 
@@ -26819,14 +26833,24 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
         body: JSON.stringify({ chat_id: chatId, text }),
       });
       addToast(fr ? "Message envoyé" : "Message sent", "success");
-      // Réconciliation 2 s après l'envoi — remplace l'optimiste par la vraie donnée
+      // Réconciliation 2 s après l'envoi — merge, ne remplace pas les messages optimistes
       setTimeout(async () => {
         if (chatIdRef.current !== convId) return;
         try {
           const data = await carlosFetch(`/conversations/${convId}/messages?limit=500`);
           const list = Array.isArray(data) ? data : (data.messages || data.data || []);
           shouldScrollRef.current = true;
-          setMessages(list);
+          setMessages(prev => {
+            const existingIds = new Set(prev.map(m => String(m.id)));
+            const toAdd = list.filter(m => !existingIds.has(String(m.id)));
+            const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+            const withoutStale = prev.filter(m =>
+              !m._pending || !confirmedTexts.has(m.text || "")
+            );
+            return [...withoutStale, ...toAdd].sort((a, b) =>
+              new Date(a.created_at) - new Date(b.created_at)
+            );
+          });
         } catch (_) { /* garder l'optimiste jusqu'au prochain poll */ }
       }, 2000);
     } catch (e) {
@@ -26860,7 +26884,17 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
               const data = await carlosFetch(`/conversations/${convId}/messages?limit=500`);
               const list = Array.isArray(data) ? data : (data.messages || data.data || []);
               shouldScrollRef.current = true;
-              setMessages(list);
+              setMessages(prev => {
+                const existingIds = new Set(prev.map(m => String(m.id)));
+                const toAdd = list.filter(m => !existingIds.has(String(m.id)));
+                const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+                const withoutStale = prev.filter(m =>
+                  !m._pending || !confirmedTexts.has(m.text || "")
+                );
+                return [...withoutStale, ...toAdd].sort((a, b) =>
+                  new Date(a.created_at) - new Date(b.created_at)
+                );
+              });
             } catch (_) {}
           }, 2000);
         })
