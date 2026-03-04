@@ -26185,18 +26185,52 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     selectedConvRef.current = selectedConv;
   }, [selectedConv]);
 
+  // ── selectedChatId : clé stable pour tous les useEffect liés à la conv ──────
+  // BUG RACINE : les convs de l'API Carlos n'ont PAS de champ "id" — elles ont
+  // "chat_id" (TG ID). selectedConv?.id était toujours undefined → aucun effet
+  // ne se re-déclenchait après la 1ère sélection.
+  // Solution : utiliser le vrai Telegram chat_id comme clé de stabilité.
+  const selectedChatId = selectedConv ? String(_dmsgChatId(selectedConv) || "") : "";
+
   // ── Fiche spender : rechargement réactif à chaque changement de conversation ──
-  // Ce useEffect est la source de vérité pour activeSpender.
-  // Il se déclenche UNIQUEMENT quand l'id de la conv change (pas au polling).
   useEffect(() => {
     if (!selectedConv) {
       setActiveSpender(null);
       setSpenderLoading(false);
       return;
     }
-    resolveSpender(selectedConv);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedConv?.id]);
+    // Fetch direct Supabase — plusieurs champs TG testés pour maximiser les matchs
+    const chatId = String(_dmsgChatId(selectedConv) || "");
+    if (!chatId) {
+      setActiveSpender(_dmsgMinimalSpender(selectedConv));
+      setSpenderLoading(false);
+      return;
+    }
+    setSpenderLoading(true);
+    // Affichage instantané depuis props en attendant Supabase
+    const all = spenders || [];
+    const quick = (selectedConv.spender_id && all.find(x => x.id === selectedConv.spender_id))
+      || all.find(x => String(x.tg_user_id || x.telegram_id || x.tg_chat_id || "") === chatId)
+      || null;
+    if (quick) setActiveSpender(quick);
+
+    sb.from("spenders")
+      .select("*")
+      .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId},tg_chat_id.eq.${chatId}`)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (data && !error) {
+          console.log("[SPENDER_FICHE] Data found:", data.first_name || data.handle || chatId);
+          setActiveSpender(data);
+        } else {
+          console.log("[SPENDER_FICHE] No data in DB for chatId:", chatId, "→ fallback minimal");
+          setActiveSpender(quick || _dmsgMinimalSpender(selectedConv));
+        }
+      })
+      .catch(() => setActiveSpender(quick || _dmsgMinimalSpender(selectedConv)))
+      .finally(() => setSpenderLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedChatId]);
 
   // ── Détecter si l'utilisateur scrolle manuellement ──────────────────────
   useEffect(() => {
@@ -26208,9 +26242,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     };
     container.addEventListener('scroll', handleScroll, { passive: true });
     return () => container.removeEventListener('scroll', handleScroll);
-  // Reset listener when conv changes so the ref is re-initialized
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedConv?.id]);
+  }, [selectedChatId]);
 
   // ── Scroll automatique : seulement si nouveaux messages ET user pas en train de scroller ──
   useEffect(() => {
@@ -26228,12 +26261,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     prevMsgCountRef.current = messages.length;
     isUserScrollRef.current = false;
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedConv?.id]);
+  }, [selectedChatId]);
 
   // ── Polling messages toutes les 2s (guard contre les appels parallèles) ──
   useEffect(() => {
     clearInterval(pollRef.current);
-    if (!selectedConv || !chatIdRef.current) return;
+    if (!selectedChatId || !chatIdRef.current) return;
     pollRef.current = setInterval(async () => {
       if (isMsgPollingRef.current || !chatIdRef.current) return;
       isMsgPollingRef.current = true;
@@ -26244,23 +26277,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       }
     }, 2000);
     return () => clearInterval(pollRef.current);
-  }, [selectedConv?.id, loadMessagesById]);
+  }, [selectedChatId, loadMessagesById]);
 
-  // ── Polling conversations toutes les 3s (silencieux, guard parallèle) ───────
-  // Démarre dès le montage, indépendant de la conversation sélectionnée.
+  // ── Ref stable vers loadConversations ───────────────────────────────────────
+  // BUG RACINE POLLING AGRESSIF : loadConversations dépend de chatterCtx qui
+  // dépend de models (prop). Si models change référence à chaque render du
+  // parent, loadConversations change, l'useEffect redémarre le setInterval
+  // → 30+ appels/s. Solution : isoler l'interval via un ref, deps vides.
+  const loadConversationsRef = React.useRef(loadConversations);
+  useEffect(() => { loadConversationsRef.current = loadConversations; }, [loadConversations]);
+
+  // ── Polling conversations toutes les 3s — intervalle STABLE ([] deps) ────────
   useEffect(() => {
-    clearInterval(convPollRef.current);
     convPollRef.current = setInterval(async () => {
-      if (isConvPollingRef.current) return; // Éviter les appels parallèles
+      if (isConvPollingRef.current) return;
       isConvPollingRef.current = true;
       try {
-        await loadConversations();
+        await loadConversationsRef.current();
       } finally {
         isConvPollingRef.current = false;
       }
     }, 3000);
     return () => clearInterval(convPollRef.current);
-  }, [loadConversations]);
+  }, []); // Vide intentionnel — l'interval ne redémarre JAMAIS
 
   // ── Helpers for display ──────────────────────────
   const getConvName = (conv) => {
