@@ -25956,7 +25956,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const prevMsgCountRef = React.useRef(0);
   const isUserScrollRef = React.useRef(false);
   // Guard against parallel polling calls
-  const isMsgPollingRef = React.useRef(false);
+  const isMsgPollingRef  = React.useRef(false);
+  const isConvPollingRef = React.useRef(false);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
@@ -25989,7 +25990,27 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
       const data = await _dmsgFetch(path);
       const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      setConversations(list);
+
+      setConversations(prev => {
+        // Premier chargement ou liste vide → remplacer directement
+        if (!convLoadedRef.current || prev.length === 0) return list;
+        // Smart merge : préserver l'identité des objets non-modifiés (évite re-renders inutiles)
+        // Utilise id ou chat_id comme clé stable
+        const prevMap = new Map(prev.map(c => [c.id || c.chat_id, c]));
+        return list.map(serverConv => {
+          const key = serverConv.id || serverConv.chat_id;
+          const existing = prevMap.get(key);
+          if (!existing) return serverConv; // Nouvelle conv
+          // Ne recréer l'objet que si quelque chose de visible a changé
+          const changed =
+            existing.last_message_at !== serverConv.last_message_at ||
+            existing.last_message     !== serverConv.last_message    ||
+            existing.status           !== serverConv.status          ||
+            existing.updated_at       !== serverConv.updated_at;
+          return changed ? { ...existing, ...serverConv } : existing;
+        });
+      });
+
       if (isInitialLoad) {
         setApiOk(true);
         setApiError(null);
@@ -26111,6 +26132,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     if (isMobile) setMobilePane("chat");
   }, [loadMessagesById, isMobile]);
 
+  // ── Sync selectedConvRef avec le state (belt-and-suspenders) ───────────────
+  // Garantit que le ref reflète toujours selectedConv, même si quelque chose
+  // d'autre que selectConv met à jour le state.
+  useEffect(() => {
+    selectedConvRef.current = selectedConv;
+  }, [selectedConv]);
+
   // ── Fiche spender : rechargement réactif à chaque changement de conversation ──
   // Ce useEffect est la source de vérité pour activeSpender.
   // Il se déclenche UNIQUEMENT quand l'id de la conv change (pas au polling).
@@ -26172,19 +26200,20 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     return () => clearInterval(pollRef.current);
   }, [selectedConv?.id, loadMessagesById]);
 
-  // ── Polling conversations toutes les 5s (silencieux) ────────────────────
+  // ── Polling conversations toutes les 3s (silencieux, guard parallèle) ───────
   // Démarre dès le montage, indépendant de la conversation sélectionnée.
   useEffect(() => {
     clearInterval(convPollRef.current);
-    // Premier tick immédiat (après le chargement initial)
-    const firstTick = setTimeout(() => loadConversations(), 3000);
-    convPollRef.current = setInterval(() => {
-      loadConversations();
-    }, 5000);
-    return () => {
-      clearTimeout(firstTick);
-      clearInterval(convPollRef.current);
-    };
+    convPollRef.current = setInterval(async () => {
+      if (isConvPollingRef.current) return; // Éviter les appels parallèles
+      isConvPollingRef.current = true;
+      try {
+        await loadConversations();
+      } finally {
+        isConvPollingRef.current = false;
+      }
+    }, 3000);
+    return () => clearInterval(convPollRef.current);
   }, [loadConversations]);
 
   // ── Helpers for display ──────────────────────────
