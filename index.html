@@ -26825,21 +26825,39 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     try {
       // Appel API Carlos pour déclencher l'enrichissement IA
       await _dmsgFetch("/enrich/" + enrichId, { method: "POST" });
-      console.log("[SYNC] Enrichment triggered, waiting 1s for Supabase write…");
-      // Laisser le temps à Carlos d'écrire dans Supabase
-      await new Promise(r => setTimeout(r, 1000));
-      // Re-fetch fiche complète depuis Supabase
-      const { data } = await sb.from("spenders")
-        .select("*")
-        .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId},tg_chat_id.eq.${chatId}`)
-        .maybeSingle();
-      if (data) {
-        console.log("[SYNC] Refreshed data:", data.first_name || data.handle || chatId);
-        setActiveSpender(data);
-        addToast(fr ? "Fiche mise à jour ✓" : "Profile updated ✓", "success");
+      console.log("[SYNC] Enrichment triggered — polling Supabase until data is ready…");
+
+      // Polling jusqu'à 10s : on vérifie chaque seconde si ai_personality est rempli
+      let attempts = 0;
+      let enrichedData = null;
+      while (attempts < 10 && !enrichedData) {
+        await new Promise(r => setTimeout(r, 1000)); // attendre 1s
+        const { data: polled } = await sb.from("spenders")
+          .select("*")
+          .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId},tg_chat_id.eq.${chatId}`)
+          .maybeSingle();
+        // Données prêtes si au moins un champ IA est rempli
+        if (polled && (polled.ai_personality || polled.personality_notes || polled.ai_interests || polled.interest_notes)) {
+          enrichedData = polled;
+          console.log("[SYNC] Enrichment found after", attempts + 1, "second(s)");
+        } else {
+          console.log("[SYNC] Waiting for enrichment…", attempts + 1, "/ 10");
+        }
+        attempts++;
+      }
+      if (enrichedData) {
+        setActiveSpender(enrichedData);
+        addToast(fr ? "Enrichissement terminé ✓" : "Enrichment done ✓", "success");
       } else {
-        console.log("[SYNC] No data found after enrichment");
-        addToast(fr ? "Enrichissement lancé (pas encore en DB)" : "Enrichment started (not in DB yet)", "info");
+        // Timeout : Carlos a peut-être réussi mais sans champ IA (spender sans analyse)
+        // On rafraîchit quand même la fiche pour prendre tout ce qui a été écrit
+        const { data: fallback } = await sb.from("spenders")
+          .select("*")
+          .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId},tg_chat_id.eq.${chatId}`)
+          .maybeSingle();
+        if (fallback) setActiveSpender(fallback);
+        console.log("[SYNC] Timeout — enrichment not completed in 10s");
+        addToast(fr ? "Enrichissement en cours — re-clique Sync dans quelques secondes" : "Enrichment in progress — click Sync again in a few seconds", "info");
       }
     } catch (e) {
       console.error("[SYNC] Error:", e);
