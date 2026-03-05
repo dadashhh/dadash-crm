@@ -5214,7 +5214,7 @@ const MiniSparkline = ({data, width=120, height=28, color="var(--accent)"}) => {
 
 // ═══ ROLE ACCESS ═══
 const ROLE_ACCESS = {
-  gerant: ["dashboard","business","equipe","messagerie","compta","bots","admin"],
+  gerant: ["dashboard","business","equipe","messagerie","compta","bots","scripts","admin"],
   admin: ["admin"],
   ceo: ["admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments","model_compta","model_notif"],
@@ -5427,6 +5427,7 @@ const GERANT_NAV = [
   { id: "messagerie",icon: "✈️",        label: "Messagerie" },
   { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
   { id: "bots",      icon: "\u{1F916}", label: "Bots" },
+  { id: "scripts",   icon: "🎬",        label: "Scripts" },
   { id: "admin",     icon: "\u{1F511}", label: "Admin" },
 ];
 
@@ -5490,6 +5491,46 @@ const FAB_ACTIONS_CHATTER = [
   { id: "create_tx", label: "Créer Transaction", icon: "\u{1F4B0}", color: "#10B981" },
   { id: "verify_screen", label: "Vérifier Screen", icon: "\u{1F4F8}", color: "#F59E0B" },
 ];
+
+// =============================================
+// SCRIPT BUILDER — Templates & Audience Map
+// =============================================
+const SCRIPT_TEMPLATE = {
+  id: null,
+  name: '',
+  category: 'vente',
+  model_id: 'carla',
+  target_audiences: [],
+  sequence: [],
+  variables_used: [],
+  is_active: true,
+  stats: { total_sent: 0, success_rate: 0, avg_revenue: 0 }
+};
+
+const STEP_TEMPLATE = {
+  order: 1,
+  type: 'text',
+  content: '',
+  delay_ms: 0,
+  media_url: null,
+  conditions: null
+};
+
+// Audience segments map (mirrors BROADCAST_AUDIENCES tiers + activity)
+const SCRIPT_AUDIENCES = {
+  sharks:               { name: "Sharks",         emoji: "🦈",  desc: "≥ 500 CHF" },
+  baleines:             { name: "Baleines",        emoji: "🐋",  desc: "350–499 CHF" },
+  gorilles:             { name: "Gorilles",        emoji: "🦍",  desc: "200–349 CHF" },
+  orang_outan:          { name: "Orang-Outan",     emoji: "🦧",  desc: "100–199 CHF" },
+  ouistiti:             { name: "Ouistiti",        emoji: "🐒",  desc: "50–99 CHF" },
+  poissons:             { name: "Poissons",        emoji: "🐟",  desc: "1–49 CHF" },
+  gratuits:             { name: "Gratuits",        emoji: "🆓",  desc: "0 CHF" },
+  actifs:               { name: "Actifs",          emoji: "🔥",  desc: "msg < 7j" },
+  inactifs_30j:         { name: "Inactifs 30j",    emoji: "💤",  desc: "30–90j sans msg" },
+  ghosters:             { name: "Ghosters",        emoji: "👻",  desc: "> 90j sans msg" },
+  sharks_actifs:        { name: "Sharks Actifs",   emoji: "🦈🔥", desc: "≥500 CHF + < 7j" },
+  top_spenders_inactifs:{ name: "Top Inactifs",    emoji: "💎💤", desc: "≥200 CHF + > 30j" },
+};
 
 // =============================================
 // EXPORT & RAPPORTS (PR#29)
@@ -29175,6 +29216,509 @@ const ScriptsAdminTab = ({ user, lang, models }) => {
 };
 
 // =============================================
+// SCRIPT BUILDER — Visual sequence builder (modal)
+// =============================================
+const ScriptBuilder = ({ script, onSave, onClose }) => {
+  const addToast = useToast();
+  const [form, setForm] = React.useState({
+    name: script.name || '',
+    category: script.category || 'vente',
+    model_id: script.model_id || 'carla',
+    target_audiences: script.target_audiences || [],
+    sequence: script.sequence || [],
+    is_active: script.is_active !== false,
+  });
+  const [selectedStep, setSelectedStep] = React.useState(0);
+  const [saving, setSaving] = React.useState(false);
+
+  const addStep = () => {
+    const newStep = { ...STEP_TEMPLATE, order: form.sequence.length + 1 };
+    setForm(f => ({ ...f, sequence: [...f.sequence, newStep] }));
+    setSelectedStep(form.sequence.length);
+  };
+
+  const removeStep = (idx) => {
+    const newSeq = form.sequence.filter((_, i) => i !== idx).map((s, i) => ({ ...s, order: i + 1 }));
+    setForm(f => ({ ...f, sequence: newSeq }));
+    setSelectedStep(s => Math.min(s, newSeq.length - 1));
+  };
+
+  const moveStep = (idx, dir) => {
+    const newSeq = [...form.sequence];
+    const target = idx + dir;
+    if (target < 0 || target >= newSeq.length) return;
+    [newSeq[idx], newSeq[target]] = [newSeq[target], newSeq[idx]];
+    setForm(f => ({ ...f, sequence: newSeq.map((s, i) => ({ ...s, order: i + 1 })) }));
+    setSelectedStep(target);
+  };
+
+  const updateStep = (idx, updates) => {
+    setForm(f => ({ ...f, sequence: f.sequence.map((s, i) => i === idx ? { ...s, ...updates } : s) }));
+  };
+
+  const toggleAudience = (id) => {
+    setForm(f => ({
+      ...f,
+      target_audiences: f.target_audiences.includes(id)
+        ? f.target_audiences.filter(a => a !== id)
+        : [...f.target_audiences, id]
+    }));
+  };
+
+  const detectVariables = (seq) => {
+    const regex = /\{\{(\w+)\}\}/g;
+    const vars = [];
+    seq.forEach(s => {
+      let m;
+      const src = s.content || '';
+      while ((m = regex.exec(src)) !== null) { if (!vars.includes(m[1])) vars.push(m[1]); }
+    });
+    return vars;
+  };
+
+  const save = async () => {
+    if (!form.name.trim()) { addToast('Nom du script requis', 'error'); return; }
+    if (form.sequence.length === 0) { addToast('Ajoutez au moins une étape', 'error'); return; }
+    setSaving(true);
+    const payload = {
+      name: form.name.trim(),
+      category: form.category,
+      model_id: form.model_id,
+      target_audiences: form.target_audiences,
+      sequence: form.sequence,
+      variables_used: detectVariables(form.sequence),
+      is_active: form.is_active,
+      updated_at: new Date().toISOString(),
+    };
+    let error;
+    if (script.id) {
+      ({ error } = await sb.from('scripts_sequences').update(payload).eq('id', script.id));
+    } else {
+      ({ error } = await sb.from('scripts_sequences').insert({ ...payload, stats: { total_sent: 0, success_rate: 0, avg_revenue: 0 } }));
+    }
+    setSaving(false);
+    if (error) { addToast('Erreur: ' + error.message, 'error'); return; }
+    addToast(script.id ? '✅ Script modifié' : '✅ Script créé', 'success');
+    onSave();
+  };
+
+  const currentStep = form.sequence[selectedStep];
+  const STEP_TYPES = [
+    { id: 'text',       icon: '💬', label: 'Texte' },
+    { id: 'photo',      icon: '📸', label: 'Photo' },
+    { id: 'video',      icon: '🎥', label: 'Vidéo' },
+    { id: 'audio',      icon: '🎵', label: 'Audio' },
+    { id: 'wait_reply', icon: '⏳', label: 'Attendre réponse' },
+  ];
+  const stepIcon = (type) => STEP_TYPES.find(t => t.id === type)?.icon || '💬';
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.88)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '12px' }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{ background: '#0f1117', borderRadius: '18px', border: '1px solid #2d3250', width: '100%', maxWidth: '1100px', maxHeight: '94vh', display: 'flex', flexDirection: 'column', overflow: 'hidden', boxShadow: '0 24px 64px rgba(0,0,0,0.5)' }}>
+        {/* Header */}
+        <div style={{ padding: '18px 22px', borderBottom: '1px solid #2d3250', display: 'flex', alignItems: 'center', gap: '14px', flexShrink: 0 }}>
+          <div style={{ flex: 1 }}>
+            <input
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="Nom du script..."
+              style={{ background: 'transparent', border: 'none', outline: 'none', fontSize: '20px', fontWeight: '800', color: 'white', width: '100%', fontFamily: 'inherit' }}
+            />
+          </div>
+          <select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))}
+            style={{ padding: '8px 12px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', fontFamily: 'inherit' }}>
+            <option value="vente">💰 Vente</option>
+            <option value="relance">🔄 Relance</option>
+            <option value="accueil">👋 Accueil</option>
+            <option value="upsell">📈 Upsell</option>
+          </select>
+          <select value={form.model_id} onChange={e => setForm(f => ({ ...f, model_id: e.target.value }))}
+            style={{ padding: '8px 12px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', fontFamily: 'inherit' }}>
+            <option value="carla">Carla 💜</option>
+            <option value="bella">Bella 💖</option>
+            <option value="sophie">Sophie 💙</option>
+          </select>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', color: '#9ca3af', cursor: 'pointer', userSelect: 'none' }}>
+            <input type="checkbox" checked={form.is_active} onChange={e => setForm(f => ({ ...f, is_active: e.target.checked }))} style={{ accentColor: '#6366f1', width: '15px', height: '15px' }} />
+            Actif
+          </label>
+          <button onClick={save} disabled={saving}
+            style={{ padding: '10px 20px', background: saving ? '#374151' : 'linear-gradient(135deg, #6366f1, #8b5cf6)', border: 'none', borderRadius: '9px', color: 'white', fontWeight: '700', cursor: saving ? 'not-allowed' : 'pointer', fontSize: '14px', flexShrink: 0 }}>
+            {saving ? '⏳ Sauvegarde…' : '💾 Sauvegarder'}
+          </button>
+          <button onClick={onClose}
+            style={{ padding: '10px 14px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '9px', color: '#9ca3af', cursor: 'pointer', fontSize: '14px', flexShrink: 0 }}>
+            ✕
+          </button>
+        </div>
+
+        {/* Audiences row */}
+        <div style={{ padding: '10px 22px', borderBottom: '1px solid #2d3250', display: 'flex', gap: '8px', alignItems: 'center', overflowX: 'auto', flexShrink: 0 }}>
+          <span style={{ fontSize: '12px', color: '#6b7280', fontWeight: '700', flexShrink: 0 }}>🎯 Cibles:</span>
+          {Object.entries(SCRIPT_AUDIENCES).map(([id, aud]) => (
+            <button key={id} onClick={() => toggleAudience(id)} title={aud.desc}
+              style={{ padding: '5px 10px', background: form.target_audiences.includes(id) ? '#6366f1' : '#1a1d2e', border: `1px solid ${form.target_audiences.includes(id) ? '#6366f1' : '#2d3250'}`, borderRadius: '7px', color: 'white', cursor: 'pointer', fontSize: '12px', fontWeight: '600', whiteSpace: 'nowrap', flexShrink: 0, transition: 'all 0.12s' }}>
+              {aud.emoji} {aud.name}
+            </button>
+          ))}
+        </div>
+
+        {/* Body */}
+        <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+          {/* Sidebar: step list */}
+          <div style={{ width: '250px', borderRight: '1px solid #2d3250', overflowY: 'auto', padding: '14px', flexShrink: 0 }}>
+            <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '10px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              Séquence · {form.sequence.length} étape{form.sequence.length !== 1 ? 's' : ''}
+            </div>
+            {form.sequence.length === 0 && (
+              <div style={{ color: '#374151', fontSize: '13px', textAlign: 'center', padding: '24px 0' }}>
+                Aucune étape.<br/>Cliquez ➕ ci-dessous.
+              </div>
+            )}
+            {form.sequence.map((step, idx) => (
+              <div key={idx} onClick={() => setSelectedStep(idx)}
+                style={{ padding: '10px 12px', background: selectedStep === idx ? '#6366f1' : '#1a1d2e', borderRadius: '9px', marginBottom: '7px', cursor: 'pointer', border: `1px solid ${selectedStep === idx ? '#818cf8' : '#2d3250'}`, transition: 'all 0.12s' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span style={{ fontSize: '15px' }}>{stepIcon(step.type)}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: '12px', fontWeight: '700', color: selectedStep === idx ? 'white' : '#d1d5db' }}>Étape {idx + 1}</div>
+                    <div style={{ fontSize: '11px', color: selectedStep === idx ? 'rgba(255,255,255,0.65)' : '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {step.type === 'text' ? (step.content || 'Vide') : step.type}{step.delay_ms > 0 ? ` · ${step.delay_ms / 1000}s` : ''}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '1px' }}>
+                    <button onClick={e => { e.stopPropagation(); moveStep(idx, -1); }} disabled={idx === 0}
+                      style={{ background: 'none', border: 'none', color: idx === 0 ? '#374151' : '#9ca3af', cursor: idx === 0 ? 'default' : 'pointer', fontSize: '10px', padding: '1px 3px', lineHeight: 1 }}>▲</button>
+                    <button onClick={e => { e.stopPropagation(); moveStep(idx, 1); }} disabled={idx === form.sequence.length - 1}
+                      style={{ background: 'none', border: 'none', color: idx === form.sequence.length - 1 ? '#374151' : '#9ca3af', cursor: idx === form.sequence.length - 1 ? 'default' : 'pointer', fontSize: '10px', padding: '1px 3px', lineHeight: 1 }}>▼</button>
+                  </div>
+                  <button onClick={e => { e.stopPropagation(); removeStep(idx); }}
+                    style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: '13px', padding: '2px 4px', lineHeight: 1, flexShrink: 0 }}>✕</button>
+                </div>
+              </div>
+            ))}
+            <button onClick={addStep}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = '#6366f1'; e.currentTarget.style.color = '#818cf8'; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = '#2d3250'; e.currentTarget.style.color = '#6366f1'; }}
+              style={{ width: '100%', padding: '10px', background: 'transparent', border: '2px dashed #2d3250', borderRadius: '9px', color: '#6366f1', cursor: 'pointer', fontSize: '13px', fontWeight: '700', transition: 'all 0.12s', marginTop: '4px' }}>
+              ➕ Ajouter une étape
+            </button>
+          </div>
+
+          {/* Step editor */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '22px' }}>
+            {!currentStep && (
+              <div style={{ textAlign: 'center', color: '#374151', padding: '64px 20px' }}>
+                <div style={{ fontSize: '44px', marginBottom: '14px' }}>👈</div>
+                <div style={{ fontSize: '14px' }}>Sélectionnez ou ajoutez une étape pour l'éditer</div>
+              </div>
+            )}
+            {currentStep && (
+              <div style={{ maxWidth: '680px' }}>
+                <div style={{ fontSize: '15px', fontWeight: '800', marginBottom: '20px', color: '#e5e7eb' }}>
+                  ✏️ Étape {selectedStep + 1}
+                </div>
+
+                {/* Type selector */}
+                <div style={{ marginBottom: '20px' }}>
+                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Type</div>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                    {STEP_TYPES.map(t => (
+                      <button key={t.id} onClick={() => updateStep(selectedStep, { type: t.id, content: '', media_url: null })}
+                        style={{ padding: '8px 14px', background: currentStep.type === t.id ? '#6366f1' : '#1a1d2e', border: `1px solid ${currentStep.type === t.id ? '#818cf8' : '#2d3250'}`, borderRadius: '8px', color: 'white', cursor: 'pointer', fontSize: '13px', fontWeight: '600', transition: 'all 0.12s' }}>
+                        {t.icon} {t.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Content */}
+                {currentStep.type === 'text' && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Contenu</div>
+                    <textarea value={currentStep.content || ''} onChange={e => updateStep(selectedStep, { content: e.target.value })}
+                      placeholder="Écrivez votre message... Utilisez {{prenom}}, {{montant}}, {{modele}} pour des variables dynamiques"
+                      rows={6}
+                      style={{ width: '100%', boxSizing: 'border-box', padding: '12px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '10px', color: 'white', fontSize: '14px', lineHeight: '1.65', resize: 'vertical', outline: 'none', fontFamily: 'inherit' }}
+                    />
+                    <div style={{ fontSize: '11px', color: '#4b5563', marginTop: '5px' }}>Variables: {'{{prenom}}'}, {'{{montant}}'}, {'{{modele}}'}, {'{{tier}}'}</div>
+                  </div>
+                )}
+
+                {(currentStep.type === 'photo' || currentStep.type === 'video' || currentStep.type === 'audio') && (
+                  <div style={{ marginBottom: '20px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>URL Média</div>
+                    <input value={currentStep.media_url || ''} onChange={e => updateStep(selectedStep, { media_url: e.target.value })}
+                      placeholder="https://..."
+                      style={{ width: '100%', boxSizing: 'border-box', padding: '12px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '10px', color: 'white', fontSize: '14px', outline: 'none', fontFamily: 'inherit' }}
+                    />
+                    <div style={{ fontSize: '11px', color: '#4b5563', marginTop: '5px' }}>
+                      {currentStep.type === 'photo' ? 'Image (jpg, png, gif, webp)' : currentStep.type === 'video' ? 'Vidéo (mp4, mov)' : 'Audio (ogg, mp3, m4a)'}
+                    </div>
+                    {currentStep.media_url && currentStep.type === 'photo' && (
+                      <img src={currentStep.media_url} alt="preview" onError={e => { e.target.style.display = 'none'; }} style={{ marginTop: '10px', maxHeight: '160px', borderRadius: '8px', objectFit: 'cover', display: 'block' }} />
+                    )}
+                    <div style={{ marginTop: '14px' }}>
+                      <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Légende (optionnel)</div>
+                      <input value={currentStep.content || ''} onChange={e => updateStep(selectedStep, { content: e.target.value })}
+                        placeholder="Légende du média..."
+                        style={{ width: '100%', boxSizing: 'border-box', padding: '10px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', outline: 'none', fontFamily: 'inherit' }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {currentStep.type === 'wait_reply' && (
+                  <div style={{ marginBottom: '20px', padding: '16px', background: '#1a1d2e', borderRadius: '10px', border: '1px solid #2d3250' }}>
+                    <div style={{ fontSize: '14px', color: '#9ca3af' }}>⏳ Attendre la réponse du client avant de continuer</div>
+                    <div style={{ fontSize: '12px', color: '#4b5563', marginTop: '8px' }}>La séquence se met en pause jusqu'à ce que le client réponde.</div>
+                  </div>
+                )}
+
+                {/* Delay */}
+                <div style={{ marginBottom: '20px' }}>
+                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Délai avant envoi</div>
+                  <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
+                    {[0, 1000, 3000, 5000, 10000, 30000].map(ms => (
+                      <button key={ms} onClick={() => updateStep(selectedStep, { delay_ms: ms })}
+                        style={{ padding: '7px 12px', background: currentStep.delay_ms === ms ? '#6366f1' : '#1a1d2e', border: `1px solid ${currentStep.delay_ms === ms ? '#818cf8' : '#2d3250'}`, borderRadius: '8px', color: 'white', cursor: 'pointer', fontSize: '12px', fontWeight: '600', transition: 'all 0.12s' }}>
+                        {ms === 0 ? 'Immédiat' : ms < 1000 ? ms + 'ms' : (ms / 1000) + 's'}
+                      </button>
+                    ))}
+                    <input type="number" value={currentStep.delay_ms} onChange={e => updateStep(selectedStep, { delay_ms: Math.max(0, parseInt(e.target.value) || 0) })}
+                      min={0} placeholder="ms"
+                      style={{ width: '80px', padding: '7px 10px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '12px', outline: 'none', fontFamily: 'inherit' }}
+                    />
+                  </div>
+                </div>
+
+                {/* Bubble preview */}
+                {currentStep.type === 'text' && currentStep.content && (
+                  <div style={{ marginTop: '24px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: '700', color: '#6b7280', marginBottom: '8px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Aperçu</div>
+                    <div style={{ padding: '14px 18px', background: '#6366f1', borderRadius: '16px 16px 16px 4px', color: 'white', fontSize: '14px', lineHeight: '1.65', maxWidth: '320px', boxShadow: '0 4px 16px rgba(99,102,241,0.25)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                      {currentStep.content}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// SCRIPTS PAGE — Liste des scripts séquences
+// =============================================
+const ScriptsPage = ({ user, lang }) => {
+  const addToast = useToast();
+  const [scripts, setScripts] = React.useState([]);
+  const [showBuilder, setShowBuilder] = React.useState(false);
+  const [currentScript, setCurrentScript] = React.useState(null);
+  const [filterCategory, setFilterCategory] = React.useState('all');
+  const [filterModel, setFilterModel] = React.useState('all');
+  const [isLoading, setIsLoading] = React.useState(true);
+
+  React.useEffect(() => { loadScripts(); }, []);
+
+  const loadScripts = async () => {
+    setIsLoading(true);
+    try {
+      const { data, error } = await sb.from('scripts_sequences').select('*').order('updated_at', { ascending: false });
+      if (!error) setScripts(data || []);
+      else addToast('Erreur chargement: ' + error.message, 'error');
+    } catch (err) {
+      console.error('[SCRIPTS_PAGE] Load error:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const filteredScripts = scripts.filter(s => {
+    if (filterCategory !== 'all' && s.category !== filterCategory) return false;
+    if (filterModel !== 'all' && s.model_id !== filterModel) return false;
+    return true;
+  });
+
+  const deleteScript = async (id) => {
+    if (!confirm('Supprimer ce script définitivement ?')) return;
+    const { error } = await sb.from('scripts_sequences').delete().eq('id', id);
+    if (!error) { addToast('Script supprimé', 'success'); loadScripts(); }
+    else addToast('Erreur: ' + error.message, 'error');
+  };
+
+  const duplicateScript = async (script) => {
+    const { id, created_at, updated_at, ...rest } = script;
+    const { error } = await sb.from('scripts_sequences').insert({
+      ...rest,
+      name: script.name + ' (copie)',
+      stats: { total_sent: 0, success_rate: 0, avg_revenue: 0 },
+    });
+    if (!error) { addToast('✅ Script dupliqué', 'success'); loadScripts(); }
+    else addToast('Erreur: ' + error.message, 'error');
+  };
+
+  const toggleActive = async (id, current) => {
+    const { error } = await sb.from('scripts_sequences').update({ is_active: !current }).eq('id', id);
+    if (!error) loadScripts();
+    else addToast('Erreur: ' + error.message, 'error');
+  };
+
+  const modelColor = (id) => id === 'carla' ? '#7c3aed' : id === 'bella' ? '#be185d' : '#1d4ed8';
+
+  return (
+    <div style={{ padding: '24px', maxWidth: '1600px', margin: '0 auto' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '28px', gap: '16px', flexWrap: 'wrap' }}>
+        <div>
+          <h1 style={{ margin: '0 0 6px', fontSize: '26px', fontWeight: '800' }}>🎬 Mes Scripts</h1>
+          <p style={{ margin: 0, color: '#6b7280', fontSize: '14px' }}>Séquences automatisées multi-étapes avec médias, timing et ciblage intelligent</p>
+        </div>
+        <button
+          onClick={() => { setCurrentScript({ ...SCRIPT_TEMPLATE }); setShowBuilder(true); }}
+          style={{ padding: '12px 22px', background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)', border: 'none', borderRadius: '10px', color: 'white', fontWeight: '700', cursor: 'pointer', fontSize: '14px', boxShadow: '0 4px 16px rgba(99,102,241,0.3)', flexShrink: 0 }}
+          onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 6px 20px rgba(99,102,241,0.4)'; }}
+          onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = '0 4px 16px rgba(99,102,241,0.3)'; }}
+        >
+          ➕ Créer un script
+        </button>
+      </div>
+
+      {/* Filters */}
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '22px', alignItems: 'center', flexWrap: 'wrap' }}>
+        <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)}
+          style={{ padding: '9px 13px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', fontFamily: 'inherit' }}>
+          <option value="all">Toutes catégories</option>
+          <option value="vente">💰 Vente</option>
+          <option value="relance">🔄 Relance</option>
+          <option value="accueil">👋 Accueil</option>
+          <option value="upsell">📈 Upsell</option>
+        </select>
+        <select value={filterModel} onChange={e => setFilterModel(e.target.value)}
+          style={{ padding: '9px 13px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', fontFamily: 'inherit' }}>
+          <option value="all">Tous modèles</option>
+          <option value="carla">Carla 💜</option>
+          <option value="bella">Bella 💖</option>
+          <option value="sophie">Sophie 💙</option>
+        </select>
+        <div style={{ marginLeft: 'auto', color: '#6b7280', fontSize: '13px', fontWeight: '600' }}>
+          {filteredScripts.length} script{filteredScripts.length !== 1 ? 's' : ''}
+        </div>
+      </div>
+
+      {/* Loading */}
+      {isLoading && (
+        <div style={{ textAlign: 'center', padding: '80px 20px', color: '#4b5563' }}>
+          <div style={{ fontSize: '36px', marginBottom: '12px' }}>⏳</div>
+          <div>Chargement des scripts...</div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!isLoading && filteredScripts.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '72px 20px', background: '#1a1d2e', borderRadius: '16px', border: '2px dashed #2d3250' }}>
+          <div style={{ fontSize: '52px', marginBottom: '16px' }}>🎬</div>
+          <h3 style={{ margin: '0 0 8px', fontSize: '18px', fontWeight: '700' }}>{scripts.length === 0 ? 'Aucun script créé' : 'Aucun script trouvé'}</h3>
+          <p style={{ margin: '0 0 20px', color: '#4b5563', fontSize: '14px' }}>
+            {scripts.length === 0 ? 'Créez votre premier script pour automatiser vos séquences de messages' : 'Essayez de modifier les filtres'}
+          </p>
+          {scripts.length === 0 && (
+            <button onClick={() => { setCurrentScript({ ...SCRIPT_TEMPLATE }); setShowBuilder(true); }}
+              style={{ padding: '11px 22px', background: '#6366f1', border: 'none', borderRadius: '9px', color: 'white', fontWeight: '600', cursor: 'pointer', fontSize: '14px' }}>
+              ➕ Créer mon premier script
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Grid */}
+      {!isLoading && filteredScripts.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(360px, 1fr))', gap: '18px' }}>
+          {filteredScripts.map(script => (
+            <div key={script.id}
+              style={{ background: '#1a1d2e', padding: '20px', borderRadius: '14px', border: '1px solid #2d3250', transition: 'all 0.18s', cursor: 'default' }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = '#6366f1'; e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(0,0,0,0.2)'; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = '#2d3250'; e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'none'; }}
+            >
+              {/* Card header */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <h3 style={{ margin: '0 0 7px', fontSize: '16px', fontWeight: '700', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{script.name}</h3>
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    <span style={{ background: '#6366f1', padding: '3px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: '600' }}>{script.category}</span>
+                    <span style={{ background: modelColor(script.model_id), padding: '3px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: '600' }}>{script.model_id}</span>
+                    {!script.is_active && <span style={{ background: '#374151', padding: '3px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: '600' }}>⏸ Inactif</span>}
+                  </div>
+                </div>
+                <button onClick={e => { e.stopPropagation(); toggleActive(script.id, script.is_active); }} title={script.is_active ? 'Désactiver' : 'Activer'}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: '16px', opacity: 0.75, padding: '2px', marginLeft: '8px', flexShrink: 0 }}>
+                  {script.is_active ? '🟢' : '⭕'}
+                </button>
+              </div>
+
+              {/* Audiences */}
+              {script.target_audiences && script.target_audiences.length > 0 && (
+                <div style={{ marginBottom: '12px', padding: '9px 11px', background: '#0f1117', borderRadius: '8px', display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' }}>
+                  <span style={{ fontSize: '11px', color: '#4b5563', fontWeight: '700' }}>🎯</span>
+                  {script.target_audiences.map(aId => {
+                    const a = SCRIPT_AUDIENCES[aId];
+                    return a ? <span key={aId} title={`${a.name} · ${a.desc}`} style={{ fontSize: '17px', cursor: 'help' }}>{a.emoji}</span> : null;
+                  })}
+                </div>
+              )}
+
+              {/* Stats */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', marginBottom: '14px' }}>
+                {[
+                  { label: 'Étapes',  value: (script.sequence || []).length, color: '#6366f1' },
+                  { label: 'Envois',  value: script.stats?.total_sent || 0,  color: '#8b5cf6' },
+                  { label: 'Succès',  value: (script.stats?.success_rate || 0) + '%', color: (script.stats?.success_rate || 0) > 0 ? '#10b981' : '#374151' },
+                ].map(({ label, value, color }) => (
+                  <div key={label} style={{ textAlign: 'center', padding: '10px 6px', background: '#0f1117', borderRadius: '8px' }}>
+                    <div style={{ fontSize: '20px', fontWeight: '800', color, marginBottom: '2px' }}>{value}</div>
+                    <div style={{ fontSize: '10px', color: '#4b5563', fontWeight: '600', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Actions */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '8px', paddingTop: '12px', borderTop: '1px solid #2d3250' }}>
+                <button onClick={e => { e.stopPropagation(); setCurrentScript(script); setShowBuilder(true); }}
+                  style={{ padding: '9px', background: '#6366f1', border: 'none', borderRadius: '8px', color: 'white', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}>
+                  ✏️ Modifier
+                </button>
+                <button onClick={e => { e.stopPropagation(); duplicateScript(script); }}
+                  style={{ padding: '9px', background: '#2d3250', border: 'none', borderRadius: '8px', color: 'white', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}>
+                  📋 Dupliquer
+                </button>
+                <button onClick={e => { e.stopPropagation(); deleteScript(script.id); }}
+                  style={{ padding: '9px 13px', background: '#ef4444', border: 'none', borderRadius: '8px', color: 'white', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}>
+                  🗑️
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showBuilder && currentScript && (
+        <ScriptBuilder
+          script={currentScript}
+          onSave={() => { loadScripts(); setShowBuilder(false); }}
+          onClose={() => setShowBuilder(false)}
+        />
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // TELEGRAM BETA — Messagerie (gerant/chatter) + enforcement messaging_permissions
 // =============================================
 const DEFAULT_MP = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
@@ -41551,6 +42095,8 @@ const App = () => {
           {(!subTab||subTab==="bots")&&<BotsManagementPage lang={lang} user={user} />}
           {subTab==="ia_insights"&&<IAInsightsPage user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} lang={lang} onNavigate={navigateTo} />}
         </>);
+      case "scripts":
+        return <ScriptsPage user={user} lang={lang} />;
       case "admin":
         return <AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} dbSpenders={spenders} />;
       default:
