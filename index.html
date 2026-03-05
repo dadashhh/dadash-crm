@@ -26006,6 +26006,28 @@ const getModelColor = (modelName) => {
   return colors[modelName?.toLowerCase()] || { bg: "#6b7280", text: "#ffffff" };
 };
 
+// Merge server message list into current local state.
+// - Keeps pending/error messages that haven't been confirmed yet.
+// - Uses ID-based dedup (primary) + text-based (fallback for pending).
+// - Preserves sort order by created_at.
+const mergeMessages = (prev, serverList) => {
+  const serverIds  = new Set(serverList.map(m => String(m.id)));
+  const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()));
+  // Keep pending/error messages not yet on server (by ID and text)
+  const localOnly = prev.filter(m =>
+    (m._pending || m._error) &&
+    !serverIds.has(String(m.id)) &&
+    !serverTexts.has((m.text || "").trim())
+  );
+  // Merge: server list + unconfirmed locals, dedup by id
+  const merged = new Map();
+  serverList.forEach(m => merged.set(String(m.id), m));
+  localOnly.forEach(m => { if (!merged.has(String(m.id))) merged.set(String(m.id), m); });
+  return Array.from(merged.values()).sort((a, b) =>
+    new Date(a.created_at || 0) - new Date(b.created_at || 0)
+  );
+};
+
 const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) => {
   const fr = lang === "fr";
   const addToast = useToast();
@@ -26020,7 +26042,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [messages, setMessages]           = useState([]);
   const [msgLoading, setMsgLoading]       = useState(false);
   const [msgInput, setMsgInput]           = useState("");
-  const [sending, setSending]             = useState(false);
   const [mobilePane, setMobilePane]       = useState("list");
   const [showScripts, setShowScripts]     = useState(false);
   const [showTxModal, setShowTxModal]     = useState(false);
@@ -26132,34 +26153,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       const list = Array.isArray(data) ? data : (data.messages || data.data || []);
 
       setMessages(prev => {
-        if (isInitial) {
-          return list;
-        }
-        // Polling: preserve pending (optimistic) messages until confirmed
-        const pendingMessages = prev.filter(m => m._pending === true);
-        const prevConfirmed = prev.filter(m => !m._pending);
+        if (isInitial) return list;
 
-        // Détection robuste de nouveaux messages :
-        // 1. Nombre de messages différent
-        // 2. Dernier message différent (id ou timestamp)
-        // 3. Un des messages serveur n'est pas encore dans prev
+        // Détection de nouveaux messages : évite re-render si rien n'a changé
+        const prevConfirmed = prev.filter(m => !m._pending && !m._error);
         const prevIds = new Set(prevConfirmed.map(m => String(m.id)));
-        const prevLast = prevConfirmed[prevConfirmed.length - 1];
-        const newLast  = list[list.length - 1];
-        const hasNew = list.length !== prevConfirmed.length
-          || (newLast && prevLast && (String(newLast.id) !== String(prevLast.id) || newLast.created_at !== prevLast.created_at))
-          || list.some(m => !prevIds.has(String(m.id)));
-        if (!hasNew) return prev; // Aucun nouveau message → garder prev intact (no re-render)
+        const hasNew = list.some(m => !prevIds.has(String(m.id))) || prevConfirmed.length !== list.length;
+        if (!hasNew) return prev;
 
-        // Identifier les pending confirmés par le serveur (texte correspondant)
-        const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
-        const stillPending = pendingMessages.filter(p =>
-          !confirmedTexts.has(p.text || "")
-        );
-        // Merger : messages serveur + pending non confirmés, triés par date
-        return [...list, ...stillPending].sort((a, b) =>
-          new Date(a.created_at || 0) - new Date(b.created_at || 0)
-        );
+        return mergeMessages(prev, list);
       });
     } catch (_) {
       if (isInitial) setMessages([]);
@@ -26460,17 +26462,16 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
-    if (!selectedConv || !msgInput.trim() || sending) return;
+    if (!selectedConv || !msgInput.trim()) return;
     const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
     if (!chatId) { addToast(fr ? "Aucun chat_id" : "Missing chat_id", "error"); return; }
 
     const text = msgInput.trim();
-    // Bug 1 fix — clear textarea immediately so it feels snappy
+    // Clear input immediately — snappy UX, don't wait for API
     setMsgInput("");
-    setSending(true);
 
-    // Inject the message locally right now (optimistic update)
-    const localId = Date.now();
+    // Optimistic message — visible instantly, pending state
+    const localId = "pending-" + Date.now();
     const optimistic = {
       id: localId,
       text,
@@ -26488,34 +26489,28 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text, ...(modelId ? { model_id: modelId } : {}) }),
       });
-      addToast(fr ? "Message envoyé ✓" : "Message sent ✓", "success");
-
-      // Réconciliation 2 s après l'envoi — confirme l'optimiste + capte les réponses
+      // Confirm the optimistic message immediately (remove _pending flag)
+      setMessages(prev => prev.map(m =>
+        m.id === localId ? { ...m, _pending: false, id: localId + "_sent" } : m
+      ));
+      // Reconciliation after 2s — pick up server IDs and any replies
       setTimeout(async () => {
-        if (chatIdRef.current !== chatId) return; // l'utilisateur a changé de conv
+        if (String(chatIdRef.current) !== String(chatId)) return;
         try {
           const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
           const list = Array.isArray(data) ? data : (data.messages || data.data || []);
-          setMessages(prev => {
-            const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
-            // Garder les pending non encore confirmés
-            const stillPending = prev.filter(m => m._pending && !confirmedTexts.has(m.text || ""));
-            const existingIds = new Set(prev.map(m => String(m.id)));
-            const toAdd = list.filter(m => !existingIds.has(String(m.id)));
-            return [...prev.filter(m => !m._pending), ...stillPending, ...toAdd]
-              .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-          });
-        } catch (_) { /* garder l'optimiste jusqu'au prochain poll */ }
+          setMessages(prev => mergeMessages(prev, list));
+        } catch (_) { /* keep confirmed state */ }
       }, 2000);
 
     } catch (e) {
-      // Revert: remove optimistic entry and restore the typed text
-      setMessages(prev => prev.filter(m => m.id !== localId));
-      setMsgInput(text);
+      // Don't remove — mark the message as failed so user sees it and can retry
+      setMessages(prev => prev.map(m =>
+        m.id === localId ? { ...m, _pending: false, _error: true } : m
+      ));
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
     }
-    setSending(false);
-  }, [selectedConv, msgInput, sending, selectedModelId, chatterCtx, fr, addToast]);
+  }, [selectedConv, msgInput, selectedModelId, chatterCtx, fr, addToast]);
 
   // ── Apply script ─────────────────────────────────
   const applyScript = (script) => {
@@ -26843,27 +26838,27 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               const text = msg.text || msg.content || msg.message || "";
               const ts = msg.created_at || msg.timestamp || msg.date;
               const isPending = msg._pending === true;
-              const isNew = i >= prevMsgCountRef.current - 1 && !isPending;
+              const isError   = msg._error === true;
+              const isNew = i >= prevMsgCountRef.current - 1 && !isPending && !isError;
               return (
                 <div key={msg.id || i}
                   className={isNew ? "message-new" : undefined}
-                  style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%", display: "flex", flexDirection: "column", gap: 2, opacity: isPending ? 0.7 : 1 }}>
+                  style={{ alignSelf: isOut ? "flex-end" : "flex-start", maxWidth: "72%", display: "flex", flexDirection: "column", gap: 2, opacity: isPending ? 0.65 : 1 }}>
                   <div style={{
                     padding: "9px 13px",
                     borderRadius: isOut ? "16px 16px 4px 16px" : "16px 16px 16px 4px",
-                    background: isOut ? "var(--accent)" : "rgba(255,255,255,0.08)",
+                    background: isError ? "rgba(239,68,68,0.15)" : isOut ? "var(--accent)" : "rgba(255,255,255,0.08)",
                     color: "#fff", fontSize: 13, lineHeight: 1.45, wordBreak: "break-word",
                     boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
-                    border: isPending ? "1px dashed rgba(255,255,255,0.3)" : "none",
+                    border: isPending ? "1px dashed rgba(255,255,255,0.3)" : isError ? "1px solid #ef4444" : "none",
                   }}>
                     {text || <span style={{ opacity: 0.5, fontStyle: "italic" }}>—</span>}
                   </div>
-                  {ts && (
-                    <div style={{ fontSize: 9, color: "var(--text-quaternary)", textAlign: isOut ? "right" : "left" }}>
-                      {(() => { try { return new Date(ts).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }); } catch (_) { return ""; } })()}
-                      {isPending && <span style={{ marginLeft: 4, opacity: 0.6 }}>⏳</span>}
-                    </div>
-                  )}
+                  <div style={{ fontSize: 9, color: isError ? "#ef4444" : "var(--text-quaternary)", textAlign: isOut ? "right" : "left" }}>
+                    {ts && (() => { try { return new Date(ts).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }); } catch (_) { return ""; } })()}
+                    {isPending && <span style={{ marginLeft: 4, opacity: 0.6 }}>⏳</span>}
+                    {isError   && <span style={{ marginLeft: 4 }}>❌ {fr ? "Échec — réessaie" : "Failed — retry"}</span>}
+                  </div>
                 </div>
               );
             })}
@@ -26898,14 +26893,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             </div>
             <div style={{ display: "flex", gap: 8, padding: "8px 14px 12px", alignItems: "flex-end" }}>
               <textarea ref={inputRef} value={msgInput} onChange={e => setMsgInput(e.target.value)}
-                onKeyDown={e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendMessage(); } }}
-                placeholder={fr ? "Écrire un message… (⌘+Entrée)" : "Write a message… (⌘+Enter)"}
-                disabled={sending} rows={2}
+                onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                placeholder={fr ? "Écrire un message… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" : "Write a message… (Enter to send, Shift+Enter for newline)"}
+                rows={2}
                 style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-raised))", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4 }}
               />
-              <button onClick={sendMessage} disabled={sending || !msgInput.trim()}
-                style={{ alignSelf: "flex-end", padding: "10px 18px", borderRadius: 10, border: "none", background: sending || !msgInput.trim() ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: sending || !msgInput.trim() ? "not-allowed" : "pointer", flexShrink: 0, transition: "background 0.2s" }}>
-                {sending ? "⏳" : (fr ? "Envoyer" : "Send")}
+              <button onClick={sendMessage} disabled={!msgInput.trim()}
+                style={{ alignSelf: "flex-end", padding: "10px 18px", borderRadius: 10, border: "none", background: !msgInput.trim() ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: !msgInput.trim() ? "not-allowed" : "pointer", flexShrink: 0, transition: "background 0.2s" }}>
+                {fr ? "Envoyer" : "Send"}
               </button>
             </div>
           </div>
