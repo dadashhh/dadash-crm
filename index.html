@@ -26585,15 +26585,19 @@ const GestionChattersTab = ({ chatters, models, txs, onRefresh, lang }) => {
       ? current.filter(m => m !== modelId)
       : [...current, modelId];
     setSaving(chatterId + "_" + modelId);
-    const { error } = await sb.from("profiles").update({ assigned_models: updated }).eq("id", chatterId);
+    const { error } = await sb.auth.admin.updateUserById(chatterId, {
+      user_metadata: { assigned_models: updated }
+    });
     setSaving(null);
     if (error) { addToast("❌ " + error.message, "error"); }
     else { addToast(fr ? "✅ Mis à jour" : "✅ Updated", "success"); onRefresh(); }
   };
 
-  const handleShiftToggle = async (chatterId, current) => {
+  const handleShiftToggle = async (chatterId, currentOnShift) => {
     setSaving(chatterId + "_shift");
-    const { error } = await sb.from("profiles").update({ on_shift: !current }).eq("id", chatterId);
+    const { error } = await sb.auth.admin.updateUserById(chatterId, {
+      user_metadata: { status: currentOnShift ? 'inactive' : 'active' }
+    });
     setSaving(null);
     if (error) addToast("❌ " + error.message, "error");
     else onRefresh();
@@ -26694,7 +26698,9 @@ const GestionAssignationsTab = ({ chatters, models, onToggleModel, lang }) => {
       ? current.filter(m => m !== modelId)
       : [...current, modelId];
     setSaving(chatterId + "_" + modelId);
-    const { error } = await sb.from("profiles").update({ assigned_models: updated }).eq("id", chatterId);
+    const { error } = await sb.auth.admin.updateUserById(chatterId, {
+      user_metadata: { assigned_models: updated }
+    });
     setSaving(null);
     if (error) { addToast("❌ " + error.message, "error"); }
     else { addToast(fr ? "✅ Mis à jour" : "✅ Updated", "success"); onToggleModel(); }
@@ -26807,14 +26813,17 @@ const GestionAssignationsTab = ({ chatters, models, onToggleModel, lang }) => {
 };
 
 // ── Gestion page shell ────────────────────────────────────────────────
-// Data sources: profiles (role=chatter) + transactions
-// Assignments managed via profiles.assigned_models (JSONB array of model IDs)
+// Data sources: auth.users (role=chatter in user_metadata)
+// Assignments managed via user_metadata.assigned_models (array of model IDs)
 const GestionSubpage = ({ models = [], lang, user }) => {
   const fr = lang === "fr";
   const addToast = useToast();
 
   const [activeGestionTab, setActiveGestionTab] = useState("chatters");
   const [chatters, setChatters]                 = useState([]);
+  const [assignments, setAssignments]           = useState([]);
+  const [stats, setStats]                       = useState([]);
+  const [activityLogs, setActivityLogs]         = useState([]);
   const [txs, setTxs]                           = useState([]);
   const [isLoading, setIsLoading]               = useState(true);
   const [refreshKey, setRefreshKey]             = useState(0);
@@ -26824,26 +26833,123 @@ const GestionSubpage = ({ models = [], lang, user }) => {
   const loadData = async () => {
     setIsLoading(true);
     try {
-      // Chatters are profiles with role='chatter'
-      const { data: ch } = await sb.from("profiles")
-        .select("id,name,email,handle,role,assigned_models,on_shift,commission_pct,daily_goal")
-        .eq("role", "chatter")
-        .order("name");
-      setChatters(ch || []);
-      // TX stats for CA calculations per chatter
-      const { data: tx } = await sb.from("transactions")
-        .select("id,chatter_id,amount,status,date,model_id")
-        .in("status", ["validated","validée","confirmee","payee"])
-        .limit(500);
-      setTxs(tx || []);
+      console.log('[GESTION] Loading users from auth.users...');
+      const { data: { users: allUsers }, error } = await sb.auth.admin.listUsers();
+      if (error) {
+        console.error('[GESTION] Error loading users:', error);
+        addToast("❌ Erreur chargement users", "error");
+        return;
+      }
+      console.log('[GESTION] Total users loaded:', allUsers?.length);
+      const chattersData = (allUsers || [])
+        .filter(u => u.user_metadata?.role === 'chatter')
+        .map(u => ({
+          id: u.id,
+          email: u.email,
+          name: u.user_metadata?.full_name || u.email,
+          full_name: u.user_metadata?.full_name || u.email,
+          role: u.user_metadata?.role,
+          assigned_models: u.user_metadata?.assigned_models || [],
+          commission_rate: u.user_metadata?.commission_rate || 0,
+          commission_pct: u.user_metadata?.commission_rate || 0,
+          on_shift: u.user_metadata?.status === 'active',
+          status: u.user_metadata?.status || 'active',
+          created_at: u.created_at
+        }));
+      console.log('[GESTION] Chatters found:', chattersData.length);
+      setChatters(chattersData);
+      const assignmentsData = [];
+      chattersData.forEach(chatter => {
+        (chatter.assigned_models || []).forEach((modelId, index) => {
+          assignmentsData.push({
+            id: `${chatter.id}-${modelId}`,
+            model_id: modelId,
+            chatter_id: chatter.id,
+            chatter_email: chatter.email,
+            chatter_name: chatter.name,
+            is_active: chatter.status === 'active',
+            priority: index === 0 ? 1 : 2,
+            quota_daily: 100
+          });
+        });
+      });
+      console.log('[GESTION] Assignments created:', assignmentsData.length);
+      setAssignments(assignmentsData);
+      setStats(chattersData.map(chatter => ({
+        id: chatter.id,
+        chatter_email: chatter.email,
+        messages_today: 0,
+        messages_week: 0,
+        messages_month: 0,
+        conversations_active: 0,
+        last_activity: null,
+        quota_daily: 100,
+        quota_used_today: 0,
+        is_online: false
+      })));
+      setActivityLogs([]);
     } catch (err) {
-      console.error("[GESTION] Load error:", err);
-      addToast("❌ Erreur chargement", "error");
+      console.error('[GESTION] Fatal error:', err);
+      addToast("❌ Erreur fatale chargement", "error");
+    } finally {
+      setIsLoading(false);
     }
-    setIsLoading(false);
   };
 
-  useEffect(() => { loadData(); }, [refreshKey]);
+  const updateQuota = async (chatterEmail, newQuota) => {
+    addToast(`ℹ️ Quota : ${newQuota} msg/jour (prochainement)`, "info");
+  };
+
+  const assignModel = async (modelId, chatterEmail, chatterName) => {
+    try {
+      console.log('[GESTION] Assigning', modelId, 'to', chatterEmail);
+      const chatter = chatters.find(c => c.email === chatterEmail);
+      if (!chatter) { addToast("❌ Chatter introuvable", "error"); return; }
+      if (chatter.assigned_models.includes(modelId)) { addToast("⚠️ Modèle déjà assigné", "warning"); return; }
+      const newAssignedModels = [...chatter.assigned_models, modelId];
+      const { error } = await sb.auth.admin.updateUserById(chatter.id, {
+        user_metadata: { assigned_models: newAssignedModels }
+      });
+      if (error) { console.error('[GESTION] Assign error:', error); addToast("❌ Erreur assignation", "error"); return; }
+      console.log('[GESTION] ✅ Assignment successful');
+      addToast(`✅ ${chatterName} assigné à ${modelId}`, "success");
+      loadData();
+    } catch (err) {
+      console.error('[GESTION] Assign exception:', err);
+      addToast("❌ Erreur assignation", "error");
+    }
+  };
+
+  const removeAssignment = async (assignmentId) => {
+    if (!window.confirm('Retirer cette assignation ?')) return;
+    try {
+      console.log('[GESTION] Removing assignment:', assignmentId);
+      const lastDash = assignmentId.lastIndexOf('-');
+      const chatterId = assignmentId.substring(0, lastDash);
+      const modelId = assignmentId.substring(lastDash + 1);
+      const chatter = chatters.find(c => c.id === chatterId);
+      if (!chatter) { addToast("❌ Chatter introuvable", "error"); return; }
+      const newAssignedModels = chatter.assigned_models.filter(m => m !== modelId);
+      const { error } = await sb.auth.admin.updateUserById(chatter.id, {
+        user_metadata: { assigned_models: newAssignedModels }
+      });
+      if (error) { console.error('[GESTION] Remove error:', error); addToast("❌ Erreur suppression", "error"); return; }
+      console.log('[GESTION] ✅ Removal successful');
+      addToast("✅ Assignation retirée", "success");
+      loadData();
+    } catch (err) {
+      console.error('[GESTION] Remove exception:', err);
+      addToast("❌ Erreur suppression", "error");
+    }
+  };
+
+  useEffect(() => {
+    loadData();
+    const interval = setInterval(() => {
+      if (activeGestionTab === 'activity') loadData();
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [activeGestionTab, refreshKey]);
 
   const tabBtnStyle = (id) => ({
     padding: "11px 22px",
