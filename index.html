@@ -25921,6 +25921,8 @@ const _dmsgFetch = async (path, opts = {}) => {
   try {
     res = await fetch(url, { headers: reqHeaders, ...restOpts });
   } catch (networkErr) {
+    // Abort is intentional — propagate as-is so callers can detect it
+    if (networkErr.name === "AbortError") throw networkErr;
     // Network-level failure (CORS blocked, DNS, offline…)
     const isCors = networkErr.message && (networkErr.message.toLowerCase().includes("cors") || networkErr.message.toLowerCase().includes("blocked") || networkErr.message.toLowerCase().includes("failed to fetch"));
     const detail = isCors ? "Erreur CORS ou réseau — vérifier les origines autorisées côté serveur." : networkErr.message;
@@ -26073,6 +26075,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // Guard against parallel polling calls
   const isMsgPollingRef  = React.useRef(false);
   const isConvPollingRef = React.useRef(false);
+  // AbortController for in-flight message fetches (rapid conv switching)
+  const abortMsgRef = React.useRef(null);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
@@ -26145,11 +26149,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
   // ── Load messages — isInitial=true on first open, false on poll ──
-  const loadMessagesById = useCallback(async (chatId, isInitial) => {
+  const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
     if (isInitial) setMsgLoading(true);
     try {
-      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
+      const data = await _dmsgFetch(
+        "/conversations/" + chatId + "/messages?limit=50",
+        signal ? { signal } : {}
+      );
       const list = Array.isArray(data) ? data : (data.messages || data.data || []);
 
       setMessages(prev => {
@@ -26163,7 +26170,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
         return mergeMessages(prev, list);
       });
-    } catch (_) {
+    } catch (err) {
+      // Fetch was intentionally aborted (rapid conv switch) — do nothing
+      if (err.name === "AbortError") return;
       if (isInitial) setMessages([]);
     }
     if (isInitial) setMsgLoading(false);
@@ -26223,11 +26232,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Select conversation ───────────────────────────
   const selectConv = useCallback((conv) => {
     const chatId = _dmsgChatId(conv);
+
+    // Cancel any in-flight message fetch from the previous conv
+    if (abortMsgRef.current) {
+      abortMsgRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortMsgRef.current = controller;
+
     chatIdRef.current = chatId;
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
-    setMessages([]);
+    setMessages([]);           // Immediate clear — no residual messages from previous conv
     setMsgInput("");
     setShowScripts(false);
     isUserScrollRef.current = false;
@@ -26236,7 +26253,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setActiveSpender(null);
     setSpenderLoading(false);
     setSpenderTab("profil");
-    if (chatId) loadMessagesById(chatId, true); // isInitial=true
+    if (chatId) loadMessagesById(chatId, true, controller.signal);
     if (isMobile) setMobilePane("chat");
   }, [loadMessagesById, isMobile]);
 
@@ -26827,7 +26844,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
           {/* Messages — FIX SCROLL: flex:1 + minHeight:0 */}
           <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 6 }}>
-            {msgLoading && <div style={{ textAlign: "center", color: "var(--text-quaternary)", fontSize: 12, padding: 20 }}>⏳ {fr ? "Chargement…" : "Loading…"}</div>}
+            {msgLoading && (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 12, color: "var(--text-quaternary)" }}>
+                <div style={{ width: 28, height: 28, border: "3px solid var(--border-subtle)", borderTop: "3px solid var(--accent)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                <span style={{ fontSize: 12 }}>{fr ? "Chargement des messages…" : "Loading messages…"}</span>
+              </div>
+            )}
             {!msgLoading && messages.length === 0 && (
               <div style={{ textAlign: "center", color: "var(--text-quaternary)", fontSize: 12, padding: 20 }}>
                 {fr ? "Aucun message" : "No messages yet"}
