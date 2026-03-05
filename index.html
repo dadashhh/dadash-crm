@@ -26256,6 +26256,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [scheduleSpacing, setScheduleSpacing]     = useState(true);
   const [showScheduledList, setShowScheduledList] = useState(false);
   const [scheduledBroadcasts, setScheduledBroadcasts] = useState([]);
+  // Script assistant
+  const [activeScript, setActiveScript]       = useState(null);
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [showScriptModal, setShowScriptModal] = useState(false);
+  const [availableScripts, setAvailableScripts] = useState([]);
+
   useEffect(() => {
     if (!lightboxUrl) return;
     const onKey = (e) => { if (e.key === "Escape") setLightboxUrl(null); };
@@ -26277,6 +26283,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       document.removeEventListener("mousedown", onOutside);
     };
   }, [showScripts]);
+
+  // Load available scripts_sequences on mount
+  useEffect(() => { loadAvailableScripts(); }, []);
 
   const pollRef        = React.useRef(null);
   const convPollRef    = React.useRef(null);
@@ -26761,7 +26770,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     }
   }, [selectedConv, msgInput, selectedModelId, chatterCtx, fr, addToast]);
 
-  // ── Apply script ─────────────────────────────────
+  // ── Apply script (quick scripts library) ─────────
   const applyScript = (script) => {
     const prenom = activeSpender?.first_name || activeSpender?.handle || "bébé";
     const filled = script.text
@@ -26770,6 +26779,77 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setMsgInput(filled);
     setShowScripts(false);
     setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  // ── Script assistant (scripts_sequences) ─────────
+  const loadAvailableScripts = async () => {
+    const { data } = await sb.from('scripts_sequences').select('*').eq('is_active', true).order('name');
+    setAvailableScripts(data || []);
+  };
+
+  const _replaceVars = (text) => {
+    if (!text) return '';
+    const spent = Number(activeSpender?.total_spent || 0);
+    const tier = CONV_TIERS.find(t => spent >= t.min && spent < t.max) || CONV_TIERS[6];
+    const vars = {
+      '{prenom}': activeSpender?.first_name || 'bébé',
+      '{{prenom}}': activeSpender?.first_name || 'bébé',
+      '{nom}': activeSpender?.last_name || '',
+      '{{nom}}': activeSpender?.last_name || '',
+      '{budget}': `${spent.toFixed(0)} CHF`,
+      '{{budget}}': `${spent.toFixed(0)} CHF`,
+      '{total_depense}': `${spent.toFixed(0)} CHF`,
+      '{{total_depense}}': `${spent.toFixed(0)} CHF`,
+      '{audience}': tier.name,
+      '{{audience}}': tier.name,
+      '{emoji_audience}': tier.emoji,
+      '{{emoji_audience}}': tier.emoji,
+      '{modele}': selectedConv?.model_name || selectedConv?.model_id || 'Carla',
+      '{{modele}}': selectedConv?.model_name || selectedConv?.model_id || 'Carla',
+    };
+    let result = text;
+    Object.entries(vars).forEach(([k, v]) => { result = result.split(k).join(v); });
+    return result;
+  };
+
+  const _loadStepIntoInput = (script, stepIndex) => {
+    if (!script || stepIndex >= script.sequence.length) {
+      setActiveScript(null);
+      setCurrentStepIndex(0);
+      return;
+    }
+    const step = script.sequence[stepIndex];
+    setMsgInput(_replaceVars(step.content) || '');
+    setTimeout(() => inputRef.current?.focus(), 50);
+    console.log(`[SCRIPT] Loaded step ${stepIndex + 1}/${script.sequence.length} · type: ${step.type}`);
+  };
+
+  const startScript = (script) => {
+    setActiveScript(script);
+    setCurrentStepIndex(0);
+    _loadStepIntoInput(script, 0);
+  };
+
+  const nextStep = () => {
+    if (!activeScript) return;
+    const next = currentStepIndex + 1;
+    if (next >= activeScript.sequence.length) {
+      alert(`✅ Script "${activeScript.name}" terminé !`);
+      setActiveScript(null);
+      setCurrentStepIndex(0);
+      setMsgInput('');
+    } else {
+      setCurrentStepIndex(next);
+      _loadStepIntoInput(activeScript, next);
+    }
+  };
+
+  const stopScript = () => {
+    if (confirm('Arrêter ce script ?')) {
+      setActiveScript(null);
+      setCurrentStepIndex(0);
+      setMsgInput('');
+    }
   };
 
   // ── Create transaction ───────────────────────────
@@ -27516,10 +27596,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           {/* Scripts + send bar */}
           <div style={{ flexShrink: 0, borderTop: "1px solid var(--border-subtle)", background: "var(--bg-overlay)" }}>
             <div ref={scriptsRef} style={{ position: "relative" }}>
-              <div style={{ padding: "8px 14px 0" }}>
+              <div style={{ padding: "8px 14px 0", display: "flex", gap: 8, alignItems: "center" }}>
                 <button onClick={() => setShowScripts(s => !s)}
                   style={{ padding: "5px 12px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: showScripts ? "var(--accent-muted)" : "var(--bg-raised)", color: showScripts ? "var(--accent)" : "var(--text-secondary)", fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
                   📝 Scripts {showScripts ? "▲" : "▼"}
+                </button>
+                <button
+                  onClick={() => { loadAvailableScripts(); setShowScriptModal(true); }}
+                  disabled={!selectedConv}
+                  style={{ padding: "5px 12px", borderRadius: 8, border: "1px solid " + (activeScript ? "#10b981" : "var(--border-subtle)"), background: activeScript ? "rgba(16,185,129,0.15)" : "var(--bg-raised)", color: activeScript ? "#10b981" : "var(--text-secondary)", fontSize: 11, fontWeight: 600, cursor: selectedConv ? "pointer" : "not-allowed", display: "flex", alignItems: "center", gap: 5, opacity: !selectedConv ? 0.5 : 1, transition: "all 0.2s" }}
+                >
+                  {activeScript ? `🎬 Script (${currentStepIndex + 1}/${activeScript.sequence.length})` : "🎬 Scripts"}
                 </button>
               </div>
               {showScripts && (
@@ -27552,12 +27639,65 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 </div>
               )}
             </div>
+            {/* Script assistant active — above textarea */}
+            {activeScript && (
+              <div style={{ padding: "0 14px 8px" }}>
+                <div style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.15) 0%, rgba(139,92,246,0.15) 100%)", border: "1.5px solid #6366f1", borderRadius: 12, padding: 14 }}>
+                  {/* Header */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 2 }}>🎬 {activeScript.name}</div>
+                      <div style={{ fontSize: 12, color: "#9ca3af" }}>Étape {currentStepIndex + 1} / {activeScript.sequence.length}</div>
+                    </div>
+                    <button onClick={stopScript} style={{ padding: "5px 10px", background: "#ef4444", border: "none", borderRadius: 6, color: "white", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>❌ Arrêter</button>
+                  </div>
+                  {/* Progress bar */}
+                  <div style={{ height: 5, background: "#2d3250", borderRadius: 3, overflow: "hidden", marginBottom: 10 }}>
+                    <div style={{ height: "100%", width: `${((currentStepIndex + 1) / activeScript.sequence.length) * 100}%`, background: "linear-gradient(90deg, #6366f1 0%, #8b5cf6 100%)", transition: "width 0.3s" }} />
+                  </div>
+                  {/* Step info */}
+                  {activeScript.sequence[currentStepIndex] && (() => {
+                    const step = activeScript.sequence[currentStepIndex];
+                    return (
+                      <div>
+                        {step.media_url && (
+                          <div style={{ background: "#0f1117", padding: "10px 12px", borderRadius: 8, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                            <div style={{ fontSize: 12 }}>
+                              {step.type === "photo" && "🖼️ Photo"}{step.type === "video" && "🎥 Vidéo"}{step.type === "audio" && "🎵 Audio"}
+                              {" : "}
+                              <code style={{ fontSize: 11, color: "#6366f1", background: "#1a1d2e", padding: "2px 6px", borderRadius: 4 }}>
+                                {step.media_url.substring(0, 40)}…
+                              </code>
+                            </div>
+                            <button onClick={() => { navigator.clipboard.writeText(step.media_url); addToast("✅ URL copiée", "success"); }}
+                              style={{ padding: "4px 10px", background: "#2d3250", border: "none", borderRadius: 6, color: "white", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                              📋 Copier
+                            </button>
+                          </div>
+                        )}
+                        {step.delay_ms > 0 && (
+                          <div style={{ fontSize: 11, color: "#f59e0b", marginBottom: 8 }}>
+                            ⏱️ Délai recommandé : {(step.delay_ms / 1000).toFixed(1)}s
+                          </div>
+                        )}
+                        <button onClick={nextStep} style={{ width: "100%", padding: "9px", background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)", border: "none", borderRadius: 8, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                          {currentStepIndex < activeScript.sequence.length - 1
+                            ? `⏭️ Étape suivante (${currentStepIndex + 2}/${activeScript.sequence.length})`
+                            : "✅ Terminer le script"}
+                        </button>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: 8, padding: "8px 14px 12px", alignItems: "flex-end" }}>
               <textarea ref={inputRef} value={msgInput} onChange={e => setMsgInput(e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
                 placeholder={fr ? "Écrire un message… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" : "Write a message… (Enter to send, Shift+Enter for newline)"}
                 rows={2}
-                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-raised))", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4 }}
+                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 10, border: activeScript ? "1px solid #6366f1" : "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-raised))", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4, transition: "border-color 0.2s" }}
               />
               <button onClick={sendMessage} disabled={!msgInput.trim()}
                 style={{ alignSelf: "flex-end", padding: "10px 18px", borderRadius: 10, border: "none", background: !msgInput.trim() ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: !msgInput.trim() ? "not-allowed" : "pointer", flexShrink: 0, transition: "background 0.2s" }}>
@@ -27565,6 +27705,48 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               </button>
             </div>
           </div>
+
+          {/* Script selection modal */}
+          {showScriptModal && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+              onClick={e => { if (e.target === e.currentTarget) setShowScriptModal(false); }}>
+              <div style={{ background: "#1a1d2e", borderRadius: 16, padding: 24, width: 520, maxWidth: "96vw", maxHeight: "80vh", overflow: "auto", boxShadow: "0 16px 48px rgba(0,0,0,0.5)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+                  <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>🎬 Choisir un script</h3>
+                  <button onClick={() => setShowScriptModal(false)} style={{ background: "none", border: "none", color: "#9ca3af", fontSize: 24, cursor: "pointer", lineHeight: 1 }}>✕</button>
+                </div>
+                {availableScripts.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: "40px 20px", color: "#6b7280" }}>
+                    <div style={{ fontSize: 40, marginBottom: 12 }}>🎬</div>
+                    <div>Aucun script actif. Créez-en dans l'onglet Scripts.</div>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {availableScripts.map(script => (
+                      <div key={script.id} style={{ background: "#0f1117", borderRadius: 12, padding: "14px 16px", border: "1px solid #2d3250", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{script.name}</div>
+                          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                            <span style={{ fontSize: 11, padding: "2px 7px", background: "#6366f1", borderRadius: 5, fontWeight: 600 }}>{script.category}</span>
+                            <span style={{ fontSize: 11, padding: "2px 7px", background: "#374151", borderRadius: 5, fontWeight: 600 }}>{(script.sequence || []).length} étapes</span>
+                            {(script.target_audiences || []).map(aId => {
+                              const a = SCRIPT_AUDIENCES[aId];
+                              return a ? <span key={aId} title={a.name} style={{ fontSize: 15 }}>{a.emoji}</span> : null;
+                            })}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => { startScript(script); setShowScriptModal(false); }}
+                          style={{ padding: "9px 16px", background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)", border: "none", borderRadius: 9, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0, whiteSpace: "nowrap" }}>
+                          ▶️ Utiliser
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </>
       )}
     </div>
