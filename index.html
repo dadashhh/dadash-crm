@@ -27148,6 +27148,30 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       }
     }
     console.log(`[BROADCAST] Done: ✅ ${ok} success, ❌ ${fail} errors`);
+
+    // ── Save to broadcast_history for analytics ─────────────────
+    try {
+      const audEntry = BROADCAST_AUDIENCES.find(a => a.id === selectedAudience);
+      await sb.from('broadcast_history').insert({
+        model_id:          broadcastModel,
+        audience_id:       selectedAudience !== 'manual' ? selectedAudience : null,
+        audience_name:     selectedAudience !== 'manual' ? (audEntry?.name || selectedAudience) : 'Sélection manuelle',
+        message:           broadcastMessage.trim(),
+        has_media:         !!broadcastMedia,
+        media_type:        broadcastMedia?.type || null,
+        total_recipients:  chatIds.length,
+        sent_count:        ok,
+        failed_count:      fail,
+        read_count:        0,
+        reply_count:       0,
+        revenue_generated: 0,
+        metadata:          { spacing: scheduleSpacing, recipients_count: chatIds.length },
+      });
+      console.log('[BROADCAST] History saved to broadcast_history');
+    } catch (histErr) {
+      console.error('[BROADCAST] Error saving history:', histErr?.message || histErr);
+    }
+
     setBroadcastResult({ ok, fail });
     setBroadcastSending(false);
     if (ok > 0) {
@@ -30199,6 +30223,165 @@ const MediaLibraryPage = ({ user }) => {
 // =============================================
 // TELEGRAM BETA — Messagerie (gerant/chatter) + enforcement messaging_permissions
 // =============================================
+// =============================================
+// BROADCAST ANALYTICS PAGE
+// =============================================
+const BroadcastAnalytics = ({ user }) => {
+  const addToast = useToast();
+  const [broadcasts, setBroadcasts] = useState([]);
+  const [filterModel, setFilterModel] = useState('all');
+  const [filterAudience, setFilterAudience] = useState('all');
+  const [dateRange, setDateRange] = useState('30');
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => { loadBroadcasts(); }, [filterModel, filterAudience, dateRange]);
+
+  const loadBroadcasts = async () => {
+    setIsLoading(true);
+    try {
+      let query = sb.from('broadcast_history').select('*').order('sent_at', { ascending: false });
+      if (filterModel !== 'all') query = query.eq('model_id', filterModel);
+      if (filterAudience !== 'all') query = query.eq('audience_id', filterAudience);
+      if (dateRange !== 'all') {
+        const d = new Date();
+        d.setDate(d.getDate() - parseInt(dateRange));
+        query = query.gte('sent_at', d.toISOString());
+      }
+      const { data, error } = await query;
+      if (!error) setBroadcasts(data || []);
+      else addToast('Erreur chargement: ' + error.message, 'error');
+    } catch (err) {
+      console.error('[ANALYTICS] Load error:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const totalBroadcasts  = broadcasts.length;
+  const totalRecipients  = broadcasts.reduce((s, b) => s + (b.total_recipients || 0), 0);
+  const totalSent        = broadcasts.reduce((s, b) => s + (b.sent_count || 0), 0);
+  const totalFailed      = broadcasts.reduce((s, b) => s + (b.failed_count || 0), 0);
+  const successRate      = totalRecipients > 0 ? ((totalSent / totalRecipients) * 100).toFixed(1) : '0.0';
+
+  const modelColor = (id) => id === 'carla' ? '#8b5cf6' : id === 'bella' ? '#ec4899' : '#3b82f6';
+  const rateColor  = (r) => r >= 90 ? '#10b981' : r >= 70 ? '#f59e0b' : '#ef4444';
+
+  const FILTER_AUDIENCES = ['sharks','baleines','gorilles','orang_outan','ouistiti','poissons','actifs','inactifs_30j','ghosters'];
+
+  return (
+    <div style={{ padding: '24px', maxWidth: '1400px', margin: '0 auto' }}>
+      {/* Header */}
+      <div style={{ marginBottom: '28px' }}>
+        <h1 style={{ margin: '0 0 6px', fontSize: '26px', fontWeight: '800' }}>📊 Analytics Broadcasts</h1>
+        <p style={{ margin: 0, color: '#6b7280', fontSize: '14px' }}>Analyse la performance de tes broadcasts</p>
+      </div>
+
+      {/* Global stats */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '16px', marginBottom: '28px' }}>
+        {[
+          { label: 'Broadcasts',        value: totalBroadcasts, color: '#6366f1' },
+          { label: 'Destinataires',     value: totalRecipients, color: '#8b5cf6' },
+          { label: 'Envoyés',           value: totalSent,       color: '#10b981' },
+          { label: 'Taux de succès',    value: successRate + '%', color: rateColor(parseFloat(successRate)) },
+          { label: 'Erreurs',           value: totalFailed,     color: totalFailed > 0 ? '#ef4444' : '#4b5563' },
+        ].map(({ label, value, color }) => (
+          <div key={label} style={{ background: '#1a1d2e', padding: '18px 20px', borderRadius: '12px', border: '1px solid #2d3250' }}>
+            <div style={{ fontSize: '11px', color: '#6b7280', marginBottom: '8px', textTransform: 'uppercase', fontWeight: '700', letterSpacing: '0.05em' }}>{label}</div>
+            <div style={{ fontSize: '28px', fontWeight: '800', color }}>{value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Filters */}
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '22px', flexWrap: 'wrap', alignItems: 'center' }}>
+        {[
+          { value: dateRange, onChange: setDateRange, options: [['7','7 derniers jours'],['30','30 derniers jours'],['90','90 derniers jours'],['all','Tout l\'historique']] },
+          { value: filterModel, onChange: setFilterModel, options: [['all','Tous modèles'],['carla','Carla 💜'],['bella','Bella 💖'],['sophie','Sophie 💙']] },
+        ].map((sel, i) => (
+          <select key={i} value={sel.value} onChange={e => sel.onChange(e.target.value)}
+            style={{ padding: '9px 14px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
+            {sel.options.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+          </select>
+        ))}
+        <select value={filterAudience} onChange={e => setFilterAudience(e.target.value)}
+          style={{ padding: '9px 14px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}>
+          <option value="all">Toutes audiences</option>
+          <option value="">Sélection manuelle</option>
+          {FILTER_AUDIENCES.map(id => {
+            const a = SCRIPT_AUDIENCES[id];
+            return a ? <option key={id} value={id}>{a.emoji} {a.name}</option> : null;
+          })}
+        </select>
+        <button onClick={loadBroadcasts} style={{ padding: '9px 16px', background: '#2d3250', border: 'none', borderRadius: '8px', color: 'white', fontSize: '13px', fontWeight: '700', cursor: 'pointer' }}>
+          🔄 Actualiser
+        </button>
+        <div style={{ marginLeft: 'auto', fontSize: '13px', color: '#6b7280', fontWeight: '600' }}>
+          {broadcasts.length} broadcast{broadcasts.length !== 1 ? 's' : ''}
+        </div>
+      </div>
+
+      {/* Loading */}
+      {isLoading && (
+        <div style={{ textAlign: 'center', padding: '60px', color: '#4b5563' }}>
+          <div style={{ fontSize: '32px', marginBottom: '12px' }}>⏳</div>
+          <div>Chargement...</div>
+        </div>
+      )}
+
+      {/* Empty */}
+      {!isLoading && broadcasts.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '60px', background: '#1a1d2e', borderRadius: '12px', border: '2px dashed #2d3250' }}>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>📊</div>
+          <div style={{ color: '#6b7280', fontSize: '14px' }}>Aucun broadcast trouvé.<br/>Lance un broadcast pour le voir apparaître ici.</div>
+        </div>
+      )}
+
+      {/* List */}
+      {!isLoading && broadcasts.length > 0 && (
+        <div style={{ background: '#1a1d2e', borderRadius: '12px', border: '1px solid #2d3250', overflow: 'hidden' }}>
+          {broadcasts.map((b, idx) => {
+            const rate = b.total_recipients > 0 ? Math.round((b.sent_count / b.total_recipients) * 100) : 0;
+            return (
+              <div key={b.id} style={{ padding: '18px 20px', borderBottom: idx < broadcasts.length - 1 ? '1px solid #2d3250' : 'none' }}>
+                {/* Top row: model + audience + date */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px', flexWrap: 'wrap' }}>
+                  <span style={{ background: modelColor(b.model_id), padding: '3px 9px', borderRadius: '6px', fontSize: '11px', fontWeight: '700', textTransform: 'uppercase' }}>{b.model_id}</span>
+                  {b.has_media && <span style={{ fontSize: '11px', padding: '3px 8px', background: '#2d3250', borderRadius: '6px', fontWeight: '600' }}>{b.media_type === 'photo' ? '🖼️' : b.media_type === 'video' ? '🎥' : '🎵'} {b.media_type}</span>}
+                  {b.audience_name && <span style={{ fontSize: '13px', color: '#9ca3af' }}>→ {b.audience_name}</span>}
+                  <span style={{ fontSize: '12px', color: '#4b5563', marginLeft: 'auto' }}>{new Date(b.sent_at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                </div>
+
+                {/* Message preview */}
+                {b.message && (
+                  <div style={{ fontSize: '13px', color: '#d1d5db', background: '#0f1117', padding: '9px 12px', borderRadius: '6px', marginBottom: '12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {b.message.length > 120 ? b.message.substring(0, 120) + '…' : b.message}
+                  </div>
+                )}
+
+                {/* Stats row */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))', gap: '12px' }}>
+                  {[
+                    { label: 'Envoyés',  value: `${b.sent_count}/${b.total_recipients}`, color: '#10b981' },
+                    { label: 'Succès',   value: rate + '%',    color: rateColor(rate) },
+                    { label: 'Erreurs',  value: b.failed_count, color: b.failed_count > 0 ? '#ef4444' : '#4b5563' },
+                    { label: 'Réponses', value: b.reply_count || 0, color: '#6366f1' },
+                    { label: 'Revenue',  value: b.revenue_generated ? `${b.revenue_generated} CHF` : '—', color: '#f59e0b' },
+                  ].map(({ label, value, color }) => (
+                    <div key={label}>
+                      <div style={{ fontSize: '10px', color: '#4b5563', fontWeight: '700', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '3px' }}>{label}</div>
+                      <div style={{ fontSize: '18px', fontWeight: '800', color }}>{value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const DEFAULT_MP = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
 const _devLog = (action, meta) => { try { if (typeof window!=="undefined" && localStorage.getItem("dadash_tg_simu_enabled")==="1") console.log("[MSG]", action, meta||""); } catch(_){} };
 
@@ -42519,12 +42702,13 @@ const App = () => {
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("push")} style={msgTabStyle("push")}>{"\u{1F4AC}"} Push</button>}
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("scripts")} style={msgTabStyle("scripts")}>🎬 Scripts</button>}
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("media")} style={msgTabStyle("media")}>📁 Médias</button>}
+              {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("analytics")} style={msgTabStyle("analytics")}>📊 Analytics</button>}
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("admin_panel")} style={msgTabStyle("admin_panel")}>{"\u{1F6E0}"} Admin Panel</button>}
               {simuEnabled&&<span style={{padding:"4px 10px",borderRadius:10,background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,marginLeft:4,flexShrink:0}}>{"\u{1F4DD}"} Mode test</span>}
             </div>
           </div>
           {messagerieSubTab==="dadash_live"&&<DadashMessagerieTab user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />}
-          {user?.role==="gerant"&&messagerieSubTab!=="dadash_live"&&messagerieSubTab!=="scripts"&&messagerieSubTab!=="media"&&(
+          {user?.role==="gerant"&&messagerieSubTab!=="dadash_live"&&messagerieSubTab!=="scripts"&&messagerieSubTab!=="media"&&messagerieSubTab!=="analytics"&&(
             <div style={{marginBottom:20,padding:14,background:"var(--card-bg)",borderRadius:12,border:"1px solid var(--border-subtle)",fontSize:12,fontFamily:"'Inter', sans-serif"}}>
               <span style={{fontWeight:600,color:"var(--text-secondary)",marginRight:12}}>{"\u{1F4DD}"} Mode test UI (local)</span>
               <label style={{display:"inline-flex",alignItems:"center",gap:8,cursor:"pointer",marginRight:12}}>
@@ -42548,6 +42732,7 @@ const App = () => {
           {messagerieSubTab==="push"&&<PushPageV1 user={user} lang={lang} models={models} spenders={spenders} botStats={botStats} onRefresh={onRefresh} />}
           {messagerieSubTab==="scripts"&&user?.role==="gerant"&&<ScriptsPage user={user} lang={lang} />}
           {messagerieSubTab==="media"&&user?.role==="gerant"&&<MediaLibraryPage user={user} lang={lang} />}
+          {messagerieSubTab==="analytics"&&user?.role==="gerant"&&<BroadcastAnalytics user={user} lang={lang} />}
           {messagerieSubTab==="admin_panel"&&user?.role==="gerant"&&<MessagerieGerantAdminPanel user={user} lang={lang} profiles={profiles} models={models} botStats={botStats} spenders={spenders} onRefresh={onRefresh} />}
         </>);
       case "compta":
