@@ -26029,25 +26029,34 @@ const getModelColor = (modelName) => {
   return colors[modelName?.toLowerCase()] || { bg: "#6b7280", text: "#ffffff" };
 };
 
+// Stable message key — API may use different field names for the ID.
+const _msgKey = (m) => String(m.id || m.message_id || m.tg_message_id || m._localId || "");
+
 // Merge server message list into current local state.
 // - Keeps pending/error messages that haven't been confirmed yet.
 // - Uses ID-based dedup (primary) + text-based (fallback for pending).
-// - Preserves sort order by created_at.
+// - Preserves sort order by created_at / timestamp.
 const mergeMessages = (prev, serverList) => {
-  const serverIds  = new Set(serverList.map(m => String(m.id)));
-  const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()));
-  // Keep pending/error messages not yet on server (by ID and text)
+  const serverIds   = new Set(serverList.map(m => _msgKey(m)).filter(Boolean));
+  const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()).filter(Boolean));
+  // Keep pending/error messages not yet confirmed on server
   const localOnly = prev.filter(m =>
     (m._pending || m._error) &&
-    !serverIds.has(String(m.id)) &&
+    !serverIds.has(_msgKey(m)) &&
     !serverTexts.has((m.text || "").trim())
   );
-  // Merge: server list + unconfirmed locals, dedup by id
+  // Merge: server list + unconfirmed locals, dedup by stable key
   const merged = new Map();
-  serverList.forEach(m => merged.set(String(m.id), m));
-  localOnly.forEach(m => { if (!merged.has(String(m.id))) merged.set(String(m.id), m); });
+  serverList.forEach((m, i) => {
+    const key = _msgKey(m) || ("srv_" + i);
+    merged.set(key, m);
+  });
+  localOnly.forEach((m, i) => {
+    const key = _msgKey(m) || ("loc_" + i);
+    if (!merged.has(key)) merged.set(key, m);
+  });
   return Array.from(merged.values()).sort((a, b) =>
-    new Date(a.created_at || 0) - new Date(b.created_at || 0)
+    new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
   );
 };
 
@@ -26081,6 +26090,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [spenderTab, setSpenderTab] = useState("profil");
   // Lightbox pour affichage image en grand
   const [lightboxUrl, setLightboxUrl] = useState(null);
+  // "Nouveaux messages" indicator when user has scrolled up
+  const [hasNewMessages, setHasNewMessages] = useState(false);
+  // "Nouveaux messages" indicator when user scrolled up
+  const [hasNewMessages, setHasNewMessages] = useState(false);
+  const msgContainerRef = React.useRef(null);
   // Broadcast (envoi multiple)
   const [selectionMode, setSelectionMode]         = useState(false);
   const [selectedConvIds, setSelectedConvIds]     = useState(new Set());
@@ -26130,6 +26144,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const abortMsgRef = React.useRef(null);
   // Ref for scripts panel (click-outside to close)
   const scriptsRef = React.useRef(null);
+  // Ref for messages scroll container
+  const msgContainerRef = React.useRef(null);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
@@ -26215,10 +26231,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       setMessages(prev => {
         if (isInitial) return list;
 
-        // Détection de nouveaux messages : évite re-render si rien n'a changé
+        // Détection de nouveaux messages — utilise _msgKey pour cohérence avec mergeMessages
         const prevConfirmed = prev.filter(m => !m._pending && !m._error);
-        const prevIds = new Set(prevConfirmed.map(m => String(m.id)));
-        const hasNew = list.some(m => !prevIds.has(String(m.id))) || prevConfirmed.length !== list.length;
+        const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
+        const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
         if (!hasNew) return prev;
 
         return mergeMessages(prev, list);
@@ -26364,34 +26380,36 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId]);
 
-  // ── Détecter si l'utilisateur scrolle manuellement ──────────────────────
-  useEffect(() => {
-    const container = msgEndRef.current?.parentElement;
-    if (!container) return;
-    const handleScroll = () => {
-      const isAtBottom = container.scrollHeight - container.scrollTop <= container.clientHeight + 100;
-      isUserScrollRef.current = !isAtBottom;
-    };
-    container.addEventListener('scroll', handleScroll, { passive: true });
-    return () => container.removeEventListener('scroll', handleScroll);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedChatId]);
+  // ── Scroll handler (attached via onScroll prop, not DOM listener) ──────
+  const handleMsgScroll = (e) => {
+    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 80;
+    isUserScrollRef.current = !isAtBottom;
+    if (isAtBottom) setHasNewMessages(false);
+  };
 
-  // ── Scroll automatique : seulement si nouveaux messages ET user pas en train de scroller ──
+  // ── Auto-scroll : nouveaux messages arrivés ──────────────────────────
   useEffect(() => {
-    if (messages.length > prevMsgCountRef.current && !isUserScrollRef.current && msgEndRef.current) {
-      msgEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (messages.length > prevMsgCountRef.current) {
+      if (!isUserScrollRef.current && msgEndRef.current) {
+        msgEndRef.current.scrollIntoView({ behavior: "smooth" });
+      } else if (isUserScrollRef.current) {
+        setHasNewMessages(true);
+      }
     }
     prevMsgCountRef.current = messages.length;
   }, [messages]);
 
-  // ── Scroll instant lors du changement de conversation ──
+  // ── Scroll instant + reset au changement de conversation ─────────────
   useEffect(() => {
-    if (msgEndRef.current) {
-      msgEndRef.current.scrollIntoView({ behavior: 'instant' });
-    }
-    prevMsgCountRef.current = messages.length;
+    setHasNewMessages(false);
     isUserScrollRef.current = false;
+    prevMsgCountRef.current = 0;
+    // Scroll after a short tick so the container has rendered
+    const t = setTimeout(() => {
+      if (msgEndRef.current) msgEndRef.current.scrollIntoView({ behavior: "instant" });
+    }, 60);
+    return () => clearTimeout(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId]);
 
@@ -26978,7 +26996,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           </div>
 
           {/* Messages - FIX SCROLL: flex:1 + minHeight:0 */}
-          <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+          {hasNewMessages && (
+            <button onClick={() => { setHasNewMessages(false); isUserScrollRef.current = false; msgEndRef.current?.scrollIntoView({ behavior: "smooth" }); }}
+              style={{ position: "absolute", bottom: 12, left: "50%", transform: "translateX(-50%)", zIndex: 10, padding: "7px 16px", borderRadius: 20, border: "none", background: "var(--accent)", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 14px rgba(0,0,0,0.4)", whiteSpace: "nowrap" }}>
+              ↓ {fr ? "Nouveaux messages" : "New messages"}
+            </button>
+          )}
+          <div ref={msgContainerRef} onScroll={handleMsgScroll} style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 6 }}>
             {msgLoading && (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 12, color: "var(--text-quaternary)" }}>
                 <div style={{ width: 28, height: 28, border: "3px solid var(--border-subtle)", borderTop: "3px solid var(--accent)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
@@ -27070,6 +27095,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             })}
             <div ref={msgEndRef} />
           </div>
+          </div>{/* end messages wrapper */}
 
           {/* Scripts + send bar */}
           <div style={{ flexShrink: 0, borderTop: "1px solid var(--border-subtle)", background: "var(--bg-overlay)" }}>
