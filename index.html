@@ -26206,21 +26206,369 @@ const mergeMessages = (prev, serverList) => {
   );
 };
 
-const DadacastSubpage = () => (
-  <div style={{ padding: "32px", maxWidth: "1200px", margin: "0 auto" }}>
-    <h1 style={{ margin: 0, marginBottom: "8px", fontSize: "32px", fontWeight: "800" }}>
-      📡 Dadacast
-    </h1>
-    <p style={{ margin: 0, marginBottom: "32px", color: "#9ca3af", fontSize: "15px" }}>
-      Envoie des broadcasts massifs à tes audiences
-    </p>
-    <div style={{ background: "#1a1d2e", padding: "40px", borderRadius: "16px", textAlign: "center", border: "2px dashed #2d3250" }}>
-      <div style={{ fontSize: "64px", marginBottom: "20px" }}>📡</div>
-      <h3 style={{ marginBottom: "12px" }}>Dadacast en construction</h3>
-      <p style={{ color: "#9ca3af" }}>Interface de broadcast dédiée arrive bientôt</p>
+const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+
+  const [selectedAudience, setSelectedAudience] = useState("manual");
+  const [selectedConvIds, setSelectedConvIds]   = useState(new Set());
+  const [broadcastModel, setBroadcastModel]     = useState("");
+  const [broadcastMessage, setBroadcastMessage] = useState("");
+  const [broadcastMedia, setBroadcastMedia]     = useState(null);
+  const [scheduleSpacing, setScheduleSpacing]   = useState(true);
+  const [isSending, setIsSending]               = useState(false);
+  const [sendProgress, setSendProgress]         = useState(null); // {current, total, ok, fail}
+  const [recentBroadcasts, setRecentBroadcasts] = useState([]);
+  const [loadingRecent, setLoadingRecent]       = useState(true);
+  const fileInputRef = React.useRef(null);
+
+  // Init broadcastModel to first available model
+  useEffect(() => {
+    if (!broadcastModel && models.length > 0) setBroadcastModel(models[0].id);
+  }, [models]);
+
+  useEffect(() => { loadRecentBroadcasts(); }, []);
+
+  const loadRecentBroadcasts = async () => {
+    setLoadingRecent(true);
+    try {
+      const { data } = await sb.from("broadcast_history").select("*").order("sent_at", { ascending: false }).limit(5);
+      setRecentBroadcasts(data || []);
+    } catch (_) {}
+    setLoadingRecent(false);
+  };
+
+  const getAudienceConvs = (audienceId) => {
+    if (audienceId === "manual") return [];
+    const aud = BROADCAST_AUDIENCES.find(a => a.id === audienceId);
+    if (!aud) return [];
+    return conversations.filter(c => aud.filter(c, convTotalsMap));
+  };
+
+  const applyAudience = (audienceId) => {
+    setSelectedAudience(audienceId);
+    if (audienceId === "manual") { setSelectedConvIds(new Set()); return; }
+    const convs = getAudienceConvs(audienceId);
+    setSelectedConvIds(new Set(convs.map(c => String(_dmsgChatId(c)))));
+  };
+
+  const handleMediaUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    let mediaType = "photo";
+    if (file.type.startsWith("video/")) mediaType = "video";
+    else if (file.type.startsWith("audio/")) mediaType = "audio";
+    setBroadcastMedia({ type: mediaType, url: URL.createObjectURL(file), file, fileName: file.name, fileSize: file.size });
+    e.target.value = "";
+  };
+
+  const sendBroadcast = async () => {
+    if (!broadcastMessage.trim() && !broadcastMedia) {
+      addToast(fr ? "Message ou média requis" : "Message or media required", "error"); return;
+    }
+    if (selectedConvIds.size === 0) {
+      addToast(fr ? "Aucun destinataire sélectionné" : "No recipients selected", "error"); return;
+    }
+    setIsSending(true);
+    const chatIds = Array.from(selectedConvIds);
+    let ok = 0, fail = 0;
+    setSendProgress({ current: 0, total: chatIds.length, ok: 0, fail: 0 });
+    console.log(`[DADACAST] Starting: ${chatIds.length} recipients`);
+    try {
+      for (let i = 0; i < chatIds.length; i++) {
+        try {
+          if (broadcastMedia) {
+            const endpoint = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
+            await _dmsgFetch(endpoint, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: broadcastModel }) });
+          } else {
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: broadcastModel }) });
+          }
+          ok++;
+        } catch (err) {
+          fail++;
+          console.error(`[DADACAST] ❌ ${i + 1}/${chatIds.length}:`, err?.message || err);
+        }
+        setSendProgress({ current: i + 1, total: chatIds.length, ok, fail });
+        if (scheduleSpacing && i < chatIds.length - 1) {
+          await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+        }
+      }
+      console.log(`[DADACAST] Done: ✅ ${ok} / ❌ ${fail}`);
+      // Save to history
+      try {
+        const audEntry = BROADCAST_AUDIENCES.find(a => a.id === selectedAudience);
+        const { error: histError } = await sb.from("broadcast_history").insert({
+          model_id: broadcastModel,
+          audience_id: selectedAudience !== "manual" ? selectedAudience : null,
+          audience_name: selectedAudience !== "manual" ? (audEntry?.name || selectedAudience) : "Sélection manuelle",
+          message: broadcastMessage.trim(),
+          has_media: !!broadcastMedia,
+          media_type: broadcastMedia?.type || null,
+          total_recipients: chatIds.length,
+          sent_count: ok,
+          failed_count: fail,
+          read_count: 0, reply_count: 0, revenue_generated: 0,
+          metadata: { spacing: scheduleSpacing || false, chat_ids: chatIds },
+        });
+        if (histError) console.error("[DADACAST] History error:", histError);
+        else { console.log("[DADACAST] ✅ History saved"); loadRecentBroadcasts(); }
+      } catch (he) { console.error("[DADACAST] History exception:", he); }
+      addToast(`✅ ${ok}/${chatIds.length} envoyés${fail > 0 ? ` · ❌ ${fail} erreurs` : ""}`, ok > 0 ? "success" : "error");
+      setBroadcastMessage(""); setBroadcastMedia(null); setSelectedAudience("manual"); setSelectedConvIds(new Set());
+    } catch (err) {
+      console.error("[DADACAST] Fatal:", err);
+      addToast("❌ Erreur broadcast", "error");
+    } finally {
+      setIsSending(false);
+      setTimeout(() => setSendProgress(null), 3000);
+    }
+  };
+
+  const selAud = BROADCAST_AUDIENCES.find(a => a.id === selectedAudience);
+  const estMinutes = Math.max(1, Math.ceil(selectedConvIds.size * 3.5 / 60));
+  const canSend = (!!broadcastMessage.trim() || !!broadcastMedia) && selectedConvIds.size > 0 && !isSending;
+
+  const cardStyle = { background: "var(--card-bg, #1a1d2e)", padding: "24px", borderRadius: "16px", border: "1px solid var(--border-subtle, #2d3250)" };
+  const sectionTitle = (icon, text, sub) => (
+    <h3 style={{ margin: "0 0 16px 0", fontSize: "17px", fontWeight: "700", display: "flex", alignItems: "center", gap: "8px" }}>
+      {icon} {text} {sub && <span style={{ fontSize: "12px", color: "var(--text-tertiary, #6b7280)", fontWeight: "400" }}>{sub}</span>}
+    </h3>
+  );
+
+  return (
+    <div style={{ padding: "28px 32px", maxWidth: "1400px", margin: "0 auto", overflowY: "auto" }}>
+      {/* ── Header ── */}
+      <div style={{ marginBottom: "32px" }}>
+        <h1 style={{ margin: 0, marginBottom: "6px", fontSize: "32px", fontWeight: "800", background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+          📡 Dadacast
+        </h1>
+        <p style={{ margin: 0, color: "var(--text-tertiary, #9ca3af)", fontSize: "15px" }}>
+          {fr ? "Lance des broadcasts massifs à tes audiences" : "Launch mass broadcasts to your audiences"}
+        </p>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)", gap: "28px", alignItems: "start" }}>
+
+        {/* ─── LEFT COLUMN ─── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+
+          {/* Audience */}
+          <div style={cardStyle}>
+            {sectionTitle("🎯", fr ? "Audience cible" : "Target audience")}
+            <select
+              value={selectedAudience}
+              onChange={e => applyAudience(e.target.value)}
+              style={{ width: "100%", padding: "12px 14px", background: "var(--bg-raised, #0f1117)", border: "1.5px solid var(--border-subtle, #2d3250)", borderRadius: "10px", color: "var(--text-primary, white)", fontSize: "14px", cursor: "pointer", fontFamily: "'Inter', sans-serif", marginBottom: "12px" }}
+            >
+              <option value="manual">{fr ? "— Sélection manuelle —" : "— Manual selection —"}</option>
+              <optgroup label={fr ? "💰 Par niveau de dépense" : "💰 By spend tier"}>
+                {BROADCAST_AUDIENCES.filter(a => a.group === "spend").map(aud => (
+                  <option key={aud.id} value={aud.id}>{aud.name} — {aud.desc} ({getAudienceConvs(aud.id).length})</option>
+                ))}
+              </optgroup>
+              <optgroup label={fr ? "📊 Par activité" : "📊 By activity"}>
+                {BROADCAST_AUDIENCES.filter(a => a.group === "activity").map(aud => (
+                  <option key={aud.id} value={aud.id}>{aud.name} — {aud.desc} ({getAudienceConvs(aud.id).length})</option>
+                ))}
+              </optgroup>
+              <optgroup label={fr ? "🎯 Audiences combinées" : "🎯 Combined"}>
+                {BROADCAST_AUDIENCES.filter(a => a.group === "combo").map(aud => (
+                  <option key={aud.id} value={aud.id}>{aud.name} — {aud.desc} ({getAudienceConvs(aud.id).length})</option>
+                ))}
+              </optgroup>
+            </select>
+            {selAud && (
+              <div style={{ padding: "14px 16px", background: selAud.color + "18", border: `1.5px solid ${selAud.color}55`, borderRadius: "10px", display: "flex", alignItems: "center", gap: "14px" }}>
+                <span style={{ fontSize: "28px" }}>{selAud.name.split(" ")[0]}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontWeight: "700", color: selAud.color, fontSize: "15px" }}>{selAud.name}</div>
+                  <div style={{ fontSize: "12px", color: "var(--text-tertiary, #9ca3af)", marginTop: "2px" }}>{selAud.desc}</div>
+                </div>
+                <div style={{ fontSize: "28px", fontWeight: "800", color: selAud.color }}>{selectedConvIds.size}</div>
+              </div>
+            )}
+            {selectedAudience === "manual" && (
+              <div style={{ marginTop: "8px", fontSize: "12px", color: "var(--text-tertiary, #6b7280)" }}>
+                {fr ? "Utilisez la page Conversations pour sélectionner manuellement et lancer un broadcast." : "Use the Conversations page to manually select and launch a broadcast."}
+              </div>
+            )}
+          </div>
+
+          {/* Modèle */}
+          <div style={cardStyle}>
+            {sectionTitle("👤", fr ? "Envoyer depuis" : "Send from")}
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(models.length, 4)}, 1fr)`, gap: "10px" }}>
+              {models.map(model => {
+                const mc = getModelColor(model.name);
+                const isActive = broadcastModel === model.id;
+                return (
+                  <button key={model.id} onClick={() => setBroadcastModel(model.id)}
+                    style={{ padding: "14px 10px", background: isActive ? mc.bg + "25" : "var(--bg-raised, #0f1117)", border: `2px solid ${isActive ? mc.bg : "var(--border-subtle, #2d3250)"}`, borderRadius: "10px", color: isActive ? mc.bg : "var(--text-primary, white)", cursor: "pointer", textAlign: "center", transition: "all 0.2s", fontFamily: "'Inter', sans-serif" }}>
+                    <div style={{ fontSize: "22px", marginBottom: "6px" }}>👤</div>
+                    <div style={{ fontWeight: "700", fontSize: "13px" }}>{model.name}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Média */}
+          <div style={cardStyle}>
+            {sectionTitle("📎", fr ? "Média" : "Media", fr ? "(optionnel)" : "(optional)")}
+            <input type="file" accept="image/*,video/*,audio/*" onChange={handleMediaUpload} ref={fileInputRef} style={{ display: "none" }} />
+            {broadcastMedia ? (
+              <div style={{ padding: "16px", background: "var(--bg-raised, #0f1117)", borderRadius: "10px", border: "2px solid #6366f1" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "12px" }}>
+                  <span style={{ fontSize: "36px" }}>
+                    {broadcastMedia.type === "photo" ? "🖼️" : broadcastMedia.type === "video" ? "🎥" : "🎵"}
+                  </span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: "700", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{broadcastMedia.fileName}</div>
+                    <div style={{ fontSize: "12px", color: "var(--text-tertiary, #9ca3af)" }}>
+                      {broadcastMedia.type} · {(broadcastMedia.fileSize / 1024 / 1024).toFixed(2)} MB
+                    </div>
+                  </div>
+                  <button onClick={() => setBroadcastMedia(null)}
+                    style={{ padding: "6px 14px", background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", borderRadius: "8px", color: "#ef4444", fontSize: "13px", fontWeight: "700", cursor: "pointer" }}>
+                    🗑️
+                  </button>
+                </div>
+                {broadcastMedia.type === "photo" && (
+                  <img src={broadcastMedia.url} alt="preview" style={{ maxWidth: "100%", maxHeight: "180px", borderRadius: "8px", objectFit: "cover" }} />
+                )}
+              </div>
+            ) : (
+              <label onClick={() => fileInputRef.current?.click()}
+                style={{ display: "block", padding: "32px 20px", border: "2px dashed var(--border-subtle, #2d3250)", borderRadius: "10px", textAlign: "center", cursor: "pointer" }}
+                onMouseEnter={e => e.currentTarget.style.borderColor = "#6366f1"}
+                onMouseLeave={e => e.currentTarget.style.borderColor = "var(--border-subtle, #2d3250)"}
+              >
+                <div style={{ fontSize: "48px", marginBottom: "12px" }}>📤</div>
+                <div style={{ color: "var(--text-tertiary, #9ca3af)", fontSize: "14px" }}>
+                  {fr ? "Clique pour ajouter une photo, vidéo ou audio" : "Click to add a photo, video or audio"}
+                </div>
+              </label>
+            )}
+          </div>
+
+          {/* Message */}
+          <div style={cardStyle}>
+            {sectionTitle("✉️", fr ? "Message" : "Message")}
+            <textarea
+              value={broadcastMessage}
+              onChange={e => setBroadcastMessage(e.target.value)}
+              placeholder={fr ? "Écris ton message ici... Tu peux utiliser {prenom}, {budget}, etc." : "Write your message here..."}
+              style={{ width: "100%", minHeight: "160px", padding: "14px", background: "var(--bg-raised, #0f1117)", border: "1.5px solid var(--border-subtle, #2d3250)", borderRadius: "10px", color: "var(--text-primary, white)", fontSize: "14px", resize: "vertical", fontFamily: "'Inter', sans-serif", lineHeight: "1.7", boxSizing: "border-box" }}
+            />
+            <div style={{ marginTop: "10px", padding: "10px 12px", background: "rgba(99,102,241,0.08)", borderRadius: "8px", fontSize: "11px", color: "#a5b4fc", lineHeight: "1.6" }}>
+              💡 {fr ? "Variables" : "Variables"} : {"{prenom}"} · {"{budget}"} · {"{audience}"} · {"{modele}"}
+            </div>
+          </div>
+
+          {/* Options */}
+          <div style={{ ...cardStyle, padding: "16px 24px" }}>
+            <label style={{ display: "flex", alignItems: "center", gap: "14px", cursor: "pointer" }}>
+              <input type="checkbox" checked={scheduleSpacing} onChange={e => setScheduleSpacing(e.target.checked)}
+                style={{ cursor: "pointer", width: "17px", height: "17px", accentColor: "#6366f1" }} />
+              <div>
+                <div style={{ fontWeight: "700", fontSize: "14px", marginBottom: "2px" }}>⏱️ {fr ? "Étaler l'envoi (2-5s entre messages)" : "Space out sends (2-5s between messages)"}</div>
+                <div style={{ fontSize: "12px", color: "var(--text-tertiary, #9ca3af)" }}>
+                  {fr ? "Recommandé pour éviter les bans Telegram" : "Recommended to avoid Telegram bans"}
+                </div>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        {/* ─── RIGHT COLUMN ─── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: "20px", position: "sticky", top: "20px" }}>
+
+          {/* Preview card */}
+          <div style={cardStyle}>
+            <h3 style={{ margin: "0 0 18px 0", fontSize: "17px", fontWeight: "700" }}>📊 {fr ? "Aperçu" : "Preview"}</h3>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "14px" }}>
+              {[
+                { label: fr ? "Destinataires" : "Recipients", value: selectedConvIds.size, color: "#6366f1", big: true },
+                { label: fr ? "Durée estimée" : "Est. time", value: `~${estMinutes} min`, color: "#10b981" },
+              ].map(item => (
+                <div key={item.label} style={{ padding: "14px", background: "var(--bg-raised, #0f1117)", borderRadius: "10px", textAlign: "center" }}>
+                  <div style={{ fontSize: "11px", color: "var(--text-tertiary, #6b7280)", marginBottom: "4px", textTransform: "uppercase", fontWeight: "700", letterSpacing: "0.5px" }}>{item.label}</div>
+                  <div style={{ fontSize: item.big ? "28px" : "20px", fontWeight: "800", color: item.color }}>{item.value}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ padding: "12px 14px", background: "var(--bg-raised, #0f1117)", borderRadius: "8px", fontSize: "13px", lineHeight: "2", marginBottom: "18px" }}>
+              <div><span style={{ color: "var(--text-tertiary, #9ca3af)" }}>{fr ? "Modèle" : "Model"} : </span><strong>{models.find(m => m.id === broadcastModel)?.name || broadcastModel || "—"}</strong></div>
+              <div><span style={{ color: "var(--text-tertiary, #9ca3af)" }}>Type : </span><strong>{broadcastMedia ? `${broadcastMedia.type} + ${fr ? "texte" : "text"}` : (fr ? "texte seul" : "text only")}</strong></div>
+              <div><span style={{ color: "var(--text-tertiary, #9ca3af)" }}>Audience : </span><strong>{selAud?.name || (fr ? "Manuelle" : "Manual")}</strong></div>
+            </div>
+
+            {/* Progress bar during send */}
+            {sendProgress && (
+              <div style={{ marginBottom: "16px", padding: "12px", background: "rgba(99,102,241,0.08)", borderRadius: "10px", border: "1px solid rgba(99,102,241,0.2)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "8px", fontWeight: "600" }}>
+                  <span>⏳ {sendProgress.current}/{sendProgress.total}</span>
+                  <span>✅ {sendProgress.ok} · ❌ {sendProgress.fail}</span>
+                </div>
+                <div style={{ height: "6px", background: "var(--bg-raised, #0f1117)", borderRadius: "3px", overflow: "hidden" }}>
+                  <div style={{ height: "100%", background: "linear-gradient(90deg, #6366f1, #8b5cf6)", borderRadius: "3px", width: `${(sendProgress.current / sendProgress.total) * 100}%`, transition: "width 0.3s ease" }} />
+                </div>
+              </div>
+            )}
+
+            {/* Send button */}
+            <button onClick={sendBroadcast} disabled={!canSend}
+              style={{ width: "100%", padding: "16px", background: canSend ? "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)" : "var(--bg-raised, #374151)", border: "none", borderRadius: "12px", color: "white", fontSize: "16px", fontWeight: "800", cursor: canSend ? "pointer" : "not-allowed", opacity: canSend ? 1 : 0.5, boxShadow: canSend ? "0 8px 24px rgba(99,102,241,0.35)" : "none", transition: "all 0.2s", fontFamily: "'Inter', sans-serif" }}>
+              {isSending ? `⏳ ${fr ? "Envoi en cours" : "Sending"}…` : `📡 ${fr ? "Envoyer à" : "Send to"} ${selectedConvIds.size}`}
+            </button>
+            {!broadcastMessage.trim() && !broadcastMedia && (
+              <p style={{ margin: "8px 0 0", fontSize: "11px", color: "var(--text-tertiary, #9ca3af)", textAlign: "center" }}>
+                {fr ? "Écris un message ou ajoute un média pour continuer" : "Write a message or add media to continue"}
+              </p>
+            )}
+          </div>
+
+          {/* Recent broadcasts */}
+          <div style={cardStyle}>
+            <h4 style={{ margin: "0 0 14px 0", fontSize: "15px", fontWeight: "700" }}>📋 {fr ? "Récents" : "Recent"}</h4>
+            {loadingRecent ? (
+              <div style={{ textAlign: "center", padding: "20px 0", color: "var(--text-tertiary, #9ca3af)", fontSize: "13px" }}>⏳</div>
+            ) : recentBroadcasts.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "20px 0", color: "var(--text-tertiary, #9ca3af)", fontSize: "13px" }}>
+                {fr ? "Aucun broadcast encore" : "No broadcasts yet"}
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {recentBroadcasts.map(bc => (
+                  <div key={bc.id} style={{ padding: "11px 13px", background: "var(--bg-raised, #0f1117)", borderRadius: "8px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                      <div style={{ fontWeight: "700", fontSize: "12px", color: "var(--text-primary, white)" }}>{bc.audience_name || "—"}</div>
+                      <div style={{ fontSize: "10px", color: "var(--text-tertiary, #6b7280)" }}>
+                        {bc.sent_at ? new Date(bc.sent_at).toLocaleDateString("fr-FR") : "—"}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: "10px", fontSize: "11px", color: "var(--text-tertiary, #9ca3af)" }}>
+                      <span>✅ {bc.sent_count ?? "?"}/{bc.total_recipients ?? "?"}</span>
+                      {bc.failed_count > 0 && <span style={{ color: "#ef4444" }}>❌ {bc.failed_count}</span>}
+                      {bc.model_id && <span>· {bc.model_id}</span>}
+                    </div>
+                    {bc.message && (
+                      <div style={{ marginTop: "5px", fontSize: "11px", color: "var(--text-tertiary, #6b7280)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {bc.message.slice(0, 60)}{bc.message.length > 60 ? "…" : ""}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 const GestionSubpage = () => (
   <div style={{ padding: "32px", maxWidth: "1600px", margin: "0 auto" }}>
@@ -28429,7 +28777,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               {rightPanel}
             </div>
           )}
-          {activeTab === "dadacast" && <DadacastSubpage />}
+          {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
           {activeTab === "scripts" && isManager && <ScriptsPage user={user} lang={lang} />}
           {activeTab === "media" && isManager && <MediaLibraryPage user={user} lang={lang} />}
           {activeTab === "analytics" && isManager && <BroadcastAnalytics user={user} lang={lang} />}
@@ -28452,7 +28800,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             {mobilePane === "spender" && rightPanel}
           </div>
         )}
-        {activeTab === "dadacast" && <DadacastSubpage />}
+        {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
         {activeTab === "scripts" && isManager && <ScriptsPage user={user} lang={lang} />}
         {activeTab === "media" && isManager && <MediaLibraryPage user={user} lang={lang} />}
         {activeTab === "analytics" && isManager && <BroadcastAnalytics user={user} lang={lang} />}
