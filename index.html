@@ -29895,6 +29895,221 @@ const ScriptsPage = ({ user, lang }) => {
 };
 
 // =============================================
+// MEDIA LIBRARY PAGE
+// =============================================
+const MediaLibraryPage = ({ user }) => {
+  const addToast = useToast();
+  const [media, setMedia] = useState([]);
+  const [filterType, setFilterType] = useState('all');
+  const [isUploading, setIsUploading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => { loadMedia(); }, []);
+
+  const loadMedia = async () => {
+    setIsLoading(true);
+    const { data, error } = await sb.from('media_library').select('*').order('created_at', { ascending: false });
+    if (!error) setMedia(data || []);
+    else addToast('Erreur chargement: ' + error.message, 'error');
+    setIsLoading(false);
+  };
+
+  const filteredMedia = media.filter(item => {
+    const matchType = filterType === 'all' || item.type === filterType;
+    const matchSearch = !searchQuery || item.name.toLowerCase().includes(searchQuery.toLowerCase());
+    return matchType && matchSearch;
+  });
+
+  const handleUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = '';
+    setIsUploading(true);
+    try {
+      let type = 'photo';
+      if (file.type.startsWith('video/')) type = 'video';
+      else if (file.type.startsWith('audio/')) type = 'audio';
+
+      // Upload vers Supabase Storage
+      const ext = file.name.split('.').pop();
+      const path = `${type}/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const { error: upErr } = await sb.storage.from('media-library').upload(path, file, { upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = sb.storage.from('media-library').getPublicUrl(path);
+
+      const { error } = await sb.from('media_library').insert({
+        name: file.name,
+        type,
+        url: urlData.publicUrl,
+        file_size: file.size,
+        usage_count: 0,
+        tags: [],
+        user_id: user?.id || null,
+      });
+      if (error) throw new Error(error.message);
+      addToast('✅ Média ajouté', 'success');
+      loadMedia();
+    } catch (err) {
+      console.error('[MEDIA] Upload error:', err);
+      addToast('❌ Erreur upload: ' + (err.message || err), 'error');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const deleteMedia = async (id) => {
+    if (!confirm('Supprimer ce média définitivement ?')) return;
+    const { error } = await sb.from('media_library').delete().eq('id', id);
+    if (!error) { addToast('Média supprimé', 'success'); loadMedia(); }
+    else addToast('Erreur: ' + error.message, 'error');
+  };
+
+  const copyUrl = (url, name) => {
+    navigator.clipboard.writeText(url).then(() => {
+      addToast(`✅ URL de "${name}" copiée !`, 'success');
+    }).catch(() => {
+      addToast('Erreur copie', 'error');
+    });
+  };
+
+  const incrementUsage = async (id) => {
+    const item = media.find(m => m.id === id);
+    if (!item) return;
+    await sb.from('media_library').update({ usage_count: (item.usage_count || 0) + 1 }).eq('id', id);
+    setMedia(prev => prev.map(m => m.id === id ? { ...m, usage_count: (m.usage_count || 0) + 1 } : m));
+  };
+
+  const formatSize = (bytes) => {
+    if (!bytes) return '—';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + ' KB';
+    return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+  };
+
+  const typeCounts = { photo: 0, video: 0, audio: 0 };
+  media.forEach(m => { if (typeCounts[m.type] !== undefined) typeCounts[m.type]++; });
+
+  return (
+    <div style={{ padding: '24px', maxWidth: '1600px', margin: '0 auto' }}>
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '28px', gap: '16px', flexWrap: 'wrap' }}>
+        <div>
+          <h1 style={{ margin: '0 0 6px', fontSize: '26px', fontWeight: '800' }}>📁 Bibliothèque Médias</h1>
+          <p style={{ margin: 0, color: '#6b7280', fontSize: '14px' }}>Stocke et réutilise tes photos, vidéos et audios dans les scripts</p>
+        </div>
+        <div>
+          <input type="file" accept="image/*,video/*,audio/*" onChange={handleUpload} style={{ display: 'none' }} id="media-upload-input" disabled={isUploading} />
+          <label htmlFor="media-upload-input" style={{
+            padding: '12px 22px', background: isUploading ? '#6b7280' : 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
+            border: 'none', borderRadius: '10px', color: 'white', fontWeight: '700', cursor: isUploading ? 'not-allowed' : 'pointer',
+            fontSize: '14px', display: 'inline-block', opacity: isUploading ? 0.6 : 1,
+            boxShadow: isUploading ? 'none' : '0 4px 16px rgba(99,102,241,0.3)', transition: 'all 0.2s'
+          }}>
+            {isUploading ? '⏳ Upload...' : '📤 Upload média'}
+          </label>
+        </div>
+      </div>
+
+      {/* Search + filters */}
+      <div style={{ display: 'flex', gap: '10px', marginBottom: '22px', alignItems: 'center', flexWrap: 'wrap' }}>
+        <input
+          type="text"
+          placeholder="🔍 Rechercher un média..."
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          style={{ flex: 1, minWidth: '200px', padding: '10px 14px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '14px', outline: 'none', fontFamily: 'inherit' }}
+          onFocus={e => e.target.style.borderColor = '#6366f1'}
+          onBlur={e => e.target.style.borderColor = '#2d3250'}
+        />
+        {[
+          { id: 'all',   label: `Tout (${media.length})` },
+          { id: 'photo', label: `🖼️ Photos (${typeCounts.photo})` },
+          { id: 'video', label: `🎥 Vidéos (${typeCounts.video})` },
+          { id: 'audio', label: `🎵 Audio (${typeCounts.audio})` },
+        ].map(f => (
+          <button key={f.id} onClick={() => setFilterType(f.id)}
+            style={{ padding: '10px 18px', background: filterType === f.id ? '#6366f1' : '#2d3250', border: 'none', borderRadius: '8px', color: 'white', cursor: 'pointer', fontWeight: '600', fontSize: '13px', transition: 'background 0.15s' }}>
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Loading */}
+      {isLoading && (
+        <div style={{ textAlign: 'center', padding: '80px 20px', color: '#4b5563' }}>
+          <div style={{ fontSize: '36px', marginBottom: '12px' }}>⏳</div>
+          <div>Chargement...</div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {!isLoading && filteredMedia.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '72px 20px', background: '#1a1d2e', borderRadius: '16px', border: '2px dashed #2d3250' }}>
+          <div style={{ fontSize: '52px', marginBottom: '16px' }}>{searchQuery ? '🔍' : '📁'}</div>
+          <h3 style={{ margin: '0 0 8px', fontSize: '18px', fontWeight: '700' }}>{searchQuery ? 'Aucun résultat' : 'Aucun média'}</h3>
+          <p style={{ margin: '0 0 20px', color: '#4b5563', fontSize: '14px' }}>{searchQuery ? 'Essaie une autre recherche' : 'Upload ton premier média pour commencer'}</p>
+          {!searchQuery && (
+            <label htmlFor="media-upload-input" style={{ padding: '11px 22px', background: '#6366f1', border: 'none', borderRadius: '9px', color: 'white', fontWeight: '600', cursor: 'pointer', fontSize: '14px', display: 'inline-block' }}>
+              📤 Upload un média
+            </label>
+          )}
+        </div>
+      )}
+
+      {/* Grid */}
+      {!isLoading && filteredMedia.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(230px, 1fr))', gap: '20px' }}>
+          {filteredMedia.map(item => (
+            <div key={item.id}
+              style={{ background: '#1a1d2e', borderRadius: '14px', padding: '16px', border: '1px solid #2d3250', transition: 'all 0.18s' }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = '#6366f1'; e.currentTarget.style.transform = 'translateY(-3px)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(0,0,0,0.2)'; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = '#2d3250'; e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = 'none'; }}
+            >
+              {/* Preview area */}
+              <div style={{ background: '#0f1117', borderRadius: '10px', height: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '12px', fontSize: '52px', position: 'relative', overflow: 'hidden' }}>
+                {item.type === 'photo' && (
+                  item.url
+                    ? <img src={item.url} alt={item.name} style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '10px' }} onError={e => { e.target.style.display = 'none'; e.target.parentNode.querySelector('.type-icon').style.display = 'flex'; }} />
+                    : <span className="type-icon" style={{ display: 'flex' }}>🖼️</span>
+                )}
+                {item.type === 'video' && <span>🎥</span>}
+                {item.type === 'audio' && <span>🎵</span>}
+                {item.usage_count > 0 && (
+                  <div style={{ position: 'absolute', top: 7, right: 7, background: 'rgba(99,102,241,0.9)', padding: '3px 8px', borderRadius: 6, fontSize: 11, fontWeight: 700 }}>
+                    {item.usage_count}×
+                  </div>
+                )}
+              </div>
+
+              {/* Info */}
+              <div style={{ fontWeight: '700', marginBottom: '5px', fontSize: '14px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.name}>
+                {item.name}
+              </div>
+              <div style={{ fontSize: '12px', color: '#4b5563', marginBottom: '12px' }}>
+                {item.type} · {formatSize(item.file_size)}
+              </div>
+
+              {/* Actions */}
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => { copyUrl(item.url, item.name); incrementUsage(item.id); }}
+                  style={{ flex: 1, padding: '9px', background: '#6366f1', border: 'none', borderRadius: '8px', color: 'white', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}>
+                  📋 Copier URL
+                </button>
+                <button onClick={() => deleteMedia(item.id)}
+                  style={{ padding: '9px 12px', background: '#ef4444', border: 'none', borderRadius: '8px', color: 'white', fontSize: '12px', fontWeight: '700', cursor: 'pointer' }}>
+                  🗑️
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
 // TELEGRAM BETA — Messagerie (gerant/chatter) + enforcement messaging_permissions
 // =============================================
 const DEFAULT_MP = { can_send: true, can_close: false, can_assign: false, can_view_all_assigned: true };
@@ -42216,12 +42431,13 @@ const App = () => {
               <button onClick={()=>setMessagerieSubTab("whatsapp")} style={msgTabStyle("whatsapp")}>WhatsApp</button>
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("push")} style={msgTabStyle("push")}>{"\u{1F4AC}"} Push</button>}
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("scripts")} style={msgTabStyle("scripts")}>🎬 Scripts</button>}
+              {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("media")} style={msgTabStyle("media")}>📁 Médias</button>}
               {user?.role==="gerant"&&<button onClick={()=>setMessagerieSubTab("admin_panel")} style={msgTabStyle("admin_panel")}>{"\u{1F6E0}"} Admin Panel</button>}
               {simuEnabled&&<span style={{padding:"4px 10px",borderRadius:10,background:"var(--accent-muted)",color:"var(--accent)",fontSize:11,fontWeight:600,marginLeft:4,flexShrink:0}}>{"\u{1F4DD}"} Mode test</span>}
             </div>
           </div>
           {messagerieSubTab==="dadash_live"&&<DadashMessagerieTab user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />}
-          {user?.role==="gerant"&&messagerieSubTab!=="dadash_live"&&messagerieSubTab!=="scripts"&&(
+          {user?.role==="gerant"&&messagerieSubTab!=="dadash_live"&&messagerieSubTab!=="scripts"&&messagerieSubTab!=="media"&&(
             <div style={{marginBottom:20,padding:14,background:"var(--card-bg)",borderRadius:12,border:"1px solid var(--border-subtle)",fontSize:12,fontFamily:"'Inter', sans-serif"}}>
               <span style={{fontWeight:600,color:"var(--text-secondary)",marginRight:12}}>{"\u{1F4DD}"} Mode test UI (local)</span>
               <label style={{display:"inline-flex",alignItems:"center",gap:8,cursor:"pointer",marginRight:12}}>
@@ -42244,6 +42460,7 @@ const App = () => {
           {messagerieSubTab==="whatsapp"&&<GerantMessagerieTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} navigateToSpender={navigateToSpender} />}
           {messagerieSubTab==="push"&&<PushPageV1 user={user} lang={lang} models={models} spenders={spenders} botStats={botStats} onRefresh={onRefresh} />}
           {messagerieSubTab==="scripts"&&user?.role==="gerant"&&<ScriptsPage user={user} lang={lang} />}
+          {messagerieSubTab==="media"&&user?.role==="gerant"&&<MediaLibraryPage user={user} lang={lang} />}
           {messagerieSubTab==="admin_panel"&&user?.role==="gerant"&&<MessagerieGerantAdminPanel user={user} lang={lang} profiles={profiles} models={models} botStats={botStats} spenders={spenders} onRefresh={onRefresh} />}
         </>);
       case "compta":
