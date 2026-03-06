@@ -27079,6 +27079,46 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [showScriptModal, setShowScriptModal] = useState(false);
   const [availableScripts, setAvailableScripts] = useState([]);
 
+  // === RBAC FILTERING ===
+  const [userProfile, setUserProfile] = useState(null);
+  const [isLoadingProfile, setIsLoadingProfile] = useState(true);
+
+  useEffect(() => {
+    loadUserProfile();
+  }, []);
+
+  const loadUserProfile = async () => {
+    try {
+      const { data: { user: authUser } } = await sb.auth.getUser();
+
+      if (!authUser) {
+        console.log('[MESSAGING] No user found');
+        setIsLoadingProfile(false);
+        return;
+      }
+
+      const { data: profile, error } = await sb
+        .from('profiles')
+        .select('role, assigned_models')
+        .eq('id', authUser.id)
+        .single();
+
+      if (error) {
+        console.error('[MESSAGING] Profile error:', error);
+        setUserProfile({ role: 'gerant', assigned_models: [] });
+      } else {
+        setUserProfile(profile);
+        console.log('[MESSAGING] ✅ Profile loaded - Role:', profile.role);
+      }
+
+    } catch (err) {
+      console.error('[MESSAGING] Exception:', err);
+      setUserProfile({ role: 'gerant', assigned_models: [] });
+    } finally {
+      setIsLoadingProfile(false);
+    }
+  };
+
   useEffect(() => {
     if (!lightboxUrl) return;
     const onKey = (e) => { if (e.key === "Escape") setLightboxUrl(null); };
@@ -27137,51 +27177,52 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Load conversations ───────────────────────────
   const loadConversations = useCallback(async () => {
-    const isInitialLoad = !convLoadedRef.current;
-    if (isInitialLoad) {
-      setConvLoading(true);
-      setApiError(null);
-    }
-    try {
-      const { data, error } = await sb
-        .from('conversations')
-        .select('*')
-        .order('last_message_at', { ascending: false });
+    setConvLoading(true);
 
-      if (error) {
-        console.error('[CONV] Error:', error);
-        if (isInitialLoad) { setConversations([]); setApiError(error.message || "Erreur inconnue"); }
-        return;
+    try {
+      let query = sb
+        .from('conversations')
+        .select('*');
+
+      // === FILTRAGE RBAC ===
+      if (userProfile && userProfile.role === 'chatter') {
+        const assignedModels = userProfile.assigned_models || [];
+
+        if (assignedModels.length === 0) {
+          console.log('[MESSAGING] ⚠️ Chatter has no assigned models');
+          setConversations([]);
+          setConvLoading(false);
+          return;
+        }
+
+        query = query.in('model_id', assignedModels);
+        console.log('[MESSAGING] 🔒 Chatter filter - Models:', assignedModels);
+      } else {
+        console.log('[MESSAGING] 👑 Gérant mode - All conversations');
       }
 
-      console.log('[CONV] ✅ Loaded:', (data || []).length, 'conversations');
+      query = query.order('last_message_at', { ascending: false });
 
-      setConversations(prev => {
-        if (!convLoadedRef.current || prev.length === 0) return data || [];
-        const prevMap = new Map(prev.map(c => [c.id || c.chat_id, c]));
-        return (data || []).map(serverConv => {
-          const key = serverConv.id || serverConv.chat_id;
-          const existing = prevMap.get(key);
-          if (!existing) return serverConv;
-          const changed =
-            existing.last_message_at !== serverConv.last_message_at ||
-            existing.last_message     !== serverConv.last_message    ||
-            existing.status           !== serverConv.status          ||
-            existing.updated_at       !== serverConv.updated_at;
-          return changed ? { ...existing, ...serverConv } : existing;
-        });
-      });
+      const { data, error } = await query;
 
-      if (isInitialLoad) { setApiOk(true); setApiError(null); }
-      convLoadedRef.current = true;
+      if (error) throw error;
+
+      console.log('[MESSAGING] ✅ Loaded:', data?.length || 0, 'conversations');
+      setConversations(data || []);
+
     } catch (err) {
-      console.error('[CONV] Fatal error:', err);
-      if (isInitialLoad) { setApiOk(false); setConversations([]); setApiError(err.message || "Erreur inconnue"); }
+      console.error('[MESSAGING] ❌ Error:', err);
+    } finally {
+      setConvLoading(false);
     }
-    if (isInitialLoad) setConvLoading(false);
-  }, []);
+  }, [userProfile]);
 
-  useEffect(() => { loadConversations(); }, [loadConversations]);
+  // Charger conversations quand profil est prêt
+  useEffect(() => {
+    if (!isLoadingProfile && userProfile) {
+      loadConversations();
+    }
+  }, [isLoadingProfile, userProfile]);
 
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
@@ -27709,6 +27750,25 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     }
     setTxSaving(false);
   };
+
+  // Loader pendant chargement profil
+  if (isLoadingProfile) {
+    return (
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        minHeight: '60vh',
+        flexDirection: 'column',
+        gap: '16px'
+      }}>
+        <div style={{ fontSize: '56px' }}>⏳</div>
+        <div style={{ color: '#9ca3af', fontSize: '15px' }}>
+          Chargement de vos conversations...
+        </div>
+      </div>
+    );
+  }
 
   // ── API error banner ─────────────────────────────
   if (apiOk === false && conversations.length === 0 && !convLoading) {
