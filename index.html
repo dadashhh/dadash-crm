@@ -27027,6 +27027,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const addToast = useToast();
   const isMobile = useIsMobile();
 
+  // ── RBAC State ─────────────────────────────────────
+  const [currentUser, setCurrentUser]         = useState(null);
+  const [userRole, setUserRole]               = useState(null);
+  const [assignedModelIds, setAssignedModelIds] = useState([]);
+  const [isLoadingUser, setIsLoadingUser]     = useState(true);
+
+  useEffect(() => { loadCurrentUser(); }, []);
+
   // ── State ──────────────────────────────────────────
   const [activeTab, setActiveTab]         = useState("conversations"); // conversations | dadacast | scripts | media | analytics | gestion
   const [apiOk, setApiOk]                 = useState(null);
@@ -27135,41 +27143,67 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     _dmsgFetch("/health").then(() => setApiOk(true)).catch(() => setApiOk(false));
   }, []);
 
+  // ── Load user profile + role ─────────────────────
+  const loadCurrentUser = async () => {
+    setIsLoadingUser(true);
+    try {
+      const { data: { user: authUser }, error } = await sb.auth.getUser();
+      if (error || !authUser) { console.error('[AUTH] No user'); return; }
+      setCurrentUser(authUser);
+      const { data: profile } = await sb.from('profiles').select('role, assigned_models').eq('id', authUser.id).single();
+      if (profile) {
+        setUserRole(profile.role);
+        setAssignedModelIds(profile.assigned_models || []);
+        console.log('[AUTH] ✅ User:', authUser.email, '| Role:', profile.role, '| Models:', profile.assigned_models);
+      }
+    } catch (err) {
+      console.error('[AUTH] Error:', err);
+    } finally {
+      setIsLoadingUser(false);
+    }
+  };
+
   // ── Load conversations ───────────────────────────
   const loadConversations = useCallback(async () => {
-    // Spinner uniquement au premier chargement — les rechargements suivants (polling)
-    // sont silencieux : pas de spinner, pas de reset d'état, conv sélectionnée intacte.
+    if (!currentUser || !userRole) {
+      console.log('[CONV] Waiting for user...');
+      return;
+    }
     const isInitialLoad = !convLoadedRef.current;
     if (isInitialLoad) {
       setConvLoading(true);
       setApiError(null);
     }
     try {
-      // Build URL — pass model_id for chatters (required by API) or manager filter
-      const params = new URLSearchParams();
-      if (isManager && selectedModelId) {
-        params.set("model_id", selectedModelId);
-      } else if (!isManager) {
-        const mid = chatterCtx.assignedModelIds?.[0];
-        if (mid) params.set("model_id", mid);
-      }
-      const qs = params.toString();
-      const path = "/conversations" + (qs ? "?" + qs : "");
+      let query = sb.from('conversations').select('*');
 
-      const data = await _dmsgFetch(path);
-      const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      // === FILTRAGE PAR RÔLE ===
+      if (userRole === 'chatter') {
+        if (assignedModelIds.length === 0) {
+          console.log('[CONV] ⚠️ Chatter has no assigned models');
+          setConversations([]);
+          if (isInitialLoad) setConvLoading(false);
+          return;
+        }
+        query = query.in('model_id', assignedModelIds);
+        console.log('[CONV] 🔒 Filtering by models:', assignedModelIds);
+      } else {
+        console.log('[CONV] 👑 Gérant - showing all conversations');
+      }
+
+      query = query.order('last_message_at', { ascending: false });
+      const { data, error } = await query;
+      if (error) throw error;
+
+      console.log('[CONV] ✅ Loaded:', data.length, 'conversations');
 
       setConversations(prev => {
-        // Premier chargement ou liste vide → remplacer directement
-        if (!convLoadedRef.current || prev.length === 0) return list;
-        // Smart merge : préserver l'identité des objets non-modifiés (évite re-renders inutiles)
-        // Utilise id ou chat_id comme clé stable
+        if (!convLoadedRef.current || prev.length === 0) return data || [];
         const prevMap = new Map(prev.map(c => [c.id || c.chat_id, c]));
-        return list.map(serverConv => {
+        return (data || []).map(serverConv => {
           const key = serverConv.id || serverConv.chat_id;
           const existing = prevMap.get(key);
-          if (!existing) return serverConv; // Nouvelle conv
-          // Ne recréer l'objet que si quelque chose de visible a changé
+          if (!existing) return serverConv;
           const changed =
             existing.last_message_at !== serverConv.last_message_at ||
             existing.last_message     !== serverConv.last_message    ||
@@ -27179,10 +27213,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         });
       });
 
-      if (isInitialLoad) {
-        setApiOk(true);
-        setApiError(null);
-      }
+      if (isInitialLoad) { setApiOk(true); setApiError(null); }
       convLoadedRef.current = true;
     } catch (err) {
       if (isInitialLoad) {
@@ -27190,12 +27221,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         setConversations([]);
         setApiError(err.message || "Erreur inconnue");
       }
-      // Polling silencieux : on ne perturbe pas l'UI en cas d'erreur réseau temporaire
     }
     if (isInitialLoad) setConvLoading(false);
-  }, [isManager, selectedModelId, chatterCtx]);
+  }, [currentUser, userRole, assignedModelIds]);
 
-  useEffect(() => { loadConversations(); }, [loadConversations]);
+  // Charger conversations quand l'user est prêt
+  useEffect(() => {
+    if (currentUser && userRole) loadConversations();
+  }, [currentUser, userRole]);
 
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
