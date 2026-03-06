@@ -27142,6 +27142,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [txSaving, setTxSaving]           = useState(false);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [filterSpender, setFilterSpender] = useState("all");
+  const [filterModel, setFilterModel] = useState("all");
+  const [filterTier, setFilterTier] = useState("all");
   const [apiError, setApiError] = useState(null); // detailed error message for UI display
   // Spender resolved for the active conversation (with Supabase fallback)
   const [activeSpender, setActiveSpender] = useState(null);
@@ -27268,47 +27270,33 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
-  // ── Load conversations from Supabase ────────────
+  // ── Load conversations: Carlos API primary, Supabase fallback ────────────
   const loadConversations = useCallback(async () => {
-    setConvLoading(true);
-
+    if (!convLoadedRef.current) setConvLoading(true);
     try {
-      let query = sb
-        .from('conversations')
-        .select('*');
-
-      // === FILTRAGE RBAC ===
-      if (userProfile && userProfile.role === 'chatter') {
-        const assignedModels = userProfile.assigned_models || [];
-
-        if (assignedModels.length === 0) {
-          console.log('[MESSAGING] ⚠️ Chatter has no assigned models');
-          setConversations([]);
-          setConvLoading(false);
-          return;
-        }
-
-        query = query.in('model_id', assignedModels);
-        console.log('[MESSAGING] 🔒 Chatter filter - Models:', assignedModels);
-      } else {
-        console.log('[MESSAGING] 👑 Gérant mode - All conversations');
-      }
-
-      query = query.order('created_at', { ascending: false });
-
-      const { data, error } = await query;
-
-      if (error) throw error;
-
-      console.log('[MESSAGING] ✅ Loaded:', data?.length || 0, 'conversations');
-      setConversations(data || []);
+      // Source principale : Carlos API (Telethon live)
+      const data = await _dmsgFetch("/conversations");
+      const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      setConversations(list);
       setApiOk(true);
-
-    } catch (err) {
-      console.error('[MESSAGING] ❌ Supabase error:', err);
-      setApiOk(false);
-      setApiError(err.message || 'Erreur Supabase inconnue');
+    } catch (e) {
+      // Fallback Supabase si Carlos indispo
+      try {
+        let q = sb.from("tg_conversations").select("*");
+        if (userProfile?.role === "chatter") {
+          const assigned = userProfile.assigned_models || [];
+          if (assigned.length > 0) q = q.in("model_id", assigned);
+        }
+        const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
+        if (error) throw new Error(error.message);
+        setConversations(sbData || []);
+        setApiOk(true);
+      } catch (e2) {
+        setApiOk(false);
+        setApiError(e2.message || "Erreur");
+      }
     } finally {
+      convLoadedRef.current = true;
       setConvLoading(false);
     }
   }, [userProfile]);
@@ -27584,7 +27572,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       || (tgId && all.find(x => String(x.tg_user_id || x.telegram_id || "") === tidStr))
       || null;
     if (sp) return sp.first_name || sp.handle || sp.name || "—";
-    return conv.display_name || conv.username || conv.tg_username || String(tgId || "—");
+    if (conv.display_name || conv.username || conv.tg_username) return conv.display_name || conv.username || conv.tg_username;
+    const raw = String(tgId || "");
+    if (raw && raw.length > 6) return "TG·" + raw.slice(-4);
+    return raw || "—";
   };
 
   const getConvHandle = (conv) => {
@@ -27674,8 +27665,32 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       return tB - tA;
     });
 
+    // Filtre modèle
+    if (filterModel !== "all")
+      result = result.filter(c => c.model_id === filterModel);
+
+    // Filtre tier (basé sur total dépensé)
+    if (filterTier !== "all") {
+      const TIERS = {
+        sharks:     [500, Infinity],
+        baleines:   [350, 500],
+        gorilles:   [200, 350],
+        orangoutan: [100, 200],
+        ouistiti:   [50,  100],
+        poissons:   [1,   50],
+        free:       [0,   1],
+      };
+      const range = TIERS[filterTier];
+      if (range) result = result.filter(c => {
+        const cidStr = String(_dmsgChatId(c) || "");
+        const sp = (spenders||[]).find(x => x.id===c.spender_id || String(x.tg_user_id||x.telegram_id||"")===cidStr);
+        const total = Number(c.total_spent||0) || convTotalsMap[cidStr] || Number(sp?.ltv||sp?.total_spent||0);
+        return total >= range[0] && total < range[1];
+      });
+    }
+
     return result;
-  }, [conversations, searchQuery, filterSpender, spenders, convTotalsMap]);
+  }, [conversations, searchQuery, filterSpender, filterModel, filterTier, spenders, convTotalsMap]);
 
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
@@ -28325,6 +28340,39 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             <option value="paying">{fr ? "💰 Payants (≥ 1 CHF)" : "💰 Paying (≥ 1 CHF)"}</option>
             <option value="free">{fr ? "🆓 Gratuits (0 CHF)" : "🆓 Free (0 CHF)"}</option>
           </select>
+        </div>
+        {/* Filtre modèle */}
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:6}}>
+          {[{id:"all",label:"Tous"},...(models||[]).map(m=>({id:m.id,label:m.name}))].map(f=>(
+            <button key={f.id} onClick={()=>setFilterModel(f.id)}
+              style={{padding:"3px 8px",borderRadius:8,fontSize:10,fontWeight:600,cursor:"pointer",
+                border:"1px solid "+(filterModel===f.id?"var(--accent)":"var(--border-subtle)"),
+                background:filterModel===f.id?"var(--accent-muted)":"transparent",
+                color:filterModel===f.id?"var(--accent)":"var(--text-tertiary)"}}>
+              {f.label}
+            </button>
+          ))}
+        </div>
+        {/* Filtre tier */}
+        <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:4,marginBottom:6}}>
+          {[
+            {id:"all",label:"Tous"},
+            {id:"sharks",label:"🦈"},
+            {id:"baleines",label:"🐋"},
+            {id:"gorilles",label:"🦍"},
+            {id:"orangoutan",label:"🦧"},
+            {id:"ouistiti",label:"🐒"},
+            {id:"poissons",label:"🐟"},
+            {id:"free",label:"FREE"},
+          ].map(f=>(
+            <button key={f.id} onClick={()=>setFilterTier(f.id)}
+              style={{padding:"3px 8px",borderRadius:8,fontSize:10,fontWeight:600,cursor:"pointer",
+                border:"1px solid "+(filterTier===f.id?"var(--accent)":"var(--border-subtle)"),
+                background:filterTier===f.id?"var(--accent-muted)":"transparent",
+                color:filterTier===f.id?"var(--accent)":"var(--text-tertiary)"}}>
+              {f.label}
+            </button>
+          ))}
         </div>
         {/* Search */}
         <div style={{ position: "relative" }}>
