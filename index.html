@@ -27254,6 +27254,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const selectedConvRef = React.useRef(null);
   // Track if conversations have been loaded at least once — spinner only on first load
   const convLoadedRef  = React.useRef(false);
+  const convCacheRef    = React.useRef([]);   // cache local conversations
+  const convLastFetchRef = React.useRef(0);   // timestamp dernier fetch réussi
   // Scroll stability refs
   const prevMsgCountRef = React.useRef(0);
   const isUserScrollRef = React.useRef(false);
@@ -27270,30 +27272,51 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
-  // ── Load conversations: Carlos API primary, Supabase fallback ────────────
-  const loadConversations = useCallback(async () => {
-    if (!convLoadedRef.current) setConvLoading(true);
+  // ── Load conversations: cache immédiat + Carlos API + fallback Supabase ──
+  const loadConversations = useCallback(async (force = false) => {
+    const now = Date.now();
+    const isInitial = !convLoadedRef.current;
+
+    // Afficher le cache immédiatement si disponible
+    if (convCacheRef.current.length > 0 && !force) {
+      setConversations(convCacheRef.current);
+      setConvLoading(false);
+    } else if (isInitial) {
+      setConvLoading(true);
+    }
+
     try {
-      // Source principale : Carlos API (Telethon live)
       const data = await _dmsgFetch("/conversations");
       const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      setConversations(list);
+      // Tri chronologique DESC immédiat avant de stocker
+      const sorted = [...list].sort((a, b) => {
+        const tA = new Date(a.last_message_at || a.updated_at || 0).getTime();
+        const tB = new Date(b.last_message_at || b.updated_at || 0).getTime();
+        return tB - tA;
+      });
+      convCacheRef.current = sorted;
+      convLastFetchRef.current = now;
+      setConversations(sorted);
       setApiOk(true);
     } catch (e) {
-      // Fallback Supabase si Carlos indispo
-      try {
-        let q = sb.from("tg_conversations").select("*");
-        if (userProfile?.role === "chatter") {
-          const assigned = userProfile.assigned_models || [];
-          if (assigned.length > 0) q = q.in("model_id", assigned);
+      // Fallback Supabase uniquement si cache vide
+      if (convCacheRef.current.length === 0) {
+        try {
+          let q = sb.from("tg_conversations").select("*");
+          if (userProfile?.role === "chatter") {
+            const assigned = userProfile.assigned_models || [];
+            if (assigned.length > 0) q = q.in("model_id", assigned);
+          }
+          const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
+          if (error) throw new Error(error.message);
+          const fallback = sbData || [];
+          convCacheRef.current = fallback;
+          setConversations(fallback);
+          setApiOk(true);
+        } catch (e2) {
+          setApiOk(false);
+          setApiError(e2.message || "Erreur");
         }
-        const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
-        if (error) throw new Error(error.message);
-        setConversations(sbData || []);
-        setApiOk(true);
-      } catch (e2) {
-        setApiOk(false);
-        setApiError(e2.message || "Erreur");
       }
     } finally {
       convLoadedRef.current = true;
@@ -27680,12 +27703,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       });
     }
 
-    // Tri chronologique : conversation avec le message le plus récent en premier
-    result = [...result].sort((a, b) => {
-      const tA = new Date(a.last_message_at || a.last_message_timestamp || a.updated_at || 0).getTime();
-      const tB = new Date(b.last_message_at || b.last_message_timestamp || b.updated_at || 0).getTime();
-      return tB - tA;
-    });
+    // Tri déjà appliqué dans loadConversations — garder l'ordre stable ici
+    // result reste dans l'ordre du cache
 
     // Filtre modèle
     if (filterModel !== "all")
@@ -27736,6 +27755,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       _pending: true,
     };
     setMessages(prev => [...prev, optimistic]);
+    // Mise à jour optimiste de la conv dans la liste (remonte en tête + last_message)
+    setConversations(prev => {
+      const updated = prev.map(c =>
+        String(_dmsgChatId(c)) === String(chatId)
+          ? { ...c, last_message: text, last_message_text: text, last_message_at: new Date().toISOString() }
+          : c
+      );
+      // Remonter la conv en tête
+      return [...updated].sort((a, b) =>
+        new Date(b.last_message_at || b.updated_at || 0).getTime() -
+        new Date(a.last_message_at || a.updated_at || 0).getTime()
+      );
+    });
 
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
