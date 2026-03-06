@@ -26046,6 +26046,9 @@ const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSp
 
 const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = "679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade";
+// Cache global — survit aux remontages du composant (changements d'onglet)
+const _DMSG_CONV_CACHE = { list: [], ts: 0 };
+const _DMSG_MSG_CACHE  = {}; // { chatId: messages[] }
 
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
@@ -27303,11 +27306,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
-  // ── Load conversations: cache instantané + Carlos API + fallback Supabase ──
-  const loadConversations = useCallback(async (force = false) => {
-    // Afficher le cache immédiatement — zéro spinner si déjà chargé
-    if (convCacheRef.current.length > 0) {
-      setConversations(convCacheRef.current);
+  // ── Load conversations: cache global + Carlos API + fallback Supabase ──
+  const loadConversations = useCallback(async () => {
+    // Afficher le cache global immédiatement — zéro spinner si déjà chargé
+    if (_DMSG_CONV_CACHE.list.length > 0) {
+      setConversations(_DMSG_CONV_CACHE.list);
       setConvLoading(false);
       convLoadedRef.current = true;
     } else {
@@ -27315,16 +27318,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     }
     try {
       const data = await _dmsgFetch("/conversations");
-      const raw = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      const raw  = Array.isArray(data) ? data : (data.conversations || data.data || []);
       const sorted = [...raw].sort((a, b) =>
         new Date(b.last_message_at || b.updated_at || 0).getTime() -
         new Date(a.last_message_at || a.updated_at || 0).getTime()
       );
-      convCacheRef.current = sorted;
+      _DMSG_CONV_CACHE.list = sorted;
+      _DMSG_CONV_CACHE.ts   = Date.now();
       setConversations(sorted);
       setApiOk(true);
     } catch (e) {
-      if (convCacheRef.current.length === 0) {
+      if (_DMSG_CONV_CACHE.list.length === 0) {
         try {
           let q = sb.from("tg_conversations").select("*");
           if (userProfile?.role === "chatter") {
@@ -27334,7 +27338,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
           if (error) throw new Error(error.message);
           const fallback = sbData || [];
-          convCacheRef.current = fallback;
+          _DMSG_CONV_CACHE.list = fallback;
           setConversations(fallback);
           setApiOk(true);
         } catch (e2) {
@@ -27359,59 +27363,39 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
     const cid = String(chatId);
-
     // Afficher cache immédiatement si dispo
-    if (isInitial && msgCacheRef.current[cid]?.length > 0) {
-      setMessages(msgCacheRef.current[cid]);
+    if (isInitial && _DMSG_MSG_CACHE[cid]?.length > 0) {
+      setMessages(_DMSG_MSG_CACHE[cid]);
       setMsgLoading(false);
       setTimeout(() => scrollToBottom('instant'), 50);
       // Continuer pour refresh silencieux
     } else if (isInitial) {
       setMsgLoading(true);
     }
-
     try {
-      // Paramètre since pour ne récupérer que les nouveaux messages
-      const lastTs = msgLastTsRef.current[cid];
-      const url = lastTs && !isInitial
-        ? "/conversations/" + cid + "/messages?limit=50&since=" + encodeURIComponent(lastTs)
-        : "/conversations/" + cid + "/messages?limit=100";
-
-      const data = await _dmsgFetch(url);
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=100");
       if (signal?.aborted) return;
-      const raw = Array.isArray(data) ? data : (data.messages || data.data || []);
-      const sorted = [...raw].sort((a, b) =>
+      const raw  = Array.isArray(data) ? data : (data.messages || data.data || []);
+      const list = [...raw].sort((a, b) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
-
-      if (sorted.length > 0) {
-        // Mettre à jour le timestamp du dernier message
-        const last = sorted[sorted.length - 1];
-        msgLastTsRef.current[cid] = last.created_at || last.timestamp || lastTs;
-      }
-
+      if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
       if (isInitial) {
-        msgCacheRef.current[cid] = sorted;
-        setMessages(sorted);
+        setMessages(list);
         setTimeout(() => scrollToBottom('instant'), 100);
       } else {
         setMessages(prev => {
-          if (sorted.length === 0) return prev;
-          const merged = mergeMessages(prev.filter(m => !m._pending && !m._error), sorted);
-          // Réinjecter les pending
-          const pending = prev.filter(m => m._pending || m._error);
-          const result = [...merged, ...pending].sort((a, b) =>
-            new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
-          );
-          msgCacheRef.current[cid] = result.filter(m => !m._pending && !m._error);
-          return result;
+          const prevConfirmed = prev.filter(m => !m._pending && !m._error);
+          const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
+          const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
+          if (!hasNew) return prev;
+          return mergeMessages(prev, list);
         });
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      // Fallback Supabase via UUID
-      if (isInitial && msgCacheRef.current[cid]?.length === 0) {
+      if (isInitial && !_DMSG_MSG_CACHE[cid]?.length) {
         try {
           const { data: convRow } = await sb
             .from("tg_conversations").select("id")
@@ -27421,11 +27405,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: true });
             const list = data || [];
-            msgCacheRef.current[cid] = list;
+            if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
             setMessages(list);
             setTimeout(() => scrollToBottom('instant'), 100);
           }
-        } catch (_) { if (isInitial) setMessages([]); }
+        } catch (_) { setMessages([]); }
       }
     } finally {
       if (isInitial) setMsgLoading(false);
@@ -27506,10 +27490,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
-    // Afficher le cache immédiatement si dispo (évite le spinner)
     const cid = String(chatId || "");
-    if (msgCacheRef.current[cid]?.length > 0) {
-      setMessages(msgCacheRef.current[cid]);
+    const cached = _DMSG_MSG_CACHE[cid];
+    if (cached?.length > 0) {
+      setMessages(cached);
     } else {
       setMessages([]);
     }
@@ -27818,22 +27802,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       _pending: true,
     };
     setMessages(prev => [...prev, optimistic]);
-    // Mise à jour optimiste de la conv dans la liste (remonte en tête + last_message)
-    setConversations(prev => {
-      const updated = prev.map(c =>
-        String(_dmsgChatId(c)) === String(chatId)
-          ? { ...c, last_message: text, last_message_text: text,
-              last_message_at: new Date().toISOString(),
-              last_message_direction: "out" }
-          : c
-      );
-      const sorted = [...updated].sort((a, b) =>
-        new Date(b.last_message_at || b.updated_at || 0).getTime() -
-        new Date(a.last_message_at || a.updated_at || 0).getTime()
-      );
-      convCacheRef.current = sorted;
-      return sorted;
-    });
+    // Mettre à jour cache global conversations (remonte en tête)
+    const updatedConvs = _DMSG_CONV_CACHE.list.map(c =>
+      String(_dmsgChatId(c)) === String(chatId)
+        ? { ...c, last_message: text, last_message_text: text,
+            last_message_at: new Date().toISOString(),
+            last_message_direction: "out" }
+        : c
+    ).sort((a, b) =>
+      new Date(b.last_message_at || b.updated_at || 0).getTime() -
+      new Date(a.last_message_at || a.updated_at || 0).getTime()
+    );
+    _DMSG_CONV_CACHE.list = updatedConvs;
+    setConversations(updatedConvs);
 
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
