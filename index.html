@@ -27474,16 +27474,46 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     }
     try {
       // Timeout 5s sur Carlos — fallback Supabase si trop lent
-      const modelParam = filterModel && filterModel !== "all"
-        ? filterModel.toLowerCase()
-        : (models && models.length > 0 ? (models[0].name || models[0].slug || "carla").toLowerCase() : "carla");
-      const carlosPromise = _dmsgFetch("/conversations?model=" + modelParam);
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("carlos_timeout")), 4000)
-      );
-      const data = await Promise.race([carlosPromise, timeoutPromise]);
-      const raw  = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      const sorted = [...raw].sort((a, b) =>
+      const resolveModelName = (id) => {
+        if (!id || id === "all") return null;
+        if (!id.includes("-")) return id.toLowerCase();
+        const found = (models || []).find(m => m.id === id);
+        return found ? (found.name || found.slug || found.username || "").toLowerCase() : null;
+      };
+      const modelName = resolveModelName(filterModel);
+
+      let allConvs = [];
+      if (modelName) {
+        // Modèle spécifique sélectionné
+        const data = await _dmsgFetch("/conversations?model=" + modelName);
+        allConvs = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      } else {
+        // "Tous" → fetch tous les modèles en parallèle
+        const modelNames = (models || [])
+          .map(m => (m.name || m.slug || m.username || "").toLowerCase())
+          .filter(Boolean);
+        const results = await Promise.allSettled(
+          modelNames.map(mn => _dmsgFetch("/conversations?model=" + mn))
+        );
+        results.forEach(r => {
+          if (r.status === "fulfilled") {
+            const d = r.value;
+            const list = Array.isArray(d) ? d : (d.conversations || d.data || []);
+            allConvs = allConvs.concat(list);
+          }
+        });
+        // Dédupliquer par chat_id
+        const seen = new Set();
+        allConvs = allConvs.filter(c => {
+          const key = String(c.chat_id || c.id);
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        // Trier par date desc
+        allConvs.sort((a, b) => new Date(b.last_message_at || 0) - new Date(a.last_message_at || 0));
+      }
+      const sorted = [...allConvs].sort((a, b) =>
         new Date(b.last_message_at || b.updated_at || 0).getTime() -
         new Date(a.last_message_at || a.updated_at || 0).getTime()
       );
