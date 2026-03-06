@@ -27247,6 +27247,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const pollRef        = React.useRef(null);
   const convPollRef    = React.useRef(null);
   const msgEndRef      = React.useRef(null);
+  const msgCacheRef    = React.useRef({});  // cache { chatId: messages[] }
+  const msgLastTsRef   = React.useRef({});  // cache { chatId: lastTimestamp }
   const inputRef       = React.useRef(null);
   // Keep a ref to the current chatId so the polling interval always uses fresh value
   const chatIdRef      = React.useRef(null);
@@ -27334,59 +27336,74 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
-    if (isInitial) setMsgLoading(true);
+    const cid = String(chatId);
+
+    // Afficher cache immédiatement si dispo
+    if (isInitial && msgCacheRef.current[cid]?.length > 0) {
+      setMessages(msgCacheRef.current[cid]);
+      setMsgLoading(false);
+      setTimeout(() => scrollToBottom('instant'), 50);
+      // Continuer pour refresh silencieux
+    } else if (isInitial) {
+      setMsgLoading(true);
+    }
+
     try {
-      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=100");
+      // Paramètre since pour ne récupérer que les nouveaux messages
+      const lastTs = msgLastTsRef.current[cid];
+      const url = lastTs && !isInitial
+        ? "/conversations/" + cid + "/messages?limit=50&since=" + encodeURIComponent(lastTs)
+        : "/conversations/" + cid + "/messages?limit=100";
+
+      const data = await _dmsgFetch(url);
       if (signal?.aborted) return;
       const raw = Array.isArray(data) ? data : (data.messages || data.data || []);
-      const list = [...raw].sort((a, b) =>
+      const sorted = [...raw].sort((a, b) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
+
+      if (sorted.length > 0) {
+        // Mettre à jour le timestamp du dernier message
+        const last = sorted[sorted.length - 1];
+        msgLastTsRef.current[cid] = last.created_at || last.timestamp || lastTs;
+      }
+
       if (isInitial) {
-        setMessages(list);
+        msgCacheRef.current[cid] = sorted;
+        setMessages(sorted);
         setTimeout(() => scrollToBottom('instant'), 300);
       } else {
         setMessages(prev => {
-          const prevConfirmed = prev.filter(m => !m._pending && !m._error);
-          const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
-          const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
-          if (!hasNew) return prev;
-          return mergeMessages(prev, list);
+          if (sorted.length === 0) return prev;
+          const merged = mergeMessages(prev.filter(m => !m._pending && !m._error), sorted);
+          // Réinjecter les pending
+          const pending = prev.filter(m => m._pending || m._error);
+          const result = [...merged, ...pending].sort((a, b) =>
+            new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
+          );
+          msgCacheRef.current[cid] = result.filter(m => !m._pending && !m._error);
+          return result;
         });
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      try {
-        const { data: convRow } = await sb
-          .from("tg_conversations")
-          .select("id")
-          .eq("tg_chat_id", String(chatId))
-          .maybeSingle();
-        const convUuid = convRow?.id;
-        if (!convUuid) throw new Error("not found");
-        const { data, error } = await sb
-          .from("tg_messages")
-          .select("*")
-          .eq("conversation_id", convUuid)
-          .order("created_at", { ascending: true });
-        if (error) throw error;
-        if (signal?.aborted) return;
-        const list = data || [];
-        if (isInitial) {
-          setMessages(list);
-          setTimeout(() => scrollToBottom('instant'), 300);
-        } else {
-          setMessages(prev => {
-            const prevConfirmed = prev.filter(m => !m._pending && !m._error);
-            const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
-            const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
-            if (!hasNew) return prev;
-            return mergeMessages(prev, list);
-          });
-        }
-      } catch (_) {
-        if (isInitial) setMessages([]);
+      // Fallback Supabase via UUID
+      if (isInitial && msgCacheRef.current[cid]?.length === 0) {
+        try {
+          const { data: convRow } = await sb
+            .from("tg_conversations").select("id")
+            .eq("tg_chat_id", cid).maybeSingle();
+          if (convRow?.id) {
+            const { data } = await sb.from("tg_messages").select("*")
+              .eq("conversation_id", convRow.id)
+              .order("created_at", { ascending: true });
+            const list = data || [];
+            msgCacheRef.current[cid] = list;
+            setMessages(list);
+            setTimeout(() => scrollToBottom('instant'), 300);
+          }
+        } catch (_) { if (isInitial) setMessages([]); }
       }
     } finally {
       if (isInitial) setMsgLoading(false);
@@ -27446,6 +27463,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Select conversation ───────────────────────────
   const selectConv = useCallback((conv) => {
+    // Reset last-ts pour forcer reload complet sur nouvelle conv
+    if (conv) {
+      const newCid = String(_dmsgChatId(conv));
+      if (newCid !== String(chatIdRef.current)) {
+        msgLastTsRef.current[newCid] = null;
+      }
+    }
+
     const chatId = _dmsgChatId(conv);
 
     // Cancel any in-flight message fetch from the previous conv
@@ -27602,7 +27627,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       } finally {
         isConvPollingRef.current = false;
       }
-    }, 3000);
+    }, 5000);
     return () => clearInterval(convPollRef.current);
   }, []); // Vide intentionnel — l'interval ne redémarre JAMAIS
 
