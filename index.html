@@ -27313,23 +27313,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     if (!chatId) return;
     if (isInitial) setMsgLoading(true);
     try {
-      console.log('[MESSAGES] Loading for chat:', chatId);
-
-      const { data, error } = await sb
-        .from('tg_messages')
-        .select('*')
-        .eq('conversation_id', chatId)
-        .order('created_at', { ascending: true }); // Ordre chrono croissant
-
+      // Source principale : Carlos API
+      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
       if (signal?.aborted) return;
-      if (error) throw error;
-
-      const list = data || [];
-      console.log('[MESSAGES] ✅ Loaded:', list.length, 'messages');
-
+      const list = Array.isArray(data) ? data : (data.messages || data.data || []);
       if (isInitial) {
         setMessages(list);
-        // Scroll auto en bas après rendu
         setTimeout(() => scrollToBottom('instant'), 100);
       } else {
         setMessages(prev => {
@@ -27340,12 +27329,42 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           return mergeMessages(prev, list);
         });
       }
-    } catch (err) {
-      if (err.name === "AbortError") return;
-      console.error('[MESSAGES] ❌ Error:', err);
-      if (isInitial) setMessages([]);
+    } catch (e) {
+      // Fallback Supabase : chercher l'UUID de la conv via tg_chat_id
+      try {
+        const { data: convRow } = await sb
+          .from("tg_conversations")
+          .select("id")
+          .eq("tg_chat_id", chatId)
+          .maybeSingle();
+        const convUuid = convRow?.id;
+        if (!convUuid) throw new Error("conv not found");
+        const { data, error } = await sb
+          .from("tg_messages")
+          .select("*")
+          .eq("conversation_id", convUuid)
+          .order("created_at", { ascending: true });
+        if (error) throw error;
+        if (signal?.aborted) return;
+        const list = data || [];
+        if (isInitial) {
+          setMessages(list);
+          setTimeout(() => scrollToBottom('instant'), 100);
+        } else {
+          setMessages(prev => {
+            const prevConfirmed = prev.filter(m => !m._pending && !m._error);
+            const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
+            const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
+            if (!hasNew) return prev;
+            return mergeMessages(prev, list);
+          });
+        }
+      } catch (_) {
+        if (isInitial) setMessages([]);
+      }
+    } finally {
+      if (isInitial) setMsgLoading(false);
     }
-    if (isInitial) setMsgLoading(false);
   }, []);
 
   // ── Resolve spender: quick match from props + always hydrate from Supabase ──
