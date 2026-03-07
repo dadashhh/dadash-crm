@@ -5123,15 +5123,15 @@ const SPENDER_AVATAR_DEFAULT = { emoji: null, bg: "#374151", color: "#9ca3af" };
 const getSpenderAvatar = (sp) => {
   if (!sp) return { ...SPENDER_AVATAR_DEFAULT, initials: "?" };
   const initials = ((sp.first_name || sp.handle || sp.name || "?")[0] || "?").toUpperCase();
-  // Cherche d'abord dans la map par classification
-  const raw = (sp.classification || sp.tier || sp.badge || "").toString().toUpperCase().replace(/[_-]/g, "");
+  // 1. Classification explicite en DB (priorité max)
+  const raw = (sp.classification || sp.tier || sp.badge || sp.segment || "").toString().toUpperCase().replace(/[_-]/g, "");
   const key = Object.keys(SPENDER_AVATAR_MAP).find(k => raw === k || raw.includes(k));
   if (key) return { ...SPENDER_AVATAR_MAP[key], initials };
-  // Fallback : calcul auto depuis ltv
-  const ltv = sp.ltv || sp.total_spent || sp.validCA || 0;
+  // 2. Calcul auto depuis ltv/total_spent — TOUJOURS retourner un emoji, jamais initiales
+  const ltv = Number(sp.ltv || sp.total_spent || sp.validCA || sp.total || 0);
   const tier = getBadgeFromSpent(ltv);
   const tierKey = tier.tier.toUpperCase().replace(/[_-]/g, "");
-  const tierEntry = SPENDER_AVATAR_MAP[tierKey] || SPENDER_AVATAR_DEFAULT;
+  const tierEntry = SPENDER_AVATAR_MAP[tierKey] || SPENDER_AVATAR_MAP["POUSSIN"];
   return { ...tierEntry, initials };
 };
 
@@ -9062,41 +9062,56 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
   // ═══════════════════════════════════════════════════
   const kpiData = useMemo(() => {
     const now = Date.now();
-    const d7 = 7 * 86400000;
-    const current = allTxs.filter(tx => (now - new Date(tx.date).getTime()) < d7);
-    const previous = allTxs.filter(tx => {
-      const age = now - new Date(tx.date).getTime();
-      return age >= d7 && age < d7 * 2;
+    const days = period === "24h" ? 1 : period === "7j" ? 7 : period === "30j" ? 30 : period === "90j" ? 90 : 99999;
+    const ms = days * 86400000;
+    const current = allTxs.filter(tx => {
+      const age = now - new Date(tx.date || tx.created_at).getTime();
+      if (age > ms) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
     });
-    const caBrut = current.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
-    const prevBrut = previous.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
-    const caNet = current.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
-    const prevNet = previous.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || 0), tx.currency), 0);
-    const nbTx = current.length;
-    const prevNbTx = previous.length;
-    const marge = caBrut > 0 ? ((caNet / caBrut) * 100) : 0;
-    const prevMarge = prevBrut > 0 ? ((prevNet / prevBrut) * 100) : 0;
-    const variation = (curr, prev) => prev > 0 ? (((curr - prev) / prev) * 100) : (curr > 0 ? 100 : 0);
-    // Sparkline data (last 7 days)
+    const previous = allTxs.filter(tx => {
+      const age = now - new Date(tx.date || tx.created_at).getTime();
+      if (age < ms || age > ms * 2) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
+    });
+    const valid = current.filter(tx => ["validated","validé","confirmee","payee"].includes(tx.status));
+    const pending = current.filter(tx => tx.status === "pending");
+    const pValid = previous.filter(tx => ["validated","validé","confirmee","payee"].includes(tx.status));
+    const caBrut = valid.reduce((s,tx) => s + convertAmount(Number(tx.amount||0), tx.currency), 0);
+    const caNet = valid.reduce((s,tx) => s + convertAmount(Number(tx.net_amount||tx.amount||0), tx.currency), 0);
+    const pCaBrut = pValid.reduce((s,tx) => s + convertAmount(Number(tx.amount||0), tx.currency), 0);
+    const pCaNet = pValid.reduce((s,tx) => s + convertAmount(Number(tx.net_amount||tx.amount||0), tx.currency), 0);
+    const nbTx = valid.length;
+    const pNbTx = pValid.length;
+    const marge = caBrut > 0 ? (caNet / caBrut) * 100 : 0;
+    const pMarge = pCaBrut > 0 ? (pCaNet / pCaBrut) * 100 : 0;
+    const panierMoyen = nbTx > 0 ? Math.round(caBrut / nbTx) : 0;
+    const pPanier = pNbTx > 0 ? Math.round(pCaBrut / pNbTx) : 0;
+    const tauxValid = (nbTx + pending.length) > 0 ? Math.round(nbTx / (nbTx + pending.length) * 100) : 0;
+    const variation = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
     const spark = [];
-    for (let i = 6; i >= 0; i--) {
-      const dayStart = now - (i + 1) * 86400000;
-      const dayEnd = now - i * 86400000;
+    for (let i = Math.min(days-1, 29); i >= 0; i--) {
+      const dayStart = now - (i+1)*86400000;
+      const dayEnd = now - i*86400000;
       const dayCA = allTxs.filter(tx => {
-        const t = new Date(tx.date).getTime();
-        return t >= dayStart && t < dayEnd;
-      }).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+        const t = new Date(tx.date||tx.created_at).getTime();
+        return t >= dayStart && t < dayEnd && ["validated","validé","confirmee","payee"].includes(tx.status);
+      }).reduce((s,tx) => s + convertAmount(Number(tx.amount||0), tx.currency), 0);
       spark.push(dayCA);
     }
     return {
-      caBrut, caNet, nbTx, marge,
-      varBrut: variation(caBrut, prevBrut),
-      varNet: variation(caNet, prevNet),
-      varTx: variation(nbTx, prevNbTx),
-      varMarge: marge - prevMarge,
+      caBrut, caNet, nbTx, marge, panierMoyen, tauxValid,
+      txPending: pending.length,
+      varBrut: variation(caBrut, pCaBrut),
+      varNet: variation(caNet, pCaNet),
+      varTx: variation(nbTx, pNbTx),
+      varMarge: marge - pMarge,
+      varPanier: variation(panierMoyen, pPanier),
       spark,
     };
-  }, [allTxs, convertAmount]);
+  }, [allTxs, period, modelFilter, convertAmount]);
 
   // ═══════════════════════════════════════════════════
   // 3. BREAKDOWN PAR LANGUE
@@ -9222,6 +9237,8 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
   // ═══════════════════════════════════════════════════
   // 7. WA → TG REDIRECT METRICS
   // ═══════════════════════════════════════════════════
+  const [period, setPeriod] = useState("30j");
+  const [modelFilter, setModelFilter] = useState("all");
   const [waMetrics, setWaMetrics] = useState({ contactsToday: 0, sent: 0, converted: 0, rate: 0 });
   const [waRows, setWaRows] = useState([]);
   const [waLoading, setWaLoading] = useState(true);
@@ -9265,7 +9282,22 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
       })),
 
       // ═══════ SECTION 2: KPIs CARDS ═══════
-      React.createElement("div", {style:{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}},
+      React.createElement("div", {style:{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap",alignItems:"center"}},
+        ...["24h","7j","30j","90j","all"].map(p =>
+          React.createElement("button", {key:p, onClick:()=>setPeriod(p),
+            style:{padding:"6px 14px",borderRadius:8,border:"none",fontSize:13,fontWeight:700,
+              cursor:"pointer",background:period===p?"var(--accent)":"var(--bg-card)",
+              color:period===p?"#fff":"var(--text-tertiary)",transition:"all 0.15s"}},
+            p === "all" ? "Tout" : p)
+        ),
+        React.createElement("select", {value:modelFilter, onChange:e=>setModelFilter(e.target.value),
+          style:{marginLeft:"auto",padding:"6px 12px",background:"var(--bg-card)",border:"1px solid var(--border-subtle)",
+            borderRadius:8,color:"var(--text-primary)",fontSize:13,fontFamily:"inherit"}},
+          React.createElement("option", {value:"all"}, "Tous modèles"),
+          ...allModels.map(m => React.createElement("option", {key:m.id, value:m.id}, m.name))
+        )
+      ),
+      React.createElement("div", {style:{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:12,marginBottom:20}},
         // CA Brut
         React.createElement("div", {style:{...cardStyle,marginBottom:0,display:"flex",flexDirection:"column",gap:6}},
           React.createElement("div", {style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
@@ -9286,6 +9318,23 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
             React.createElement("span", {style:{fontSize:13,fontWeight:600,color:"var(--text-secondary)",marginLeft:4}}, cs),
             React.createElement(VarBadge, {value: kpiData.varNet}),
           ),
+        ),
+        // TX Pending
+        React.createElement("div", {className:"kpi-card amber", style:{...cardStyle,marginBottom:0}},
+          React.createElement("div", {className:"kpi-card-label"}, "TX PENDING ⏳"),
+          React.createElement("div", {className:"kpi-card-value amber", style:{fontSize:26,fontWeight:800}}, kpiData.txPending),
+        ),
+        // Panier moyen
+        React.createElement("div", {className:"kpi-card white", style:{...cardStyle,marginBottom:0}},
+          React.createElement("div", {className:"kpi-card-label"}, "PANIER MOYEN"),
+          React.createElement("div", {className:"kpi-card-value white", style:{fontSize:26,fontWeight:800}}, kpiData.panierMoyen, " ", cs),
+          kpiData.varPanier !== 0 && React.createElement("div", {className:"kpi-card-delta " + (kpiData.varPanier >= 0 ? "up" : "down")},
+            kpiData.varPanier >= 0 ? "↑" : "↓", " ", Math.abs(Math.round(kpiData.varPanier)), "%"),
+        ),
+        // Taux validation
+        React.createElement("div", {className:"kpi-card green", style:{...cardStyle,marginBottom:0}},
+          React.createElement("div", {className:"kpi-card-label"}, "TAUX VALID."),
+          React.createElement("div", {className:"kpi-card-value green", style:{fontSize:26,fontWeight:800}}, kpiData.tauxValid, "%"),
         ),
         // Nb TX
         React.createElement("div", {style:{...cardStyle,marginBottom:0,display:"flex",flexDirection:"column",gap:6}},
@@ -11679,7 +11728,11 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
   const [srvLoading, setSrvLoading] = useState(false);
   const srvTotalPages = Math.max(1, Math.ceil(srvTotal / TX_PAGE_SIZE));
   useEffect(() => { if (initialTotal !== undefined) setSrvTotal(initialTotal); }, [initialTotal]);
-  const displayTxs = srvData || txs;
+  // Filtre défensif : un provider ne voit jamais les TX d'un autre provider
+  const _rawTxs = srvData || txs;
+  const displayTxs = user.role === "provider"
+    ? _rawTxs.filter(tx => tx.provider_id === user.id)
+    : _rawTxs;
   const { validate, refuse, processingIds } = useTransactionActions({
     txs, setTxs, setTxSummary, setSrvData, srvData, onNotify, addToast, currencySymbol, models, profiles, lang, t, convertAmount
   });
@@ -11691,7 +11744,12 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     if (status) f.status = status;
     if (model) f.model_id = model;
     if (chatter) f.chatter_id = chatter;
-    if (txProvider) f.provider_id = txProvider;
+    // Provider voit uniquement ses propres TX — filtre forcé (défense en profondeur)
+    if (user.role === "provider") {
+      f.provider_id = user.id;
+    } else if (txProvider) {
+      f.provider_id = txProvider;
+    }
     const qm = (q) => {
       if (dr.startISO) q = q.gte("created_at", dr.startISO);
       if (dr.endISO) q = q.lte("created_at", dr.endISO);
@@ -11702,7 +11760,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
     setSrvTotal(result.total);
     setSrvPage(p);
     setSrvLoading(false);
-  }, [status, model, chatter, txProvider, dr.startDate, dr.endDate]);
+  }, [status, model, chatter, txProvider, dr.startDate, dr.endDate, user.role, user.id]);
 
   // Reset to page 0 when filters change (skip initial render)
   const filtersKey = `${status}|${model}|${chatter}|${txProvider}|${dr.activePreset}|${dr.startDate}|${dr.endDate}`;
@@ -12121,6 +12179,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                 <SortTh label="Montant" sortKey="amount" sort={sort} onSort={onSort}/>
                 <th>Méthode paiement</th>
                 {user.role==="gerant"&&<SortTh label="Chatter" sortKey="chatter_id" sort={sort} onSort={onSort}/>}
+                {user.role==="provider"&&<th style={{fontSize:11,whiteSpace:"nowrap"}}>Ma commission</th>}
                 <SortTh label="Statut" sortKey="status" sort={sort} onSort={onSort}/>
                 {(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&<th>Actions</th>}
               </tr>
@@ -12174,6 +12233,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txTotal: initialTotal, mod
                     </td>
                     <td style={{fontSize:11,whiteSpace:"nowrap"}}>{tx.payment_method?(()=>{const ptc=PAYMENT_TYPE_COLORS[tx.payment_method]||PAYMENT_TYPE_COLORS["Autre"];return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 8px",borderRadius:9,fontSize:10,fontWeight:600,background:ptc.bg,color:ptc.text}}>{ptc.icon} {tx.payment_method}</span>;})():"—"}</td>
                     {user.role==="gerant"&&<td style={{fontSize:12,whiteSpace:"nowrap"}}>{profiles.find(p=>p.id===tx.chatter_id)?.name||"—"}</td>}
+                    {user.role==="provider"&&<td style={{fontSize:13,fontWeight:700,color:"#10b981",whiteSpace:"nowrap"}}>{tx.provider_fee!=null?fmtAmount(tx.provider_fee,tx.currency):"—"}</td>}
                     <td><StatusPill status={tx.status} lang={lang}/></td>
                     {(user.role==="gerant"||user.role==="chatter"||user.role==="provider")&&(
                       <td style={{whiteSpace:"nowrap"}}>
@@ -26046,6 +26106,9 @@ const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSp
 
 const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = "679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade";
+// Cache global — survit aux remontages du composant (changements d'onglet)
+const _DMSG_CONV_CACHE = { list: [], ts: 0 };
+const _DMSG_MSG_CACHE  = {}; // { chatId: messages[] }
 
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
@@ -26308,362 +26371,428 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   const fr = lang === "fr";
   const addToast = useToast();
 
-  const [selectedAudience, setSelectedAudience] = useState("manual");
-  const [selectedConvIds, setSelectedConvIds]   = useState(new Set());
+  // ── Broadcast state ──────────────────────────────────────
   const [broadcastModel, setBroadcastModel]     = useState("");
+  const [selectedTier,   setSelectedTier]       = useState("all");
+  const [selectedConvIds, setSelectedConvIds]   = useState(new Set());
   const [broadcastMessage, setBroadcastMessage] = useState("");
   const [broadcastMedia, setBroadcastMedia]     = useState(null);
   const [scheduleSpacing, setScheduleSpacing]   = useState(true);
   const [isSending, setIsSending]               = useState(false);
-  const [sendProgress, setSendProgress]         = useState(null); // {current, total, ok, fail}
-  const [recentBroadcasts, setRecentBroadcasts] = useState([]);
-  const [loadingRecent, setLoadingRecent]       = useState(true);
+  const [sendProgress, setSendProgress]         = useState(null);
   const fileInputRef = React.useRef(null);
 
-  // Init broadcastModel to first available model
+  // ── Analytics state ───────────────────────────────────────
+  const [broadcasts, setBroadcasts]             = useState([]);
+  const [analyticsLoading, setAnalyticsLoading] = useState(true);
+  const [filterModel,   setFilterModel]         = useState("all");
+  const [filterDateRange, setFilterDateRange]   = useState("30");
+
   useEffect(() => {
     if (!broadcastModel && models.length > 0) setBroadcastModel(models[0].id);
   }, [models]);
 
-  useEffect(() => { loadRecentBroadcasts(); }, []);
+  useEffect(() => { loadAnalytics(); }, [filterModel, filterDateRange]);
 
-  const loadRecentBroadcasts = async () => {
-    setLoadingRecent(true);
+  const loadAnalytics = async () => {
+    setAnalyticsLoading(true);
     try {
-      const { data } = await sb.from("broadcast_history").select("*").order("sent_at", { ascending: false }).limit(5);
-      setRecentBroadcasts(data || []);
+      let q = sb.from("broadcast_history").select("*").order("sent_at", { ascending: false });
+      if (filterModel !== "all") q = q.eq("model_id", filterModel);
+      if (filterDateRange !== "all") {
+        const d = new Date();
+        d.setDate(d.getDate() - parseInt(filterDateRange));
+        q = q.gte("sent_at", d.toISOString());
+      }
+      const { data } = await q;
+      setBroadcasts(data || []);
     } catch (_) {}
-    setLoadingRecent(false);
+    setAnalyticsLoading(false);
   };
 
-  const getAudienceConvs = (audienceId) => {
-    if (audienceId === "manual") return [];
-    const aud = BROADCAST_AUDIENCES.find(a => a.id === audienceId);
-    if (!aud) return [];
-    return conversations.filter(c => aud.filter(c, convTotalsMap));
-  };
+  const TIERS = [
+    { id: "all",        label: "Tous",    emoji: "✦",  range: [0, Infinity] },
+    { id: "sharks",     label: "Shark",   emoji: "🦈", range: [500, Infinity] },
+    { id: "baleines",   label: "Baleine", emoji: "🐋", range: [350, 500] },
+    { id: "gorilles",   label: "Gorille", emoji: "🦍", range: [200, 350] },
+    { id: "orangoutan", label: "Orang",   emoji: "🦧", range: [100, 200] },
+    { id: "ouistiti",   label: "Ouistiti",emoji: "🐒", range: [50, 100] },
+    { id: "poissons",   label: "Poisson", emoji: "🐟", range: [1, 50] },
+    { id: "free",       label: "FREE",    emoji: "🆓", range: [0, 1] },
+  ];
 
-  const applyAudience = (audienceId) => {
-    setSelectedAudience(audienceId);
-    if (audienceId === "manual") { setSelectedConvIds(new Set()); return; }
-    const convs = getAudienceConvs(audienceId);
-    setSelectedConvIds(new Set(convs.map(c => String(_dmsgChatId(c)))));
+  const MODEL_COLORS = {
+    carla:  { bg: "#8b5cf6", glow: "rgba(139,92,246,0.3)" },
+    sophie: { bg: "#ec4899", glow: "rgba(236,72,153,0.3)" },
+    bella:  { bg: "#f59e0b", glow: "rgba(245,158,11,0.3)" },
   };
+  const getModelClr = (name) => MODEL_COLORS[(name||"").toLowerCase()] || { bg: "#6366f1", glow: "rgba(99,102,241,0.3)" };
+  const rateColor = (r) => r >= 90 ? "#10b981" : r >= 70 ? "#f59e0b" : "#ef4444";
+
+  const modelConvs = React.useMemo(() => {
+    if (!broadcastModel) return conversations;
+    return conversations.filter(c => c.model_id === broadcastModel);
+  }, [conversations, broadcastModel]);
+
+  const tierCounts = React.useMemo(() => {
+    const counts = {};
+    TIERS.forEach(t => {
+      if (t.id === "all") { counts[t.id] = modelConvs.length; return; }
+      counts[t.id] = modelConvs.filter(c => {
+        const cid = String(_dmsgChatId(c) || "");
+        const total = Number(c.total_spent || 0) || convTotalsMap[cid] || 0;
+        return total >= t.range[0] && total < t.range[1];
+      }).length;
+    });
+    return counts;
+  }, [modelConvs, convTotalsMap]);
+
+  useEffect(() => {
+    if (!broadcastModel) return;
+    let pool = modelConvs;
+    if (selectedTier !== "all") {
+      const tier = TIERS.find(t => t.id === selectedTier);
+      if (tier) pool = pool.filter(c => {
+        const cid = String(_dmsgChatId(c) || "");
+        const total = Number(c.total_spent || 0) || convTotalsMap[cid] || 0;
+        return total >= tier.range[0] && total < tier.range[1];
+      });
+    }
+    setSelectedConvIds(new Set(pool.map(c => String(_dmsgChatId(c))).filter(Boolean)));
+  }, [broadcastModel, selectedTier, modelConvs]);
 
   const handleMediaUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    let mediaType = "photo";
-    if (file.type.startsWith("video/")) mediaType = "video";
-    else if (file.type.startsWith("audio/")) mediaType = "audio";
-    setBroadcastMedia({ type: mediaType, url: URL.createObjectURL(file), file, fileName: file.name, fileSize: file.size });
+    let t = "photo";
+    if (file.type.startsWith("video/")) t = "video";
+    else if (file.type.startsWith("audio/")) t = "audio";
+    setBroadcastMedia({ type: t, url: URL.createObjectURL(file), file, fileName: file.name, fileSize: file.size });
     e.target.value = "";
   };
 
   const sendBroadcast = async () => {
-    if (!broadcastMessage.trim() && !broadcastMedia) {
-      addToast(fr ? "Message ou média requis" : "Message or media required", "error"); return;
-    }
-    if (selectedConvIds.size === 0) {
-      addToast(fr ? "Aucun destinataire sélectionné" : "No recipients selected", "error"); return;
-    }
+    if (!broadcastMessage.trim() && !broadcastMedia) { addToast("Message ou média requis", "error"); return; }
+    if (selectedConvIds.size === 0) { addToast("Aucun destinataire", "error"); return; }
     setIsSending(true);
     const chatIds = Array.from(selectedConvIds);
+    // Carlos attend "carla"/"sophie"/"bella" — pas l'UUID Supabase
+    const carlosModelId = (models.find(m => m.id === broadcastModel)?.name || "").toLowerCase();
     let ok = 0, fail = 0;
     setSendProgress({ current: 0, total: chatIds.length, ok: 0, fail: 0 });
-    console.log(`[DADACAST] Starting: ${chatIds.length} recipients`);
     try {
       for (let i = 0; i < chatIds.length; i++) {
         try {
           if (broadcastMedia) {
-            const endpoint = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
-            await _dmsgFetch(endpoint, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: broadcastModel }) });
+            const ep = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
+            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }) });
           } else {
-            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: broadcastModel }) });
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }) });
           }
           ok++;
-        } catch (err) {
-          fail++;
-          console.error(`[DADACAST] ❌ ${i + 1}/${chatIds.length}:`, err?.message || err);
-        }
+        } catch (_) { fail++; }
         setSendProgress({ current: i + 1, total: chatIds.length, ok, fail });
-        if (scheduleSpacing && i < chatIds.length - 1) {
+        if (scheduleSpacing && i < chatIds.length - 1)
           await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
-        }
       }
-      console.log(`[DADACAST] Done: ✅ ${ok} / ❌ ${fail}`);
-      // Save to history
-      console.log('[DADACAST] Saving to history...');
-      try {
-        const audEntry = BROADCAST_AUDIENCES.find(a => a.id === selectedAudience);
-        const { error: histError } = await sb.from("broadcast_history").insert({
-          model_id: broadcastModel,
-          audience_id: selectedAudience !== "manual" ? selectedAudience : null,
-          audience_name: selectedAudience !== "manual" ? (audEntry?.name || selectedAudience) : "Sélection manuelle",
-          message: broadcastMessage.trim(),
-          has_media: !!broadcastMedia,
-          media_type: broadcastMedia?.type || null,
-          total_recipients: chatIds.length,
-          sent_count: ok,
-          failed_count: fail,
-          read_count: 0, reply_count: 0, revenue_generated: 0,
-          metadata: { spacing: scheduleSpacing || false, chat_ids: chatIds },
-        });
-        if (histError) console.error("[DADACAST] History error:", histError);
-        else { console.log("[DADACAST] ✅ History saved"); loadRecentBroadcasts(); }
-      } catch (he) { console.error("[DADACAST] History exception:", he); }
+      const modelName = models.find(m => m.id === broadcastModel)?.name || broadcastModel;
+      const tierLabel = TIERS.find(t => t.id === selectedTier)?.label || "Tous";
+      await sb.from("broadcast_history").insert({
+        model_id: broadcastModel,
+        audience_name: `${modelName} · ${tierLabel}`,
+        message: broadcastMessage.trim(),
+        has_media: !!broadcastMedia, media_type: broadcastMedia?.type || null,
+        total_recipients: chatIds.length, sent_count: ok, failed_count: fail,
+        read_count: 0, reply_count: 0, revenue_generated: 0,
+        metadata: { tier: selectedTier, spacing: scheduleSpacing },
+      }).catch(() => {});
       addToast(`✅ ${ok}/${chatIds.length} envoyés${fail > 0 ? ` · ❌ ${fail} erreurs` : ""}`, ok > 0 ? "success" : "error");
-      setBroadcastMessage(""); setBroadcastMedia(null); setSelectedAudience("manual"); setSelectedConvIds(new Set());
-    } catch (err) {
-      console.error("[DADACAST] Fatal:", err);
-      addToast("❌ Erreur broadcast", "error");
-    } finally {
-      setIsSending(false);
-      setTimeout(() => setSendProgress(null), 3000);
-    }
+      setBroadcastMessage(""); setBroadcastMedia(null); setSelectedTier("all");
+      loadAnalytics();
+    } catch (_) { addToast("❌ Erreur broadcast", "error"); }
+    finally { setIsSending(false); setTimeout(() => setSendProgress(null), 3000); }
   };
 
-  const selAud = BROADCAST_AUDIENCES.find(a => a.id === selectedAudience);
+  // Analytics computed
+  const totalBroadcasts = broadcasts.length;
+  const totalRecipients = broadcasts.reduce((s, b) => s + (b.total_recipients || 0), 0);
+  const totalSent       = broadcasts.reduce((s, b) => s + (b.sent_count || 0), 0);
+  const totalFailed     = broadcasts.reduce((s, b) => s + (b.failed_count || 0), 0);
+  const successRate     = totalRecipients > 0 ? ((totalSent / totalRecipients) * 100).toFixed(1) : "0.0";
+
+  const selectedModel = models.find(m => m.id === broadcastModel);
   const estMinutes = Math.max(1, Math.ceil(selectedConvIds.size * 3.5 / 60));
   const canSend = (!!broadcastMessage.trim() || !!broadcastMedia) && selectedConvIds.size > 0 && !isSending;
-
-  const cardStyle = { background: "var(--card-bg, #1a1d2e)", padding: "24px", borderRadius: "16px", border: "1px solid var(--border-subtle, #2d3250)" };
-  const sectionTitle = (icon, text, sub) => (
-    <h3 style={{ margin: "0 0 16px 0", fontSize: "17px", fontWeight: "700", display: "flex", alignItems: "center", gap: "8px" }}>
-      {icon} {text} {sub && <span style={{ fontSize: "12px", color: "var(--text-tertiary, #6b7280)", fontWeight: "400" }}>{sub}</span>}
-    </h3>
-  );
+  const card = { background: "rgba(255,255,255,0.03)", padding: "22px 24px", borderRadius: 16, border: "1px solid rgba(255,255,255,0.07)" };
 
   return (
-    <div style={{ padding: "28px 32px", maxWidth: "1400px", margin: "0 auto", overflowY: "auto" }}>
-      {/* ── Header ── */}
-      <div style={{ marginBottom: "32px" }}>
-        <h1 style={{ margin: 0, marginBottom: "6px", fontSize: "32px", fontWeight: "800", background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
-          📡 Dadacast
-        </h1>
-        <p style={{ margin: 0, color: "var(--text-tertiary, #9ca3af)", fontSize: "15px" }}>
-          {fr ? "Lance des broadcasts massifs à tes audiences" : "Launch mass broadcasts to your audiences"}
-        </p>
+    <div style={{ padding: "24px 32px", maxWidth: 1300, margin: "0 auto", overflowY: "auto" }}>
+
+      {/* ── HEADER + KPIs analytics ── */}
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <h1 style={{ margin: 0, marginBottom: 4, fontSize: 26, fontWeight: 800,
+              background: "linear-gradient(135deg,#6366f1,#8b5cf6)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+              📡 Dadacast
+            </h1>
+            <p style={{ margin: 0, color: "var(--text-tertiary)", fontSize: 13 }}>Modèle → Audience → Message → Envoyer</p>
+          </div>
+          {/* Filtres analytics inline */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <select value={filterDateRange} onChange={e => setFilterDateRange(e.target.value)}
+              style={{ padding: "7px 12px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, color: "var(--text-primary)", fontSize: 12, cursor: "pointer" }}>
+              <option value="7">7 jours</option>
+              <option value="30">30 jours</option>
+              <option value="90">90 jours</option>
+              <option value="all">Tout</option>
+            </select>
+            <select value={filterModel} onChange={e => setFilterModel(e.target.value)}
+              style={{ padding: "7px 12px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, color: "var(--text-primary)", fontSize: 12, cursor: "pointer" }}>
+              <option value="all">Tous modèles</option>
+              {models.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+            <button onClick={loadAnalytics}
+              style={{ padding: "7px 12px", background: "rgba(99,102,241,0.15)", border: "1px solid rgba(99,102,241,0.3)", borderRadius: 8, color: "#a5b4fc", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+              🔄
+            </button>
+          </div>
+        </div>
+
+        {/* KPI strip */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
+          {[
+            { label: "Broadcasts", value: totalBroadcasts, color: "#6366f1" },
+            { label: "Destinataires", value: totalRecipients, color: "#8b5cf6" },
+            { label: "Envoyés", value: totalSent, color: "#10b981" },
+            { label: "Taux succès", value: successRate + "%", color: rateColor(parseFloat(successRate)) },
+            { label: "Erreurs", value: totalFailed, color: totalFailed > 0 ? "#ef4444" : "var(--text-tertiary)" },
+          ].map(({ label, value, color }) => (
+            <div key={label} style={{ padding: "14px 16px", background: "rgba(255,255,255,0.03)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)", textAlign: "center" }}>
+              <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 4 }}>{label}</div>
+              <div style={{ fontSize: 22, fontWeight: 800, color }}>{analyticsLoading ? "…" : value}</div>
+            </div>
+          ))}
+        </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)", gap: "28px", alignItems: "start" }}>
+      {/* ── WORKFLOW + APERÇU ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,2fr) minmax(0,1fr)", gap: 20, marginBottom: 24 }}>
 
-        {/* ─── LEFT COLUMN ─── */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
+        {/* COLONNE GAUCHE */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
-          {/* Audience */}
-          <div style={cardStyle}>
-            {sectionTitle("🎯", fr ? "Audience cible" : "Target audience")}
-            <select
-              value={selectedAudience}
-              onChange={e => applyAudience(e.target.value)}
-              style={{ width: "100%", padding: "12px 14px", background: "var(--bg-raised, #0f1117)", border: "1.5px solid var(--border-subtle, #2d3250)", borderRadius: "10px", color: "var(--text-primary, white)", fontSize: "14px", cursor: "pointer", fontFamily: "'Inter', sans-serif", marginBottom: "12px" }}
-            >
-              <option value="manual">{fr ? "— Sélection manuelle —" : "— Manual selection —"}</option>
-              <optgroup label={fr ? "💰 Par niveau de dépense" : "💰 By spend tier"}>
-                {BROADCAST_AUDIENCES.filter(a => a.group === "spend").map(aud => (
-                  <option key={aud.id} value={aud.id}>{aud.name} — {aud.desc} ({getAudienceConvs(aud.id).length})</option>
-                ))}
-              </optgroup>
-              <optgroup label={fr ? "📊 Par activité" : "📊 By activity"}>
-                {BROADCAST_AUDIENCES.filter(a => a.group === "activity").map(aud => (
-                  <option key={aud.id} value={aud.id}>{aud.name} — {aud.desc} ({getAudienceConvs(aud.id).length})</option>
-                ))}
-              </optgroup>
-              <optgroup label={fr ? "🎯 Audiences combinées" : "🎯 Combined"}>
-                {BROADCAST_AUDIENCES.filter(a => a.group === "combo").map(aud => (
-                  <option key={aud.id} value={aud.id}>{aud.name} — {aud.desc} ({getAudienceConvs(aud.id).length})</option>
-                ))}
-              </optgroup>
-            </select>
-            {selAud && (
-              <div style={{ padding: "14px 16px", background: selAud.color + "18", border: `1.5px solid ${selAud.color}55`, borderRadius: "10px", display: "flex", alignItems: "center", gap: "14px" }}>
-                <span style={{ fontSize: "28px" }}>{selAud.name.split(" ")[0]}</span>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: "700", color: selAud.color, fontSize: "15px" }}>{selAud.name}</div>
-                  <div style={{ fontSize: "12px", color: "var(--text-tertiary, #9ca3af)", marginTop: "2px" }}>{selAud.desc}</div>
-                </div>
-                <div style={{ fontSize: "28px", fontWeight: "800", color: selAud.color }}>{selectedConvIds.size}</div>
-              </div>
-            )}
-            {selectedAudience === "manual" && (
-              <div style={{ marginTop: "8px", fontSize: "12px", color: "var(--text-tertiary, #6b7280)" }}>
-                {fr ? "Utilisez la page Conversations pour sélectionner manuellement et lancer un broadcast." : "Use the Conversations page to manually select and launch a broadcast."}
-              </div>
-            )}
-          </div>
-
-          {/* Modèle */}
-          <div style={cardStyle}>
-            {sectionTitle("👤", fr ? "Envoyer depuis" : "Send from")}
-            <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(models.length, 4)}, 1fr)`, gap: "10px" }}>
-              {models.map(model => {
-                const mc = getModelColor(model.name);
-                const isActive = broadcastModel === model.id;
+          {/* ÉTAPE 1 — Modèle */}
+          <div style={card}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "#fff" }}>1</span>
+              <span style={{ fontSize: 14, fontWeight: 700 }}>Choisir le modèle</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(models.length, 4)}, 1fr)`, gap: 8 }}>
+              {models.map(m => {
+                const clr = getModelClr(m.name);
+                const active = broadcastModel === m.id;
+                const convCount = conversations.filter(c => c.model_id === m.id).length;
                 return (
-                  <button key={model.id} onClick={() => setBroadcastModel(model.id)}
-                    style={{ padding: "14px 10px", background: isActive ? mc.bg + "25" : "var(--bg-raised, #0f1117)", border: `2px solid ${isActive ? mc.bg : "var(--border-subtle, #2d3250)"}`, borderRadius: "10px", color: isActive ? mc.bg : "var(--text-primary, white)", cursor: "pointer", textAlign: "center", transition: "all 0.2s", fontFamily: "'Inter', sans-serif" }}>
-                    <div style={{ fontSize: "22px", marginBottom: "6px" }}>👤</div>
-                    <div style={{ fontWeight: "700", fontSize: "13px" }}>{model.name}</div>
+                  <button key={m.id} onClick={() => { setBroadcastModel(m.id); setSelectedTier("all"); }}
+                    style={{ padding: "14px 8px", borderRadius: 10, border: `2px solid ${active ? clr.bg : "rgba(255,255,255,0.07)"}`,
+                      background: active ? clr.bg + "22" : "rgba(255,255,255,0.02)",
+                      color: active ? clr.bg : "var(--text-secondary)",
+                      cursor: "pointer", textAlign: "center", transition: "all 0.15s",
+                      boxShadow: active ? `0 0 16px ${clr.glow}` : "none" }}>
+                    <div style={{ fontSize: 24, marginBottom: 5 }}>
+                      {(m.name||"").toLowerCase() === "carla" ? "💜" : (m.name||"").toLowerCase() === "sophie" ? "🩷" : (m.name||"").toLowerCase() === "bella" ? "💛" : "👤"}
+                    </div>
+                    <div style={{ fontWeight: 800, fontSize: 13 }}>{m.name}</div>
+                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{convCount} fans</div>
                   </button>
                 );
               })}
             </div>
           </div>
 
-          {/* Média */}
-          <div style={cardStyle}>
-            {sectionTitle("📎", fr ? "Média" : "Media", fr ? "(optionnel)" : "(optional)")}
-            <input type="file" accept="image/*,video/*,audio/*" onChange={handleMediaUpload} ref={fileInputRef} style={{ display: "none" }} />
-            {broadcastMedia ? (
-              <div style={{ padding: "16px", background: "var(--bg-raised, #0f1117)", borderRadius: "10px", border: "2px solid #6366f1" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "12px" }}>
-                  <span style={{ fontSize: "36px" }}>
-                    {broadcastMedia.type === "photo" ? "🖼️" : broadcastMedia.type === "video" ? "🎥" : "🎵"}
-                  </span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: "700", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{broadcastMedia.fileName}</div>
-                    <div style={{ fontSize: "12px", color: "var(--text-tertiary, #9ca3af)" }}>
-                      {broadcastMedia.type} · {(broadcastMedia.fileSize / 1024 / 1024).toFixed(2)} MB
-                    </div>
-                  </div>
-                  <button onClick={() => setBroadcastMedia(null)}
-                    style={{ padding: "6px 14px", background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", borderRadius: "8px", color: "#ef4444", fontSize: "13px", fontWeight: "700", cursor: "pointer" }}>
-                    🗑️
+          {/* ÉTAPE 2 — Segment */}
+          <div style={card}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "#fff" }}>2</span>
+              <span style={{ fontSize: 14, fontWeight: 700 }}>Segmenter l'audience</span>
+              {broadcastModel && <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-tertiary)" }}>{modelConvs.length} fans · {selectedModel?.name}</span>}
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {TIERS.map(t => {
+                const count = tierCounts[t.id] || 0;
+                const active = selectedTier === t.id;
+                return (
+                  <button key={t.id} onClick={() => setSelectedTier(t.id)}
+                    style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+                      padding: "8px 12px", borderRadius: 10, minWidth: 58,
+                      border: `2px solid ${active ? "#6366f1" : "rgba(255,255,255,0.06)"}`,
+                      background: active ? "rgba(99,102,241,0.15)" : "rgba(255,255,255,0.02)",
+                      color: active ? "#a5b4fc" : "var(--text-tertiary)",
+                      cursor: "pointer", transition: "all 0.12s",
+                      opacity: count === 0 && t.id !== "all" ? 0.3 : 1 }}>
+                    <span style={{ fontSize: 18 }}>{t.emoji}</span>
+                    <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase" }}>{t.label}</span>
+                    <span style={{ fontSize: 14, fontWeight: 800, color: active ? "#a5b4fc" : "var(--text-secondary)" }}>{count}</span>
                   </button>
-                </div>
-                {broadcastMedia.type === "photo" && (
-                  <img src={broadcastMedia.url} alt="preview" style={{ maxWidth: "100%", maxHeight: "180px", borderRadius: "8px", objectFit: "cover" }} />
-                )}
+                );
+              })}
+            </div>
+            {selectedConvIds.size > 0 && (
+              <div style={{ marginTop: 10, padding: "6px 10px", borderRadius: 7,
+                background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.2)",
+                fontSize: 11, color: "#a5b4fc", fontWeight: 600 }}>
+                ✓ {selectedConvIds.size} destinataire{selectedConvIds.size > 1 ? "s" : ""}
               </div>
-            ) : (
-              <label onClick={() => fileInputRef.current?.click()}
-                style={{ display: "block", padding: "32px 20px", border: "2px dashed var(--border-subtle, #2d3250)", borderRadius: "10px", textAlign: "center", cursor: "pointer" }}
-                onMouseEnter={e => e.currentTarget.style.borderColor = "#6366f1"}
-                onMouseLeave={e => e.currentTarget.style.borderColor = "var(--border-subtle, #2d3250)"}
-              >
-                <div style={{ fontSize: "48px", marginBottom: "12px" }}>📤</div>
-                <div style={{ color: "var(--text-tertiary, #9ca3af)", fontSize: "14px" }}>
-                  {fr ? "Clique pour ajouter une photo, vidéo ou audio" : "Click to add a photo, video or audio"}
-                </div>
-              </label>
             )}
           </div>
 
-          {/* Message */}
-          <div style={cardStyle}>
-            {sectionTitle("✉️", fr ? "Message" : "Message")}
-            <textarea
-              value={broadcastMessage}
-              onChange={e => setBroadcastMessage(e.target.value)}
-              placeholder={fr ? "Écris ton message ici... Tu peux utiliser {prenom}, {budget}, etc." : "Write your message here..."}
-              style={{ width: "100%", minHeight: "160px", padding: "14px", background: "var(--bg-raised, #0f1117)", border: "1.5px solid var(--border-subtle, #2d3250)", borderRadius: "10px", color: "var(--text-primary, white)", fontSize: "14px", resize: "vertical", fontFamily: "'Inter', sans-serif", lineHeight: "1.7", boxSizing: "border-box" }}
-            />
-            <div style={{ marginTop: "10px", padding: "10px 12px", background: "rgba(99,102,241,0.08)", borderRadius: "8px", fontSize: "11px", color: "#a5b4fc", lineHeight: "1.6" }}>
-              💡 {fr ? "Variables" : "Variables"} : {"{prenom}"} · {"{budget}"} · {"{audience}"} · {"{modele}"}
+          {/* ÉTAPE 3 — Média */}
+          <div style={card}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "#fff" }}>3</span>
+              <span style={{ fontSize: 14, fontWeight: 700 }}>Média <span style={{ fontSize: 11, fontWeight: 400, color: "var(--text-tertiary)" }}>(optionnel)</span></span>
             </div>
+            <input type="file" accept="image/*,video/*,audio/*" onChange={handleMediaUpload} ref={fileInputRef} style={{ display: "none" }} />
+            {broadcastMedia ? (
+              <div style={{ padding: 14, borderRadius: 10, border: "2px solid #6366f1", background: "rgba(99,102,241,0.07)", display: "flex", alignItems: "center", gap: 12 }}>
+                <span style={{ fontSize: 28 }}>{broadcastMedia.type === "photo" ? "🖼️" : broadcastMedia.type === "video" ? "🎥" : "🎵"}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13 }}>{broadcastMedia.fileName}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{broadcastMedia.type} · {(broadcastMedia.fileSize/1024/1024).toFixed(2)} MB</div>
+                </div>
+                <button onClick={() => setBroadcastMedia(null)}
+                  style={{ padding: "5px 10px", background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.3)", borderRadius: 7, color: "#ef4444", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>✕</button>
+              </div>
+            ) : (
+              <div onClick={() => fileInputRef.current?.click()}
+                style={{ padding: "20px", border: "2px dashed rgba(255,255,255,0.08)", borderRadius: 10, textAlign: "center", cursor: "pointer" }}
+                onMouseEnter={e => e.currentTarget.style.borderColor = "#6366f1"}
+                onMouseLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.08)"}>
+                <div style={{ fontSize: 28, marginBottom: 6 }}>📎</div>
+                <div style={{ fontSize: 12, color: "var(--text-tertiary)" }}>Photo, vidéo ou audio</div>
+              </div>
+            )}
           </div>
 
-          {/* Options */}
-          <div style={{ ...cardStyle, padding: "16px 24px" }}>
-            <label style={{ display: "flex", alignItems: "center", gap: "14px", cursor: "pointer" }}>
-              <input type="checkbox" checked={scheduleSpacing} onChange={e => setScheduleSpacing(e.target.checked)}
-                style={{ cursor: "pointer", width: "17px", height: "17px", accentColor: "#6366f1" }} />
+          {/* ÉTAPE 4 — Message */}
+          <div style={card}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+              <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "#fff" }}>4</span>
+              <span style={{ fontSize: 14, fontWeight: 700 }}>Message</span>
+              <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-tertiary)" }}>{broadcastMessage.length} car.</span>
+            </div>
+            <textarea value={broadcastMessage} onChange={e => setBroadcastMessage(e.target.value)}
+              placeholder="Écris ton message… Variables : {prenom}, {budget}"
+              style={{ width: "100%", minHeight: 120, padding: 12, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, color: "var(--text-primary)", fontSize: 13, resize: "vertical", fontFamily: "'Inter',sans-serif", lineHeight: 1.7, boxSizing: "border-box", outline: "none" }} />
+          </div>
+
+          {/* Option espacement */}
+          <div style={{ ...card, padding: "12px 18px" }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+              <input type="checkbox" checked={scheduleSpacing} onChange={e => setScheduleSpacing(e.target.checked)} style={{ width: 15, height: 15, accentColor: "#6366f1", cursor: "pointer" }} />
               <div>
-                <div style={{ fontWeight: "700", fontSize: "14px", marginBottom: "2px" }}>⏱️ {fr ? "Étaler l'envoi (2-5s entre messages)" : "Space out sends (2-5s between messages)"}</div>
-                <div style={{ fontSize: "12px", color: "var(--text-tertiary, #9ca3af)" }}>
-                  {fr ? "Recommandé pour éviter les bans Telegram" : "Recommended to avoid Telegram bans"}
-                </div>
+                <div style={{ fontWeight: 700, fontSize: 12 }}>⏱️ Étaler l'envoi (2–5s)</div>
+                <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>Évite les bans Telegram</div>
               </div>
             </label>
           </div>
         </div>
 
-        {/* ─── RIGHT COLUMN ─── */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "20px", position: "sticky", top: "20px" }}>
-
-          {/* Preview card */}
-          <div style={cardStyle}>
-            <h3 style={{ margin: "0 0 18px 0", fontSize: "17px", fontWeight: "700" }}>📊 {fr ? "Aperçu" : "Preview"}</h3>
-
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "14px" }}>
-              {[
-                { label: fr ? "Destinataires" : "Recipients", value: selectedConvIds.size, color: "#6366f1", big: true },
-                { label: fr ? "Durée estimée" : "Est. time", value: `~${estMinutes} min`, color: "#10b981" },
-              ].map(item => (
-                <div key={item.label} style={{ padding: "14px", background: "var(--bg-raised, #0f1117)", borderRadius: "10px", textAlign: "center" }}>
-                  <div style={{ fontSize: "11px", color: "var(--text-tertiary, #6b7280)", marginBottom: "4px", textTransform: "uppercase", fontWeight: "700", letterSpacing: "0.5px" }}>{item.label}</div>
-                  <div style={{ fontSize: item.big ? "28px" : "20px", fontWeight: "800", color: item.color }}>{item.value}</div>
-                </div>
-              ))}
+        {/* COLONNE DROITE — sticky */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "sticky", top: 20 }}>
+          <div style={card}>
+            <h3 style={{ margin: "0 0 14px", fontSize: 14, fontWeight: 700 }}>📊 Aperçu</h3>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+              <div style={{ padding: "12px 10px", background: "rgba(255,255,255,0.03)", borderRadius: 10, textAlign: "center" }}>
+                <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Destinataires</div>
+                <div style={{ fontSize: 26, fontWeight: 800, color: "#6366f1" }}>{selectedConvIds.size}</div>
+              </div>
+              <div style={{ padding: "12px 10px", background: "rgba(255,255,255,0.03)", borderRadius: 10, textAlign: "center" }}>
+                <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Durée est.</div>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "#10b981" }}>~{estMinutes} min</div>
+              </div>
             </div>
-
-            <div style={{ padding: "12px 14px", background: "var(--bg-raised, #0f1117)", borderRadius: "8px", fontSize: "13px", lineHeight: "2", marginBottom: "18px" }}>
-              <div><span style={{ color: "var(--text-tertiary, #9ca3af)" }}>{fr ? "Modèle" : "Model"} : </span><strong>{models.find(m => m.id === broadcastModel)?.name || broadcastModel || "—"}</strong></div>
-              <div><span style={{ color: "var(--text-tertiary, #9ca3af)" }}>Type : </span><strong>{broadcastMedia ? `${broadcastMedia.type} + ${fr ? "texte" : "text"}` : (fr ? "texte seul" : "text only")}</strong></div>
-              <div><span style={{ color: "var(--text-tertiary, #9ca3af)" }}>Audience : </span><strong>{selAud?.name || (fr ? "Manuelle" : "Manual")}</strong></div>
+            <div style={{ padding: "10px 12px", background: "rgba(255,255,255,0.02)", borderRadius: 8, fontSize: 12, lineHeight: 2, marginBottom: 14 }}>
+              <div><span style={{ color: "var(--text-tertiary)" }}>Modèle : </span><strong>{selectedModel?.name || "—"}</strong></div>
+              <div><span style={{ color: "var(--text-tertiary)" }}>Segment : </span><strong>{TIERS.find(t => t.id === selectedTier)?.emoji} {TIERS.find(t => t.id === selectedTier)?.label}</strong></div>
+              <div><span style={{ color: "var(--text-tertiary)" }}>Type : </span><strong>{broadcastMedia ? broadcastMedia.type + " + texte" : "texte seul"}</strong></div>
             </div>
-
-            {/* Progress bar during send */}
             {sendProgress && (
-              <div style={{ marginBottom: "16px", padding: "12px", background: "rgba(99,102,241,0.08)", borderRadius: "10px", border: "1px solid rgba(99,102,241,0.2)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: "12px", marginBottom: "8px", fontWeight: "600" }}>
+              <div style={{ marginBottom: 12, padding: 10, background: "rgba(99,102,241,0.08)", borderRadius: 10, border: "1px solid rgba(99,102,241,0.2)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6, fontWeight: 600 }}>
                   <span>⏳ {sendProgress.current}/{sendProgress.total}</span>
                   <span>✅ {sendProgress.ok} · ❌ {sendProgress.fail}</span>
                 </div>
-                <div style={{ height: "6px", background: "var(--bg-raised, #0f1117)", borderRadius: "3px", overflow: "hidden" }}>
-                  <div style={{ height: "100%", background: "linear-gradient(90deg, #6366f1, #8b5cf6)", borderRadius: "3px", width: `${(sendProgress.current / sendProgress.total) * 100}%`, transition: "width 0.3s ease" }} />
+                <div style={{ height: 5, background: "rgba(255,255,255,0.05)", borderRadius: 3 }}>
+                  <div style={{ height: "100%", background: "linear-gradient(90deg,#6366f1,#8b5cf6)", borderRadius: 3, width: `${(sendProgress.current/sendProgress.total)*100}%`, transition: "width 0.3s" }} />
                 </div>
               </div>
             )}
-
-            {/* Send button */}
             <button onClick={sendBroadcast} disabled={!canSend}
-              style={{ width: "100%", padding: "16px", background: canSend ? "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)" : "var(--bg-raised, #374151)", border: "none", borderRadius: "12px", color: "white", fontSize: "16px", fontWeight: "800", cursor: canSend ? "pointer" : "not-allowed", opacity: canSend ? 1 : 0.5, boxShadow: canSend ? "0 8px 24px rgba(99,102,241,0.35)" : "none", transition: "all 0.2s", fontFamily: "'Inter', sans-serif" }}>
-              {isSending ? `⏳ ${fr ? "Envoi en cours" : "Sending"}…` : `📡 ${fr ? "Envoyer à" : "Send to"} ${selectedConvIds.size}`}
+              style={{ width: "100%", padding: 14, borderRadius: 12, border: "none",
+                background: canSend ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : "rgba(255,255,255,0.04)",
+                color: canSend ? "#fff" : "var(--text-tertiary)",
+                fontSize: 14, fontWeight: 800, cursor: canSend ? "pointer" : "not-allowed",
+                boxShadow: canSend ? "0 6px 20px rgba(99,102,241,0.35)" : "none", transition: "all 0.2s" }}>
+              {isSending ? "⏳ Envoi en cours…" : `📡 Envoyer à ${selectedConvIds.size} fan${selectedConvIds.size > 1 ? "s" : ""}`}
             </button>
-            {!broadcastMessage.trim() && !broadcastMedia && (
-              <p style={{ margin: "8px 0 0", fontSize: "11px", color: "var(--text-tertiary, #9ca3af)", textAlign: "center" }}>
-                {fr ? "Écris un message ou ajoute un média pour continuer" : "Write a message or add media to continue"}
+            {!canSend && !isSending && (
+              <p style={{ margin: "6px 0 0", fontSize: 11, color: "var(--text-tertiary)", textAlign: "center" }}>
+                {selectedConvIds.size === 0 ? "Sélectionne modèle + segment" : "Ajoute un message ou média"}
               </p>
             )}
           </div>
-
-          {/* Recent broadcasts */}
-          <div style={cardStyle}>
-            <h4 style={{ margin: "0 0 14px 0", fontSize: "15px", fontWeight: "700" }}>📋 {fr ? "Récents" : "Recent"}</h4>
-            {loadingRecent ? (
-              <div style={{ textAlign: "center", padding: "20px 0", color: "var(--text-tertiary, #9ca3af)", fontSize: "13px" }}>⏳</div>
-            ) : recentBroadcasts.length === 0 ? (
-              <div style={{ textAlign: "center", padding: "20px 0", color: "var(--text-tertiary, #9ca3af)", fontSize: "13px" }}>
-                {fr ? "Aucun broadcast encore" : "No broadcasts yet"}
-              </div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                {recentBroadcasts.map(bc => (
-                  <div key={bc.id} style={{ padding: "11px 13px", background: "var(--bg-raised, #0f1117)", borderRadius: "8px" }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
-                      <div style={{ fontWeight: "700", fontSize: "12px", color: "var(--text-primary, white)" }}>{bc.audience_name || "—"}</div>
-                      <div style={{ fontSize: "10px", color: "var(--text-tertiary, #6b7280)" }}>
-                        {bc.sent_at ? new Date(bc.sent_at).toLocaleDateString("fr-FR") : "—"}
-                      </div>
-                    </div>
-                    <div style={{ display: "flex", gap: "10px", fontSize: "11px", color: "var(--text-tertiary, #9ca3af)" }}>
-                      <span>✅ {bc.sent_count ?? "?"}/{bc.total_recipients ?? "?"}</span>
-                      {bc.failed_count > 0 && <span style={{ color: "#ef4444" }}>❌ {bc.failed_count}</span>}
-                      {bc.model_id && <span>· {bc.model_id}</span>}
-                    </div>
-                    {bc.message && (
-                      <div style={{ marginTop: "5px", fontSize: "11px", color: "var(--text-tertiary, #6b7280)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {bc.message.slice(0, 60)}{bc.message.length > 60 ? "…" : ""}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
         </div>
+      </div>
+
+      {/* ── HISTORIQUE BROADCASTS ── */}
+      <div style={card}>
+        <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 700 }}>📋 Historique des broadcasts</h3>
+        {analyticsLoading ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: "var(--text-tertiary)", fontSize: 13 }}>⏳ Chargement…</div>
+        ) : broadcasts.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: "var(--text-tertiary)", fontSize: 13 }}>Aucun broadcast encore — lance ton premier !</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+            {broadcasts.map((b, idx) => {
+              const rate = b.total_recipients > 0 ? Math.round((b.sent_count / b.total_recipients) * 100) : 0;
+              const clr = getModelClr(models.find(m => m.id === b.model_id)?.name || "");
+              return (
+                <div key={b.id} style={{ padding: "14px 16px", borderBottom: idx < broadcasts.length - 1 ? "1px solid rgba(255,255,255,0.05)" : "none", display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 120 }}>
+                    <span style={{ padding: "2px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                      background: clr.bg + "22", color: clr.bg, border: `1px solid ${clr.bg}44` }}>
+                      {models.find(m => m.id === b.model_id)?.name || b.model_id || "—"}
+                    </span>
+                    {b.has_media && <span style={{ fontSize: 14 }}>{b.media_type === "photo" ? "🖼️" : b.media_type === "video" ? "🎥" : "🎵"}</span>}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2 }}>{b.audience_name || "Manuelle"}</div>
+                    {b.message && <div style={{ fontSize: 11, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.message.slice(0, 80)}{b.message.length > 80 ? "…" : ""}</div>}
+                  </div>
+                  <div style={{ display: "flex", gap: 16, flexShrink: 0 }}>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase" }}>Envoyés</div>
+                      <div style={{ fontSize: 15, fontWeight: 800, color: "#10b981" }}>{b.sent_count}/{b.total_recipients}</div>
+                    </div>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase" }}>Succès</div>
+                      <div style={{ fontSize: 15, fontWeight: 800, color: rateColor(rate) }}>{rate}%</div>
+                    </div>
+                    {b.failed_count > 0 && <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase" }}>Erreurs</div>
+                      <div style={{ fontSize: 15, fontWeight: 800, color: "#ef4444" }}>{b.failed_count}</div>
+                    </div>}
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--text-tertiary)", flexShrink: 0 }}>
+                    {b.sent_at ? new Date(b.sent_at).toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—"}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -27120,6 +27249,87 @@ const GestionSubpage = ({ models = [], lang, user }) => {
   );
 };
 
+const MediaPanelGrid = ({ mediaType, onSelect, modelName }) => {
+  const [mediaItems, setMediaItems] = React.useState([]);
+  const [mediaLoading, setMediaLoading] = React.useState(true);
+  React.useEffect(() => {
+    setMediaLoading(true);
+    let query = sb.from("media_library").select("*").eq("type", mediaType);
+    if (modelName) {
+      query = query.eq("model", modelName);
+    }
+    query
+      .order("created_at", { ascending: false })
+      .limit(50)
+      .then(({ data }) => { setMediaItems(data || []); setMediaLoading(false); });
+  }, [mediaType, modelName]);
+  if (mediaLoading) return (
+    <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>Chargement…</div>
+  );
+  if (!mediaItems.length) return (
+    <div style={{ padding: 20, textAlign: "center", color: "#6b7280", fontSize: 12 }}>
+      Aucun {mediaType === "photo" ? "photo" : "vidéo"} dans la library.<br/>
+      <span style={{ fontSize: 10 }}>Va dans Ressources → Médias pour uploader.</span>
+    </div>
+  );
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, padding: 10 }}>
+      {mediaItems.map(item => (
+        <div key={item.id}
+          onClick={() => onSelect(item)}
+          style={{ position: "relative", borderRadius: 8, overflow: "hidden", cursor: "pointer",
+            background: "#0f1117", border: "1px solid rgba(255,255,255,0.06)",
+            aspectRatio: "1", transition: "border-color 0.12s" }}
+          onMouseEnter={e => e.currentTarget.style.borderColor = "rgba(99,102,241,0.5)"}
+          onMouseLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"}>
+          {mediaType === "photo" ? (
+            <img src={item.url} alt={item.name}
+              style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          ) : (
+            <div style={{ position: "relative", width: "100%", paddingBottom: "75%", borderRadius: 8, overflow: "hidden", background: "#0e1220" }}>
+              <video
+                src={item.url}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+                preload="metadata"
+                muted
+                playsInline
+                onLoadedMetadata={e => { try { e.target.currentTime = 1; } catch(_) {} }}
+                onError={e => {
+                  e.target.style.display = "none";
+                  e.target.parentElement.querySelector('.fallback-icon').style.display = "flex";
+                }}
+              />
+              <div className="fallback-icon" style={{
+                display: "none", position: "absolute", inset: 0,
+                flexDirection: "column", alignItems: "center", justifyContent: "center",
+                background: "#0e1220", gap: 4
+              }}>
+                <span style={{ fontSize: 22 }}>🎥</span>
+                <span style={{ fontSize: 9, color: "#6b7280", textAlign: "center", padding: "0 6px" }}>
+                  {item.name || item.filename || "vidéo"}
+                </span>
+              </div>
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+                <div style={{ width: 30, height: 30, borderRadius: "50%", background: "rgba(255,255,255,0.85)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, paddingLeft: 2 }}>▶</div>
+              </div>
+              <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, background: "linear-gradient(transparent, rgba(0,0,0,0.75))", padding: "16px 6px 5px", fontSize: 9, color: "#e2e8f0", textAlign: "center", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {item.name || item.filename || "vidéo"}
+              </div>
+            </div>
+          )}
+          <div style={{ position: "absolute", inset: 0, background: "rgba(99,102,241,0.15)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            opacity: 0, transition: "opacity 0.15s" }}
+            onMouseEnter={e => e.currentTarget.style.opacity = "1"}
+            onMouseLeave={e => e.currentTarget.style.opacity = "0"}>
+            <span style={{ fontSize: 20 }}>➕</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) => {
   const fr = lang === "fr";
   const addToast = useToast();
@@ -27137,11 +27347,24 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [msgInput, setMsgInput]           = useState("");
   const [mobilePane, setMobilePane]       = useState("list");
   const [showScripts, setShowScripts]     = useState(false);
+  const [scriptPanelTab, setScriptPanelTab] = useState("scripts");
+  const [pendingMedia, setPendingMedia] = React.useState(null);
+  const [openTabs, setOpenTabs] = React.useState([]);
+  const [activeTabId, setActiveTabId] = React.useState(null);
+  const [layoutMode, setLayoutMode] = React.useState("single");
   const [showTxModal, setShowTxModal]     = useState(false);
-  const [txForm, setTxForm]               = useState({ amount: "", type: "tip", note: "" });
+  const [txForm, setTxForm]               = useState({
+    amount: "", currency: "CHF",
+    product: "", product_id: "",
+    provider_id: "", payment_method: "",
+    note: ""
+  });
+  const [txProducts, setTxProducts] = useState([]);
   const [txSaving, setTxSaving]           = useState(false);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [filterSpender, setFilterSpender] = useState("all");
+  const [filterModel, setFilterModel] = useState("all");
+  const [filterTier, setFilterTier] = useState("all");
   const [apiError, setApiError] = useState(null); // detailed error message for UI display
   // Spender resolved for the active conversation (with Supabase fallback)
   const [activeSpender, setActiveSpender] = useState(null);
@@ -27165,6 +27388,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [broadcastSending, setBroadcastSending]   = useState(false);
   const [broadcastResult, setBroadcastResult]     = useState(null); // {ok, fail}
   const [broadcastModel, setBroadcastModel]       = useState("carla");
+  // Synchroniser broadcastModel avec filterModel (modèle sélectionné dans les pills)
+  useEffect(() => {
+    if (filterModel === "all") return;
+    const m = (models || []).find(x => x.id === filterModel);
+    if (m) setBroadcastModel(m.name.toLowerCase());
+  }, [filterModel, models]);
   const [broadcastMedia, setBroadcastMedia]       = useState(null);
   const [isUploadingMedia, setIsUploadingMedia]   = useState(false);
   const [selectedAudience, setSelectedAudience]   = useState("manual");
@@ -27249,6 +27478,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const pollRef        = React.useRef(null);
   const convPollRef    = React.useRef(null);
   const msgEndRef      = React.useRef(null);
+  const msgCacheRef    = React.useRef({});  // cache { chatId: messages[] }
+  const msgLastTsRef   = React.useRef({});  // cache { chatId: lastTimestamp }
   const inputRef       = React.useRef(null);
   // Keep a ref to the current chatId so the polling interval always uses fresh value
   const chatIdRef      = React.useRef(null);
@@ -27256,6 +27487,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const selectedConvRef = React.useRef(null);
   // Track if conversations have been loaded at least once — spinner only on first load
   const convLoadedRef  = React.useRef(false);
+  const convCacheRef    = React.useRef([]);   // cache local conversations
+  const convLastFetchRef = React.useRef(0);   // timestamp dernier fetch réussi
   // Scroll stability refs
   const prevMsgCountRef = React.useRef(0);
   const isUserScrollRef = React.useRef(false);
@@ -27272,47 +27505,57 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
-  // ── Load conversations from Supabase ────────────
-  const loadConversations = useCallback(async () => {
-    setConvLoading(true);
+  const convsCache = React.useRef({ data: [], lastFetch: 0 });
+  const CACHE_TTL = 30000;
 
+  // ── Load conversations: cache + Carlos API + fallback Supabase ──
+  const loadConversations = useCallback(async (force = false) => {
+    const now = Date.now();
+    if (!force && convsCache.current.data.length > 0
+        && (now - convsCache.current.lastFetch) < CACHE_TTL) {
+      setConversations(convsCache.current.data);
+      setConvLoading(false);
+      convLoadedRef.current = true;
+      return;
+    }
+    if (_DMSG_CONV_CACHE.list.length > 0) {
+      setConversations(_DMSG_CONV_CACHE.list);
+      setConvLoading(false);
+      convLoadedRef.current = true;
+    } else {
+      setConvLoading(true);
+    }
     try {
-      let query = sb
-        .from('conversations')
-        .select('*');
-
-      // === FILTRAGE RBAC ===
-      if (userProfile && userProfile.role === 'chatter') {
-        const assignedModels = userProfile.assigned_models || [];
-
-        if (assignedModels.length === 0) {
-          console.log('[MESSAGING] ⚠️ Chatter has no assigned models');
-          setConversations([]);
-          setConvLoading(false);
-          return;
-        }
-
-        query = query.in('model_id', assignedModels);
-        console.log('[MESSAGING] 🔒 Chatter filter - Models:', assignedModels);
-      } else {
-        console.log('[MESSAGING] 👑 Gérant mode - All conversations');
-      }
-
-      query = query.order('created_at', { ascending: false });
-
-      const { data, error } = await query;
-
-      if (error) throw error;
-
-      console.log('[MESSAGING] ✅ Loaded:', data?.length || 0, 'conversations');
-      setConversations(data || []);
+      const data = await _dmsgFetch("/conversations");
+      const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      convsCache.current = { data: list, lastFetch: now };
+      _DMSG_CONV_CACHE.list = list;
+      _DMSG_CONV_CACHE.ts = now;
+      setConversations(list);
       setApiOk(true);
-
-    } catch (err) {
-      console.error('[MESSAGING] ❌ Supabase error:', err);
-      setApiOk(false);
-      setApiError(err.message || 'Erreur Supabase inconnue');
+    } catch (e) {
+      console.error("loadConversations error:", e);
+      if (_DMSG_CONV_CACHE.list.length === 0) {
+        try {
+          let q = sb.from("tg_conversations").select("*");
+          if (userProfile?.role === "chatter") {
+            const assigned = userProfile.assigned_models || [];
+            if (assigned.length > 0) q = q.in("model_id", assigned);
+          }
+          const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
+          if (error) throw new Error(error.message);
+          const fallback = sbData || [];
+          convsCache.current = { data: fallback, lastFetch: now };
+          _DMSG_CONV_CACHE.list = fallback;
+          setConversations(fallback);
+          setApiOk(true);
+        } catch (e2) {
+          setApiOk(false);
+          setApiError(e2.message || "Erreur");
+        }
+      }
     } finally {
+      convLoadedRef.current = true;
       setConvLoading(false);
     }
   }, [userProfile]);
@@ -27327,56 +27570,63 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
-    if (isInitial) setMsgLoading(true);
+    const cid = String(chatId);
+    // Afficher cache immédiatement si dispo
+    if (isInitial && _DMSG_MSG_CACHE[cid]?.length > 0) {
+      setMessages(_DMSG_MSG_CACHE[cid]);
+      setMsgLoading(false);
+      setTimeout(() => scrollToBottom('instant'), 50);
+      // Continuer pour refresh silencieux
+    } else if (isInitial) {
+      setMsgLoading(true);
+    }
     try {
-      // Source principale : Carlos API
-      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=100");
       if (signal?.aborted) return;
-      const list = Array.isArray(data) ? data : (data.messages || data.data || []);
+      const raw  = Array.isArray(data) ? data : (data.messages || data.data || []);
+      const list = [...raw].sort((a, b) =>
+        new Date(a.created_at || a.timestamp || 0).getTime() -
+        new Date(b.created_at || b.timestamp || 0).getTime()
+      );
+      if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
       if (isInitial) {
         setMessages(list);
         setTimeout(() => scrollToBottom('instant'), 100);
       } else {
+        if (list.length === 0) return; // Ne pas vider les messages si le serveur renvoie vide
         setMessages(prev => {
           const prevConfirmed = prev.filter(m => !m._pending && !m._error);
           const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
-          const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
+          const hasNew = list.some(m => !prevKeys.has(_msgKey(m)));
           if (!hasNew) return prev;
           return mergeMessages(prev, list);
         });
       }
-    } catch (e) {
-      // Fallback Supabase : chercher l'UUID de la conv via tg_chat_id
-      try {
-        const { data: convRow } = await sb
-          .from("tg_conversations")
-          .select("id")
-          .eq("tg_chat_id", chatId)
-          .maybeSingle();
-        const convUuid = convRow?.id;
-        if (!convUuid) throw new Error("conv not found");
-        const { data, error } = await sb
-          .from("tg_messages")
-          .select("*")
-          .eq("conversation_id", convUuid)
-          .order("created_at", { ascending: true });
-        if (error) throw error;
-        if (signal?.aborted) return;
-        const list = data || [];
-        if (isInitial) {
-          setMessages(list);
-          setTimeout(() => scrollToBottom('instant'), 100);
-        } else {
-          setMessages(prev => {
-            const prevConfirmed = prev.filter(m => !m._pending && !m._error);
-            const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
-            const hasNew = list.some(m => !prevKeys.has(_msgKey(m))) || prevConfirmed.length !== list.length;
-            if (!hasNew) return prev;
-            return mergeMessages(prev, list);
-          });
+      // Si nouveau message entrant → rafraîchir la liste conv
+      if (!isInitial && list.length > 0) {
+        const lastMsg = list[list.length - 1];
+        const isIncoming = lastMsg.direction === "in" || lastMsg.sender_type === "user";
+        if (isIncoming) {
+          loadConversationsRef.current();
         }
-      } catch (_) {
-        if (isInitial) setMessages([]);
+      }
+    } catch (e) {
+      if (e.name === "AbortError") return;
+      if (isInitial && !_DMSG_MSG_CACHE[cid]?.length) {
+        try {
+          const { data: convRow } = await sb
+            .from("tg_conversations").select("id")
+            .eq("tg_chat_id", cid).maybeSingle();
+          if (convRow?.id) {
+            const { data } = await sb.from("tg_messages").select("*")
+              .eq("conversation_id", convRow.id)
+              .order("created_at", { ascending: true });
+            const list = data || [];
+            if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+            setMessages(list);
+            setTimeout(() => scrollToBottom('instant'), 100);
+          }
+        } catch (_) { setMessages([]); }
       }
     } finally {
       if (isInitial) setMsgLoading(false);
@@ -27436,6 +27686,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Select conversation ───────────────────────────
   const selectConv = useCallback((conv) => {
+    // Reset last-ts pour forcer reload complet sur nouvelle conv
+    if (conv) {
+      const newCid = String(_dmsgChatId(conv));
+      if (newCid !== String(chatIdRef.current)) {
+        msgLastTsRef.current[newCid] = null;
+      }
+    }
+
     const chatId = _dmsgChatId(conv);
 
     // Cancel any in-flight message fetch from the previous conv
@@ -27449,9 +27707,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
-    setMessages([]);           // Immediate clear — no residual messages from previous conv
+    // Ouvrir dans les onglets
+    openTab(conv);
+    const cid = String(chatId || "");
+    const cached = _DMSG_MSG_CACHE[cid];
+    if (cached?.length > 0) {
+      setMessages(cached);
+    } else {
+      setMessages([]);
+    }
     setMsgInput("");
     setShowScripts(false);
+    setPendingMedia(null);
     isUserScrollRef.current = false;
     prevMsgCountRef.current = 0;
     // Vider immédiatement l'ancienne fiche — le useEffect ci-dessous rechargera la nouvelle
@@ -27468,6 +27735,43 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   useEffect(() => {
     selectedConvRef.current = selectedConv;
   }, [selectedConv]);
+
+  // ── Gestion onglets multiples ─────────────────────────────────────────────
+  const openTab = (conv) => {
+    const cid = _dmsgChatId(conv);
+    setOpenTabs(prev => {
+      if (prev.find(t => _dmsgChatId(t) === cid)) {
+        setActiveTabId(cid);
+        return prev;
+      }
+      if (prev.length >= 4) {
+        const filtered = prev.filter(t => _dmsgChatId(t) !== activeTabId);
+        const next = [...filtered.slice(-3), conv];
+        setActiveTabId(cid);
+        return next;
+      }
+      setActiveTabId(cid);
+      return [...prev, conv];
+    });
+  };
+
+  const closeTab = (e, cid) => {
+    e.stopPropagation();
+    setOpenTabs(prev => {
+      const next = prev.filter(t => _dmsgChatId(t) !== cid);
+      if (activeTabId === cid) {
+        const lastCid = next.length > 0 ? _dmsgChatId(next[next.length - 1]) : null;
+        setActiveTabId(lastCid);
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (activeTabId && activeTabId !== String(_dmsgChatId(selectedConv) || "")) {
+      setPendingMedia(null);
+    }
+  }, [activeTabId]);
 
   // ── selectedChatId : clé stable pour tous les useEffect liés à la conv ──────
   // BUG RACINE : les convs de l'API Carlos n'ont PAS de champ "id" — elles ont
@@ -27565,7 +27869,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     isUserScrollRef.current = false;
     prevMsgCountRef.current = 0;
     // Scroll after a short tick so the container has rendered
-    const t = setTimeout(() => { scrollToBottom('instant'); }, 60);
+    const t = setTimeout(() => { scrollToBottom('instant'); }, 300);
     return () => clearTimeout(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId]);
@@ -27604,7 +27908,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       } finally {
         isConvPollingRef.current = false;
       }
-    }, 3000);
+    }, 30000);
     return () => clearInterval(convPollRef.current);
   }, []); // Vide intentionnel — l'interval ne redémarre JAMAIS
 
@@ -27619,13 +27923,26 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       || (tgId && all.find(x => String(x.tg_user_id || x.telegram_id || "") === tidStr))
       || null;
     if (sp) return sp.first_name || sp.handle || sp.name || "—";
-    return conv.display_name || conv.username || conv.tg_username || String(tgId || "—");
+    if (conv.display_name || conv.username || conv.tg_username) return conv.display_name || conv.username || conv.tg_username;
+    const raw = String(tgId || "");
+    if (raw && raw.length > 6) return "TG·" + raw.slice(-4);
+    return raw || "—";
   };
 
   const getConvHandle = (conv) => {
     if (!conv) return "";
     const u = activeSpender?.telegram_username || conv.tg_username || "";
     return u ? "@" + String(u).replace(/^@/, "") : "";
+  };
+
+  const isUnanswered = (conv) => {
+    // Le dernier message vient du fan (direction "in") = non-répondu
+    const lastDir = conv.last_message_direction || conv.last_direction || null;
+    if (lastDir) return lastDir === "in" || lastDir === "incoming" || lastDir === "user";
+    // Fallback : si last_message existe et n'est pas de nous
+    const lastFrom = conv.last_sender_type || conv.last_from || null;
+    if (lastFrom) return lastFrom === "user" || lastFrom === "client" || lastFrom === "fan";
+    return false; // incertain = pas de badge
   };
 
   const fmtTime = (ts) => {
@@ -27702,15 +28019,41 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       });
     }
 
-    // Tri chronologique : conversation avec le message le plus récent en premier
-    result = [...result].sort((a, b) => {
-      const tA = new Date(a.last_message_at || a.last_message_timestamp || a.updated_at || 0).getTime();
-      const tB = new Date(b.last_message_at || b.last_message_timestamp || b.updated_at || 0).getTime();
-      return tB - tA;
-    });
+    // Tri déjà appliqué dans loadConversations — garder l'ordre stable ici
+    // result reste dans l'ordre du cache
+
+    // Filtre modèle
+    if (filterModel && filterModel !== "all") {
+      const fm = filterModel.toLowerCase();
+      result = result.filter(c =>
+        (c.model_id && c.model_id === filterModel) ||
+        (c.model_name && c.model_name.toLowerCase() === fm) ||
+        (c.username && c.username.toLowerCase().includes(fm))
+      );
+    }
+
+    // Filtre tier (basé sur total dépensé)
+    if (filterTier !== "all") {
+      const TIERS = {
+        sharks:     [500, Infinity],
+        baleines:   [350, 500],
+        gorilles:   [200, 350],
+        orangoutan: [100, 200],
+        ouistiti:   [50,  100],
+        poissons:   [1,   50],
+        free:       [0,   1],
+      };
+      const range = TIERS[filterTier];
+      if (range) result = result.filter(c => {
+        const cidStr = String(_dmsgChatId(c) || "");
+        const sp = (spenders||[]).find(x => x.id===c.spender_id || String(x.tg_user_id||x.telegram_id||"")===cidStr);
+        const total = Number(c.total_spent||0) || convTotalsMap[cidStr] || Number(sp?.ltv||sp?.total_spent||0);
+        return total >= range[0] && total < range[1];
+      });
+    }
 
     return result;
-  }, [conversations, searchQuery, filterSpender, spenders, convTotalsMap]);
+  }, [conversations, searchQuery, filterSpender, filterModel, filterTier, spenders, convTotalsMap]);
 
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
@@ -27734,17 +28077,32 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       _pending: true,
     };
     setMessages(prev => [...prev, optimistic]);
+    // Mettre à jour cache global conversations (remonte en tête)
+    const updatedConvs = _DMSG_CONV_CACHE.list.map(c =>
+      String(_dmsgChatId(c)) === String(chatId)
+        ? { ...c, last_message: text, last_message_text: text,
+            last_message_at: new Date().toISOString(),
+            last_message_direction: "out" }
+        : c
+    ).sort((a, b) =>
+      new Date(b.last_message_at || b.updated_at || 0).getTime() -
+      new Date(a.last_message_at || a.updated_at || 0).getTime()
+    );
+    _DMSG_CONV_CACHE.list = updatedConvs;
+    setConversations(updatedConvs);
 
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
       await _dmsgFetch("/send-message", {
         method: "POST",
-        body: JSON.stringify({ chat_id: chatId, text, ...(modelId ? { model_id: modelId } : {}) }),
+        body: JSON.stringify({ chat_id: chatId, text }),
       });
       // Confirm the optimistic message immediately (remove _pending flag)
       setMessages(prev => prev.map(m =>
         m.id === localId ? { ...m, _pending: false, id: localId + "_sent" } : m
       ));
+      // Remonter la conv en haut de liste
+      loadConversations(true);
       // Reconciliation after 2s — pick up server IDs and any replies
       setTimeout(async () => {
         if (String(chatIdRef.current) !== String(chatId)) return;
@@ -27859,26 +28217,34 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     if (!txForm.amount || isNaN(Number(txForm.amount))) {
       addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return;
     }
-    const modelId = selectedConv?.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || null;
+    const modelId = selectedConv?.model_id || selectedModelId || null;
     setTxSaving(true);
     try {
-      const { error } = await sb.from("transactions").insert({
-        spender_id: activeSpender?.id || null,
-        model_id:   modelId || null,
-        amount:     parseFloat(txForm.amount),
-        type:       txForm.type,
-        note:       txForm.note || null,
-        created_at: new Date().toISOString(),
-        chatter_id: user?.id || null,
-        status:     "pending",
-      });
+      const payload = {
+        spender_id:     activeSpender?.id || null,
+        spender_handle: activeSpender?.handle || null,
+        telegram_id:    activeSpender?.tg_user_id || activeSpender?.telegram_id || null,
+        model_id:       modelId || null,
+        provider_id:    txForm.provider_id || null,
+        product:        txForm.product || null,
+        product_id:     txForm.product_id || null,
+        amount:         parseFloat(txForm.amount),
+        currency:       txForm.currency || "CHF",
+        payment_method: txForm.payment_method || null,
+        notes:          txForm.note || null,
+        created_at:     new Date().toISOString(),
+        chatter_id:     user?.id || null,
+        status:         "pending",
+      };
+      const { error } = await sb.from("transactions").insert(payload);
       if (error) throw new Error(error.message);
       addToast(fr ? "Transaction enregistrée ✅" : "Transaction saved ✅", "success");
       setShowTxModal(false);
-      setTxForm({ amount: "", type: "tip", note: "" });
+      setTxForm({ amount: "", currency: "CHF", product: "", product_id: "", provider_id: "", payment_method: "", note: "" });
     } catch (e) {
       addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
     }
+      if (onRefresh) onRefresh();
     setTxSaving(false);
   };
 
@@ -27958,39 +28324,162 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const PANEL_H = "calc(100vh - 200px)";
 
   // ── TX Modal ─────────────────────────────────────
+  // Charger produits au premier ouverture
+  React.useEffect(() => {
+    if (!showTxModal || txProducts.length > 0) return;
+    sb.from("products").select("*").eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
+  }, [showTxModal]);
+
   const txModal = showTxModal && (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 9999,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
       onClick={e => { if (e.target === e.currentTarget) setShowTxModal(false); }}>
-      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: 360, maxWidth: "95vw", boxShadow: "var(--shadow-lg)" }}>
-        <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)", marginBottom: 4 }}>💳 {fr ? "Créer une transaction" : "Create transaction"}</div>
-        {activeSpender && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginBottom: 18 }}>Spender: <strong>{activeSpender.first_name || activeSpender.handle || "?"}</strong></div>}
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div>
-            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>{fr ? "Montant *" : "Amount *"}</label>
-            <input type="number" min="0" step="0.01" value={txForm.amount} onChange={e => setTxForm(f => ({ ...f, amount: e.target.value }))} placeholder="0.00" autoFocus
-              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 14, fontWeight: 700, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
+      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)",
+        borderRadius: 16, padding: 24, width: 520, maxWidth: "95vw",
+        maxHeight: "90vh", overflowY: "auto", boxShadow: "var(--shadow-lg)" }}>
+
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+          <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)" }}>💳 Nouvelle Transaction</div>
+          <button onClick={() => setShowTxModal(false)}
+            style={{ background: "none", border: "none", color: "var(--text-secondary)", fontSize: 22, cursor: "pointer" }}>×</button>
+        </div>
+
+        {/* Spender pré-rempli (read-only) */}
+        {activeSpender && (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px",
+            borderRadius: 10, background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)",
+            marginBottom: 18 }}>
+            <div style={{ width: 36, height: 36, borderRadius: 10, background: "var(--accent-muted)",
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700, color: "var(--accent)" }}>
+              {(activeSpender.first_name || activeSpender.handle || "?")[0].toUpperCase()}
+            </div>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-primary)" }}>
+                {activeSpender.first_name || activeSpender.handle || "—"}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>
+                TG: {activeSpender.tg_user_id || activeSpender.telegram_id || "—"} · 
+                Modèle: {(models||[]).find(m => m.id === (selectedConv?.model_id || selectedModelId))?.name || "—"}
+              </div>
+            </div>
           </div>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+
+          {/* Produit */}
           <div>
-            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>Type *</label>
-            <select value={txForm.type} onChange={e => setTxForm(f => ({ ...f, type: e.target.value }))}
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Produit *
+            </label>
+            <select value={txForm.product} onChange={e => setTxForm(f => ({ ...f, product: e.target.value, product_id: "" }))}
               style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", boxSizing: "border-box" }}>
-              {_DMSG_TX_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+              <option value="">— Choisir —</option>
+              {[...new Set(txProducts.map(p => p.category).filter(Boolean))].sort().map(cat => (
+                <option key={cat} value={cat}>{CATEGORY_ICONS[cat] || "📦"} {cat}</option>
+              ))}
             </select>
           </div>
+
+          {/* Détail produit */}
           <div>
-            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600 }}>Note</label>
-            <input type="text" value={txForm.note} onChange={e => setTxForm(f => ({ ...f, note: e.target.value }))} placeholder={fr ? "Optionnel…" : "Optional…"}
-              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Détail produit
+            </label>
+            <select value={txForm.product_id} onChange={e => {
+              const pid = e.target.value;
+              const prod = txProducts.find(p => p.id === pid);
+              setTxForm(f => ({ ...f, product_id: pid, amount: prod?.price_chf > 0 ? String(prod.price_chf) : f.amount, currency: prod?.price_chf > 0 ? "CHF" : f.currency }));
+            }}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", boxSizing: "border-box" }}>
+              <option value="">— Aucun —</option>
+              {txProducts.filter(p => p.category === txForm.product).map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.icon ? p.icon + " " : ""}{p.name}{p.price_chf > 0 ? ` (${p.price_chf} CHF)` : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Montant + devise */}
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Montant *
+            </label>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input type="number" min="0" step="0.01" value={txForm.amount}
+                onChange={e => setTxForm(f => ({ ...f, amount: e.target.value }))}
+                placeholder="0.00" autoFocus
+                style={{ flex: 1, padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 14, fontWeight: 700, fontFamily: "'Inter',sans-serif", outline: "none" }} />
+              <div style={{ display: "flex", borderRadius: 9, border: "1px solid var(--border-subtle)", overflow: "hidden", flexShrink: 0 }}>
+                <button type="button" onClick={() => setTxForm(f => ({ ...f, currency: "EUR" }))}
+                  style={{ padding: "0 11px", border: "none", background: txForm.currency === "EUR" ? "#F97316" : "var(--bg-raised)", color: txForm.currency === "EUR" ? "#fff" : "var(--text-tertiary)", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>EUR</button>
+                <button type="button" onClick={() => setTxForm(f => ({ ...f, currency: "CHF" }))}
+                  style={{ padding: "0 11px", border: "none", background: txForm.currency === "CHF" ? "var(--accent)" : "var(--bg-raised)", color: txForm.currency === "CHF" ? "#fff" : "var(--text-tertiary)", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>CHF</button>
+              </div>
+            </div>
+          </div>
+
+          {/* Méthode paiement */}
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Méthode paiement *
+            </label>
+            <select value={txForm.payment_method} onChange={e => setTxForm(f => ({ ...f, payment_method: e.target.value }))}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", boxSizing: "border-box" }}>
+              <option value="">— Choisir —</option>
+              {PAYMENT_METHODS.map(pm => <option key={pm} value={pm}>{pm}</option>)}
+            </select>
+          </div>
+
+          {/* Provider */}
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Provider
+            </label>
+            <select value={txForm.provider_id} onChange={e => setTxForm(f => ({ ...f, provider_id: e.target.value }))}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", boxSizing: "border-box" }}>
+              <option value="">— Choisir —</option>
+              {(profiles || []).filter(p => p.role === "provider").map(p => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+
+          {/* Chatter (read-only) */}
+          <div>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Chatter
+            </label>
+            <input value={user?.name || user?.email || "—"} disabled
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-tertiary)", fontSize: 13, fontFamily: "'Inter',sans-serif", opacity: 0.6, boxSizing: "border-box" }} />
+          </div>
+
+          {/* Notes (pleine largeur) */}
+          <div style={{ gridColumn: "1 / -1" }}>
+            <label style={{ fontSize: 11, color: "var(--text-tertiary)", display: "block", marginBottom: 4, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+              Notes <span style={{ textTransform: "none", fontWeight: 400 }}>(optionnel)</span>
+            </label>
+            <textarea value={txForm.note} onChange={e => setTxForm(f => ({ ...f, note: e.target.value }))}
+              placeholder={fr ? "Remarque, contexte…" : "Note, context…"} rows={2}
+              style={{ width: "100%", padding: "9px 12px", borderRadius: 9, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", resize: "vertical", boxSizing: "border-box" }} />
           </div>
         </div>
+
+        {/* Actions */}
         <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
           <button onClick={createTx} disabled={txSaving || !txForm.amount}
-            style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "none", background: txSaving || !txForm.amount ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: txSaving || !txForm.amount ? "not-allowed" : "pointer" }}>
-            {txSaving ? "⏳ …" : (fr ? "✅ Créer" : "✅ Create")}
+            style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "none",
+              background: txSaving || !txForm.amount ? "var(--border-subtle)" : "var(--accent)",
+              color: "#fff", fontSize: 13, fontWeight: 700,
+              cursor: txSaving || !txForm.amount ? "not-allowed" : "pointer" }}>
+            {txSaving ? "⏳ …" : "✅ Créer"}
           </button>
           <button onClick={() => setShowTxModal(false)}
-            style={{ flex: 1, padding: "10px 0", borderRadius: 10, border: "1px solid var(--border-subtle)", background: "transparent", color: "var(--text-secondary)", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
-            {fr ? "Annuler" : "Cancel"}
+            style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "1px solid var(--border-subtle)",
+              background: "transparent", color: "var(--text-secondary)", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+            Annuler
           </button>
         </div>
       </div>
@@ -28001,7 +28490,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const getAudienceConvs = (audienceId) => {
     const aud = BROADCAST_AUDIENCES.find(a => a.id === audienceId);
     if (!aud) return [];
-    return conversations.filter(c => aud.filter(c, convTotalsMap));
+    // Utiliser filteredConvs pour respecter le filtre modèle actif
+    const base = filterModel !== "all"
+      ? conversations.filter(c => c.model_id === filterModel)
+      : conversations;
+    return base.filter(c => aud.filter(c, convTotalsMap));
   };
 
   const applyAudience = (audienceId) => {
@@ -28263,11 +28756,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // LEFT PANEL — conversation list
   // ══════════════════════════════════════════
   const leftPanel = (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-sidebar)", borderRight: "1px solid var(--border-subtle)", overflow: "hidden" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "rgba(8,11,20,0.55)", backdropFilter: "blur(20px)", borderRight: "1px solid var(--border-subtle)", overflow: "hidden" }}>
       {/* Header */}
       <div style={{ padding: "14px 12px 10px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-          <span style={{ fontSize: 13, fontWeight: 800, color: "var(--text-primary)" }}>💬 {fr ? "Conversations" : "Conversations"}</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#94a3b8", fontFamily: "'DM Sans',sans-serif" }}>💬 {fr ? "Conversations" : "Conversations"}</span>
           <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
             <button
               onClick={() => { setSelectionMode(s => !s); setSelectedConvIds(new Set()); setSelectedAudience("manual"); }}
@@ -28279,13 +28772,23 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               title={fr ? "Broadcasts programmés" : "Scheduled broadcasts"}>
               ⏰
             </button>
-            <button onClick={loadConversations} disabled={convLoading}
+            <button onClick={() => loadConversations(true)} disabled={convLoading}
               style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: 4, borderRadius: 6, opacity: convLoading ? 0.5 : 1 }}>🔄</button>
           </div>
         </div>
         {/* Barre d'actions broadcast */}
         {selectionMode && (
           <div style={{ padding: "6px 0 4px", display: "flex", flexDirection: "column", gap: 6 }}>
+            {/* Warning si aucun modèle sélectionné */}
+            {filterModel === "all" && (
+              <div style={{
+                padding: "6px 10px", borderRadius: 7, marginBottom: 4,
+                background: "rgba(245,158,11,0.12)", border: "1px solid rgba(245,158,11,0.3)",
+                fontSize: 11, color: "#f59e0b", fontWeight: 600
+              }}>
+                ⚠️ Sélectionne un modèle (Carla / Sophie / Bella) avant de choisir une audience
+              </div>
+            )}
             {/* Audience dropdown with optgroups */}
             <select
               value={selectedAudience}
@@ -28345,28 +28848,59 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             </div>
           </div>
         )}
-        {isManager && (
-          <select value={selectedModelId} onChange={e => setSelectedModelId(e.target.value)}
-            style={{ width: "100%", padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 11, fontWeight: 600, marginBottom: 6, fontFamily: "'Inter',sans-serif" }}>
-            <option value="">{fr ? "— Toutes les conversations —" : "— All conversations —"}</option>
-            {(models || []).map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-          </select>
-        )}
-        {/* Filtre Type Spender */}
-        <div style={{ marginBottom: 8 }}>
-          <select value={filterSpender} onChange={e => setFilterSpender(e.target.value)}
-            style={{ width: "100%", padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 11, fontWeight: 600, fontFamily: "'Inter',sans-serif", cursor: "pointer" }}>
-            <option value="all">{fr ? "— Tous les spenders —" : "— All spenders —"}</option>
-            <option value="paying">{fr ? "💰 Payants (≥ 1 CHF)" : "💰 Paying (≥ 1 CHF)"}</option>
-            <option value="free">{fr ? "🆓 Gratuits (0 CHF)" : "🆓 Free (0 CHF)"}</option>
-          </select>
+        {/* ── FILTRE MODÈLE — pills ── */}
+        <div style={{ display: "flex", gap: 4, marginBottom: 5 }}>
+          {[{ id: "all", label: "Tous", color: null },
+            ...(models || []).map(m => ({
+              id: m.id, label: m.name,
+              color: m.name?.toLowerCase() === "carla" ? { bg: "rgba(139,92,246,0.18)", border: "rgba(139,92,246,0.45)", text: "#a78bfa" }
+                   : m.name?.toLowerCase() === "sophie" ? { bg: "rgba(236,72,153,0.18)", border: "rgba(236,72,153,0.45)", text: "#f472b6" }
+                   : m.name?.toLowerCase() === "bella"  ? { bg: "rgba(245,158,11,0.18)",  border: "rgba(245,158,11,0.45)",  text: "#fbbf24" }
+                   : null
+            }))
+          ].map(f => {
+            const isActive = filterModel === f.id;
+            const clr = f.color;
+            return (
+              <button key={f.id} onClick={() => setFilterModel(f.id)} style={{
+                padding: "4px 10px", borderRadius: 20, fontSize: 11, fontWeight: 700,
+                cursor: "pointer", transition: "all 0.12s", flexShrink: 0,
+                border: isActive ? "1px solid " + (clr?.border || "var(--accent)") : "1px solid var(--border-subtle)",
+                background: isActive ? (clr?.bg || "var(--accent-muted)") : "transparent",
+                color: isActive ? (clr?.text || "var(--accent)") : "var(--text-tertiary)",
+              }}>{f.label}</button>
+            );
+          })}
         </div>
-        {/* Search */}
+
+        {/* ── FILTRE TIER — pills emoji ── */}
+        <div style={{ display: "flex", gap: 3, flexWrap: "wrap", marginBottom: 7 }}>
+          {[
+            { id: "all",        label: "Tous" },
+            { id: "sharks",     label: "🦈" },
+            { id: "baleines",   label: "🐋" },
+            { id: "gorilles",   label: "🦍" },
+            { id: "orangoutan", label: "🦧" },
+            { id: "ouistiti",   label: "🐒" },
+            { id: "poissons",   label: "🐟" },
+            { id: "free",       label: "FREE" },
+          ].map(f => (
+            <button key={f.id} onClick={() => setFilterTier(f.id)} style={{
+              padding: "3px 8px", borderRadius: 20, fontSize: 11, fontWeight: 700,
+              cursor: "pointer", transition: "all 0.12s",
+              border: filterTier === f.id ? "1px solid var(--accent)" : "1px solid var(--border-subtle)",
+              background: filterTier === f.id ? "var(--accent-muted)" : "transparent",
+              color: filterTier === f.id ? "var(--accent)" : "var(--text-tertiary)",
+            }}>{f.label}</button>
+          ))}
+        </div>
+
+        {/* ── SEARCH ── */}
         <div style={{ position: "relative" }}>
           <span style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: "var(--text-tertiary)", pointerEvents: "none" }}>🔍</span>
           <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
             placeholder={fr ? "Rechercher…" : "Search…"}
-            style={{ width: "100%", padding: "7px 10px 7px 28px", borderRadius: 8, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 12, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
+            style={{ width: "100%", padding: "7px 10px 7px 28px", borderRadius: 20, border: "1px solid var(--border-subtle)", background: "var(--bg-raised)", color: "var(--text-primary)", fontSize: 12, fontFamily: "'Inter',sans-serif", outline: "none", boxSizing: "border-box" }} />
         </div>
       </div>
 
@@ -28425,7 +28959,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           <div style={{ margin: "10px 10px 0", padding: "10px 12px", background: "rgba(244,63,94,0.09)", border: "1px solid rgba(244,63,94,0.3)", borderRadius: 8, fontSize: 11, color: "var(--danger)", lineHeight: 1.5 }}>
             <div style={{ fontWeight: 700, marginBottom: 4 }}>⚠️ Erreur de chargement</div>
             <div style={{ fontFamily: "monospace", wordBreak: "break-all", fontSize: 10 }}>{apiError.replace(/^NETWORK:/, "")}</div>
-            <button onClick={loadConversations} style={{ marginTop: 8, padding: "4px 10px", borderRadius: 6, border: "1px solid var(--danger)", background: "transparent", color: "var(--danger)", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>🔄 Réessayer</button>
+            <button onClick={() => loadConversations(true)} style={{ marginTop: 8, padding: "4px 10px", borderRadius: 6, border: "1px solid var(--danger)", background: "transparent", color: "var(--danger)", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>🔄 Réessayer</button>
           </div>
         )}
         {!convLoading && !apiError && filteredConvs.length === 0 && (
@@ -28444,6 +28978,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           const cid = _dmsgChatId(conv);
           const isActive = selectedConv && _dmsgChatId(selectedConv) === cid;
           const name = getConvName(conv);
+          const isUnread = !isActive && (
+            conv.last_message_direction === "in" ||
+            conv.unread_count > 0 ||
+            conv.has_unread === true
+          );
           const lastMsg = conv.last_message || conv.last_message_text || "";
           const ts = fmtTime(conv.last_message_at || conv.updated_at);
           // Find spender avatar from props (best-effort, no loading state here)
@@ -28466,10 +29005,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             <div key={cid || idx}
               onClick={() => selectionMode ? toggleConvSelection(cidStr2) : selectConv(conv)}
               style={{
-                padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)",
+                padding: "11px 14px", borderBottom: "1px solid rgba(255,255,255,0.04)",
                 cursor: "pointer", userSelect: "none",
-                background: isSelected ? "rgba(99,102,241,0.18)" : isActive ? "rgba(99,102,241,0.13)" : "transparent",
-                borderLeft: isSelected ? "3px solid var(--accent)" : isActive ? "3px solid var(--accent)" : "3px solid transparent",
+                background: isSelected ? "rgba(99,102,241,0.18)" : isActive ? "rgba(99,102,241,0.09)" : "transparent",
+                borderLeft: isSelected ? "2px solid rgba(129,140,248,0.6)" : isActive ? "2px solid rgba(129,140,248,0.6)" : openTabs.find(t => _dmsgChatId(t) === cid) ? "2px solid #6366f1" : "2px solid transparent",
                 transition: "background 0.12s",
               }}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -28477,7 +29016,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                   <input type="checkbox" readOnly checked={isSelected}
                     style={{ width: 16, height: 16, accentColor: "var(--accent)", flexShrink: 0, cursor: "pointer" }} />
                 )}
-                <SpenderAvatar sp={sp} size={36} radius="50%" fontSize={16} />
+                <SpenderAvatar sp={sp} size={34} radius="10px" fontSize={16} />
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 4 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
@@ -28490,7 +29029,23 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                         </span>
                       )}
                     </div>
-                    <span style={{ fontSize: 9, color: "var(--text-quaternary)", flexShrink: 0 }}>{ts}</span>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                        {isUnread && (
+                          <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#3B82F6", display: "inline-block", flexShrink: 0 }} />
+                        )}
+                        <span style={{ fontSize: 9, color: isUnread ? "#3B82F6" : "var(--text-quaternary)", fontWeight: isUnread ? 700 : 400 }}>{ts}</span>
+                      </div>
+                      {isUnanswered(conv) && (
+                        <span style={{
+                          width: 8, height: 8, borderRadius: "50%",
+                          background: "#3b82f6",
+                          boxShadow: "0 0 6px rgba(59,130,246,0.8)",
+                          display: "inline-block",
+                          flexShrink: 0,
+                        }} />
+                      )}
+                    </div>
                   </div>
                   <div style={{ fontSize: 11, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>
                     {lastMsg || conv.tg_username || ""}
@@ -28518,7 +29073,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // CENTER PANEL — chat window
   // ══════════════════════════════════════════
   const centerPanel = (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-base)", overflow: "hidden" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "rgba(8,11,20,0.25)", overflow: "hidden" }}>
       {!selectedConv ? (
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10, color: "var(--text-quaternary)" }}>
           <div style={{ fontSize: 40 }}>💬</div>
@@ -28527,7 +29082,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       ) : (
         <>
           {/* Header */}
-          <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-overlay)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+          <div style={{ padding: "10px 14px", borderBottom: "1px solid rgba(255,255,255,0.07)", background: "rgba(8,11,20,0.55)", backdropFilter: "blur(20px)", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
             {isMobile && (
               <button onClick={() => setMobilePane("list")} style={{ background: "none", border: "none", color: "var(--text-secondary)", cursor: "pointer", fontSize: 18, padding: "0 4px 0 0" }}>←</button>
             )}
@@ -28548,6 +29103,65 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               <button onClick={() => setMobilePane("spender")} style={{ background: "none", border: "1px solid var(--border-subtle)", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: "5px 8px", borderRadius: 8 }}>👤</button>
             )}
           </div>
+
+          {/* Barre d'onglets */}
+          {openTabs.length > 0 && (
+            <div style={{
+              display: "flex", alignItems: "center",
+              background: "#0e1220",
+              borderBottom: "1px solid rgba(255,255,255,0.06)",
+              padding: "0 8px", height: 40,
+              gap: 4, overflowX: "auto", flexShrink: 0
+            }}>
+              {openTabs.map(tab => {
+                const tabCid = _dmsgChatId(tab);
+                return (
+                  <div
+                    key={tabCid}
+                    onClick={() => { setActiveTabId(tabCid); selectConv(tab); }}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 6,
+                      padding: "0 10px", height: 32, borderRadius: 7,
+                      cursor: "pointer", flexShrink: 0,
+                      background: activeTabId === tabCid ? "rgba(99,102,241,0.18)" : "transparent",
+                      border: activeTabId === tabCid ? "1px solid rgba(99,102,241,0.3)" : "1px solid transparent",
+                      transition: "all 0.15s"
+                    }}
+                  >
+                    <span style={{ fontSize: 14 }}>{tab.emoji || "👤"}</span>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: "#f0f2ff", whiteSpace: "nowrap" }}>
+                      {tab.display_name || tab.username || tab.tg_username || tabCid}
+                    </span>
+                    {tab.model_name && (
+                      <span style={{ fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: "rgba(196,181,253,0.15)", color: "#c4b5fd" }}>
+                        {tab.model_name.toUpperCase()}
+                      </span>
+                    )}
+                    {tab.unread_count > 0 && (
+                      <div style={{ width: 14, height: 14, borderRadius: "50%", background: "#3b82f6", color: "#fff", fontSize: 8, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center" }}>{tab.unread_count}</div>
+                    )}
+                    <div
+                      onClick={(e) => closeTab(e, tabCid)}
+                      style={{ width: 16, height: 16, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#4a5568", transition: "all 0.1s" }}
+                      onMouseEnter={e => { e.currentTarget.style.background = "rgba(255,255,255,0.1)"; e.currentTarget.style.color = "#f0f2ff"; }}
+                      onMouseLeave={e => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "#4a5568"; }}
+                    >×</div>
+                  </div>
+                );
+              })}
+              {openTabs.length >= 2 && (
+                <div style={{ marginLeft: "auto", display: "flex", gap: 3, background: "#131827", borderRadius: 6, padding: 3 }}>
+                  {["single", "split"].map(mode => (
+                    <button key={mode} onClick={() => setLayoutMode(mode)}
+                      style={{ width: 26, height: 26, borderRadius: 4, border: "none", cursor: "pointer", fontSize: 12,
+                        background: layoutMode === mode ? "rgba(99,102,241,0.25)" : "transparent",
+                        color: layoutMode === mode ? "#818cf8" : "#4a5568", transition: "all 0.12s" }}
+                    >{mode === "single" ? "▣" : "⊞"}</button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Messages - FIX SCROLL: flex:1 + minHeight:0 */}
           <div style={{ position: "relative", flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -28587,8 +29201,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 : mediaUrl.match(/\.(mp4|mov|webm)(\?|$)/i) ? "video"
                 : null;
               const hasMedia = !!mediaType;
-              const bubbleBg = isError ? "rgba(239,68,68,0.15)" : isOut ? "var(--accent)" : "rgba(255,255,255,0.08)";
-              const bubbleBorder = isPending ? "1px dashed rgba(255,255,255,0.3)" : isError ? "1px solid #ef4444" : "none";
+              const bubbleBg = isError ? "rgba(239,68,68,0.15)" : isOut ? "rgba(99,102,241,0.22)" : "rgba(255,255,255,0.07)";
+              const bubbleBorder = isPending ? "1px dashed rgba(255,255,255,0.3)" : isError ? "1px solid #ef4444" : isOut ? "1px solid rgba(129,140,248,0.25)" : "1px solid rgba(255,255,255,0.08)";
               const bubbleRadius = isOut ? "16px 16px 4px 16px" : "16px 16px 16px 4px";
               return (
                 <div key={msg.id || i}
@@ -28600,6 +29214,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                     color: "#fff",
                     boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
                     border: bubbleBorder,
+                    backdropFilter: "blur(10px)",
                     overflow: "hidden",
                   }}>
                     {/* ── Image ── */}
@@ -28652,7 +29267,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           </div>{/* end messages wrapper */}
 
           {/* Scripts + send bar */}
-          <div style={{ flexShrink: 0, borderTop: "1px solid var(--border-subtle)", background: "var(--bg-overlay)" }}>
+          <div style={{ flexShrink: 0, borderTop: "1px solid rgba(255,255,255,0.07)", background: "rgba(8,11,20,0.7)", backdropFilter: "blur(20px)" }}>
             <div ref={scriptsRef} style={{ position: "relative" }}>
               <div style={{ padding: "8px 14px 0", display: "flex", gap: 8, alignItems: "center" }}>
                 <button onClick={() => setShowScripts(s => !s)}
@@ -28666,34 +29281,164 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 >
                   {activeScript ? `🎬 Script (${currentStepIndex + 1}/${activeScript.sequence.length})` : "🎬 Scripts"}
                 </button>
+
+                {/* Bouton Photos */}
+                <button
+                  onClick={() => { setScriptPanelTab("photos"); setShowScripts(true); }}
+                  style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 12px", borderRadius: 8,
+                    border: "1px solid " + (showScripts && scriptPanelTab === "photos" ? "rgba(251,191,36,0.6)" : "rgba(251,191,36,0.3)"),
+                    background: showScripts && scriptPanelTab === "photos" ? "rgba(251,191,36,0.15)" : "rgba(251,191,36,0.06)",
+                    color: "#fbbf24", fontSize: 11, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" }}>
+                  📸 Photos
+                </button>
+
+                {/* Bouton Vidéos */}
+                <button
+                  onClick={() => { setScriptPanelTab("videos"); setShowScripts(true); }}
+                  style={{ display: "flex", alignItems: "center", gap: 5, padding: "5px 12px", borderRadius: 8,
+                    border: "1px solid " + (showScripts && scriptPanelTab === "videos" ? "rgba(167,139,250,0.6)" : "rgba(167,139,250,0.3)"),
+                    background: showScripts && scriptPanelTab === "videos" ? "rgba(167,139,250,0.15)" : "rgba(167,139,250,0.06)",
+                    color: "#a78bfa", fontSize: 11, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" }}>
+                  🎥 Vidéos
+                </button>
+                <div style={{display:"flex", gap:2, marginLeft:"auto", alignItems:"center"}}>
+                  {["😘","🔥","💋","😈","🍑","💦","❤️","😏"].map(em => (
+                    <button key={em} onClick={() => setMsgInput(prev => prev + em)}
+                      style={{background:"none", border:"none", fontSize:18, cursor:"pointer",
+                        padding:"2px 4px", borderRadius:6, lineHeight:1, opacity:0.85,
+                        transition:"transform 0.1s, opacity 0.1s"}}
+                      onMouseEnter={e=>{e.currentTarget.style.transform="scale(1.3)";e.currentTarget.style.opacity="1"}}
+                      onMouseLeave={e=>{e.currentTarget.style.transform="scale(1)";e.currentTarget.style.opacity="0.85"}}>
+                      {em}
+                    </button>
+                  ))}
+                </div>
               </div>
               {showScripts && (
                 <div style={{ position: "absolute", bottom: "100%", left: 14, right: 14, maxHeight: 380, overflowY: "auto", background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 12, boxShadow: "0 -4px 24px rgba(0,0,0,0.4)", zIndex: 200 }}>
-                  {/* Header */}
-                  <div style={{ padding: "10px 14px 6px", borderBottom: "1px solid var(--border-subtle)", fontSize: 11, fontWeight: 700, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.05em", position: "sticky", top: 0, background: "var(--bg-modal)", zIndex: 1 }}>
-                    {fr ? "Scripts rapides" : "Quick scripts"}{activeSpender?.first_name ? ` — ${activeSpender.first_name}` : ""}
-                  </div>
-                  {/* Categories */}
-                  {Object.entries(_DMSG_SCRIPTS).map(([category, scripts]) => (
-                    <div key={category} style={{ padding: "10px 10px 4px" }}>
-                      <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.06em", padding: "0 4px 6px" }}>
-                        {category}
-                      </div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                        {scripts.map((s, idx) => (
-                          <button key={idx} onClick={() => applyScript(s)}
-                            style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: "none", background: "transparent", color: "var(--text-primary)", fontSize: 12, cursor: "pointer", textAlign: "left", display: "flex", flexDirection: "column", gap: 2 }}
-                            onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.12)"}
-                            onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                            <span style={{ fontWeight: 700, color: "var(--accent)", fontSize: 12 }}>{s.label}</span>
-                            <span style={{ color: "var(--text-secondary)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%" }}>
-                              {s.text.replace(/\{prenom\}/g, activeSpender?.first_name || "bébé")}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
+                  {/* Tab bar */}
+                  <div style={{ display: "flex", borderBottom: "1px solid var(--border-subtle)", position: "sticky", top: 0, background: "var(--bg-modal)", zIndex: 1 }}>
+                    <div onClick={() => setScriptPanelTab("scripts")}
+                      style={{ flex: 1, padding: "10px", textAlign: "center", fontSize: 11, fontWeight: 700, cursor: "pointer",
+                        color: scriptPanelTab === "scripts" ? "var(--accent)" : "#6b7280",
+                        borderBottom: scriptPanelTab === "scripts" ? "2px solid var(--accent)" : "2px solid transparent",
+                        background: scriptPanelTab === "scripts" ? "rgba(99,102,241,0.08)" : "transparent",
+                        transition: "all 0.15s" }}>
+                      📝 Scripts
                     </div>
-                  ))}
+                    <div onClick={() => setScriptPanelTab("photos")}
+                      style={{ flex: 1, padding: "10px", textAlign: "center", fontSize: 11, fontWeight: 700, cursor: "pointer",
+                        color: scriptPanelTab === "photos" ? "#fbbf24" : "#6b7280",
+                        borderBottom: scriptPanelTab === "photos" ? "2px solid #fbbf24" : "2px solid transparent",
+                        background: scriptPanelTab === "photos" ? "rgba(251,191,36,0.08)" : "transparent",
+                        transition: "all 0.15s" }}>
+                      📸 Photos
+                    </div>
+                    <div onClick={() => setScriptPanelTab("videos")}
+                      style={{ flex: 1, padding: "10px", textAlign: "center", fontSize: 11, fontWeight: 700, cursor: "pointer",
+                        color: scriptPanelTab === "videos" ? "#a78bfa" : "#6b7280",
+                        borderBottom: scriptPanelTab === "videos" ? "2px solid #a78bfa" : "2px solid transparent",
+                        background: scriptPanelTab === "videos" ? "rgba(167,139,250,0.08)" : "transparent",
+                        transition: "all 0.15s" }}>
+                      🎥 Vidéos
+                    </div>
+                  </div>
+                  {/* Onglet Scripts */}
+                  {scriptPanelTab === "scripts" && (
+                    <div>
+                      <div style={{ padding: "10px 14px 6px", fontSize: 11, fontWeight: 700, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                        {fr ? "Scripts rapides" : "Quick scripts"}{activeSpender?.first_name ? ` — ${activeSpender.first_name}` : ""}
+                      </div>
+                      {Object.entries(_DMSG_SCRIPTS).map(([category, scripts]) => (
+                        <div key={category} style={{ padding: "10px 10px 4px" }}>
+                          <div style={{ fontSize: 10, fontWeight: 700, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.06em", padding: "0 4px 6px" }}>
+                            {category}
+                          </div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                            {scripts.map((s, idx) => (
+                              <button key={idx} onClick={() => applyScript(s)}
+                                style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: "none", background: "transparent", color: "var(--text-primary)", fontSize: 12, cursor: "pointer", textAlign: "left", display: "flex", flexDirection: "column", gap: 2 }}
+                                onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.12)"}
+                                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                                <span style={{ fontWeight: 700, color: "var(--accent)", fontSize: 12 }}>{s.label}</span>
+                                <span style={{ color: "var(--text-secondary)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%" }}>
+                                  {s.text.replace(/\{prenom\}/g, activeSpender?.first_name || "bébé")}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* ── ONGLET PHOTOS / VIDÉOS ── */}
+                  {(scriptPanelTab === "photos" || scriptPanelTab === "videos") && (
+                    <div>
+                      {pendingMedia && (
+                        <div style={{
+                          padding: "10px 12px", margin: "0 0 8px",
+                          borderRadius: 8,
+                          background: "rgba(99,102,241,0.15)",
+                          border: "1px solid rgba(99,102,241,0.4)",
+                          display: "flex", alignItems: "center", gap: 10
+                        }}>
+                          <span style={{ fontSize: 12, color: "#e2e8f0", flex: 1 }}>
+                            Envoyer <strong>{pendingMedia.name}</strong> ?
+                          </span>
+                          <button
+                            onClick={async () => {
+                              const chatId = selectedConv?.tg_chat_id || selectedConv?.chat_id;
+                              if (!chatId) return;
+                              const modelName = selectedConv?.model_name || chatterCtx?.modelName || "carla";
+                              try {
+                                const res = await _dmsgFetch("/send-media", {
+                                  method: "POST",
+                                  body: JSON.stringify({
+                                    chat_id: chatId,
+                                    media_url: pendingMedia.url,
+                                    caption: "",
+                                    model_id: modelName
+                                  })
+                                });
+                                if (res?.success) {
+                                  setPendingMedia(null);
+                                  loadMessagesById(chatId, false);
+                                } else {
+                                  alert("❌ Erreur envoi : " + (res?.error || "inconnue"));
+                                }
+                              } catch(e) {
+                                alert("❌ Erreur : " + e.message);
+                              }
+                            }}
+                            style={{
+                              background: "#6366f1", border: "none", borderRadius: 6,
+                              color: "#fff", fontSize: 11, fontWeight: 700,
+                              padding: "5px 14px", cursor: "pointer"
+                            }}
+                          >✓ Envoyer</button>
+                          <button
+                            onClick={() => setPendingMedia(null)}
+                            style={{
+                              background: "rgba(255,255,255,0.08)", border: "none",
+                              borderRadius: 6, color: "#9ca3af",
+                              fontSize: 11, padding: "5px 10px", cursor: "pointer"
+                            }}
+                          >✕</button>
+                        </div>
+                      )}
+                      <MediaPanelGrid
+                        mediaType={scriptPanelTab === "photos" ? "photo" : "video"}
+                        modelName={selectedConv?.model_name || chatterCtx?.modelName || ""}
+                        onSelect={(item) => {
+                          setPendingMedia({
+                            url: item.url,
+                            name: item.name || item.filename || "média",
+                            type: item.type
+                          });
+                        }}
+                      />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -28755,10 +29500,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
                 placeholder={fr ? "Écrire un message… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" : "Write a message… (Enter to send, Shift+Enter for newline)"}
                 rows={2}
-                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 10, border: activeScript ? "1px solid #6366f1" : "1px solid var(--border-subtle)", background: "var(--bg-input, var(--bg-raised))", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4, transition: "border-color 0.2s" }}
+                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "10px 12px", borderRadius: 12, border: activeScript ? "1px solid #6366f1" : "1px solid rgba(255,255,255,0.08)", background: "rgba(255,255,255,0.05)", color: "var(--text-primary)", fontSize: 13, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4, transition: "border-color 0.2s" }}
               />
               <button onClick={sendMessage} disabled={!msgInput.trim()}
-                style={{ alignSelf: "flex-end", padding: "10px 18px", borderRadius: 10, border: "none", background: !msgInput.trim() ? "var(--border-subtle)" : "var(--accent)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: !msgInput.trim() ? "not-allowed" : "pointer", flexShrink: 0, transition: "background 0.2s" }}>
+                style={{ alignSelf: "flex-end", padding: "10px 18px", borderRadius: 12, border: "none", background: !msgInput.trim() ? "var(--border-subtle)" : "linear-gradient(135deg,#6366f1,#818cf8)", color: "#fff", fontSize: 13, fontWeight: 700, cursor: !msgInput.trim() ? "not-allowed" : "pointer", flexShrink: 0, transition: "background 0.2s", boxShadow: msgInput.trim() ? "0 4px 14px rgba(99,102,241,0.35)" : "none" }}>
                 {fr ? "Envoyer" : "Send"}
               </button>
             </div>
@@ -28887,7 +29632,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // RIGHT PANEL — Spender fiche complète
   // ══════════════════════════════════════════
   const rightPanel = (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "var(--bg-raised)", borderLeft: "1px solid var(--border-subtle)", overflow: "hidden" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "rgba(8,11,20,0.55)", backdropFilter: "blur(20px)", borderLeft: "1px solid rgba(255,255,255,0.07)", overflow: "hidden" }}>
       {/* Header : titre + bouton Sync */}
       <div style={{ padding: "12px 14px 10px", borderBottom: "1px solid var(--border-subtle)", flexShrink: 0, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
         <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)", textTransform: "uppercase", letterSpacing: "0.05em" }}>
@@ -29000,7 +29745,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
               <button
                 onClick={() => { setShowTxModal(true); setTxForm({ amount: "", type: "tip", note: "" }); }}
-                style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "none", background: "var(--accent)", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "none", background: "linear-gradient(135deg,#6366f1,#818cf8)", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 12px rgba(99,102,241,0.3)" }}>
                 ➕ {fr ? "Créer TX" : "Create TX"}
               </button>
               <button
@@ -29026,7 +29771,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 { label: "✅",     value: spKpis.validAmt.toFixed(0) + " ₣",   color: "#22c55e" },
                 { label: "⏳",     value: spKpis.pendingAmt.toFixed(0) + " ₣", color: "#f59e0b" },
               ].map(k => (
-                <div key={k.label} style={{ textAlign: "center" }}>
+                <div key={k.label} style={{ textAlign: "center", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "10px 12px" }}>
                   <div style={{ fontSize: 8, color: "var(--text-quaternary)", textTransform: "uppercase", marginBottom: 2, fontWeight: 600 }}>{k.label}</div>
                   <div style={{ fontSize: 11, fontWeight: 700, color: k.color }}>{k.value}</div>
                 </div>
@@ -29443,8 +30188,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     padding: "8px 16px",
     background: activeTab === id ? "#6366f1" : "transparent",
     border: "none",
-    borderRadius: "6px",
-    color: activeTab === id ? "white" : "#9ca3af",
+    borderRadius: "8px",
+    color: activeTab === id ? "#fff" : "#6b7280",
     fontWeight: "600",
     cursor: "pointer",
     fontSize: "13px",
@@ -29453,12 +30198,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   const tabNav = (
     <div style={{ overflowX: "auto", overflowY: "hidden", WebkitOverflowScrolling: "touch", flexShrink: 0 }}>
-      <div style={{ display: "flex", gap: "8px", padding: "12px 16px", borderBottom: "1px solid var(--border-subtle)", background: "var(--bg-sidebar)", minWidth: "min-content" }}>
+      <div style={{ display: "flex", gap: "8px", padding: "12px 16px", borderBottom: "1px solid rgba(255,255,255,0.07)", background: "rgba(8,11,20,0.8)", backdropFilter: "blur(20px)", minWidth: "min-content" }}>
         <button onClick={() => setActiveTab("conversations")} style={tabNavStyle("conversations")}>💬 Conversations</button>
         <button onClick={() => setActiveTab("dadacast")} style={tabNavStyle("dadacast")}>📡 Dadacast</button>
-        {isManager && <button onClick={() => setActiveTab("scripts")} style={tabNavStyle("scripts")}>🎬 Scripts</button>}
-        {isManager && <button onClick={() => setActiveTab("media")} style={tabNavStyle("media")}>📁 Médias</button>}
-        {isManager && <button onClick={() => setActiveTab("analytics")} style={tabNavStyle("analytics")}>📊 Analytics</button>}
+        {isManager && <button onClick={() => setActiveTab("ressources")} style={tabNavStyle("ressources")}>🎬 Ressources</button>}
         {isManager && <button onClick={() => setActiveTab("gestion")} style={tabNavStyle("gestion")}>⚙️ Gestion</button>}
       </div>
     </div>
@@ -29480,9 +30223,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             </div>
           )}
           {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
-          {activeTab === "scripts" && isManager && <ScriptsPage user={user} lang={lang} />}
-          {activeTab === "media" && isManager && <MediaLibraryPage user={user} lang={lang} />}
-          {activeTab === "analytics" && isManager && <BroadcastAnalytics user={user} lang={lang} />}
+          {activeTab === "ressources" && isManager && <RessourcesPage user={user} lang={lang} />}
           {activeTab === "gestion" && <GestionSubpage models={models} lang={lang} user={user} />}
         </div>
       </>
@@ -29503,9 +30244,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           </div>
         )}
         {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
-        {activeTab === "scripts" && isManager && <ScriptsPage user={user} lang={lang} />}
-        {activeTab === "media" && isManager && <MediaLibraryPage user={user} lang={lang} />}
-        {activeTab === "analytics" && isManager && <BroadcastAnalytics user={user} lang={lang} />}
+        {activeTab === "ressources" && isManager && <RessourcesPage user={user} lang={lang} />}
         {activeTab === "gestion" && <GestionSubpage models={models} lang={lang} user={user} />}
       </div>
     </>
@@ -29948,7 +30687,16 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
                   <div style={{ padding: "9px 13px", borderRadius: isOut ? "14px 14px 2px 14px" : "14px 14px 14px 2px", fontSize: 13, lineHeight: 1.4,
                     background: isOut ? "#3B82F6" : "rgba(255,255,255,0.07)", color: "#fff", wordBreak: "break-word",
                     opacity: msg._pending ? 0.65 : 1 }}>
-                    {msg.text || msg.content || msg.message || "—"}
+                    {(() => {
+                      const raw = msg.text || msg.content || msg.message || "";
+                      if (!raw) return "—";
+                      try {
+                        // Décoder les emojis encodés Unicode si nécessaire
+                        return raw.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
+                          String.fromCharCode(parseInt(hex, 16))
+                        );
+                      } catch { return raw; }
+                    })()}
                   </div>
                   <div style={{ fontSize: 9, color: "var(--text-quaternary)", marginTop: 2, textAlign: isOut ? "right" : "left" }}>
                     {msg._pending ? (fr ? "Envoi…" : "Sending…") : (msg.created_at ? new Date(msg.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : "")}
@@ -30661,9 +31409,10 @@ const ScriptBuilder = ({ script, onSave, onClose }) => {
     if (localScript.sequence.length === 0) { alert('⚠️ Ajoute au moins une étape'); return; }
     setIsSaving(true);
     try {
+      const { category: _cat, is_active: _ia, target_audiences: _ta, name, ...scriptCore } = localScript;
       const scriptData = {
-        ...localScript,
-        target_audiences: selectedAudiences,
+        ...scriptCore,
+        title: name || scriptCore.title || "",
         updated_at: new Date().toISOString()
       };
       if (!script.created_at) {
@@ -30681,7 +31430,7 @@ const ScriptBuilder = ({ script, onSave, onClose }) => {
       onSave(data);
     } catch (err) {
       console.error('[SCRIPT] Save error:', err);
-      alert('❌ Erreur lors de la sauvegarde');
+      alert('❌ Erreur : ' + (err?.message || err?.details || JSON.stringify(err)));
     } finally {
       setIsSaving(false);
     }
@@ -30931,6 +31680,40 @@ const ScriptBuilder = ({ script, onSave, onClose }) => {
 // =============================================
 // SCRIPTS PAGE — Liste des scripts séquences
 // =============================================
+const RessourcesPage = ({ user, lang }) => {
+  const [subTab, setSubTab] = useState("scripts"); // "scripts" | "media"
+  const tabBtn = (id, label) => (
+    <button onClick={() => setSubTab(id)}
+      style={{ padding: "10px 22px", borderRadius: 10, border: "none", fontSize: 14, fontWeight: 700, cursor: "pointer", transition: "all 0.15s",
+        background: subTab === id ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : "rgba(255,255,255,0.04)",
+        color: subTab === id ? "#fff" : "var(--text-tertiary)",
+        boxShadow: subTab === id ? "0 4px 14px rgba(99,102,241,0.3)" : "none" }}>
+      {label}
+    </button>
+  );
+  return (
+    <div style={{ padding: "24px 32px", maxWidth: 1400, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24, flexWrap: "wrap" }}>
+        <div style={{ flex: 1 }}>
+          <h1 style={{ margin: 0, marginBottom: 4, fontSize: 26, fontWeight: 800,
+            background: "linear-gradient(135deg,#6366f1,#8b5cf6)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+            {subTab === "scripts" ? "🎬 Mes Scripts" : "📁 Bibliothèque Médias"}
+          </h1>
+          <p style={{ margin: 0, color: "var(--text-tertiary)", fontSize: 13 }}>
+            {subTab === "scripts" ? "Séquences automatisées multi-étapes avec médias, timing et ciblage" : "Stocke et réutilise tes photos, vidéos et audios dans les scripts"}
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8, background: "rgba(255,255,255,0.03)", padding: 5, borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
+          {tabBtn("scripts", "🎬 Scripts")}
+          {tabBtn("media", "📁 Médias")}
+        </div>
+      </div>
+      {subTab === "scripts" && <ScriptsPage user={user} lang={lang} />}
+      {subTab === "media" && <MediaLibraryPage user={user} lang={lang} />}
+    </div>
+  );
+};
+
 const ScriptsPage = ({ user, lang }) => {
   const addToast = useToast();
   const [scripts, setScripts] = useState([]);
@@ -30990,17 +31773,9 @@ const ScriptsPage = ({ user, lang }) => {
   return (
     <div style={{ padding: '24px', maxWidth: '1600px', margin: '0 auto' }}>
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '28px', gap: '16px', flexWrap: 'wrap' }}>
-        <div>
-          <h1 style={{ margin: '0 0 6px', fontSize: '26px', fontWeight: '800' }}>🎬 Mes Scripts</h1>
-          <p style={{ margin: 0, color: '#6b7280', fontSize: '14px' }}>Séquences automatisées multi-étapes avec médias, timing et ciblage intelligent</p>
-        </div>
-        <button
-          onClick={() => { setCurrentScript({ ...SCRIPT_TEMPLATE }); setShowBuilder(true); }}
-          style={{ padding: '12px 22px', background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)', border: 'none', borderRadius: '10px', color: 'white', fontWeight: '700', cursor: 'pointer', fontSize: '14px', boxShadow: '0 4px 16px rgba(99,102,241,0.3)', flexShrink: 0 }}
-          onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 6px 20px rgba(99,102,241,0.4)'; }}
-          onMouseLeave={e => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.boxShadow = '0 4px 16px rgba(99,102,241,0.3)'; }}
-        >
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16 }}>
+        <button onClick={() => { setCurrentScript({ ...SCRIPT_TEMPLATE }); setShowBuilder(true); }}
+          style={{ padding: "10px 20px", background: "linear-gradient(135deg,#6366f1,#8b5cf6)", border: "none", borderRadius: 10, color: "white", fontWeight: 700, cursor: "pointer", fontSize: 13, boxShadow: "0 4px 14px rgba(99,102,241,0.3)" }}>
           ➕ Créer un script
         </button>
       </div>
@@ -31156,6 +31931,8 @@ const MediaLibraryPage = ({ user }) => {
   const [mediaCategory, setMediaCategory] = useState('Autres');
   const [collapsedAlbums, setCollapsedAlbums] = useState([]);
   const [activeCategory, setActiveCategory] = useState('all');
+  const [mediaModel, setMediaModel] = useState('');
+  const [selectedModel, setSelectedModel] = useState('all');
 
   useEffect(() => { loadMedia(); }, []);
 
@@ -31169,8 +31946,9 @@ const MediaLibraryPage = ({ user }) => {
 
   const filteredMedias = media.filter(item => {
     const matchType = filterType === 'all' || item.type === filterType;
+    const matchModel = selectedModel === 'all' || (item.model || '').toLowerCase() === selectedModel;
     const matchSearch = !searchQuery || item.name.toLowerCase().includes(searchQuery.toLowerCase());
-    return matchType && matchSearch;
+    return matchType && matchModel && matchSearch;
   });
 
   const toggleAlbum = (cat) => setCollapsedAlbums(prev =>
@@ -31180,6 +31958,11 @@ const MediaLibraryPage = ({ user }) => {
   const handleUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!mediaModel) {
+      addToast('Sélectionne un modèle avant d\'uploader', 'error');
+      e.target.value = '';
+      return;
+    }
     e.target.value = '';
     setIsUploading(true);
     try {
@@ -31202,6 +31985,7 @@ const MediaLibraryPage = ({ user }) => {
         tags: [],
         user_id: user?.id || null,
         category: mediaCategory || 'Autres',
+        model: mediaModel,
       });
       if (error) throw new Error(error.message);
       addToast('✅ Média ajouté', 'success');
@@ -31275,6 +32059,13 @@ const MediaLibraryPage = ({ user }) => {
             {item.usage_count}×
           </div>
         )}
+        {item.model && (
+          <span style={{
+            position: 'absolute', top: 6, left: 6,
+            background: 'rgba(99,102,241,0.25)', color: '#a5b4fc',
+            fontSize: 9, fontWeight: 700, padding: '2px 6px', borderRadius: 4
+          }}>{item.model.toUpperCase()}</span>
+        )}
       </div>
       <div style={{ fontWeight: '700', marginBottom: '5px', fontSize: '14px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.name}>
         {item.name}
@@ -31306,6 +32097,17 @@ const MediaLibraryPage = ({ user }) => {
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <select
+            value={mediaModel}
+            onChange={e => setMediaModel(e.target.value)}
+            style={{ padding: '9px 12px', borderRadius: 8, border: '1px solid ' + (mediaModel ? '#6366f1' : '#f43f5e'),
+              background: '#1a1d2e', color: mediaModel ? 'white' : '#f87171', fontSize: 13,
+              fontFamily: 'inherit', cursor: 'pointer', outline: 'none' }}>
+            <option value="">-- Choisir un modèle --</option>
+            <option value="carla">Carla</option>
+            <option value="sophie">Sophie</option>
+            <option value="bella">Bella</option>
+          </select>
+          <select
             value={mediaCategory}
             onChange={e => setMediaCategory(e.target.value)}
             style={{ padding: '10px 14px', background: '#1a1d2e', border: '1px solid #2d3250', borderRadius: '8px', color: 'white', fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit' }}
@@ -31323,6 +32125,18 @@ const MediaLibraryPage = ({ user }) => {
             {isUploading ? '⏳ Upload...' : '📤 Upload média'}
           </label>
         </div>
+      </div>
+
+      {/* Filtres modèles */}
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
+        {["Tous", "Carla", "Sophie", "Bella"].map(m => (
+          <button key={m} onClick={() => setSelectedModel(m === "Tous" ? "all" : m.toLowerCase())}
+            style={{
+              background: selectedModel === (m === "Tous" ? "all" : m.toLowerCase()) ? "rgba(99,102,241,0.3)" : "rgba(255,255,255,0.05)",
+              border: "1px solid rgba(99,102,241,0.3)", borderRadius: 8, padding: "6px 14px",
+              color: "#e2e8f0", fontSize: 12, cursor: "pointer", fontWeight: 600, transition: "background 0.15s"
+            }}>{m}</button>
+        ))}
       </div>
 
       {/* Barre albums (filtre catégorie) */}
@@ -43455,6 +44269,8 @@ const App = () => {
         if (!payload.new) return;
         const tx = payload.new;
         if (rtDedup("tx-ins-" + tx.id)) return;
+        // RBAC: provider ne reçoit en temps réel que ses propres TX
+        if (user.role === "provider" && tx.provider_id !== user.id) return;
         // Update local txs state immediately (no full reload needed)
         setTxs(prev => prev.some(x => x.id === tx.id) ? prev : [tx, ...prev].slice(0, 100));
         setTxSummary(prev => prev.some(x => x.id === tx.id) ? prev : [tx, ...prev]);
@@ -43476,6 +44292,8 @@ const App = () => {
         if (!payload.new) return;
         const tx = payload.new;
         if (rtDedup("tx-upd-" + tx.id + "-" + (tx.updated_at || ""))) return;
+        // RBAC: provider ne met à jour en temps réel que ses propres TX
+        if (user.role === "provider" && tx.provider_id !== user.id) return;
         // Patch in-place — no full reload
         setTxs(prev => prev.map(x => x.id === tx.id ? { ...x, ...tx } : x));
         setTxSummary(prev => prev.map(x => x.id === tx.id ? { ...x, ...tx } : x));
