@@ -31938,6 +31938,8 @@ const MediaLibraryPage = ({ user }) => {
   const [activeAlbum, setActiveAlbum] = useState(null);
   const [showNewAlbum, setShowNewAlbum] = useState(false);
   const [newAlbumName, setNewAlbumName] = useState('');
+  const [selectedFiles, setSelectedFiles] = useState([]);
+  const [uploadProgress, setUploadProgress] = useState(null);
 
   useEffect(() => { loadMedia(); loadAlbums('all'); }, []);
 
@@ -31989,47 +31991,55 @@ const MediaLibraryPage = ({ user }) => {
     prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat]
   );
 
-  const handleUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!mediaModel) {
-      addToast('Sélectionne un modèle avant d\'uploader', 'error');
-      e.target.value = '';
-      return;
-    }
-    e.target.value = '';
-    setIsUploading(true);
-    try {
-      let type = 'photo';
-      if (file.type.startsWith('video/')) type = 'video';
-      else if (file.type.startsWith('audio/')) type = 'audio';
+  const uploadMultiple = async () => {
+    if (selectedFiles.length === 0) return;
+    if (!mediaModel) { addToast('Sélectionne un modèle avant d\'uploader', 'error'); return; }
 
-      const ext = file.name.split('.').pop();
-      const path = `${type}/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-      const { error: upErr } = await sb.storage.from('media-library').upload(path, file, { upsert: true });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = sb.storage.from('media-library').getPublicUrl(path);
+    setUploadProgress({ done: 0, total: selectedFiles.length, current: '' });
+    const results = { success: 0, errors: [] };
 
-      const { error } = await sb.from('media_library').insert({
-        name: file.name,
-        type,
-        url: urlData.publicUrl,
-        file_size: file.size,
-        usage_count: 0,
-        tags: [],
-        user_id: user?.id || null,
-        category: mediaCategory || 'Autres',
-        model: mediaModel,
-      });
-      if (error) throw new Error(error.message);
-      addToast('✅ Média ajouté', 'success');
-      loadMedia();
-    } catch (err) {
-      console.error('[MEDIA] Upload error:', err);
-      addToast('❌ Erreur upload: ' + (err.message || err), 'error');
-    } finally {
-      setIsUploading(false);
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const file = selectedFiles[i];
+      setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
+      try {
+        const ext = file.name.split('.').pop();
+        const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const path = `${mediaModel}/${filename}`;
+
+        const { error: storageError } = await sb.storage
+          .from('media-library')
+          .upload(path, file, { cacheControl: '3600', upsert: false });
+        if (storageError) throw storageError;
+
+        const { data: urlData } = sb.storage.from('media-library').getPublicUrl(path);
+
+        const { error: dbError } = await sb.from('media_library').insert({
+          url: urlData.publicUrl,
+          name: file.name,
+          filename: file.name,
+          type: file.type.startsWith('video') ? 'video' : 'photo',
+          model: mediaModel,
+          category: mediaCategory || 'Autres',
+          album_id: activeAlbum?.id || null,
+          size: file.size,
+          created_at: new Date().toISOString(),
+        });
+        if (dbError) throw dbError;
+        results.success++;
+      } catch (e) {
+        results.errors.push(`${file.name}: ${e.message}`);
+      }
     }
+
+    setUploadProgress(null);
+    setSelectedFiles([]);
+
+    if (results.errors.length > 0) {
+      addToast(`✅ ${results.success} uploadé(s) — ❌ ${results.errors.length} erreur(s)`, 'error');
+    } else {
+      addToast(`✅ ${results.success} média(s) uploadé(s) avec succès !`, 'success');
+    }
+    loadMedia();
   };
 
   const deleteMedia = async (id) => {
@@ -32174,17 +32184,87 @@ const MediaLibraryPage = ({ user }) => {
             <option value="">-- Catégorie --</option>
             {MEDIA_CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
           </select>
-          <input type="file" accept="image/*,video/*,audio/*" onChange={handleUpload} style={{ display: 'none' }} id="media-upload-input" disabled={isUploading} />
-          <label htmlFor="media-upload-input" style={{
-            padding: '12px 22px', background: isUploading ? '#6b7280' : 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
-            border: 'none', borderRadius: '10px', color: 'white', fontWeight: '700', cursor: isUploading ? 'not-allowed' : 'pointer',
-            fontSize: '14px', display: 'inline-block', opacity: isUploading ? 0.6 : 1,
-            boxShadow: isUploading ? 'none' : '0 4px 16px rgba(99,102,241,0.3)', transition: 'all 0.2s'
+          <input
+            type="file"
+            accept="image/*,video/*"
+            multiple
+            onChange={e => setSelectedFiles(Array.from(e.target.files))}
+            style={{ display: 'none' }}
+            id="mediaFileInput"
+          />
+          <label htmlFor="mediaFileInput" style={{
+            padding: '12px 22px', background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
+            border: 'none', borderRadius: '10px', color: 'white', fontWeight: '700', cursor: 'pointer',
+            fontSize: '14px', display: 'inline-block',
+            boxShadow: '0 4px 16px rgba(99,102,241,0.3)', transition: 'all 0.2s'
           }}>
-            {isUploading ? '⏳ Upload...' : '📤 Upload média'}
+            📂 Sélectionner fichiers
           </label>
         </div>
       </div>
+
+      {/* Aperçu fichiers sélectionnés + progression + bouton upload */}
+      {(selectedFiles.length > 0 || uploadProgress) && (
+        <div style={{ background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.15)', borderRadius: 10, padding: '12px 14px', marginBottom: 16 }}>
+          {selectedFiles.length > 0 && !uploadProgress && (
+            <>
+              <div style={{ fontSize: 11, color: '#4a5568', marginBottom: 6, fontWeight: 700 }}>
+                {selectedFiles.length} fichier(s) sélectionné(s)
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto', marginBottom: 10 }}>
+                {selectedFiles.map((file, idx) => (
+                  <div key={idx} style={{
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid rgba(255,255,255,0.06)',
+                    borderRadius: 6, padding: '4px 8px'
+                  }}>
+                    <span style={{ fontSize: 12 }}>{file.type.startsWith('video') ? '🎥' : '📸'}</span>
+                    <span style={{ fontSize: 10, color: '#e2e8f0', maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</span>
+                    <span style={{ fontSize: 9, color: '#4a5568' }}>{(file.size / 1024 / 1024).toFixed(1)}MB</span>
+                    <span
+                      onClick={() => setSelectedFiles(prev => prev.filter((_, i) => i !== idx))}
+                      style={{ fontSize: 10, color: '#4a5568', cursor: 'pointer', marginLeft: 2 }}
+                    >✕</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {uploadProgress && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 5 }}>
+                <span style={{ color: '#e2e8f0' }}>Upload en cours... {uploadProgress.current}</span>
+                <span style={{ color: '#818cf8', fontWeight: 700 }}>{uploadProgress.done}/{uploadProgress.total}</span>
+              </div>
+              <div style={{ height: 4, background: 'rgba(255,255,255,0.06)', borderRadius: 2, overflow: 'hidden' }}>
+                <div style={{
+                  height: '100%', borderRadius: 2,
+                  background: 'linear-gradient(90deg, #6366f1, #818cf8)',
+                  width: `${(uploadProgress.done / uploadProgress.total) * 100}%`,
+                  transition: 'width 0.3s ease'
+                }} />
+              </div>
+            </div>
+          )}
+          <button
+            onClick={uploadMultiple}
+            disabled={selectedFiles.length === 0 || !!uploadProgress}
+            style={{
+              background: selectedFiles.length === 0 ? 'rgba(99,102,241,0.3)' : '#6366f1',
+              border: 'none', borderRadius: 8,
+              color: '#fff', fontSize: 12, fontWeight: 700,
+              padding: '9px 20px', cursor: selectedFiles.length === 0 ? 'not-allowed' : 'pointer',
+              fontFamily: 'inherit', width: '100%', marginTop: 2
+            }}
+          >
+            {uploadProgress
+              ? `Upload ${uploadProgress.done}/${uploadProgress.total}...`
+              : `⬆️ Uploader ${selectedFiles.length > 1 ? `${selectedFiles.length} fichiers` : 'le fichier'}`
+            }
+          </button>
+        </div>
+      )}
 
       {/* Filtres modèles */}
       <div style={{ display: 'flex', gap: '8px', marginBottom: '12px', flexWrap: 'wrap' }}>
@@ -32379,8 +32459,8 @@ const MediaLibraryPage = ({ user }) => {
           <h3 style={{ margin: '0 0 8px', fontSize: '18px', fontWeight: '700' }}>{searchQuery ? 'Aucun résultat' : 'Aucun média'}</h3>
           <p style={{ margin: '0 0 20px', color: '#4b5563', fontSize: '14px' }}>{searchQuery ? 'Essaie une autre recherche' : 'Upload ton premier média pour commencer'}</p>
           {!searchQuery && (
-            <label htmlFor="media-upload-input" style={{ padding: '11px 22px', background: '#6366f1', border: 'none', borderRadius: '9px', color: 'white', fontWeight: '600', cursor: 'pointer', fontSize: '14px', display: 'inline-block' }}>
-              📤 Upload un média
+            <label htmlFor="mediaFileInput" style={{ padding: '11px 22px', background: '#6366f1', border: 'none', borderRadius: '9px', color: 'white', fontWeight: '600', cursor: 'pointer', fontSize: '14px', display: 'inline-block' }}>
+              📂 Sélectionner des médias
             </label>
           )}
         </div>
