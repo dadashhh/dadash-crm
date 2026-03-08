@@ -26109,7 +26109,7 @@ const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = "679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
-const _DMSG_MSG_CACHE  = {}; // { chatId: messages[] }
+const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s
 
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
@@ -27713,7 +27713,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       convLoadedRef.current = true;
       return;
     }
-    if (_DMSG_CONV_CACHE.list.length > 0) {
+    if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < CACHE_TTL) {
       setConversations(_DMSG_CONV_CACHE.list);
       setConvLoading(false);
       convLoadedRef.current = true;
@@ -27766,9 +27766,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
     const cid = String(chatId);
-    // Afficher cache immédiatement si dispo
-    if (isInitial && _DMSG_MSG_CACHE[cid]?.length > 0) {
-      setMessages(_DMSG_MSG_CACHE[cid]);
+    // Afficher cache immédiatement si dispo et dans le TTL (60s)
+    const _cachedMsgs = _DMSG_MSG_CACHE[cid];
+    const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
+    if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
+      setMessages(_cachedMsgs.data);
       setMsgLoading(false);
       setTimeout(() => scrollToBottom('instant'), 50);
       // Continuer pour refresh silencieux
@@ -27783,7 +27785,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
-      if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+      if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
       if (isInitial) {
         setMessages(list);
         setTimeout(() => scrollToBottom('instant'), 100);
@@ -27807,7 +27809,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      if (isInitial && !_DMSG_MSG_CACHE[cid]?.length) {
+      if (isInitial && !_DMSG_MSG_CACHE[cid]?.data?.length) {
         try {
           const { data: convRow } = await sb
             .from("tg_conversations").select("id")
@@ -27817,7 +27819,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: true });
             const list = data || [];
-            if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+            if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
             setMessages(list);
             setTimeout(() => scrollToBottom('instant'), 100);
           }
@@ -27906,8 +27908,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     openTab(conv);
     const cid = String(chatId || "");
     const cached = _DMSG_MSG_CACHE[cid];
-    if (cached?.length > 0) {
-      setMessages(cached);
+    if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
+      setMessages(cached.data);
     } else {
       setMessages([]);
     }
@@ -45244,6 +45246,10 @@ const App = () => {
   const handleLogout = async () => {
     closeDrill();
     await sb.auth.signOut();
+    // Purger les caches globaux messagerie pour éviter toute fuite entre sessions
+    Object.keys(_DMSG_MSG_CACHE).forEach(k => delete _DMSG_MSG_CACHE[k]);
+    _DMSG_CONV_CACHE.list = [];
+    _DMSG_CONV_CACHE.ts = 0;
     setUser(null);
     setTab("dashboard");
     setTxs([]);
