@@ -25901,7 +25901,7 @@ const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSp
     if (!sp?.id || enriching) return;
     setEnriching(true);
     try {
-      await _dmsgFetch("/enrich/" + sp.id, { method: "POST" });
+      await _dmsgFetch("/enrich/" + sp.id, { method: "POST", timeout: 15000 });
       const { data } = await sb.from("spenders").select("*").eq("id", sp.id).maybeSingle();
       console.log("[SPENDER_FETCH] id:", sp.id, "colonnes chargées :", data ? Object.keys(data).join(", ") : "(aucune donnée)");
       if (data) setFreshSp(data);
@@ -26109,30 +26109,47 @@ const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = "679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
-const _DMSG_MSG_CACHE  = {}; // { chatId: messages[] }
+const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s
 
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
   const url = _DMSG_API + path;
-  const { headers: extraHeaders, ...restOpts } = opts;
+  const { headers: extraHeaders, timeout: timeoutMs = 10000, signal: callerSignal, ...restOpts } = opts;
   const reqHeaders = { "Content-Type": "application/json", "X-API-Key": key, ...(extraHeaders || {}) };
 
-  console.log("[DMSG] ▶ fetch", opts.method || "GET", url);
+  console.log("[DMSG] ▶ fetch", opts.method || "GET", url, `(timeout: ${timeoutMs}ms)`);
   console.log("[DMSG]   API:", _DMSG_API);
   console.log("[DMSG]   Key:", key.slice(0, 8) + "…" + key.slice(-4) + " (" + key.length + " chars)");
   if (opts.body) console.log("[DMSG]   Body:", opts.body);
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Propagate external abort (e.g. conv switch) alongside timeout abort
+  let callerAbortHandler;
+  if (callerSignal) {
+    if (callerSignal.aborted) { clearTimeout(timer); throw new DOMException("Aborted", "AbortError"); }
+    callerAbortHandler = () => controller.abort();
+    callerSignal.addEventListener("abort", callerAbortHandler);
+  }
+
   let res;
   try {
-    res = await fetch(url, { headers: reqHeaders, ...restOpts });
+    res = await fetch(url, { headers: reqHeaders, signal: controller.signal, ...restOpts });
   } catch (networkErr) {
-    // Abort is intentional — propagate as-is so callers can detect it
-    if (networkErr.name === "AbortError") throw networkErr;
+    if (networkErr.name === "AbortError") {
+      // Distinguish caller-initiated abort from timeout
+      if (callerSignal?.aborted) throw networkErr;
+      throw new Error("Carlos timeout après " + timeoutMs + "ms (" + (opts.method || "GET") + " " + path + ")");
+    }
     // Network-level failure (CORS blocked, DNS, offline…)
     const isCors = networkErr.message && (networkErr.message.toLowerCase().includes("cors") || networkErr.message.toLowerCase().includes("blocked") || networkErr.message.toLowerCase().includes("failed to fetch"));
     const detail = isCors ? "Erreur CORS ou réseau — vérifier les origines autorisées côté serveur." : networkErr.message;
     console.error("[DMSG] ✖ network error:", networkErr.message, "\n       URL:", url);
     throw new Error("NETWORK:" + detail);
+  } finally {
+    clearTimeout(timer);
+    if (callerSignal && callerAbortHandler) callerSignal.removeEventListener("abort", callerAbortHandler);
   }
 
   const text = await res.text().catch(() => "");
@@ -26486,9 +26503,9 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
         try {
           if (broadcastMedia) {
             const ep = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
-            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }) });
+            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }), timeout: 30000 });
           } else {
-            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }) });
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }), timeout: 8000 });
           }
           ok++;
         } catch (_) { fail++; }
@@ -27520,6 +27537,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [messages, setMessages]           = useState([]);
   const [msgLoading, setMsgLoading]       = useState(false);
   const [msgInput, setMsgInput]           = useState("");
+  const msgInputRef                        = React.useRef("");
   const [mobilePane, setMobilePane]       = useState("list");
   const [showScripts, setShowScripts]     = useState(false);
   const [scriptPanelTab, setScriptPanelTab] = useState("scripts");
@@ -27579,6 +27597,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   }, [filterModel, models]);
   const [broadcastMedia, setBroadcastMedia]       = useState(null);
   const [isUploadingMedia, setIsUploadingMedia]   = useState(false);
+  const [uploadStatus, setUploadStatus]           = useState(null); // null | string — progression upload Storage
   const [selectedAudience, setSelectedAudience]   = useState("manual");
   // Scheduling
   const [isScheduled, setIsScheduled]             = useState(false);
@@ -27660,6 +27679,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   const pollRef        = React.useRef(null);
   const convPollRef    = React.useRef(null);
+  const lastActivityRef = React.useRef(Date.now());
   const msgEndRef      = React.useRef(null);
   const msgCacheRef    = React.useRef({});  // cache { chatId: messages[] }
   const msgLastTsRef   = React.useRef({});  // cache { chatId: lastTimestamp }
@@ -27685,6 +27705,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // Ref for messages scroll container
   const msgContainerRef = React.useRef(null);
 
+  // ── Tracker activité utilisateur (pour polling adaptatif) ──────────────────
+  React.useEffect(() => {
+    const resetActivity = () => { lastActivityRef.current = Date.now(); };
+    window.addEventListener('mousemove', resetActivity, { passive: true });
+    window.addEventListener('keydown', resetActivity, { passive: true });
+    window.addEventListener('click', resetActivity, { passive: true });
+    return () => {
+      window.removeEventListener('mousemove', resetActivity);
+      window.removeEventListener('keydown', resetActivity);
+      window.removeEventListener('click', resetActivity);
+    };
+  }, []);
+
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
@@ -27696,13 +27729,23 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     const now = Date.now();
     if (!force && convsCache.current.data.length > 0
         && (now - convsCache.current.lastFetch) < CACHE_TTL) {
-      setConversations(convsCache.current.data);
+      setConversations(prev => {
+        const cached = convsCache.current.data;
+        const isSame = prev.length === cached.length &&
+          prev.every((c, i) => c.id === cached[i]?.id && c.last_message_at === cached[i]?.last_message_at && c.unread_count === cached[i]?.unread_count);
+        return isSame ? prev : cached;
+      });
       setConvLoading(false);
       convLoadedRef.current = true;
       return;
     }
-    if (_DMSG_CONV_CACHE.list.length > 0) {
-      setConversations(_DMSG_CONV_CACHE.list);
+    if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < CACHE_TTL) {
+      setConversations(prev => {
+        const cached = _DMSG_CONV_CACHE.list;
+        const isSame = prev.length === cached.length &&
+          prev.every((c, i) => c.id === cached[i]?.id && c.last_message_at === cached[i]?.last_message_at && c.unread_count === cached[i]?.unread_count);
+        return isSame ? prev : cached;
+      });
       setConvLoading(false);
       convLoadedRef.current = true;
     } else {
@@ -27714,7 +27757,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       convsCache.current = { data: list, lastFetch: now };
       _DMSG_CONV_CACHE.list = list;
       _DMSG_CONV_CACHE.ts = now;
-      setConversations(list);
+      setConversations(prev => {
+        const isSame = prev.length === list.length &&
+          prev.every((c, i) => c.id === list[i]?.id && c.last_message_at === list[i]?.last_message_at && c.unread_count === list[i]?.unread_count);
+        return isSame ? prev : list;
+      });
       setApiOk(true);
     } catch (e) {
       console.error("loadConversations error:", e);
@@ -27730,7 +27777,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           const fallback = sbData || [];
           convsCache.current = { data: fallback, lastFetch: now };
           _DMSG_CONV_CACHE.list = fallback;
-          setConversations(fallback);
+          setConversations(prev => {
+            const isSame = prev.length === fallback.length &&
+              prev.every((c, i) => c.id === fallback[i]?.id && c.last_message_at === fallback[i]?.last_message_at && c.unread_count === fallback[i]?.unread_count);
+            return isSame ? prev : fallback;
+          });
           setApiOk(true);
         } catch (e2) {
           setApiOk(false);
@@ -27754,9 +27805,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
     const cid = String(chatId);
-    // Afficher cache immédiatement si dispo
-    if (isInitial && _DMSG_MSG_CACHE[cid]?.length > 0) {
-      setMessages(_DMSG_MSG_CACHE[cid]);
+    // Afficher cache immédiatement si dispo et dans le TTL (60s)
+    const _cachedMsgs = _DMSG_MSG_CACHE[cid];
+    const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
+    if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
+      setMessages(_cachedMsgs.data);
       setMsgLoading(false);
       setTimeout(() => scrollToBottom('instant'), 50);
       // Continuer pour refresh silencieux
@@ -27771,7 +27824,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
-      if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+      if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
       if (isInitial) {
         setMessages(list);
         setMsgOffset(0);
@@ -27797,7 +27850,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      if (isInitial && !_DMSG_MSG_CACHE[cid]?.length) {
+      if (isInitial && !_DMSG_MSG_CACHE[cid]?.data?.length) {
         try {
           const { data: convRow } = await sb
             .from("tg_conversations").select("id")
@@ -27807,7 +27860,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: true });
             const list = data || [];
-            if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+            if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
             setMessages(list);
             setMsgOffset(0);
             setHasMoreMsgs(false);
@@ -27925,11 +27978,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     openTab(conv);
     const cid = String(chatId || "");
     const cached = _DMSG_MSG_CACHE[cid];
-    if (cached?.length > 0) {
-      setMessages(cached);
+    if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
+      setMessages(cached.data);
     } else {
       setMessages([]);
     }
+    msgInputRef.current = "";
     setMsgInput("");
     setShowScripts(false);
     setPendingMedia(null);
@@ -27951,7 +28005,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   }, [selectedConv]);
 
   // ── Gestion onglets multiples ─────────────────────────────────────────────
-  const openTab = (conv) => {
+  const openTab = useCallback((conv) => {
     const cid = _dmsgChatId(conv);
     const all = spenders || [];
     const tidStr = String(cid || "");
@@ -27976,9 +28030,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       setActiveTabId(cid);
       return [...prev, enriched];
     });
-  };
+  }, [spenders, activeTabId]);
 
-  const closeTab = (e, cid) => {
+  const closeTab = useCallback((e, cid) => {
     e.stopPropagation();
     setOpenTabs(prev => {
       const next = prev.filter(t => _dmsgChatId(t) !== cid);
@@ -27988,7 +28042,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       }
       return next;
     });
-  };
+  }, [activeTabId]);
 
   useEffect(() => {
     if (activeTabId && activeTabId !== String(_dmsgChatId(selectedConv) || "")) {
@@ -28057,20 +28111,22 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     const chatId = selectedConv ? String(_dmsgChatId(selectedConv) || "") : "";
     if (chatId) {
       sb.from("media_sends").select("media_id").eq("chat_id", chatId)
-        .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)));
+        .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)))
+        .catch(err => console.warn('[MEDIA] media_sends fetch error:', err));
       const spId = selectedConv?.spender_id || activeSpender?.id;
       if (spId) {
         sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
-          .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)));
+          .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)))
+          .catch(err => console.warn('[MEDIA] transactions fetch error:', err));
       }
     } else {
       setSentMediaIds([]);
       setSoldMediaIds([]);
     }
-  }, [selectedChatId]);
+  }, [selectedChatId, activeSpender?.id]);
 
   // ── Scroll to bottom helper ──────────────────────────────────────────
-  const scrollToBottom = (behavior = 'smooth') => {
+  const scrollToBottom = useCallback((behavior = 'smooth') => {
     const container = msgContainerRef.current || document.getElementById('messages-container');
     if (container) {
       container.scrollTo({ top: container.scrollHeight, behavior });
@@ -28078,10 +28134,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     } else if (msgEndRef.current) {
       msgEndRef.current.scrollIntoView({ behavior });
     }
-  };
+  }, []);
 
   // ── Scroll handler (attached via onScroll prop, not DOM listener) ──────
-  const handleMsgScroll = (e) => {
+  const handleMsgScroll = useCallback((e) => {
     const el = e.currentTarget;
     const { scrollTop, scrollHeight, clientHeight } = el;
     const isAtBottom = scrollHeight - scrollTop - clientHeight < 80;
@@ -28099,7 +28155,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         });
       });
     }
-  };
+  }, [hasMoreMsgs, loadingMore, loadMoreMessages]);
 
   // ── Auto-scroll : nouveaux messages arrivés ──────────────────────────
   useEffect(() => {
@@ -28129,20 +28185,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId]);
 
-  // ── Polling messages toutes les 2s (guard contre les appels parallèles) ──
+  // ── Polling messages adaptatif : 2s si actif, 10s si inactif >1min ──────────
   useEffect(() => {
-    clearInterval(pollRef.current);
+    clearTimeout(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
-    pollRef.current = setInterval(async () => {
-      if (isMsgPollingRef.current || !chatIdRef.current) return;
-      isMsgPollingRef.current = true;
-      try {
-        await loadMessagesById(chatIdRef.current, false);
-      } finally {
-        isMsgPollingRef.current = false;
-      }
-    }, 2000);
-    return () => clearInterval(pollRef.current);
+    const scheduleNextPoll = () => {
+      const inactive = Date.now() - lastActivityRef.current > 60000;
+      const delay = inactive ? 10000 : 2000;
+      pollRef.current = setTimeout(async () => {
+        if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) {
+          scheduleNextPoll();
+          return;
+        }
+        isMsgPollingRef.current = true;
+        try {
+          await loadMessagesById(chatIdRef.current, false);
+        } finally {
+          isMsgPollingRef.current = false;
+          scheduleNextPoll();
+        }
+      }, delay);
+    };
+    scheduleNextPoll();
+    return () => clearTimeout(pollRef.current);
   }, [selectedChatId, loadMessagesById]);
 
   // ── Ref stable vers loadConversations ───────────────────────────────────────
@@ -28156,6 +28221,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Polling conversations toutes les 3s — intervalle STABLE ([] deps) ────────
   useEffect(() => {
     convPollRef.current = setInterval(async () => {
+      if (document.hidden) return;
       if (isConvPollingRef.current) return;
       isConvPollingRef.current = true;
       try {
@@ -28168,7 +28234,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   }, []); // Vide intentionnel — l'interval ne redémarre JAMAIS
 
   // ── Helpers for display ──────────────────────────
-  const getConvName = (conv) => {
+  const getConvName = useCallback((conv) => {
     if (!conv) return "—";
     if (activeSpender && (conv === selectedConv)) return activeSpender.first_name || activeSpender.handle || activeSpender.name || "—";
     const all = spenders || [];
@@ -28182,15 +28248,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     const raw = String(tgId || "");
     if (raw && raw.length > 6) return "TG·" + raw.slice(-4);
     return raw || "—";
-  };
+  }, [activeSpender, selectedConv, spenders]);
 
-  const getConvHandle = (conv) => {
+  const getConvHandle = useCallback((conv) => {
     if (!conv) return "";
     const u = activeSpender?.telegram_username || conv.tg_username || "";
     return u ? "@" + String(u).replace(/^@/, "") : "";
-  };
+  }, [activeSpender]);
 
-  const isUnanswered = (conv) => {
+  const isUnanswered = useCallback((conv) => {
     // Le dernier message vient du fan (direction "in") = non-répondu
     const lastDir = conv.last_message_direction || conv.last_direction || null;
     if (lastDir) return lastDir === "in" || lastDir === "incoming" || lastDir === "user";
@@ -28198,9 +28264,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     const lastFrom = conv.last_sender_type || conv.last_from || null;
     if (lastFrom) return lastFrom === "user" || lastFrom === "client" || lastFrom === "fan";
     return false; // incertain = pas de badge
-  };
+  }, []);
 
-  const fmtTime = (ts) => {
+  const fmtTime = useCallback((ts) => {
     if (!ts) return "";
     try {
       const d = new Date(ts);
@@ -28210,7 +28276,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       if (diffDays === 1) return fr ? "Hier" : "Yesterday";
       return d.toLocaleDateString("fr-CH", { day: "2-digit", month: "2-digit" });
     } catch (_) { return ""; }
-  };
+  }, [fr]);
 
   // ── Filtered conversations ───────────────────────
   // ── Calcul total dépensé par spender à partir des txs prop ──────────────────
@@ -28317,12 +28383,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
-    if (!selectedConv || !msgInput.trim()) return;
+    if (!selectedConv || !msgInputRef.current.trim()) return;
     const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
     if (!chatId) { addToast(fr ? "Aucun chat_id" : "Missing chat_id", "error"); return; }
 
-    const text = msgInput.trim();
+    const text = msgInputRef.current.trim();
     // Clear input immediately — snappy UX, don't wait for API
+    msgInputRef.current = "";
     setMsgInput("");
 
     // Optimistic message — visible instantly, pending state
@@ -28356,6 +28423,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       await _dmsgFetch("/send-message", {
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text }),
+        timeout: 8000,
       });
       // Confirm the optimistic message immediately (remove _pending flag)
       setMessages(prev => prev.map(m =>
@@ -28380,26 +28448,31 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       ));
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
     }
-  }, [selectedConv, msgInput, selectedModelId, chatterCtx, fr, addToast]);
+  }, [selectedConv, selectedModelId, chatterCtx, fr, addToast]);
 
   // ── Apply script (quick scripts library) ─────────
-  const applyScript = (script) => {
+  const applyScript = useCallback((script) => {
     const prenom = activeSpender?.first_name || activeSpender?.handle || "bébé";
     const filled = script.text
       .replace(/\{prenom\}/g, prenom)
       .replace(/\[prénom\]/g, prenom);
+    msgInputRef.current = filled;
     setMsgInput(filled);
     setShowScripts(false);
     setTimeout(() => inputRef.current?.focus(), 50);
-  };
+  }, [activeSpender]);
 
   // ── Script assistant ─────────────────────────────
   const loadAvailableScripts = async () => {
-    const { data } = await sb.from('scripts').select('*').eq('is_active', true).order('name');
-    setAvailableScripts(data || []);
+    try {
+      const { data } = await sb.from('scripts').select('*').eq('is_active', true).order('name');
+      setAvailableScripts(data || []);
+    } catch (err) {
+      console.warn('[SCRIPTS] loadAvailableScripts error:', err);
+    }
   };
 
-  const _replaceVars = (text) => {
+  const _replaceVars = useCallback((text) => {
     if (!text) return '';
     const spent = Number(activeSpender?.total_spent || 0);
     const tier = CONV_TIERS.find(t => spent >= t.min && spent < t.max) || CONV_TIERS[6];
@@ -28430,7 +28503,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     let result = text;
     Object.entries(vars).forEach(([k, v]) => { result = result.split(k).join(v); });
     return result;
-  };
+  }, [activeSpender, selectedConv]);
 
   const _loadStepIntoInput = (script, stepIndex) => {
     if (!script || stepIndex >= script.sequence.length) {
@@ -28439,7 +28512,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       return;
     }
     const step = script.sequence[stepIndex];
-    setMsgInput(_replaceVars(step.content) || '');
+    const val = _replaceVars(step.content) || '';
+    msgInputRef.current = val;
+    setMsgInput(val);
     setTimeout(() => inputRef.current?.focus(), 50);
     console.log(`[SCRIPT] Loaded step ${stepIndex + 1}/${script.sequence.length} · type: ${step.type}`);
   };
@@ -28457,6 +28532,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       alert(`✅ Script "${activeScript.name}" terminé !`);
       setActiveScript(null);
       setCurrentStepIndex(0);
+      msgInputRef.current = '';
       setMsgInput('');
     } else {
       setCurrentStepIndex(next);
@@ -28468,6 +28544,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     if (confirm('Arrêter ce script ?')) {
       setActiveScript(null);
       setCurrentStepIndex(0);
+      msgInputRef.current = '';
       setMsgInput('');
     }
   };
@@ -28779,7 +28856,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         .in("status", ["pending", "sending"])
         .order("scheduled_at", { ascending: true });
       setScheduledBroadcasts(data || []);
-    } catch (_) {}
+    } catch (err) { console.warn('[BROADCAST_SCHED] loadScheduledBroadcasts error:', err); }
   };
 
   const cancelScheduledBroadcast = async (id) => {
@@ -28864,6 +28941,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       setBroadcastSending(false);
       return;
     }
+
+    // ── Upload Storage si média présent (une seule fois avant la boucle) ──
+    let resolvedMediaUrl = null;
+    if (broadcastMedia) {
+      try {
+        setUploadStatus(fr ? "Envoi vidéo en cours…" : "Uploading media…");
+        const ext = broadcastMedia.file.name.split(".").pop() || (broadcastMedia.type === "video" ? "mp4" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
+        const path = `broadcasts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const { error: upErr } = await sb.storage
+          .from("media-library")
+          .upload(path, broadcastMedia.file, { upsert: false, contentType: broadcastMedia.file.type });
+        if (upErr) throw new Error((fr ? "Upload échoué : " : "Upload failed: ") + upErr.message);
+        const { data: urlData } = sb.storage.from("media-library").getPublicUrl(path);
+        resolvedMediaUrl = urlData.publicUrl;
+        setUploadStatus(fr ? "Transmission…" : "Sending…");
+      } catch (upEx) {
+        setUploadStatus(null);
+        addToast(upEx.message || (fr ? "Erreur upload" : "Upload error"), "error");
+        setBroadcastSending(false);
+        return;
+      }
+    }
+
     let ok = 0, fail = 0;
     for (let i = 0; i < chatIds.length; i++) {
       try {
@@ -28873,15 +28973,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             method: "POST",
             body: JSON.stringify({
               chat_id:   chatIds[i],
-              [broadcastMedia.type + "_url"]: broadcastMedia.url,
+              [broadcastMedia.type + "_url"]: resolvedMediaUrl,
               caption:   broadcastMessage.trim() || "",
               model_id:  broadcastModel,
             }),
+            timeout: 30000,
           });
         } else {
           await _dmsgFetch("/send-message", {
             method: "POST",
             body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: broadcastModel }),
+            timeout: 8000,
           });
         }
         ok++;
@@ -28894,6 +28996,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
       }
     }
+    setUploadStatus(null);
     console.log(`[BROADCAST] Done: ✅ ${ok} success, ❌ ${fail} errors`);
 
     // ── Save to broadcast_history for analytics ─────────────────
@@ -28951,7 +29054,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       let mediaType = "photo";
       if (file.type.startsWith("video/")) mediaType = "video";
       else if (file.type.startsWith("audio/")) mediaType = "audio";
-      setBroadcastMedia({ type: mediaType, url: URL.createObjectURL(file), file, fileName: file.name });
+      // Stocker le File brut — l'URL publique est générée après upload Storage au moment de l'envoi
+      setBroadcastMedia({ type: mediaType, file, fileName: file.name });
     } catch (_) {
       addToast(fr ? "Erreur chargement média" : "Media load error", "error");
     }
@@ -28962,7 +29066,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Load scheduled broadcasts on mount ───────────────
   useEffect(() => {
     loadScheduledBroadcasts();
-    const t = setInterval(loadScheduledBroadcasts, 30000);
+    const t = setInterval(() => { if (document.hidden) return; loadScheduledBroadcasts(); }, 30000);
     return () => clearInterval(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -29752,7 +29856,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                                     media_url: pendingMedia.url,
                                     caption: "",
                                     model_id: modelName
-                                  })
+                                  }),
+                                  timeout: 30000,
                                 });
                                 if (res?.success) {
                                   setMessages(prev => prev.map(m =>
@@ -29854,7 +29959,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             )}
 
             <div style={{ display: "flex", gap: 8, padding: "8px 14px 12px", alignItems: "flex-end" }}>
-              <textarea ref={inputRef} value={msgInput} onChange={e => setMsgInput(e.target.value)}
+              <textarea ref={inputRef} value={msgInput} onChange={e => { msgInputRef.current = e.target.value; setMsgInput(e.target.value); }}
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
                 placeholder={fr ? "Écrire un message… (Entrée pour envoyer, Shift+Entrée pour saut de ligne)" : "Write a message… (Enter to send, Shift+Enter for newline)"}
                 rows={2}
@@ -29952,7 +30057,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
     try {
       // 1. Déclencher l'enrichissement IA via API Carlos
-      const res = await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST" });
+      const enrichId = activeSpender?.id || chatId;
+      const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST", timeout: 15000 });
       console.log("[SYNC] ✅ Enrichment API called successfully", res);
 
       // 2. Subscribe Realtime sur ce spender — réagit dès que ai_personality est rempli
@@ -30105,7 +30211,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 onClick={async () => {
                   if (!activeSpender?.id) return;
                   try {
-                    await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST" });
+                    await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST", timeout: 15000 });
                     addToast(fr ? "Enrichissement lancé ✓" : "Enrichment started ✓", "success");
                     resolveSpender(selectedConv);
                   } catch(e) { addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"); }
@@ -30496,6 +30602,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           )}
         </div>
 
+        {/* Upload / transmission status */}
+        {uploadStatus && (
+          <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.3)", fontSize: 12, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ display: "inline-block", width: 12, height: 12, border: "2px solid rgba(99,102,241,0.4)", borderTopColor: "#6366f1", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+            {uploadStatus}
+          </div>
+        )}
+
         {/* Result banner */}
         {broadcastResult && (
           <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: broadcastResult.fail === 0 ? "rgba(16,185,129,0.12)" : "rgba(245,158,11,0.12)", border: "1px solid " + (broadcastResult.fail === 0 ? "rgba(16,185,129,0.3)" : "rgba(245,158,11,0.3)"), fontSize: 12, color: "var(--text-primary)" }}>
@@ -30687,6 +30801,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
     clearInterval(refreshTimerRef.current);
     if (!selectedConv || !chatIdRef.current) return;
     refreshTimerRef.current = setInterval(() => {
+      if (document.hidden) return;
       if (chatIdRef.current) loadMessages(chatIdRef.current, false);
       loadConversations(false);
     }, 10000);
@@ -44508,7 +44623,7 @@ const App = () => {
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifs, setShowNotifs] = useState(false);
-  const [lastScrollY, setLastScrollY] = React.useState(0);
+  const lastScrollYRef = React.useRef(0);
   const [topbarVisible, setTopbarVisible] = React.useState(true);
 
   React.useEffect(() => {
@@ -44516,16 +44631,16 @@ const App = () => {
       const currentY = window.scrollY;
       if (currentY < 10) {
         setTopbarVisible(true);
-      } else if (currentY < lastScrollY) {
+      } else if (currentY < lastScrollYRef.current) {
         setTopbarVisible(true);
-      } else if (currentY > lastScrollY + 5) {
+      } else if (currentY > lastScrollYRef.current + 5) {
         setTopbarVisible(false);
       }
-      setLastScrollY(currentY);
+      lastScrollYRef.current = currentY;
     };
     window.addEventListener('scroll', handleScroll, { passive: true });
     return () => window.removeEventListener('scroll', handleScroll);
-  }, [lastScrollY]);
+  }, []);
   // ── TIMEZONE & CURRENCY STATE ──
   const [timezone, setTimezone] = useState("Europe/Paris");
   const [displayCurrency, setDisplayCurrency] = useState(() => { try { return localStorage.getItem("dadash-currency") || "EUR"; } catch { return "EUR"; } });
@@ -45275,6 +45390,10 @@ const App = () => {
   const handleLogout = async () => {
     closeDrill();
     await sb.auth.signOut();
+    // Purger les caches globaux messagerie pour éviter toute fuite entre sessions
+    Object.keys(_DMSG_MSG_CACHE).forEach(k => delete _DMSG_MSG_CACHE[k]);
+    _DMSG_CONV_CACHE.list = [];
+    _DMSG_CONV_CACHE.ts = 0;
     setUser(null);
     setTab("dashboard");
     setTxs([]);
@@ -45492,7 +45611,7 @@ const App = () => {
   const isGerant = user.role === "gerant";
 
   // ── Non-gérant tabs (modele/chatter/provider) — UNCHANGED ──
-  const otherTabs = [
+  const otherTabs = React.useMemo(() => [
     {id:"model_checklist",icon:"✅",label:t(lang,"my_checklist"),show:isModele},
     {id:"model_content",icon:"\u{1F4DD}",label:t(lang,"my_content"),show:isModele},
     {id:"model_tasks",icon:"\u{1F4CB}",label:t(lang,"my_tasks"),show:isModele},
@@ -45512,7 +45631,7 @@ const App = () => {
     {id:"provider_notif",icon:"\u{1F514}",label:lang==="fr"?"Notifications":"Notifications",show:user.role==="provider"},
     {id:"model_notif",icon:"\u{1F514}",label:lang==="fr"?"Notifications":"Notifications",show:user.role==="modele"},
     {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:user.role==="chatter"},
-  ];
+  ], [lang, isModele, user.role]);
 
   // Gérant page title helper
   const gerantPageInfo = isGerant ? GERANT_NAV.find(n=>n.id===tab) : null;
