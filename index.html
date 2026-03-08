@@ -27654,6 +27654,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   const pollRef        = React.useRef(null);
   const convPollRef    = React.useRef(null);
+  const lastActivityRef = React.useRef(Date.now());
   const msgEndRef      = React.useRef(null);
   const msgCacheRef    = React.useRef({});  // cache { chatId: messages[] }
   const msgLastTsRef   = React.useRef({});  // cache { chatId: lastTimestamp }
@@ -27678,6 +27679,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const scriptsRef = React.useRef(null);
   // Ref for messages scroll container
   const msgContainerRef = React.useRef(null);
+
+  // ── Tracker activité utilisateur (pour polling adaptatif) ──────────────────
+  React.useEffect(() => {
+    const resetActivity = () => { lastActivityRef.current = Date.now(); };
+    window.addEventListener('mousemove', resetActivity, { passive: true });
+    window.addEventListener('keydown', resetActivity, { passive: true });
+    window.addEventListener('click', resetActivity, { passive: true });
+    return () => {
+      window.removeEventListener('mousemove', resetActivity);
+      window.removeEventListener('keydown', resetActivity);
+      window.removeEventListener('click', resetActivity);
+    };
+  }, []);
 
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
@@ -28077,20 +28091,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId]);
 
-  // ── Polling messages toutes les 2s (guard contre les appels parallèles) ──
+  // ── Polling messages adaptatif : 2s si actif, 10s si inactif >1min ──────────
   useEffect(() => {
-    clearInterval(pollRef.current);
+    clearTimeout(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
-    pollRef.current = setInterval(async () => {
-      if (isMsgPollingRef.current || !chatIdRef.current) return;
-      isMsgPollingRef.current = true;
-      try {
-        await loadMessagesById(chatIdRef.current, false);
-      } finally {
-        isMsgPollingRef.current = false;
-      }
-    }, 2000);
-    return () => clearInterval(pollRef.current);
+    const scheduleNextPoll = () => {
+      const inactive = Date.now() - lastActivityRef.current > 60000;
+      const delay = inactive ? 10000 : 2000;
+      pollRef.current = setTimeout(async () => {
+        if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) {
+          scheduleNextPoll();
+          return;
+        }
+        isMsgPollingRef.current = true;
+        try {
+          await loadMessagesById(chatIdRef.current, false);
+        } finally {
+          isMsgPollingRef.current = false;
+          scheduleNextPoll();
+        }
+      }, delay);
+    };
+    scheduleNextPoll();
+    return () => clearTimeout(pollRef.current);
   }, [selectedChatId, loadMessagesById]);
 
   // ── Ref stable vers loadConversations ───────────────────────────────────────
@@ -28104,6 +28127,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Polling conversations toutes les 3s — intervalle STABLE ([] deps) ────────
   useEffect(() => {
     convPollRef.current = setInterval(async () => {
+      if (document.hidden) return;
       if (isConvPollingRef.current) return;
       isConvPollingRef.current = true;
       try {
@@ -28910,7 +28934,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Load scheduled broadcasts on mount ───────────────
   useEffect(() => {
     loadScheduledBroadcasts();
-    const t = setInterval(loadScheduledBroadcasts, 30000);
+    const t = setInterval(() => { if (document.hidden) return; loadScheduledBroadcasts(); }, 30000);
     return () => clearInterval(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -30601,6 +30625,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
     clearInterval(refreshTimerRef.current);
     if (!selectedConv || !chatIdRef.current) return;
     refreshTimerRef.current = setInterval(() => {
+      if (document.hidden) return;
       if (chatIdRef.current) loadMessages(chatIdRef.current, false);
       loadConversations(false);
     }, 10000);
