@@ -25901,7 +25901,7 @@ const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSp
     if (!sp?.id || enriching) return;
     setEnriching(true);
     try {
-      await _dmsgFetch("/enrich/" + sp.id, { method: "POST" });
+      await _dmsgFetch("/enrich/" + sp.id, { method: "POST", timeout: 15000 });
       const { data } = await sb.from("spenders").select("*").eq("id", sp.id).maybeSingle();
       console.log("[SPENDER_FETCH] id:", sp.id, "colonnes chargées :", data ? Object.keys(data).join(", ") : "(aucune donnée)");
       if (data) setFreshSp(data);
@@ -26114,25 +26114,42 @@ const _DMSG_MSG_CACHE  = {}; // { chatId: messages[] }
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
   const url = _DMSG_API + path;
-  const { headers: extraHeaders, ...restOpts } = opts;
+  const { headers: extraHeaders, timeout: timeoutMs = 10000, signal: callerSignal, ...restOpts } = opts;
   const reqHeaders = { "Content-Type": "application/json", "X-API-Key": key, ...(extraHeaders || {}) };
 
-  console.log("[DMSG] ▶ fetch", opts.method || "GET", url);
+  console.log("[DMSG] ▶ fetch", opts.method || "GET", url, `(timeout: ${timeoutMs}ms)`);
   console.log("[DMSG]   API:", _DMSG_API);
   console.log("[DMSG]   Key:", key.slice(0, 8) + "…" + key.slice(-4) + " (" + key.length + " chars)");
   if (opts.body) console.log("[DMSG]   Body:", opts.body);
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Propagate external abort (e.g. conv switch) alongside timeout abort
+  let callerAbortHandler;
+  if (callerSignal) {
+    if (callerSignal.aborted) { clearTimeout(timer); throw new DOMException("Aborted", "AbortError"); }
+    callerAbortHandler = () => controller.abort();
+    callerSignal.addEventListener("abort", callerAbortHandler);
+  }
+
   let res;
   try {
-    res = await fetch(url, { headers: reqHeaders, ...restOpts });
+    res = await fetch(url, { headers: reqHeaders, signal: controller.signal, ...restOpts });
   } catch (networkErr) {
-    // Abort is intentional — propagate as-is so callers can detect it
-    if (networkErr.name === "AbortError") throw networkErr;
+    if (networkErr.name === "AbortError") {
+      // Distinguish caller-initiated abort from timeout
+      if (callerSignal?.aborted) throw networkErr;
+      throw new Error("Carlos timeout après " + timeoutMs + "ms (" + (opts.method || "GET") + " " + path + ")");
+    }
     // Network-level failure (CORS blocked, DNS, offline…)
     const isCors = networkErr.message && (networkErr.message.toLowerCase().includes("cors") || networkErr.message.toLowerCase().includes("blocked") || networkErr.message.toLowerCase().includes("failed to fetch"));
     const detail = isCors ? "Erreur CORS ou réseau — vérifier les origines autorisées côté serveur." : networkErr.message;
     console.error("[DMSG] ✖ network error:", networkErr.message, "\n       URL:", url);
     throw new Error("NETWORK:" + detail);
+  } finally {
+    clearTimeout(timer);
+    if (callerSignal && callerAbortHandler) callerSignal.removeEventListener("abort", callerAbortHandler);
   }
 
   const text = await res.text().catch(() => "");
@@ -26486,9 +26503,9 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
         try {
           if (broadcastMedia) {
             const ep = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
-            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }) });
+            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }), timeout: 30000 });
           } else {
-            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }) });
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }), timeout: 8000 });
           }
           ok++;
         } catch (_) { fail++; }
@@ -28304,6 +28321,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       await _dmsgFetch("/send-message", {
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text }),
+        timeout: 8000,
       });
       // Confirm the optimistic message immediately (remove _pending flag)
       setMessages(prev => prev.map(m =>
@@ -28825,11 +28843,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               caption:   broadcastMessage.trim() || "",
               model_id:  broadcastModel,
             }),
+            timeout: 30000,
           });
         } else {
           await _dmsgFetch("/send-message", {
             method: "POST",
             body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: broadcastModel }),
+            timeout: 8000,
           });
         }
         ok++;
@@ -29670,7 +29690,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                                     media_url: pendingMedia.url,
                                     caption: "",
                                     model_id: modelName
-                                  })
+                                  }),
+                                  timeout: 30000,
                                 });
                                 if (res?.success) {
                                   await sb.from("media_sends").insert({
@@ -29854,7 +29875,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     try {
       // 1. Déclencher l'enrichissement IA via API Carlos
       const enrichId = activeSpender?.id || chatId;
-      const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST" });
+      const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST", timeout: 15000 });
       console.log("[SYNC] ✅ Enrichment API called successfully", res);
 
       // 2. Polling : vérifier toutes les 1 s si ai_personality est rempli (max 15 s)
@@ -30019,7 +30040,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 onClick={async () => {
                   if (!activeSpender?.id) return;
                   try {
-                    await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST" });
+                    await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST", timeout: 15000 });
                     addToast(fr ? "Enrichissement lancé ✓" : "Enrichment started ✓", "success");
                     resolveSpender(selectedConv);
                   } catch(e) { addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"); }
