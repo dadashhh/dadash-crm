@@ -27577,6 +27577,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // "Nouveaux messages" indicator when user scrolled up
   const [hasNewMessages, setHasNewMessages] = useState(false);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
+  // Pagination messages
+  const [msgOffset, setMsgOffset] = React.useState(0);
+  const [hasMoreMsgs, setHasMoreMsgs] = React.useState(false);
+  const [loadingMore, setLoadingMore] = React.useState(false);
   // Broadcast (envoi multiple)
   const [selectionMode, setSelectionMode]         = useState(false);
   const [selectedConvIds, setSelectedConvIds]     = useState(new Set());
@@ -27813,7 +27817,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       setMsgLoading(true);
     }
     try {
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=100");
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=0");
       if (signal?.aborted) return;
       const raw  = Array.isArray(data) ? data : (data.messages || data.data || []);
       const list = [...raw].sort((a, b) =>
@@ -27823,6 +27827,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
       if (isInitial) {
         setMessages(list);
+        setMsgOffset(0);
+        setHasMoreMsgs(raw.length >= 50);
         setTimeout(() => scrollToBottom('instant'), 100);
       } else {
         if (list.length === 0) return; // Ne pas vider les messages si le serveur renvoie vide
@@ -27856,6 +27862,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             const list = data || [];
             if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
             setMessages(list);
+            setMsgOffset(0);
+            setHasMoreMsgs(false);
             setTimeout(() => scrollToBottom('instant'), 100);
           }
         } catch (_) { setMessages([]); }
@@ -27864,6 +27872,33 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       if (isInitial) setMsgLoading(false);
     }
   }, []);
+
+  // ── Charger les messages précédents (pagination) ──────────────────────────
+  const loadMoreMessages = useCallback(async () => {
+    const chatId = chatIdRef.current;
+    if (!chatId) return;
+    const cid = String(chatId);
+    const nextOffset = msgOffset + 50;
+    try {
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=" + nextOffset);
+      const raw = Array.isArray(data) ? data : (data.messages || data.data || []);
+      const older = [...raw].sort((a, b) =>
+        new Date(a.created_at || a.timestamp || 0).getTime() -
+        new Date(b.created_at || b.timestamp || 0).getTime()
+      );
+      if (older.length > 0) {
+        setMessages(prev => {
+          const prevKeys = new Set(prev.map(m => _msgKey(m)));
+          const newOlder = older.filter(m => !prevKeys.has(_msgKey(m)));
+          return [...newOlder, ...prev];
+        });
+        setMsgOffset(nextOffset);
+      }
+      setHasMoreMsgs(raw.length >= 50);
+    } catch (_) {
+      setHasMoreMsgs(false);
+    }
+  }, [msgOffset]);
 
   // ── Resolve spender: quick match from props + always hydrate from Supabase ──
   const resolveSpender = useCallback(async (conv) => {
@@ -28103,12 +28138,24 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Scroll handler (attached via onScroll prop, not DOM listener) ──────
   const handleMsgScroll = useCallback((e) => {
-    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+    const el = e.currentTarget;
+    const { scrollTop, scrollHeight, clientHeight } = el;
     const isAtBottom = scrollHeight - scrollTop - clientHeight < 80;
     isUserScrollRef.current = !isAtBottom;
     setShowScrollBtn(!isAtBottom);
     if (isAtBottom) setHasNewMessages(false);
-  }, []);
+    // Charger les messages précédents si on scroll vers le haut
+    if (scrollTop < 50 && hasMoreMsgs && !loadingMore) {
+      setLoadingMore(true);
+      const prevHeight = el.scrollHeight;
+      loadMoreMessages().then(() => {
+        requestAnimationFrame(() => {
+          el.scrollTop = el.scrollHeight - prevHeight;
+          setLoadingMore(false);
+        });
+      });
+    }
+  }, [hasMoreMsgs, loadingMore, loadMoreMessages]);
 
   // ── Auto-scroll : nouveaux messages arrivés ──────────────────────────
   useEffect(() => {
@@ -28129,6 +28176,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     isUserScrollRef.current = false;
     prevMsgCountRef.current = 0;
     setShowScrollBtn(false);
+    setMsgOffset(0);
+    setHasMoreMsgs(false);
+    setLoadingMore(false);
     // Scroll after a short tick so the container has rendered
     const t = setTimeout(() => { scrollToBottom('instant'); }, 300);
     return () => clearTimeout(t);
@@ -29534,6 +29584,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               style={{ position: "absolute", bottom: 12, right: 16, zIndex: 10, width: 36, height: 36, borderRadius: "50%", background: "#4f46e5", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 2px 12px rgba(79,70,229,0.4)", fontSize: 16, color: "#fff" }}>↓</button>
           )}
           <div ref={msgContainerRef} id="messages-container" onScroll={handleMsgScroll} style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "16px", display: "flex", flexDirection: "column", gap: 6 }}>
+            {loadingMore && (
+              <div style={{ textAlign: "center", padding: "8px 0", fontSize: 11, color: "#4f46e5" }}>
+                ⏳ {fr ? "Chargement…" : "Loading…"}
+              </div>
+            )}
+            {!loadingMore && hasMoreMsgs && (
+              <div
+                onClick={() => { setLoadingMore(true); loadMoreMessages().finally(() => setLoadingMore(false)); }}
+                style={{ textAlign: "center", padding: "6px 0", fontSize: 10, color: "#334155", cursor: "pointer", userSelect: "none" }}>
+                ↑ {fr ? "Messages précédents" : "Older messages"}
+              </div>
+            )}
             {msgLoading && (
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", flex: 1, gap: 12, color: "var(--text-quaternary)" }}>
                 <div style={{ width: 28, height: 28, border: "3px solid var(--border-subtle)", borderTop: "3px solid var(--accent)", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
@@ -29979,53 +30041,49 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   );
 
   // ══════════════════════════════════════════
-  // ── Sync IA : enrichissement + polling jusqu'à réception des données ────────
+  // ── Sync IA : enrichissement + Supabase Realtime (remplace le polling) ───────
   const syncSpenderAnalysis = async () => {
-    const chatId = selectedChatId;
-    if (!chatId) return;
+    if (!activeSpender?.id) return;
     setIsSyncing(true);
-    console.log("[SYNC] 🚀 Starting enrichment for chat_id:", chatId);
+    console.log("[SYNC] 🚀 Starting enrichment for spender:", activeSpender.id);
+
+    // Timeout de sécurité : nettoie le channel si Carlos ne répond pas en 15s
+    let channel = null;
+    const safetyTimer = setTimeout(() => {
+      if (channel) { sb.removeChannel(channel); channel = null; }
+      console.log("[SYNC] ⏰ Timeout — enrichment may still be processing");
+      setIsSyncing(false);
+    }, 15000);
+
     try {
       // 1. Déclencher l'enrichissement IA via API Carlos
       const enrichId = activeSpender?.id || chatId;
       const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST", timeout: 15000 });
       console.log("[SYNC] ✅ Enrichment API called successfully", res);
 
-      // 2. Polling : vérifier toutes les 1 s si ai_personality est rempli (max 15 s)
-      let attempts = 0;
-      const maxAttempts = 15;
-      let enrichedData = null;
-      while (attempts < maxAttempts) {
-        await new Promise(r => setTimeout(r, 1000));
-        attempts++;
-        const { data, error } = await sb.from("spenders")
-          .select("*")
-          .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId}`)
-          .maybeSingle();
-        if (error) { console.log("[SYNC] ⚠️ Query error:", error.message); continue; }
-        if (data?.ai_personality && data.ai_personality.length > 20) {
-          enrichedData = data;
-          console.log("[SYNC] ✅ Enrichment complete after", attempts, "second(s)");
-          break;
-        }
-        console.log("[SYNC] ⏳ Attempt", attempts, "/", maxAttempts, "- waiting...");
-      }
-
-      // 3. Mettre à jour la fiche — toujours rafraîchir même en cas de timeout
-      if (enrichedData) {
-        setActiveSpender(enrichedData);
-        console.log("[SYNC] 🎉 Fiche updated with enriched data");
-      } else {
-        console.log("[SYNC] ⏰ Timeout — enrichment may still be processing");
-        const { data: fallback } = await sb.from("spenders")
-          .select("*")
-          .or(`telegram_id.eq.${chatId},tg_user_id.eq.${chatId}`)
-          .maybeSingle();
-        if (fallback) setActiveSpender(fallback);
-      }
+      // 2. Subscribe Realtime sur ce spender — réagit dès que ai_personality est rempli
+      channel = sb
+        .channel("enrich-" + activeSpender.id)
+        .on("postgres_changes", {
+          event: "UPDATE",
+          schema: "public",
+          table: "spenders",
+          filter: "id=eq." + activeSpender.id,
+        }, (payload) => {
+          if (payload.new?.ai_personality?.length > 20) {
+            console.log("[SYNC] 🎉 Realtime — fiche enrichie reçue");
+            setActiveSpender(payload.new);
+            clearTimeout(safetyTimer);
+            sb.removeChannel(channel);
+            channel = null;
+            setIsSyncing(false);
+          }
+        })
+        .subscribe();
     } catch (e) {
       console.error("[SYNC] ❌ Error:", e);
-    } finally {
+      clearTimeout(safetyTimer);
+      if (channel) { sb.removeChannel(channel); }
       setIsSyncing(false);
     }
   };
