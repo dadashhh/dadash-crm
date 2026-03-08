@@ -25901,7 +25901,7 @@ const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSp
     if (!sp?.id || enriching) return;
     setEnriching(true);
     try {
-      await _dmsgFetch("/enrich/" + sp.id, { method: "POST" });
+      await _dmsgFetch("/enrich/" + sp.id, { method: "POST", timeout: 15000 });
       const { data } = await sb.from("spenders").select("*").eq("id", sp.id).maybeSingle();
       console.log("[SPENDER_FETCH] id:", sp.id, "colonnes chargées :", data ? Object.keys(data).join(", ") : "(aucune donnée)");
       if (data) setFreshSp(data);
@@ -26109,30 +26109,47 @@ const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = "679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
-const _DMSG_MSG_CACHE  = {}; // { chatId: messages[] }
+const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s
 
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
   const url = _DMSG_API + path;
-  const { headers: extraHeaders, ...restOpts } = opts;
+  const { headers: extraHeaders, timeout: timeoutMs = 10000, signal: callerSignal, ...restOpts } = opts;
   const reqHeaders = { "Content-Type": "application/json", "X-API-Key": key, ...(extraHeaders || {}) };
 
-  console.log("[DMSG] ▶ fetch", opts.method || "GET", url);
+  console.log("[DMSG] ▶ fetch", opts.method || "GET", url, `(timeout: ${timeoutMs}ms)`);
   console.log("[DMSG]   API:", _DMSG_API);
   console.log("[DMSG]   Key:", key.slice(0, 8) + "…" + key.slice(-4) + " (" + key.length + " chars)");
   if (opts.body) console.log("[DMSG]   Body:", opts.body);
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Propagate external abort (e.g. conv switch) alongside timeout abort
+  let callerAbortHandler;
+  if (callerSignal) {
+    if (callerSignal.aborted) { clearTimeout(timer); throw new DOMException("Aborted", "AbortError"); }
+    callerAbortHandler = () => controller.abort();
+    callerSignal.addEventListener("abort", callerAbortHandler);
+  }
+
   let res;
   try {
-    res = await fetch(url, { headers: reqHeaders, ...restOpts });
+    res = await fetch(url, { headers: reqHeaders, signal: controller.signal, ...restOpts });
   } catch (networkErr) {
-    // Abort is intentional — propagate as-is so callers can detect it
-    if (networkErr.name === "AbortError") throw networkErr;
+    if (networkErr.name === "AbortError") {
+      // Distinguish caller-initiated abort from timeout
+      if (callerSignal?.aborted) throw networkErr;
+      throw new Error("Carlos timeout après " + timeoutMs + "ms (" + (opts.method || "GET") + " " + path + ")");
+    }
     // Network-level failure (CORS blocked, DNS, offline…)
     const isCors = networkErr.message && (networkErr.message.toLowerCase().includes("cors") || networkErr.message.toLowerCase().includes("blocked") || networkErr.message.toLowerCase().includes("failed to fetch"));
     const detail = isCors ? "Erreur CORS ou réseau — vérifier les origines autorisées côté serveur." : networkErr.message;
     console.error("[DMSG] ✖ network error:", networkErr.message, "\n       URL:", url);
     throw new Error("NETWORK:" + detail);
+  } finally {
+    clearTimeout(timer);
+    if (callerSignal && callerAbortHandler) callerSignal.removeEventListener("abort", callerAbortHandler);
   }
 
   const text = await res.text().catch(() => "");
@@ -26486,9 +26503,9 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
         try {
           if (broadcastMedia) {
             const ep = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
-            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }) });
+            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }), timeout: 30000 });
           } else {
-            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }) });
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }), timeout: 8000 });
           }
           ok++;
         } catch (_) { fail++; }
@@ -27574,6 +27591,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   }, [filterModel, models]);
   const [broadcastMedia, setBroadcastMedia]       = useState(null);
   const [isUploadingMedia, setIsUploadingMedia]   = useState(false);
+  const [uploadStatus, setUploadStatus]           = useState(null); // null | string — progression upload Storage
   const [selectedAudience, setSelectedAudience]   = useState("manual");
   // Scheduling
   const [isScheduled, setIsScheduled]             = useState(false);
@@ -27655,6 +27673,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   const pollRef        = React.useRef(null);
   const convPollRef    = React.useRef(null);
+  const lastActivityRef = React.useRef(Date.now());
   const msgEndRef      = React.useRef(null);
   const msgCacheRef    = React.useRef({});  // cache { chatId: messages[] }
   const msgLastTsRef   = React.useRef({});  // cache { chatId: lastTimestamp }
@@ -27680,6 +27699,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // Ref for messages scroll container
   const msgContainerRef = React.useRef(null);
 
+  // ── Tracker activité utilisateur (pour polling adaptatif) ──────────────────
+  React.useEffect(() => {
+    const resetActivity = () => { lastActivityRef.current = Date.now(); };
+    window.addEventListener('mousemove', resetActivity, { passive: true });
+    window.addEventListener('keydown', resetActivity, { passive: true });
+    window.addEventListener('click', resetActivity, { passive: true });
+    return () => {
+      window.removeEventListener('mousemove', resetActivity);
+      window.removeEventListener('keydown', resetActivity);
+      window.removeEventListener('click', resetActivity);
+    };
+  }, []);
+
   const isManager = user?.role === "gerant" || user?.role === "admin" || user?.role === "ceo";
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
@@ -27701,7 +27733,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       convLoadedRef.current = true;
       return;
     }
-    if (_DMSG_CONV_CACHE.list.length > 0) {
+    if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < CACHE_TTL) {
       setConversations(prev => {
         const cached = _DMSG_CONV_CACHE.list;
         const isSame = prev.length === cached.length &&
@@ -27767,9 +27799,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
     const cid = String(chatId);
-    // Afficher cache immédiatement si dispo
-    if (isInitial && _DMSG_MSG_CACHE[cid]?.length > 0) {
-      setMessages(_DMSG_MSG_CACHE[cid]);
+    // Afficher cache immédiatement si dispo et dans le TTL (60s)
+    const _cachedMsgs = _DMSG_MSG_CACHE[cid];
+    const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
+    if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
+      setMessages(_cachedMsgs.data);
       setMsgLoading(false);
       setTimeout(() => scrollToBottom('instant'), 50);
       // Continuer pour refresh silencieux
@@ -27784,7 +27818,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
-      if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+      if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
       if (isInitial) {
         setMessages(list);
         setTimeout(() => scrollToBottom('instant'), 100);
@@ -27808,7 +27842,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      if (isInitial && !_DMSG_MSG_CACHE[cid]?.length) {
+      if (isInitial && !_DMSG_MSG_CACHE[cid]?.data?.length) {
         try {
           const { data: convRow } = await sb
             .from("tg_conversations").select("id")
@@ -27818,7 +27852,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: true });
             const list = data || [];
-            if (list.length > 0) _DMSG_MSG_CACHE[cid] = list;
+            if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
             setMessages(list);
             setTimeout(() => scrollToBottom('instant'), 100);
           }
@@ -27907,8 +27941,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     openTab(conv);
     const cid = String(chatId || "");
     const cached = _DMSG_MSG_CACHE[cid];
-    if (cached?.length > 0) {
-      setMessages(cached);
+    if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
+      setMessages(cached.data);
     } else {
       setMessages([]);
     }
@@ -28040,11 +28074,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     const chatId = selectedConv ? String(_dmsgChatId(selectedConv) || "") : "";
     if (chatId) {
       sb.from("media_sends").select("media_id").eq("chat_id", chatId)
-        .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)));
+        .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)))
+        .catch(err => console.warn('[MEDIA] media_sends fetch error:', err));
       const spId = selectedConv?.spender_id || activeSpender?.id;
       if (spId) {
         sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
-          .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)));
+          .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)))
+          .catch(err => console.warn('[MEDIA] transactions fetch error:', err));
       }
     } else {
       setSentMediaIds([]);
@@ -28097,20 +28133,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedChatId]);
 
-  // ── Polling messages toutes les 2s (guard contre les appels parallèles) ──
+  // ── Polling messages adaptatif : 2s si actif, 10s si inactif >1min ──────────
   useEffect(() => {
-    clearInterval(pollRef.current);
+    clearTimeout(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
-    pollRef.current = setInterval(async () => {
-      if (isMsgPollingRef.current || !chatIdRef.current) return;
-      isMsgPollingRef.current = true;
-      try {
-        await loadMessagesById(chatIdRef.current, false);
-      } finally {
-        isMsgPollingRef.current = false;
-      }
-    }, 2000);
-    return () => clearInterval(pollRef.current);
+    const scheduleNextPoll = () => {
+      const inactive = Date.now() - lastActivityRef.current > 60000;
+      const delay = inactive ? 10000 : 2000;
+      pollRef.current = setTimeout(async () => {
+        if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) {
+          scheduleNextPoll();
+          return;
+        }
+        isMsgPollingRef.current = true;
+        try {
+          await loadMessagesById(chatIdRef.current, false);
+        } finally {
+          isMsgPollingRef.current = false;
+          scheduleNextPoll();
+        }
+      }, delay);
+    };
+    scheduleNextPoll();
+    return () => clearTimeout(pollRef.current);
   }, [selectedChatId, loadMessagesById]);
 
   // ── Ref stable vers loadConversations ───────────────────────────────────────
@@ -28124,6 +28169,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Polling conversations toutes les 3s — intervalle STABLE ([] deps) ────────
   useEffect(() => {
     convPollRef.current = setInterval(async () => {
+      if (document.hidden) return;
       if (isConvPollingRef.current) return;
       isConvPollingRef.current = true;
       try {
@@ -28325,6 +28371,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       await _dmsgFetch("/send-message", {
         method: "POST",
         body: JSON.stringify({ chat_id: chatId, text }),
+        timeout: 8000,
       });
       // Confirm the optimistic message immediately (remove _pending flag)
       setMessages(prev => prev.map(m =>
@@ -28365,8 +28412,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   // ── Script assistant ─────────────────────────────
   const loadAvailableScripts = async () => {
-    const { data } = await sb.from('scripts').select('*').eq('is_active', true).order('name');
-    setAvailableScripts(data || []);
+    try {
+      const { data } = await sb.from('scripts').select('*').eq('is_active', true).order('name');
+      setAvailableScripts(data || []);
+    } catch (err) {
+      console.warn('[SCRIPTS] loadAvailableScripts error:', err);
+    }
   };
 
   const _replaceVars = useCallback((text) => {
@@ -28753,7 +28804,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         .in("status", ["pending", "sending"])
         .order("scheduled_at", { ascending: true });
       setScheduledBroadcasts(data || []);
-    } catch (_) {}
+    } catch (err) { console.warn('[BROADCAST_SCHED] loadScheduledBroadcasts error:', err); }
   };
 
   const cancelScheduledBroadcast = async (id) => {
@@ -28838,6 +28889,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       setBroadcastSending(false);
       return;
     }
+
+    // ── Upload Storage si média présent (une seule fois avant la boucle) ──
+    let resolvedMediaUrl = null;
+    if (broadcastMedia) {
+      try {
+        setUploadStatus(fr ? "Envoi vidéo en cours…" : "Uploading media…");
+        const ext = broadcastMedia.file.name.split(".").pop() || (broadcastMedia.type === "video" ? "mp4" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
+        const path = `broadcasts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const { error: upErr } = await sb.storage
+          .from("media-library")
+          .upload(path, broadcastMedia.file, { upsert: false, contentType: broadcastMedia.file.type });
+        if (upErr) throw new Error((fr ? "Upload échoué : " : "Upload failed: ") + upErr.message);
+        const { data: urlData } = sb.storage.from("media-library").getPublicUrl(path);
+        resolvedMediaUrl = urlData.publicUrl;
+        setUploadStatus(fr ? "Transmission…" : "Sending…");
+      } catch (upEx) {
+        setUploadStatus(null);
+        addToast(upEx.message || (fr ? "Erreur upload" : "Upload error"), "error");
+        setBroadcastSending(false);
+        return;
+      }
+    }
+
     let ok = 0, fail = 0;
     for (let i = 0; i < chatIds.length; i++) {
       try {
@@ -28847,15 +28921,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             method: "POST",
             body: JSON.stringify({
               chat_id:   chatIds[i],
-              [broadcastMedia.type + "_url"]: broadcastMedia.url,
+              [broadcastMedia.type + "_url"]: resolvedMediaUrl,
               caption:   broadcastMessage.trim() || "",
               model_id:  broadcastModel,
             }),
+            timeout: 30000,
           });
         } else {
           await _dmsgFetch("/send-message", {
             method: "POST",
             body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: broadcastModel }),
+            timeout: 8000,
           });
         }
         ok++;
@@ -28868,6 +28944,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
       }
     }
+    setUploadStatus(null);
     console.log(`[BROADCAST] Done: ✅ ${ok} success, ❌ ${fail} errors`);
 
     // ── Save to broadcast_history for analytics ─────────────────
@@ -28925,7 +29002,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       let mediaType = "photo";
       if (file.type.startsWith("video/")) mediaType = "video";
       else if (file.type.startsWith("audio/")) mediaType = "audio";
-      setBroadcastMedia({ type: mediaType, url: URL.createObjectURL(file), file, fileName: file.name });
+      // Stocker le File brut — l'URL publique est générée après upload Storage au moment de l'envoi
+      setBroadcastMedia({ type: mediaType, file, fileName: file.name });
     } catch (_) {
       addToast(fr ? "Erreur chargement média" : "Media load error", "error");
     }
@@ -28936,7 +29014,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // ── Load scheduled broadcasts on mount ───────────────
   useEffect(() => {
     loadScheduledBroadcasts();
-    const t = setInterval(loadScheduledBroadcasts, 30000);
+    const t = setInterval(() => { if (document.hidden) return; loadScheduledBroadcasts(); }, 30000);
     return () => clearInterval(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -29696,7 +29774,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                                     media_url: pendingMedia.url,
                                     caption: "",
                                     model_id: modelName
-                                  })
+                                  }),
+                                  timeout: 30000,
                                 });
                                 if (res?.success) {
                                   await sb.from("media_sends").insert({
@@ -29880,7 +29959,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     try {
       // 1. Déclencher l'enrichissement IA via API Carlos
       const enrichId = activeSpender?.id || chatId;
-      const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST" });
+      const res = await _dmsgFetch("/enrich/" + enrichId, { method: "POST", timeout: 15000 });
       console.log("[SYNC] ✅ Enrichment API called successfully", res);
 
       // 2. Polling : vérifier toutes les 1 s si ai_personality est rempli (max 15 s)
@@ -30045,7 +30124,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                 onClick={async () => {
                   if (!activeSpender?.id) return;
                   try {
-                    await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST" });
+                    await _dmsgFetch("/enrich/" + activeSpender.id, { method: "POST", timeout: 15000 });
                     addToast(fr ? "Enrichissement lancé ✓" : "Enrichment started ✓", "success");
                     resolveSpender(selectedConv);
                   } catch(e) { addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error"); }
@@ -30436,6 +30515,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
           )}
         </div>
 
+        {/* Upload / transmission status */}
+        {uploadStatus && (
+          <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.3)", fontSize: 12, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ display: "inline-block", width: 12, height: 12, border: "2px solid rgba(99,102,241,0.4)", borderTopColor: "#6366f1", borderRadius: "50%", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+            {uploadStatus}
+          </div>
+        )}
+
         {/* Result banner */}
         {broadcastResult && (
           <div style={{ marginTop: 10, padding: "8px 12px", borderRadius: 8, background: broadcastResult.fail === 0 ? "rgba(16,185,129,0.12)" : "rgba(245,158,11,0.12)", border: "1px solid " + (broadcastResult.fail === 0 ? "rgba(16,185,129,0.3)" : "rgba(245,158,11,0.3)"), fontSize: 12, color: "var(--text-primary)" }}>
@@ -30627,6 +30714,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
     clearInterval(refreshTimerRef.current);
     if (!selectedConv || !chatIdRef.current) return;
     refreshTimerRef.current = setInterval(() => {
+      if (document.hidden) return;
       if (chatIdRef.current) loadMessages(chatIdRef.current, false);
       loadConversations(false);
     }, 10000);
@@ -45215,6 +45303,10 @@ const App = () => {
   const handleLogout = async () => {
     closeDrill();
     await sb.auth.signOut();
+    // Purger les caches globaux messagerie pour éviter toute fuite entre sessions
+    Object.keys(_DMSG_MSG_CACHE).forEach(k => delete _DMSG_MSG_CACHE[k]);
+    _DMSG_CONV_CACHE.list = [];
+    _DMSG_CONV_CACHE.ts = 0;
     setUser(null);
     setTab("dashboard");
     setTxs([]);
