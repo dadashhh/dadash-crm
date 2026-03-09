@@ -26540,17 +26540,32 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
     if (selectedConvIds.size === 0) { addToast("Aucun destinataire", "error"); return; }
     setIsSending(true);
     const chatIds = Array.from(selectedConvIds);
-    // Carlos attend "carla"/"sophie"/"bella" — pas l'UUID Supabase
     const carlosModelId = (models.find(m => m.id === broadcastModel)?.name || "").toLowerCase();
     let ok = 0, fail = 0;
     setSendProgress({ current: 0, total: chatIds.length, ok: 0, fail: 0 });
     try {
+      // Upload vers Supabase si le média est un fichier local (vidéo compressée ou photo)
+      let resolvedMediaUrl = broadcastMedia?.url || null;
+      if (broadcastMedia?.file) {
+        let uploadFile = broadcastMedia.file;
+        if (broadcastMedia.type === 'video') {
+          const sizeMB = uploadFile.size / 1024 / 1024;
+          addToast(`🗜️ Compression vidéo (${sizeMB.toFixed(0)} MB)…`, "info");
+          uploadFile = await compressVideoForUpload(uploadFile);
+        }
+        const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "webm" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
+        const path = `broadcasts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const { error: upErr } = await sb.storage.from("media-library").upload(path, uploadFile, { upsert: false, contentType: uploadFile.type });
+        if (upErr) throw new Error((fr ? "Upload échoué : " : "Upload failed: ") + upErr.message);
+        const { data: urlData } = sb.storage.from("media-library").getPublicUrl(path);
+        resolvedMediaUrl = urlData.publicUrl;
+      }
       for (let i = 0; i < chatIds.length; i++) {
         try {
-          if (broadcastMedia) {
+          if (resolvedMediaUrl && broadcastMedia) {
             const ep = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
             const bcMediaTimeout = broadcastMedia.type === 'video' ? 300000 : broadcastMedia.type === 'audio' ? 120000 : 30000;
-            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: broadcastMedia.url, caption: broadcastMessage.trim() || "", model_id: carlosModelId }), timeout: bcMediaTimeout });
+            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: resolvedMediaUrl, caption: broadcastMessage.trim() || "", model_id: carlosModelId }), timeout: bcMediaTimeout });
           } else {
             await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }), timeout: 8000 });
           }
@@ -29243,10 +29258,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
         let uploadFile = broadcastMedia.file;
         if (broadcastMedia.type === 'video') {
           const sizeMB = uploadFile.size / 1024 / 1024;
-          if (sizeMB >= 20) {
-            setUploadStatus(`🗜️ Compression vidéo (${sizeMB.toFixed(0)} MB)…`);
-            uploadFile = await compressVideo(uploadFile);
-          }
+          setUploadStatus(`🗜️ Compression vidéo (${sizeMB.toFixed(0)} MB)…`);
+          uploadFile = await compressVideoForUpload(uploadFile);
         }
         setUploadStatus(fr ? "Envoi vidéo en cours…" : "Uploading media…");
         const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "webm" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
@@ -33028,6 +33041,86 @@ const MEDIA_CATEGORIES = [
   "Autres"
 ];
 
+// Compresse une vidéo côté navigateur avant upload Supabase.
+// Utilise MediaRecorder + canvas pour re-encoder en WebM VP8 à 720p max / 1.5 Mbps.
+// Retourne le fichier original si le navigateur ne supporte pas MediaRecorder.
+const compressVideoForUpload = (file) => new Promise((resolve) => {
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+    console.warn('[VIDEO_COMPRESS] MediaRecorder VP8 non supporté — upload sans compression');
+    return resolve(file);
+  }
+
+  const sizeMB = file.size / 1024 / 1024;
+  console.log(`[VIDEO_COMPRESS] Début compression ${sizeMB.toFixed(1)} MB…`);
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = 'metadata';
+  const objectUrl = URL.createObjectURL(file);
+  video.src = objectUrl;
+
+  video.onloadedmetadata = () => {
+    const MAX_W = 1280, MAX_H = 720;
+    let w = video.videoWidth, h = video.videoHeight;
+    const ratio = Math.min(MAX_W / w, MAX_H / h, 1);
+    w = Math.floor(w * ratio);
+    h = Math.floor(h * ratio);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+
+    let recorder;
+    try {
+      recorder = new MediaRecorder(canvas.captureStream(30), {
+        mimeType: 'video/webm;codecs=vp8',
+        videoBitsPerSecond: 1_500_000,
+      });
+    } catch (e) {
+      console.warn('[VIDEO_COMPRESS] Impossible de créer MediaRecorder:', e);
+      URL.revokeObjectURL(objectUrl);
+      return resolve(file);
+    }
+
+    const chunks = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const outName = file.name.replace(/\.[^.]+$/, '.webm');
+      const compressed = new File([blob], outName, { type: 'video/webm' });
+      console.log(`[VIDEO_COMPRESS] ✅ ${sizeMB.toFixed(1)} MB → ${(compressed.size / 1024 / 1024).toFixed(1)} MB`);
+      URL.revokeObjectURL(objectUrl);
+      resolve(compressed);
+    };
+    recorder.onerror = () => {
+      console.warn('[VIDEO_COMPRESS] Erreur recorder — upload original');
+      URL.revokeObjectURL(objectUrl);
+      resolve(file);
+    };
+
+    const drawFrame = () => {
+      if (video.paused || video.ended) { recorder.stop(); return; }
+      ctx.drawImage(video, 0, 0, w, h);
+      requestAnimationFrame(drawFrame);
+    };
+
+    recorder.start(100);
+    video.currentTime = 0;
+    video.play().then(drawFrame).catch(() => {
+      recorder.stop();
+      URL.revokeObjectURL(objectUrl);
+      resolve(file);
+    });
+  };
+
+  video.onerror = () => {
+    console.warn('[VIDEO_COMPRESS] Erreur chargement vidéo — upload original');
+    URL.revokeObjectURL(objectUrl);
+    resolve(file);
+  };
+});
+
 const MediaLibraryPage = ({ user }) => {
   const addToast = useToast();
   const [media, setMedia] = useState([]);
@@ -33097,89 +33190,6 @@ const MediaLibraryPage = ({ user }) => {
     prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat]
   );
 
-  // Compresse une vidéo côté navigateur avant upload Supabase.
-  // Utilise MediaRecorder + canvas pour re-encoder en WebM VP8 à 720p max / 1.5 Mbps.
-  // Retourne le fichier original si < 20 MB ou si le navigateur ne supporte pas MediaRecorder.
-  const compressVideo = (file) => new Promise((resolve) => {
-    const sizeMB = file.size / 1024 / 1024;
-    if (sizeMB < 20) {
-      console.log(`[VIDEO_COMPRESS] ${sizeMB.toFixed(1)} MB < 20 MB — pas de compression`);
-      return resolve(file);
-    }
-    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
-      console.warn('[VIDEO_COMPRESS] MediaRecorder VP8 non supporté — upload sans compression');
-      return resolve(file);
-    }
-
-    console.log(`[VIDEO_COMPRESS] Début compression ${sizeMB.toFixed(1)} MB…`);
-    const video = document.createElement('video');
-    video.muted = true;
-    video.playsInline = true;
-    video.preload = 'metadata';
-    const objectUrl = URL.createObjectURL(file);
-    video.src = objectUrl;
-
-    video.onloadedmetadata = () => {
-      const MAX_W = 1280, MAX_H = 720;
-      let w = video.videoWidth, h = video.videoHeight;
-      const ratio = Math.min(MAX_W / w, MAX_H / h, 1);
-      w = Math.floor(w * ratio);
-      h = Math.floor(h * ratio);
-
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-
-      let recorder;
-      try {
-        recorder = new MediaRecorder(canvas.captureStream(30), {
-          mimeType: 'video/webm;codecs=vp8',
-          videoBitsPerSecond: 1_500_000,
-        });
-      } catch (e) {
-        console.warn('[VIDEO_COMPRESS] Impossible de créer MediaRecorder:', e);
-        URL.revokeObjectURL(objectUrl);
-        return resolve(file);
-      }
-
-      const chunks = [];
-      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const outName = file.name.replace(/\.[^.]+$/, '.webm');
-        const compressed = new File([blob], outName, { type: 'video/webm' });
-        console.log(`[VIDEO_COMPRESS] ✅ ${sizeMB.toFixed(1)} MB → ${(compressed.size / 1024 / 1024).toFixed(1)} MB`);
-        URL.revokeObjectURL(objectUrl);
-        resolve(compressed);
-      };
-      recorder.onerror = () => {
-        console.warn('[VIDEO_COMPRESS] Erreur recorder — upload original');
-        URL.revokeObjectURL(objectUrl);
-        resolve(file);
-      };
-
-      const drawFrame = () => {
-        if (video.paused || video.ended) { recorder.stop(); return; }
-        ctx.drawImage(video, 0, 0, w, h);
-        requestAnimationFrame(drawFrame);
-      };
-
-      recorder.start(100); // chunk toutes les 100ms
-      video.currentTime = 0;
-      video.play().then(drawFrame).catch(() => {
-        recorder.stop();
-        URL.revokeObjectURL(objectUrl);
-        resolve(file);
-      });
-    };
-
-    video.onerror = () => {
-      console.warn('[VIDEO_COMPRESS] Erreur chargement vidéo — upload original');
-      URL.revokeObjectURL(objectUrl);
-      resolve(file);
-    };
-  });
 
   const uploadMultiple = async () => {
     if (!mediaModel) { addToast('Sélectionne un modèle avant d\'uploader', 'error'); return; }
@@ -33191,14 +33201,11 @@ const MediaLibraryPage = ({ user }) => {
       let file = selectedFiles[i];
       setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
       try {
-        // Compression automatique des vidéos >20 MB
         if (file.type.startsWith('video/')) {
           const sizeMB = file.size / 1024 / 1024;
-          if (sizeMB >= 20) {
-            setUploadProgress({ done: i, total: selectedFiles.length, current: `🗜️ Compression ${file.name} (${sizeMB.toFixed(0)} MB)…` });
-            file = await compressVideo(file);
-            setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
-          }
+          setUploadProgress({ done: i, total: selectedFiles.length, current: `🗜️ Compression ${file.name} (${sizeMB.toFixed(0)} MB)…` });
+          file = await compressVideoForUpload(file);
+          setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
         }
         const ext = file.name.split('.').pop();
         const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
