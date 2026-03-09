@@ -24,7 +24,14 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  if (e.request.method === 'GET' && url.origin === self.location.origin) {
+  // Ne jamais intercepter les requêtes cross-origin (Supabase, Carlos, CDNs, APIs)
+  // — les laisser passer directement au navigateur sans cache ni gestion SW
+  if (url.origin !== self.location.origin) {
+    return;
+  }
+
+  // Same-origin uniquement : cache-first avec fallback réseau
+  if (e.request.method === 'GET') {
     e.respondWith(
       caches.match(e.request).then(cached => {
         const fetchPromise = fetch(e.request).then(response => {
@@ -37,10 +44,7 @@ self.addEventListener('fetch', e => {
         return cached || fetchPromise;
       })
     );
-    return;
   }
-
-  e.respondWith(fetch(e.request));
 });
 
 self.addEventListener('message', e => {
