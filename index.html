@@ -29171,12 +29171,20 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     let resolvedMediaUrl = null;
     if (broadcastMedia) {
       try {
+        let uploadFile = broadcastMedia.file;
+        if (broadcastMedia.type === 'video') {
+          const sizeMB = uploadFile.size / 1024 / 1024;
+          if (sizeMB >= 20) {
+            setUploadStatus(`🗜️ Compression vidéo (${sizeMB.toFixed(0)} MB)…`);
+            uploadFile = await compressVideo(uploadFile);
+          }
+        }
         setUploadStatus(fr ? "Envoi vidéo en cours…" : "Uploading media…");
-        const ext = broadcastMedia.file.name.split(".").pop() || (broadcastMedia.type === "video" ? "mp4" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
+        const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "webm" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
         const path = `broadcasts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
         const { error: upErr } = await sb.storage
           .from("media-library")
-          .upload(path, broadcastMedia.file, { upsert: false, contentType: broadcastMedia.file.type });
+          .upload(path, uploadFile, { upsert: false, contentType: uploadFile.type });
         if (upErr) throw new Error((fr ? "Upload échoué : " : "Upload failed: ") + upErr.message);
         const { data: urlData } = sb.storage.from("media-library").getPublicUrl(path);
         resolvedMediaUrl = urlData.publicUrl;
@@ -33003,17 +33011,109 @@ const MediaLibraryPage = ({ user }) => {
     prev.includes(cat) ? prev.filter(c => c !== cat) : [...prev, cat]
   );
 
+  // Compresse une vidéo côté navigateur avant upload Supabase.
+  // Utilise MediaRecorder + canvas pour re-encoder en WebM VP8 à 720p max / 1.5 Mbps.
+  // Retourne le fichier original si < 20 MB ou si le navigateur ne supporte pas MediaRecorder.
+  const compressVideo = (file) => new Promise((resolve) => {
+    const sizeMB = file.size / 1024 / 1024;
+    if (sizeMB < 20) {
+      console.log(`[VIDEO_COMPRESS] ${sizeMB.toFixed(1)} MB < 20 MB — pas de compression`);
+      return resolve(file);
+    }
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+      console.warn('[VIDEO_COMPRESS] MediaRecorder VP8 non supporté — upload sans compression');
+      return resolve(file);
+    }
+
+    console.log(`[VIDEO_COMPRESS] Début compression ${sizeMB.toFixed(1)} MB…`);
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+    const objectUrl = URL.createObjectURL(file);
+    video.src = objectUrl;
+
+    video.onloadedmetadata = () => {
+      const MAX_W = 1280, MAX_H = 720;
+      let w = video.videoWidth, h = video.videoHeight;
+      const ratio = Math.min(MAX_W / w, MAX_H / h, 1);
+      w = Math.floor(w * ratio);
+      h = Math.floor(h * ratio);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+
+      let recorder;
+      try {
+        recorder = new MediaRecorder(canvas.captureStream(30), {
+          mimeType: 'video/webm;codecs=vp8',
+          videoBitsPerSecond: 1_500_000,
+        });
+      } catch (e) {
+        console.warn('[VIDEO_COMPRESS] Impossible de créer MediaRecorder:', e);
+        URL.revokeObjectURL(objectUrl);
+        return resolve(file);
+      }
+
+      const chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'video/webm' });
+        const outName = file.name.replace(/\.[^.]+$/, '.webm');
+        const compressed = new File([blob], outName, { type: 'video/webm' });
+        console.log(`[VIDEO_COMPRESS] ✅ ${sizeMB.toFixed(1)} MB → ${(compressed.size / 1024 / 1024).toFixed(1)} MB`);
+        URL.revokeObjectURL(objectUrl);
+        resolve(compressed);
+      };
+      recorder.onerror = () => {
+        console.warn('[VIDEO_COMPRESS] Erreur recorder — upload original');
+        URL.revokeObjectURL(objectUrl);
+        resolve(file);
+      };
+
+      const drawFrame = () => {
+        if (video.paused || video.ended) { recorder.stop(); return; }
+        ctx.drawImage(video, 0, 0, w, h);
+        requestAnimationFrame(drawFrame);
+      };
+
+      recorder.start(100); // chunk toutes les 100ms
+      video.currentTime = 0;
+      video.play().then(drawFrame).catch(() => {
+        recorder.stop();
+        URL.revokeObjectURL(objectUrl);
+        resolve(file);
+      });
+    };
+
+    video.onerror = () => {
+      console.warn('[VIDEO_COMPRESS] Erreur chargement vidéo — upload original');
+      URL.revokeObjectURL(objectUrl);
+      resolve(file);
+    };
+  });
+
   const uploadMultiple = async () => {
-    if (selectedFiles.length === 0) return;
     if (!mediaModel) { addToast('Sélectionne un modèle avant d\'uploader', 'error'); return; }
 
     setUploadProgress({ done: 0, total: selectedFiles.length, current: '' });
     const results = { success: 0, errors: [] };
 
     for (let i = 0; i < selectedFiles.length; i++) {
-      const file = selectedFiles[i];
+      let file = selectedFiles[i];
       setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
       try {
+        // Compression automatique des vidéos >20 MB
+        if (file.type.startsWith('video/')) {
+          const sizeMB = file.size / 1024 / 1024;
+          if (sizeMB >= 20) {
+            setUploadProgress({ done: i, total: selectedFiles.length, current: `🗜️ Compression ${file.name} (${sizeMB.toFixed(0)} MB)…` });
+            file = await compressVideo(file);
+            setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
+          }
+        }
         const ext = file.name.split('.').pop();
         const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
         const path = `${mediaModel}/${filename}`;
