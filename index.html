@@ -27638,6 +27638,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [showScriptModal, setShowScriptModal] = useState(false);
   const [availableScripts, setAvailableScripts] = useState([]);
   const [scriptStepCaption, setScriptStepCaption] = useState('');
+  const [isSendingStep, setIsSendingStep] = useState(false);
 
   // === RBAC FILTERING ===
   const [userProfile, setUserProfile] = useState(null);
@@ -27732,6 +27733,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // Refs pour accéder au script actif depuis sendMessage (useCallback)
   const activeScriptRef = React.useRef(null);
   const currentStepIndexRef = React.useRef(0);
+  // Verrou anti-doublon pour sendScriptStep (ref = synchrone, pas de re-render)
+  const isSendingStepRef = React.useRef(false);
   // Ref for messages scroll container
   const msgContainerRef = React.useRef(null);
   // WebSocket connection ref
@@ -28694,6 +28697,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // Envoie l'étape courante puis passe à la suivante (appelé depuis le bouton du bandeau ou sendMessage)
   const sendScriptStep = async () => {
     if (!activeScript) return;
+    // Verrou anti-doublon — ref synchrone, pas de race condition possible
+    if (isSendingStepRef.current) {
+      console.log('[SCRIPT] ⏸️ Envoi déjà en cours, clic ignoré');
+      return;
+    }
+    isSendingStepRef.current = true;
+    setIsSendingStep(true);
+
     const step = activeScript.sequence[currentStepIndex];
     const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
     const modelId = selectedConv?.model_id || selectedModelId || null;
@@ -28701,21 +28712,27 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     if (step) {
       try {
         if (step.media_url && (step.type === 'photo' || step.type === 'video' || step.type === 'audio')) {
+          console.log(`[SCRIPT] 📤 Envoi ${step.type} étape ${currentStepIndex + 1}`);
           const endpoint = step.type === 'photo' ? '/send-photo' : step.type === 'video' ? '/send-video' : '/send-audio';
           const body = { chat_id: chatId, [step.type + '_url']: step.media_url, caption: scriptStepCaption, model_id: modelId };
           const mediaTimeout = step.type === 'video' ? 120000 : step.type === 'audio' ? 90000 : 30000;
           await _dmsgFetch(endpoint, { method: 'POST', body: JSON.stringify(body), timeout: mediaTimeout });
+          console.log(`[SCRIPT] ✅ ${step.type} envoyé`);
         } else {
           const text = msgInputRef.current.trim() || scriptStepCaption || _replaceVars(step.content) || '';
           if (text) {
+            console.log(`[SCRIPT] 📤 Envoi texte étape ${currentStepIndex + 1}`);
             await _dmsgFetch('/send-message', { method: 'POST', body: JSON.stringify({ chat_id: chatId, text, model_id: modelId }), timeout: 8000 });
             msgInputRef.current = '';
             setMsgInput('');
+            console.log('[SCRIPT] ✅ Texte envoyé');
           }
         }
       } catch (e) {
-        console.error('[SCRIPT] Erreur envoi étape:', e);
+        console.error('[SCRIPT] ❌ Erreur envoi étape:', e);
         addToast('Erreur lors de l\'envoi de l\'étape', 'error');
+        isSendingStepRef.current = false;
+        setIsSendingStep(false);
         return;
       }
     }
@@ -28736,6 +28753,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       currentStepIndexRef.current = next;
       _loadStepIntoInput(activeScript, next);
     }
+    isSendingStepRef.current = false;
+    setIsSendingStep(false);
   };
 
   // Navigation vers l'étape suivante SANS envoi — alias pour compatibilité
@@ -28750,6 +28769,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       msgInputRef.current = '';
       setMsgInput('');
       setScriptStepCaption('');
+      isSendingStepRef.current = false;
+      setIsSendingStep(false);
     }
   };
 
@@ -30167,10 +30188,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                           </div>
                         )}
                         {hasMedia ? (
-                          <button onClick={nextStep} style={{ width: "100%", padding: "9px", background: "linear-gradient(135deg, #10b981 0%, #059669 100%)", border: "none", borderRadius: 8, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-                            {currentStepIndex < activeScript.sequence.length - 1
-                              ? `📤 Envoyer + Étape suivante (${currentStepIndex + 2}/${activeScript.sequence.length})`
-                              : "📤 Envoyer et terminer le script"}
+                          <button
+                            onClick={nextStep}
+                            disabled={isSendingStep}
+                            style={{ width: "100%", padding: "9px", background: isSendingStep ? "#374151" : "linear-gradient(135deg, #10b981 0%, #059669 100%)", border: "none", borderRadius: 8, color: isSendingStep ? "#9ca3af" : "white", fontSize: 13, fontWeight: 700, cursor: isSendingStep ? "not-allowed" : "pointer", transition: "background 0.2s" }}>
+                            {isSendingStep
+                              ? "⏳ Envoi en cours…"
+                              : currentStepIndex < activeScript.sequence.length - 1
+                                ? `📤 Envoyer + Étape suivante (${currentStepIndex + 2}/${activeScript.sequence.length})`
+                                : "📤 Envoyer et terminer le script"}
                           </button>
                         ) : (
                           <div style={{ fontSize: 11, color: "#9ca3af", padding: "6px 0", textAlign: "center" }}>
