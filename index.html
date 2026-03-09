@@ -27728,6 +27728,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const abortMsgRef = React.useRef(null);
   // Ref for scripts panel (click-outside to close)
   const scriptsRef = React.useRef(null);
+  // Refs pour accéder au script actif depuis sendMessage (useCallback)
+  const activeScriptRef = React.useRef(null);
+  const currentStepIndexRef = React.useRef(0);
   // Ref for messages scroll container
   const msgContainerRef = React.useRef(null);
   // WebSocket connection ref
@@ -28527,6 +28530,58 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       ));
       // Remonter la conv en haut de liste
       loadConversations(true);
+      // Si un script texte est actif, avancer à l'étape suivante
+      if (activeScriptRef.current) {
+        const sc = activeScriptRef.current;
+        const idx = currentStepIndexRef.current;
+        const step = sc.sequence[idx];
+        // Avancer seulement pour les étapes texte (les médias sont gérés par le bouton du bandeau)
+        if (!step?.media_url) {
+          const next = idx + 1;
+          if (next >= sc.sequence.length) {
+            addToast(`✅ Script "${sc.title || sc.name}" terminé !`, 'success');
+            setActiveScript(null);
+            activeScriptRef.current = null;
+            setCurrentStepIndex(0);
+            currentStepIndexRef.current = 0;
+            setScriptStepCaption('');
+          } else {
+            setCurrentStepIndex(next);
+            currentStepIndexRef.current = next;
+            _loadStepIntoInput(sc, next);
+          }
+        }
+      }
+      // Si une étape texte de script est active, avancer à l'étape suivante
+      if (activeScriptRef.current) {
+        const sc = activeScriptRef.current;
+        const idx = currentStepIndexRef.current;
+        const step = sc.sequence[idx];
+        if (step && (!step.media_url || step.type === 'text')) {
+          const nextIdx = idx + 1;
+          if (nextIdx >= sc.sequence.length) {
+            addToast(`✅ Script "${sc.title || sc.name}" terminé !`, 'success');
+            setActiveScript(null);
+            activeScriptRef.current = null;
+            setCurrentStepIndex(0);
+            currentStepIndexRef.current = 0;
+            setScriptStepCaption('');
+          } else {
+            setCurrentStepIndex(nextIdx);
+            currentStepIndexRef.current = nextIdx;
+            // _loadStepIntoInput sera appelé via useEffect sur currentStepIndex — on force ici
+            const nextStep2 = sc.sequence[nextIdx];
+            const val = nextStep2.content ? nextStep2.content : '';
+            setScriptStepCaption(val);
+            if (nextStep2.media_url && (nextStep2.type === 'photo' || nextStep2.type === 'video' || nextStep2.type === 'audio')) {
+              // étape média : laisser la textarea vide
+            } else {
+              msgInputRef.current = val;
+              setMsgInput(val);
+            }
+          }
+        }
+      }
       // Reconciliation after 2s — pick up server IDs and any replies
       setTimeout(async () => {
         if (String(chatIdRef.current) !== String(chatId)) return;
@@ -28628,51 +28683,68 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   const startScript = (script) => {
     setActiveScript(script);
+    activeScriptRef.current = script;
     setCurrentStepIndex(0);
+    currentStepIndexRef.current = 0;
     _loadStepIntoInput(script, 0);
     setSentScriptIds(prev => prev.includes(script.id) ? prev : [...prev, script.id]);
   };
 
-  const nextStep = async () => {
+  // Envoie l'étape courante puis passe à la suivante (appelé depuis le bouton du bandeau ou sendMessage)
+  const sendScriptStep = async () => {
     if (!activeScript) return;
     const step = activeScript.sequence[currentStepIndex];
     const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
     const modelId = selectedConv?.model_id || selectedModelId || null;
 
-    // Envoyer l'étape courante
     if (step) {
       try {
         if (step.media_url && (step.type === 'photo' || step.type === 'video' || step.type === 'audio')) {
           const endpoint = step.type === 'photo' ? '/send-photo' : step.type === 'video' ? '/send-video' : '/send-audio';
           const body = { chat_id: chatId, [step.type + '_url']: step.media_url, caption: scriptStepCaption, model_id: modelId };
           await _dmsgFetch(endpoint, { method: 'POST', body: JSON.stringify(body), timeout: 30000 });
-        } else if (scriptStepCaption || step.content) {
-          await _dmsgFetch('/send-message', { method: 'POST', body: JSON.stringify({ chat_id: chatId, text: scriptStepCaption || _replaceVars(step.content) || '', model_id: modelId }), timeout: 8000 });
+        } else {
+          const text = msgInputRef.current.trim() || scriptStepCaption || _replaceVars(step.content) || '';
+          if (text) {
+            await _dmsgFetch('/send-message', { method: 'POST', body: JSON.stringify({ chat_id: chatId, text, model_id: modelId }), timeout: 8000 });
+            msgInputRef.current = '';
+            setMsgInput('');
+          }
         }
       } catch (e) {
         console.error('[SCRIPT] Erreur envoi étape:', e);
         addToast('Erreur lors de l\'envoi de l\'étape', 'error');
+        return;
       }
     }
 
+    // Avancer à l'étape suivante
     const next = currentStepIndex + 1;
     if (next >= activeScript.sequence.length) {
-      alert(`✅ Script "${activeScript.name}" terminé !`);
+      addToast(`✅ Script "${activeScript.title || activeScript.name}" terminé !`, 'success');
       setActiveScript(null);
+      activeScriptRef.current = null;
       setCurrentStepIndex(0);
+      currentStepIndexRef.current = 0;
       msgInputRef.current = '';
       setMsgInput('');
       setScriptStepCaption('');
     } else {
       setCurrentStepIndex(next);
+      currentStepIndexRef.current = next;
       _loadStepIntoInput(activeScript, next);
     }
   };
 
+  // Navigation vers l'étape suivante SANS envoi — alias pour compatibilité
+  const nextStep = sendScriptStep;
+
   const stopScript = () => {
     if (confirm('Arrêter ce script ?')) {
       setActiveScript(null);
+      activeScriptRef.current = null;
       setCurrentStepIndex(0);
+      currentStepIndexRef.current = 0;
       msgInputRef.current = '';
       setMsgInput('');
       setScriptStepCaption('');
@@ -30092,11 +30164,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
                             ⏱️ Délai recommandé : {(step.delay_ms / 1000).toFixed(1)}s
                           </div>
                         )}
-                        <button onClick={nextStep} style={{ width: "100%", padding: "9px", background: "linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)", border: "none", borderRadius: 8, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-                          {currentStepIndex < activeScript.sequence.length - 1
-                            ? `⏭️ Étape suivante (${currentStepIndex + 2}/${activeScript.sequence.length})`
-                            : "✅ Terminer le script"}
-                        </button>
+                        {hasMedia ? (
+                          <button onClick={nextStep} style={{ width: "100%", padding: "9px", background: "linear-gradient(135deg, #10b981 0%, #059669 100%)", border: "none", borderRadius: 8, color: "white", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                            {currentStepIndex < activeScript.sequence.length - 1
+                              ? `📤 Envoyer + Étape suivante (${currentStepIndex + 2}/${activeScript.sequence.length})`
+                              : "📤 Envoyer et terminer le script"}
+                          </button>
+                        ) : (
+                          <div style={{ fontSize: 11, color: "#9ca3af", padding: "6px 0", textAlign: "center" }}>
+                            ✏️ Modifiez le texte ci-dessous puis cliquez <strong style={{ color: "#a5b4fc" }}>Envoyer</strong>
+                          </div>
+                        )}
                       </div>
                     );
                   })()}
