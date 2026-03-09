@@ -27632,13 +27632,38 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const [scheduleSpacing, setScheduleSpacing]     = useState(true);
   const [showScheduledList, setShowScheduledList] = useState(false);
   const [scheduledBroadcasts, setScheduledBroadcasts] = useState([]);
-  // Script assistant
-  const [activeScript, setActiveScript]       = useState(null);
-  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  // Script assistant — état par conversation (chat_id → { script, stepIndex, caption })
+  const [scriptStates, setScriptStates]       = useState({});   // persist par conv
   const [showScriptModal, setShowScriptModal] = useState(false);
   const [availableScripts, setAvailableScripts] = useState([]);
-  const [scriptStepCaption, setScriptStepCaption] = useState('');
   const [isSendingStep, setIsSendingStep] = useState(false);
+
+  // État courant du script = scriptStates[chatId] ou null
+  const _scriptChatId = () => selectedConv ? String(_dmsgChatId(selectedConv) || '') : '';
+  const activeScript      = scriptStates[_scriptChatId()]?.script      ?? null;
+  const currentStepIndex  = scriptStates[_scriptChatId()]?.stepIndex   ?? 0;
+  const scriptStepCaption = scriptStates[_scriptChatId()]?.caption      ?? '';
+
+  const setActiveScript     = (s)  => _setScriptField('script',    s);
+  const setCurrentStepIndex = (i)  => _setScriptField('stepIndex', i);
+  const setScriptStepCaption = (c) => _setScriptField('caption',   c);
+
+  const _setScriptField = (field, value) => {
+    const chatId = _scriptChatId();
+    if (!chatId) return;
+    setScriptStates(prev => ({
+      ...prev,
+      [chatId]: { ...(prev[chatId] || { script: null, stepIndex: 0, caption: '' }), [field]: value },
+    }));
+  };
+
+  const _setScriptState = (chatId, patch) => {
+    if (!chatId) return;
+    setScriptStates(prev => ({
+      ...prev,
+      [chatId]: { script: null, stepIndex: 0, caption: '', ...(prev[chatId] || {}), ...patch },
+    }));
+  };
 
   // === RBAC FILTERING ===
   const [userProfile, setUserProfile] = useState(null);
@@ -27735,6 +27760,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   const currentStepIndexRef = React.useRef(0);
   // Verrou anti-doublon pour sendScriptStep (ref = synchrone, pas de re-render)
   const isSendingStepRef = React.useRef(false);
+  // Ref miroir de scriptStates pour accès depuis useCallback sans dépendances
+  const scriptStatesRef = React.useRef({});
   // Ref for messages scroll container
   const msgContainerRef = React.useRef(null);
   // WebSocket connection ref
@@ -28085,6 +28112,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
     setActiveSpender(null);
     setSpenderLoading(false);
     setSpenderTab("profil");
+    // Reset verrou envoi script au changement de conv
+    isSendingStepRef.current = false;
+    setIsSendingStep(false);
     if (chatId) loadMessagesById(chatId, true, controller.signal);
     if (isMobile) setMobilePane("chat");
   }, [loadMessagesById, isMobile]);
@@ -28095,6 +28125,27 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   useEffect(() => {
     selectedConvRef.current = selectedConv;
   }, [selectedConv]);
+
+  // ── Sync scriptStatesRef + refs actives à chaque changement de conv/scriptStates ──
+  useEffect(() => {
+    scriptStatesRef.current = scriptStates;
+    const cid = selectedConv ? String(_dmsgChatId(selectedConv) || '') : '';
+    const st = cid ? (scriptStates[cid] || null) : null;
+    activeScriptRef.current      = st?.script      ?? null;
+    currentStepIndexRef.current  = st?.stepIndex   ?? 0;
+    // Restaurer la textarea si étape texte active sur cette conv
+    if (st?.script) {
+      const step = st.script.sequence[st.stepIndex];
+      if (step && !(step.media_url && (step.type === 'photo' || step.type === 'video' || step.type === 'audio'))) {
+        const val = st.caption || '';
+        msgInputRef.current = val;
+        setMsgInput(val);
+      } else {
+        msgInputRef.current = '';
+        setMsgInput('');
+      }
+    }
+  }, [selectedConv, scriptStates]);
 
   // ── Gestion onglets multiples ─────────────────────────────────────────────
   const openTab = useCallback((conv) => {
@@ -28534,55 +28585,24 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       ));
       // Remonter la conv en haut de liste
       loadConversations(true);
-      // Si un script texte est actif, avancer à l'étape suivante
+      // Si un script texte est actif sur cette conv, avancer à l'étape suivante
       if (activeScriptRef.current) {
         const sc = activeScriptRef.current;
         const idx = currentStepIndexRef.current;
         const step = sc.sequence[idx];
-        // Avancer seulement pour les étapes texte (les médias sont gérés par le bouton du bandeau)
         if (!step?.media_url) {
           const next = idx + 1;
+          const scChatId = String(chatId);
           if (next >= sc.sequence.length) {
             addToast(`✅ Script "${sc.title || sc.name}" terminé !`, 'success');
-            setActiveScript(null);
+            setScriptStates(prev => ({ ...prev, [scChatId]: { script: null, stepIndex: 0, caption: '' } }));
             activeScriptRef.current = null;
-            setCurrentStepIndex(0);
             currentStepIndexRef.current = 0;
-            setScriptStepCaption('');
           } else {
-            setCurrentStepIndex(next);
+            const nextStepObj = sc.sequence[next];
+            const nextCaption = nextStepObj?.content || '';
+            setScriptStates(prev => ({ ...prev, [scChatId]: { ...(prev[scChatId] || {}), stepIndex: next, caption: nextCaption } }));
             currentStepIndexRef.current = next;
-            _loadStepIntoInput(sc, next);
-          }
-        }
-      }
-      // Si une étape texte de script est active, avancer à l'étape suivante
-      if (activeScriptRef.current) {
-        const sc = activeScriptRef.current;
-        const idx = currentStepIndexRef.current;
-        const step = sc.sequence[idx];
-        if (step && (!step.media_url || step.type === 'text')) {
-          const nextIdx = idx + 1;
-          if (nextIdx >= sc.sequence.length) {
-            addToast(`✅ Script "${sc.title || sc.name}" terminé !`, 'success');
-            setActiveScript(null);
-            activeScriptRef.current = null;
-            setCurrentStepIndex(0);
-            currentStepIndexRef.current = 0;
-            setScriptStepCaption('');
-          } else {
-            setCurrentStepIndex(nextIdx);
-            currentStepIndexRef.current = nextIdx;
-            // _loadStepIntoInput sera appelé via useEffect sur currentStepIndex — on force ici
-            const nextStep2 = sc.sequence[nextIdx];
-            const val = nextStep2.content ? nextStep2.content : '';
-            setScriptStepCaption(val);
-            if (nextStep2.media_url && (nextStep2.type === 'photo' || nextStep2.type === 'video' || nextStep2.type === 'audio')) {
-              // étape média : laisser la textarea vide
-            } else {
-              msgInputRef.current = val;
-              setMsgInput(val);
-            }
           }
         }
       }
@@ -28665,15 +28685,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   }, [activeSpender, selectedConv]);
 
   const _loadStepIntoInput = (script, stepIndex) => {
+    const chatId = _scriptChatId();
     if (!script || stepIndex >= script.sequence.length) {
-      setActiveScript(null);
-      setCurrentStepIndex(0);
+      _setScriptState(chatId, { script: null, stepIndex: 0, caption: '' });
+      activeScriptRef.current = null;
+      currentStepIndexRef.current = 0;
       return;
     }
     const step = script.sequence[stepIndex];
     const val = _replaceVars(step.content) || '';
-    setScriptStepCaption(val);
-    // Si l'étape a un média, vider la textarea (le caption est dans le bandeau)
+    _setScriptState(chatId, { script, stepIndex, caption: val });
+    activeScriptRef.current = script;
+    currentStepIndexRef.current = stepIndex;
+    // Charger dans textarea seulement si étape texte
     if (step.media_url && (step.type === 'photo' || step.type === 'video' || step.type === 'audio')) {
       msgInputRef.current = '';
       setMsgInput('');
@@ -28686,10 +28710,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   };
 
   const startScript = (script) => {
-    setActiveScript(script);
+    const chatId = _scriptChatId();
+    _setScriptState(chatId, { script, stepIndex: 0, caption: _replaceVars(script.sequence?.[0]?.content || '') });
     activeScriptRef.current = script;
-    setCurrentStepIndex(0);
     currentStepIndexRef.current = 0;
+    // Charger le texte de la première étape dans la textarea
     _loadStepIntoInput(script, 0);
     setSentScriptIds(prev => prev.includes(script.id) ? prev : [...prev, script.id]);
   };
@@ -28739,19 +28764,27 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
     // Avancer à l'étape suivante
     const next = currentStepIndex + 1;
+    const scChatId = _scriptChatId();
     if (next >= activeScript.sequence.length) {
       addToast(`✅ Script "${activeScript.title || activeScript.name}" terminé !`, 'success');
-      setActiveScript(null);
+      _setScriptState(scChatId, { script: null, stepIndex: 0, caption: '' });
       activeScriptRef.current = null;
-      setCurrentStepIndex(0);
       currentStepIndexRef.current = 0;
       msgInputRef.current = '';
       setMsgInput('');
-      setScriptStepCaption('');
     } else {
-      setCurrentStepIndex(next);
+      const nextStepObj = activeScript.sequence[next];
+      const nextCaption = _replaceVars(nextStepObj?.content || '');
+      _setScriptState(scChatId, { stepIndex: next, caption: nextCaption });
+      activeScriptRef.current = activeScript;
       currentStepIndexRef.current = next;
-      _loadStepIntoInput(activeScript, next);
+      if (nextStepObj?.media_url && (nextStepObj.type === 'photo' || nextStepObj.type === 'video' || nextStepObj.type === 'audio')) {
+        msgInputRef.current = '';
+        setMsgInput('');
+      } else {
+        msgInputRef.current = nextCaption;
+        setMsgInput(nextCaption);
+      }
     }
     isSendingStepRef.current = false;
     setIsSendingStep(false);
@@ -28762,13 +28795,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
 
   const stopScript = () => {
     if (confirm('Arrêter ce script ?')) {
-      setActiveScript(null);
+      _setScriptState(_scriptChatId(), { script: null, stepIndex: 0, caption: '' });
       activeScriptRef.current = null;
-      setCurrentStepIndex(0);
       currentStepIndexRef.current = 0;
       msgInputRef.current = '';
       setMsgInput('');
-      setScriptStepCaption('');
       isSendingStepRef.current = false;
       setIsSendingStep(false);
     }
