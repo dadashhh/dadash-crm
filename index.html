@@ -27892,6 +27892,24 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       ));
     });
 
+    socket.on('transaction_created', (data) => {
+      console.log('[DADACAST] transaction_created reçu, rechargement conversations…', data);
+      // Invalider le cache pour que le prochain loadConversations récupère le total_spent à jour
+      convsCache.current.lastFetch = 0;
+      _DMSG_CONV_CACHE.ts = 0;
+      // Patch optimiste : incrémenter total_spent de la conversation concernée si chat_id connu
+      if (data && data.chat_id) {
+        const amt = Number(data.amount || 0);
+        setConversations(prev => prev.map(c =>
+          String(c.chat_id) === String(data.chat_id)
+            ? { ...c, total_spent: (Number(c.total_spent) || 0) + amt }
+            : c
+        ));
+      }
+      // Rechargement silencieux pour resynchroniser avec la DB (total_spent recalculé côté serveur)
+      setTimeout(() => { try { loadConversationsRef.current(true); } catch {} }, 1500);
+    });
+
     socket.on('disconnect', () => {
       console.log('[WS] Déconnecté — fallback polling activé');
     });
@@ -28005,6 +28023,26 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
       loadConversations();
     }
   }, [isLoadingProfile, userProfile]);
+
+  // Exposer l'invalidation du cache conversations pour le realtime Supabase global
+  useEffect(() => {
+    window.__dadashConvCacheInvalidate = (tx) => {
+      // Invalider les caches pour forcer rechargement du total_spent
+      convsCache.current.lastFetch = 0;
+      _DMSG_CONV_CACHE.ts = 0;
+      // Patch optimiste : incrémenter total_spent si on connaît le chat_id
+      if (tx && tx.tg_chat_id) {
+        const amt = Number(tx.amount || 0);
+        setConversations(prev => prev.map(c =>
+          String(c.chat_id) === String(tx.tg_chat_id)
+            ? { ...c, total_spent: (Number(c.total_spent) || 0) + amt }
+            : c
+        ));
+      }
+      setTimeout(() => { try { loadConversationsRef.current(true); } catch {} }, 1500);
+    };
+    return () => { window.__dadashConvCacheInvalidate = null; };
+  }, []);
 
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
@@ -45985,6 +46023,8 @@ const App = () => {
         setTxs(prev => prev.some(x => x.id === tx.id) ? prev : [tx, ...prev].slice(0, 100));
         setTxSummary(prev => prev.some(x => x.id === tx.id) ? prev : [tx, ...prev]);
         setTxTotal(prev => prev + 1);
+        // Invalider le cache conversations Dadacast pour forcer rechargement du total_spent
+        try { if (window.__dadashConvCacheInvalidate) window.__dadashConvCacheInvalidate(tx); } catch {}
         // If the currently open modal concerns this spender, trigger a targeted re-fetch
         if (tx.spender_id && window.__openModalSpenderId === tx.spender_id && window.__refetchModalSpender) {
           setTimeout(() => { try { window.__refetchModalSpender(tx.spender_id); } catch {} }, 350);
