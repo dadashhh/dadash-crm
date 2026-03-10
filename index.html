@@ -19781,9 +19781,13 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
   };
 
   const statusBadge = (s) => {
-    const map = {pending:{bg:"var(--warning-muted)",color:"var(--warning)",icon:"⏳"},validated:{bg:"var(--success-muted)",color:"var(--success)",icon:"✅"},rejected:{bg:"var(--danger-muted)",color:"var(--danger)",icon:"❌"}};
+    const map = {
+      pending:{bg:"var(--warning-muted)",color:"var(--warning)",icon:"⏳",label:fr?"En attente":"Pending"},
+      validated:{bg:"var(--success-muted)",color:"var(--success)",icon:"✅",label:fr?"Validé":"Validated"},
+      rejected:{bg:"var(--danger-muted)",color:"var(--danger)",icon:"❌",label:fr?"Refusé":"Rejected"}
+    };
     const st = map[s]||map.pending;
-    return React.createElement("span",{style:{padding:"3px 10px",borderRadius:12,background:st.bg,color:st.color,fontSize:14},title:s},st.icon);
+    return React.createElement("span",{style:{padding:"3px 10px",borderRadius:12,background:st.bg,color:st.color,fontSize:12,fontWeight:700,display:"inline-flex",alignItems:"center",gap:4},title:s},[st.icon," ",st.label].join(""));
   };
 
   const myProviderInvoices = (invoices||[]).filter(inv => inv.type === "incoming_provider" && inv.provider_id === user.id);
@@ -19931,7 +19935,11 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
 
       {/* Payment history */}
       <div className="card" style={{marginBottom:20}}>
-        <div className="section-title"><div className="section-bar"></div>{fr?"Historique de mes paiements":"My payment history"}</div>
+        <div className="section-title">
+          <div className="section-bar"></div>
+          {fr?"Historique de mes paiements":"My payment history"}
+          <span style={{marginLeft:8,padding:"2px 8px",borderRadius:10,background:"rgba(34,197,94,0.12)",color:"var(--success)",fontSize:10,fontWeight:700,verticalAlign:"middle"}}>● LIVE</span>
+        </div>
         {myPayouts.length===0?(
           <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:30,fontSize:13}}>{fr?"Aucun paiement déclaré":"No payments declared"}</div>
         ):(
@@ -19943,7 +19951,7 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
               </tr></thead>
               <tbody>
                 {myPayouts.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).map(p=>(
-                  <tr key={p.id}>
+                  <tr key={p.id} style={p.status==="validated"?{background:"rgba(34,197,94,0.04)"}:p.status==="rejected"?{background:"rgba(239,68,68,0.04)"}:{}}>
                     <td>{fmtDate(p.created_at)}</td>
                     <td style={{fontWeight:700}}>{Number(p.amount).toLocaleString("fr-FR",{maximumFractionDigits:0})}{p.currency==="EUR"?"€":"CHF"}</td>
                     <td style={{fontSize:10}}>{fmtDate(p.period_from)} → {fmtDate(p.period_to)}</td>
@@ -45533,7 +45541,7 @@ const App = () => {
         safe(sb.from("models").select("*"), "models"),
         (isChatter || isProvider) ? safe(sb.from("payouts").select("*").eq("user_id", currentUser.id).order("date",{ascending:false}), "payouts") : safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
         (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("*"), "expenses"),
-        (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
+        isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("*").eq("provider_id", currentUser.id).order("created_at",{ascending:false}), "provider_payouts") : safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
         safe(sb.from("products").select("*").order("sort_order"), "products"),
         safe(sb.from("product_tags").select("*").order("sort_order"), "product_tags"),
         safe(sb.from("model_prices").select("*"), "model_prices"),
@@ -46004,12 +46012,30 @@ const App = () => {
         }, 400);
       })
       // Provider payouts changes → update state directement (pas besoin de recharger tout loadData)
-      .on("postgres_changes", { event: "*", schema: "public", table: "provider_payouts" }, (payload) => {
+      .on("postgres_changes", { event: "*", schema: "public", table: "provider_payouts", ...(user.role === "provider" ? { filter: `provider_id=eq.${user.id}` } : {}) }, (payload) => {
         const ev = payload.eventType || payload.type;
         if (ev === "INSERT" && payload.new) {
+          // Pour les providers, on n'accepte que leurs propres payouts
+          if (user.role === "provider" && payload.new.provider_id !== user.id && payload.new.declared_by !== user.id) return;
           setProviderPayouts(prev => prev.some(p => p.id === payload.new.id) ? prev : [payload.new, ...prev]);
         } else if (ev === "UPDATE" && payload.new) {
+          // Pour les providers, on n'accepte que leurs propres payouts
+          if (user.role === "provider" && payload.new.provider_id !== user.id && payload.new.declared_by !== user.id) return;
           setProviderPayouts(prev => prev.map(p => p.id === payload.new.id ? payload.new : p));
+          // Notifier le provider si son paiement change de statut
+          if (user.role === "provider" && payload.old && payload.new.status !== payload.old.status) {
+            const amt = Number(payload.new.amount || 0);
+            const fmtAmt = amt.toLocaleString("fr-FR", { maximumFractionDigits: 0 });
+            if (payload.new.status === "validated") {
+              const notif = { id: "rt-pp-" + Date.now(), type: "payment_validated", title: "✅ Paiement validé", message: `${fmtAmt} CHF — reversement confirmé par le gérant`, created_at: new Date().toISOString(), read: false, _local: true };
+              setNotifications(prev => [notif, ...prev].slice(0, 50));
+              setUnreadCount(prev => prev + 1);
+            } else if (payload.new.status === "rejected") {
+              const notif = { id: "rt-pp-" + Date.now(), type: "payment_rejected", title: "❌ Paiement refusé", message: `${fmtAmt} CHF — refusé${payload.new.notes ? ` : ${payload.new.notes}` : ""}`, created_at: new Date().toISOString(), read: false, _local: true };
+              setNotifications(prev => [notif, ...prev].slice(0, 50));
+              setUnreadCount(prev => prev + 1);
+            }
+          }
         } else if (ev === "DELETE" && payload.old) {
           setProviderPayouts(prev => prev.filter(p => p.id !== payload.old.id));
         }
