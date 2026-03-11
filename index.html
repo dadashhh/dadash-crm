@@ -6055,6 +6055,8 @@ const PlaceholderTab = ({ title }) => (
 // =============================================
 // BULLETPROOF DB HELPERS
 // =============================================
+const CARLOS_WS_URL = 'https://dadash-autofill-v2-production.up.railway.app';
+
 // Helper WebSocket emit pour events TX (accès global via window.__dadashSocket)
 const _emitTxEvent = (event, data) => {
   try {
@@ -19118,7 +19120,16 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
             if(isUUID(modelId)) txRow.model_id = modelId;
             if(isUUID(leoProfile?.id)) txRow.provider_id = leoProfile.id;
             if(isUUID(defaultChatterId)) txRow.chatter_id = defaultChatterId;
-            const res = await safeInsertTx(txRow);
+            const res = await safeInsertTx(txRow, {
+              spender_name: handle || null,
+              spender_username: handle || null,
+              provider_name: leoProfile?.name || null,
+              chatter_name: (profiles || []).find(p => p.id === defaultChatterId)?.name || null,
+              model_name: modelName || null,
+              status: 'validated',
+              created_at: txRow.date,
+              created_by: user?.name || 'import_telegram',
+            });
             if (res.error) { dbTxFail++; lastDbErr = res.error.message; } else { dbTxOk++; }
           } catch (e) { /* TX import insert failed */ dbTxFail++; lastDbErr = e.message; }
         }
@@ -22975,8 +22986,15 @@ const TransactionSuggestionsTab = ({lang, user, profiles, spenders, onRefresh}) 
           if (s.field_changes.product) newTx.product = s.field_changes.product?.to || s.field_changes.product;
           if (s.field_changes.payment_method) newTx.payment_method = s.field_changes.payment_method?.to || s.field_changes.payment_method;
         }
-        const {error: txErr} = await sb.from("transactions").insert(newTx);
+        const {error: txErr, data: txInserted} = await sb.from("transactions").insert(newTx).select();
         if (txErr) throw txErr;
+        _emitTxEvent('transaction_created', {
+          ...newTx,
+          id: txInserted?.[0]?.id,
+          spender_name: (spenders || []).find(sp => sp.id === newTx.spender_id)?.name || newTx.spender_handle || null,
+          created_by: user?.name || null,
+          created_at: newTx.date,
+        });
       }
       const {error: sErr} = await sb.from("transaction_suggestions")
         .update({status: "accepted", reviewed_at: new Date().toISOString(), reviewed_by: user.id})
@@ -28011,22 +28029,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
   // WebSocket connection ref
   const socketRef = React.useRef(null);
 
-  const CARLOS_WS_URL = 'https://dadash-autofill-v2-production.up.railway.app';
-
   React.useEffect(() => {
-    const socket = io(CARLOS_WS_URL, {
-      transports: ['websocket'],
-      reconnectionAttempts: 5,
-      reconnectionDelay: 2000,
-    });
+    const socket = window.__dadashSocket;
+    if (!socket) return;
     socketRef.current = socket;
-    window.__dadashSocket = socket;
 
-    socket.on('connect', () => {
-      console.log('[WS] Connecté à Carlos');
-    });
-
-    socket.on('new_message', (data) => {
+    const onNewMessage = (data) => {
       if (data.chat_id === chatIdRef.current) {
         setMessages(prev => {
           const exists = prev.some(m => m.id === data.message.id);
@@ -28045,9 +28053,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             }
           : c
       ));
-    });
+    };
 
-    socket.on('conv_updated', (data) => {
+    const onConvUpdated = (data) => {
       setConversations(prev => prev.map(c =>
         c.chat_id === data.chat_id
           ? { ...c,
@@ -28056,14 +28064,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             }
           : c
       ));
-    });
+    };
 
-    socket.on('transaction_created', (data) => {
+    const onTxCreated = (data) => {
       console.log('[DADACAST] transaction_created reçu, rechargement conversations…', data);
-      // Invalider le cache pour que le prochain loadConversations récupère le total_spent à jour
       convsCache.current.lastFetch = 0;
       _DMSG_CONV_CACHE.ts = 0;
-      // Patch optimiste : incrémenter total_spent de la conversation concernée si chat_id connu
       if (data && data.chat_id) {
         const amt = Number(data.amount || 0);
         setConversations(prev => prev.map(c =>
@@ -28072,15 +28078,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs }) =>
             : c
         ));
       }
-      // Rechargement silencieux pour resynchroniser avec la DB (total_spent recalculé côté serveur)
       setTimeout(() => { try { loadConversationsRef.current(true); } catch {} }, 1500);
-    });
+    };
 
-    socket.on('disconnect', () => {
-      console.log('[WS] Déconnecté — fallback polling activé');
-    });
+    socket.on('new_message', onNewMessage);
+    socket.on('conv_updated', onConvUpdated);
+    socket.on('transaction_created', onTxCreated);
 
-    return () => { socket.disconnect(); window.__dadashSocket = null; };
+    return () => {
+      socket.off('new_message', onNewMessage);
+      socket.off('conv_updated', onConvUpdated);
+      socket.off('transaction_created', onTxCreated);
+    };
   }, []);
 
   // ── Tracker activité utilisateur (pour polling adaptatif) ──────────────────
@@ -45735,6 +45744,37 @@ const App = () => {
     }, 60000);
     return () => { window.removeEventListener("mousemove", handler); window.removeEventListener("keydown", handler); clearInterval(interval); };
   }, [user]);
+
+  // ═══ GLOBAL WEBSOCKET — init at boot so _emitTxEvent works from ANY tab ═══
+  useEffect(() => {
+    if (!user) return;
+    if (window.__dadashSocket && window.__dadashSocket.connected) return;
+    try {
+      const socket = io(CARLOS_WS_URL, {
+        transports: ['websocket'],
+        reconnectionAttempts: 10,
+        reconnectionDelay: 2000,
+      });
+      window.__dadashSocket = socket;
+      socket.on('connect', () => {
+        console.log('[WS-GLOBAL] Socket connecté à', CARLOS_WS_URL);
+      });
+      socket.on('disconnect', (reason) => {
+        console.log('[WS-GLOBAL] Socket déconnecté:', reason);
+      });
+      socket.on('reconnect', (attempt) => {
+        console.log('[WS-GLOBAL] Reconnecté après', attempt, 'tentatives');
+      });
+    } catch (e) {
+      console.warn('[WS-GLOBAL] Erreur init socket:', e);
+    }
+    return () => {
+      if (window.__dadashSocket) {
+        window.__dadashSocket.disconnect();
+        window.__dadashSocket = null;
+      }
+    };
+  }, [user?.id]);
 
   // Navigate to spender page from anywhere
   const navigateToSpender = (key) => {
