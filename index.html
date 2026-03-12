@@ -30032,6 +30032,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const [isSendingStep, setIsSendingStep] = useState(false);
   const [isSendingMedia, setIsSendingMedia] = useState(false);
 
+  // IA Semi-Auto state (classic messagerie)
+  const [classicIAEnabled, setClassicIAEnabled] = useState(false);
+  const [classicIAPanel, setClassicIAPanel] = useState(false);
+  const lastIncomingMsgRef = React.useRef("");
+
   // État courant du script = scriptStates[chatId] ou null
   const _scriptChatId = () => selectedConv ? String(_dmsgChatId(selectedConv) || '') : '';
   const activeScript      = scriptStates[_scriptChatId()]?.script      ?? null;
@@ -32234,6 +32239,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               style={{ padding: "5px 10px", borderRadius: 8, border: "1px solid var(--accent)", background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
               + TX
             </button>
+            <IAToggleButton
+              spenderId={selectedConv?.spender_id || _dmsgChatId(selectedConv)}
+              modelId={selectedConv?.model_id || selectedModelId}
+              onToggle={(enabled) => { setClassicIAEnabled(enabled); setClassicIAPanel(enabled); }}
+            />
+            {classicIAEnabled && (
+              <button onClick={() => setClassicIAPanel(p => !p)}
+                style={{ padding: "5px 10px", borderRadius: 8, border: classicIAPanel ? "1px solid rgba(99,102,241,0.5)" : "1px solid var(--border-subtle)", background: classicIAPanel ? "rgba(99,102,241,0.15)" : "transparent", color: classicIAPanel ? "#818cf8" : "var(--text-tertiary)", fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0, transition: "all 0.15s" }}>
+                💡 IA
+              </button>
+            )}
             {isMobile && (
               <button onClick={() => setMobilePane("spender")} style={{ background: "none", border: "1px solid var(--border-subtle)", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 14, padding: "5px 8px", borderRadius: 8 }}>👤</button>
             )}
@@ -33470,10 +33486,22 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         <div style={{ display: "flex", flexDirection: "column", border: "1px solid var(--border-subtle)", borderRadius: 16, overflow: "hidden", boxShadow: "var(--shadow-md)" }}>
           {tabNav}
           {activeTab === "conversations" && (
-            <div style={{ display: "grid", gridTemplateColumns: "25% 45% 30%", height: PANEL_H, minHeight: 520 }}>
-              {leftPanel}
-              {centerPanel}
-              {rightPanel}
+            <div style={{ display: "flex", height: PANEL_H, minHeight: 520 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "25% 45% 30%", flex: 1, minWidth: 0 }}>
+                {leftPanel}
+                {centerPanel}
+                {rightPanel}
+              </div>
+              {classicIAPanel && classicIAEnabled && selectedConv && (
+                <IASuggestionsPanel
+                  spenderId={selectedConv?.spender_id || _dmsgChatId(selectedConv)}
+                  modelId={selectedConv?.model_id || selectedModelId}
+                  lastMessage={(() => { const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing); return last?.text || last?.content || ""; })()}
+                  isGridMode={false}
+                  onUseSuggestion={(text) => { msgInputRef.current = text; setMsgInput(text); setTimeout(() => inputRef.current?.focus(), 50); }}
+                  onClose={() => setClassicIAPanel(false)}
+                />
+              )}
             </div>
           )}
           {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
@@ -47828,6 +47856,100 @@ const IASuggestionsPanel = ({ spenderId, modelId, lastMessage, isGridMode, onUse
 };
 
 // =============================================
+// IA SEMI-AUTO — Payment Detection + Notifications
+// =============================================
+const _iaPaymentNotifs = [];
+
+const showPaymentNotification = (transaction) => {
+  const notif = { id: Date.now(), transaction, timestamp: new Date() };
+  _iaPaymentNotifs.push(notif);
+  window.dispatchEvent(new CustomEvent('ia-payment-detected', { detail: notif }));
+};
+
+const handleNewMessageIA = (message, spenderId, modelId) => {
+  const state = getConvIAState(spenderId, modelId);
+  if (!state.enabled || message.is_outgoing || message.direction === "out") return;
+  if (message.media_type === 'photo' && message.media_url) {
+    detectPaymentIA(spenderId, modelId, message.media_url)
+      .then(result => { if (result.payment_detected && result.transaction) showPaymentNotification(result.transaction); })
+      .catch(err => console.warn('[IA] payment detect error:', err));
+  }
+  if (state.autoSuggest) {
+    generateIASuggestions(spenderId, modelId, message.text || message.content || '', message.media_url)
+      .catch(err => console.warn('[IA] suggestion error:', err));
+  }
+};
+
+const PaymentDetectedNotification = ({ transaction, onClose, onView }) => {
+  React.useEffect(() => { const t = setTimeout(onClose, 12000); return () => clearTimeout(t); }, []);
+  return (
+    <div style={{ width: 360, background: "rgba(13,15,30,0.97)", border: "1px solid rgba(16,185,129,0.4)", borderLeft: "4px solid #10b981", borderRadius: 12, boxShadow: "0 8px 32px rgba(0,0,0,0.5)", padding: 16, marginBottom: 8, animation: "ia-slideRight 0.3s ease-out", backdropFilter: "blur(8px)" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 22 }}>🎉</span>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 800, color: "#e5e7eb" }}>Paiement détecté !</div>
+            <div style={{ fontSize: 10, color: "#6b7280" }}>Transaction créée automatiquement</div>
+          </div>
+        </div>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#6b7280", fontSize: 16, cursor: "pointer" }}>×</button>
+      </div>
+      <div style={{ background: "rgba(16,185,129,0.08)", border: "1px solid rgba(16,185,129,0.2)", borderRadius: 8, padding: "10px 12px", marginBottom: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+          <span style={{ fontSize: 20, fontWeight: 800, color: "#34d399" }}>{transaction?.amount || "?"} {transaction?.currency || "CHF"}</span>
+          {transaction?.payment_method && <span style={{ padding: "2px 8px", borderRadius: 6, background: "rgba(16,185,129,0.15)", color: "#6ee7b7", fontSize: 10, fontWeight: 700 }}>{transaction.payment_method}</span>}
+        </div>
+        {transaction?.description && <div style={{ fontSize: 11, color: "#9ca3af" }}>{transaction.description}</div>}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        {onView && <button onClick={onView} style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "none", background: "#6366f1", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Voir la transaction</button>}
+        <button onClick={onClose} style={{ flex: onView ? 0 : 1, padding: "7px 14px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#9ca3af", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>OK</button>
+      </div>
+    </div>
+  );
+};
+
+const IANotificationsContainer = () => {
+  const [notifs, setNotifs] = React.useState([]);
+  React.useEffect(() => {
+    const handler = (e) => setNotifs(prev => [...prev, e.detail]);
+    window.addEventListener('ia-payment-detected', handler);
+    return () => window.removeEventListener('ia-payment-detected', handler);
+  }, []);
+  const close = (id) => setNotifs(prev => prev.filter(n => n.id !== id));
+  if (notifs.length === 0) return null;
+  return (
+    <div style={{ position: "fixed", top: 80, right: 20, zIndex: 10002, display: "flex", flexDirection: "column" }}>
+      {notifs.map(n => (
+        <PaymentDetectedNotification key={n.id} transaction={n.transaction} onClose={() => close(n.id)} />
+      ))}
+    </div>
+  );
+};
+
+// Keyboard shortcuts for IA
+const useIAKeyboardShortcuts = (spenderId, modelId, onUseSuggestion) => {
+  React.useEffect(() => {
+    if (!spenderId) return;
+    const handler = (e) => {
+      if (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'i')) {
+        e.preventDefault();
+        const next = toggleIAMode(spenderId, modelId);
+        window.dispatchEvent(new CustomEvent('ia-toggled', { detail: { spenderId, modelId, enabled: next } }));
+      }
+      if (e.ctrlKey && !e.shiftKey && ['1','2','3'].includes(e.key)) {
+        e.preventDefault();
+        const state = getConvIAState(spenderId, modelId);
+        const idx = parseInt(e.key) - 1;
+        if (state.suggestions?.[idx] && onUseSuggestion) onUseSuggestion(state.suggestions[idx].text, idx);
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [spenderId, modelId, onUseSuggestion]);
+};
+
+// =============================================
 // GRID CONVERSATION CELL — Compact messaging per grid slot
 // =============================================
 const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders, models, onClose, onNewMessage, visible = true }) => {
@@ -47881,7 +48003,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     setTimeout(() => inputRef.current?.focus(), 50);
   };
 
-  // Auto-suggest on new incoming message when IA enabled + autoSuggest on
+  // Auto-suggest + payment detection on new incoming message
   useEffect(() => {
     if (!iaEnabled || !messages.length) return;
     const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing && m.sender_type !== "chatter" && m.sender_type !== "bot");
@@ -47889,10 +48011,14 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     const key = _msgKey(last);
     if (key && key !== lastIncomingRef.current) {
       lastIncomingRef.current = key;
+      handleNewMessageIA(last, convData?.spender_id || chatId, modelId);
       const state = getConvIAState(convData?.spender_id, modelId);
       if (state.autoSuggest) setShowIAPanel(true);
     }
   }, [messages, iaEnabled]);
+
+  // IA keyboard shortcuts
+  useIAKeyboardShortcuts(convData?.spender_id || chatId, modelId, handleUseSuggestion);
 
   // Spender info popup state
   const [showSpenderInfo, setShowSpenderInfo] = useState(false);
@@ -51505,7 +51631,7 @@ const App = () => {
 };
 
 ReactDOM.createRoot(document.getElementById("root")).render(
-  <ErrorBoundary><ToastProvider><CardModalProvider><NavProvider><App /></NavProvider></CardModalProvider></ToastProvider></ErrorBoundary>
+  <ErrorBoundary><ToastProvider><CardModalProvider><NavProvider><><App /><IANotificationsContainer /></></NavProvider></CardModalProvider></ToastProvider></ErrorBoundary>
 );
   </script>
   <div id="modal-root"></div>
