@@ -4008,6 +4008,47 @@
     }
     .grid-page-tab:hover .grid-page-close { opacity: 0.7; }
     .grid-page-close:hover { opacity: 1 !important; color: #ef4444; }
+    .grid-btn-unread {
+      padding: 4px 12px; border-radius: 7px; font-size: 11px; font-weight: 600;
+      cursor: pointer; border: 1px solid rgba(99,102,241,0.3);
+      background: rgba(45,55,72,0.8); color: #a0aec0;
+      font-family: 'DM Sans', sans-serif; transition: all 0.2s;
+      display: flex; align-items: center; gap: 6px; white-space: nowrap;
+    }
+    .grid-btn-unread:hover { background: rgba(99,102,241,0.15); color: #818cf8; border-color: rgba(99,102,241,0.5); }
+    .grid-btn-unread.has-unread {
+      background: rgba(99,102,241,0.2); color: #818cf8;
+      border-color: rgba(99,102,241,0.5);
+      animation: grid-pulse-unread 2.5s ease-in-out infinite;
+    }
+    .grid-btn-unread:disabled { opacity: 0.5; cursor: not-allowed; animation: none; }
+    @keyframes grid-pulse-unread {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+      50% { box-shadow: 0 0 8px 2px rgba(99,102,241,0.3); }
+    }
+    .grid-unread-badge {
+      background: #ef4444; color: #fff; font-size: 10px; font-weight: 800;
+      padding: 1px 6px; border-radius: 8px; min-width: 16px; text-align: center;
+      line-height: 1.4;
+    }
+    .grid-btn-unread {
+      display: flex; align-items: center; gap: 6px;
+      padding: 4px 12px; border-radius: 7px; font-size: 11px; font-weight: 600;
+      cursor: pointer; transition: all 0.2s; font-family: 'DM Sans', sans-serif;
+      border: 1px solid rgba(99,102,241,0.3); background: rgba(99,102,241,0.08); color: #818cf8;
+    }
+    .grid-btn-unread:hover { background: rgba(99,102,241,0.2); border-color: rgba(99,102,241,0.5); }
+    .grid-btn-unread:disabled { opacity: 0.4; cursor: not-allowed; }
+    .grid-btn-unread.has-unread {
+      background: rgba(99,102,241,0.2); border-color: #6366f1;
+      animation: grid-unread-pulse 2.5s ease-in-out infinite;
+    }
+    @keyframes grid-unread-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.7; } }
+    .grid-unread-badge {
+      background: #ef4444; color: #fff; font-size: 10px; font-weight: 800;
+      padding: 1px 6px; border-radius: 8px; min-width: 16px; text-align: center;
+      line-height: 1.4;
+    }
     .grid-toolbar {
       display: flex;
       align-items: center;
@@ -48285,6 +48326,105 @@ const MessagerieGridApp = ({ user, lang, spenders, models, profiles, txs }) => {
     return modalConvs.filter(c => { const name = getConvDisplayName(c).toLowerCase(); const handle = (c.tg_username || "").toLowerCase(); return name.includes(q) || handle.includes(q); });
   }, [modalConvs, searchFilter, spenders]);
 
+  // ── Unread conversations logic ──
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [loadingUnread, setLoadingUnread] = useState(false);
+  const addToast = useToast();
+
+  const fetchUnreadConvs = React.useCallback(async () => {
+    try {
+      let convs;
+      if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < 30000) {
+        convs = _DMSG_CONV_CACHE.list;
+      } else {
+        const data = await _dmsgFetch("/conversations", { timeout: 8000 });
+        convs = Array.isArray(data) ? data : (data.conversations || data.data || []);
+        _DMSG_CONV_CACHE.list = convs;
+        _DMSG_CONV_CACHE.ts = Date.now();
+      }
+      return convs.filter(c =>
+        (c.unread_count > 0 || c.has_unread === true ||
+         c.last_message_direction === "in" || c.last_direction === "in")
+      ).sort((a, b) => (b.unread_count || 1) - (a.unread_count || 1));
+    } catch (e) {
+      console.warn("[GRID] fetchUnread error:", e);
+      return [];
+    }
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    const refresh = async () => {
+      const unread = await fetchUnreadConvs();
+      const openIds = new Set();
+      pages.forEach(p => p.conversations.forEach(c => { if (c) openIds.add(c.chat_id); }));
+      const notOpened = unread.filter(c => !openIds.has(String(_dmsgChatId(c))));
+      if (mounted) setUnreadCount(notOpened.length);
+    };
+    refresh();
+    const t = setInterval(refresh, 30000);
+    return () => { mounted = false; clearInterval(t); };
+  }, [pages]);
+
+  const loadUnreadConversations = async () => {
+    setLoadingUnread(true);
+    try {
+      const unreadConvs = await fetchUnreadConvs();
+      const openIds = new Set();
+      pages.forEach(p => p.conversations.forEach(c => { if (c) openIds.add(c.chat_id); }));
+      const newUnread = unreadConvs.filter(c => !openIds.has(String(_dmsgChatId(c))));
+
+      if (newUnread.length === 0) {
+        addToast(fr ? "Aucune conversation non lue à charger ✓" : "No unread conversations to load ✓", "success");
+        setLoadingUnread(false);
+        return;
+      }
+
+      const curPage = pages[currentPage];
+      const curMax = layoutMap[curPage.layout] || 9;
+      const emptySlots = [];
+      curPage.conversations.slice(0, curMax).forEach((c, i) => { if (!c) emptySlots.push(i); });
+
+      if (emptySlots.length === 0) {
+        if (pages.length < MAX_PAGES) {
+          addPage();
+          setTimeout(() => loadUnreadConversations(), 100);
+        } else {
+          addToast(fr ? "Toutes les pages sont pleines (max 5 pages)" : "All pages full (max 5 pages)", "warning");
+        }
+        setLoadingUnread(false);
+        return;
+      }
+
+      const toLoad = newUnread.slice(0, emptySlots.length);
+      const allSp = spenders || [];
+
+      setPages(prev => {
+        const next = prev.map(p => ({ ...p, conversations: [...p.conversations] }));
+        const pg = next[currentPage];
+        toLoad.forEach((conv, i) => {
+          const chatId = String(_dmsgChatId(conv));
+          const sp = (conv.spender_id && allSp.find(x => x.id === conv.spender_id))
+            || allSp.find(x => String(x.tg_user_id || x.telegram_id || "") === chatId) || null;
+          const name = sp ? (sp.first_name || sp.handle || sp.name) : (conv.display_name || conv.username || conv.tg_username || "Conversation");
+          pg.conversations[emptySlots[i]] = { chat_id: chatId, model_id: conv.model_id || '', name: name || 'Conversation', spender_id: conv.spender_id || '' };
+        });
+        return next;
+      });
+
+      const remaining = newUnread.length - toLoad.length;
+      if (remaining > 0 && pages.length < MAX_PAGES) {
+        addToast(`${toLoad.length} ${fr ? "chargées" : "loaded"} · ${remaining} ${fr ? "restantes" : "remaining"}`, "info");
+      } else {
+        addToast(`${toLoad.length} ${fr ? "conversations non lues chargées" : "unread conversations loaded"} ✓`, "success");
+      }
+      setUnreadCount(Math.max(0, unreadCount - toLoad.length));
+    } catch (e) {
+      addToast("Erreur: " + e.message, "error");
+    }
+    setLoadingUnread(false);
+  };
+
   if (isMobile) {
     return (
       <div className="grid-mobile-msg" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", background: "var(--bg-base, #0a0a1a)", color: "#6b7280", gap: 16, padding: 32, textAlign: "center" }}>
@@ -48328,6 +48468,11 @@ const MessagerieGridApp = ({ user, lang, spenders, models, profiles, txs }) => {
             </button>
           ))}
           <span style={{ width: 1, height: 16, background: "rgba(255,255,255,0.08)", margin: "0 4px" }} />
+          <button className={`grid-btn-unread ${unreadCount > 0 ? 'has-unread' : ''}`}
+            onClick={loadUnreadConversations} disabled={loadingUnread}>
+            {loadingUnread ? "⏳" : "📬"} {fr ? "Charger non lus" : "Load unread"}
+            {unreadCount > 0 && <span className="grid-unread-badge">{unreadCount}</span>}
+          </button>
           <button onClick={() => { const p = pages[currentPage]; const emptyIdx = p.conversations.findIndex(c => c === null); if (emptyIdx >= 0) openAddModal(emptyIdx); }}
             disabled={!page.conversations.some(c => c === null)}
             style={{ padding: "4px 12px", borderRadius: 7, fontSize: 11, fontWeight: 600, cursor: page.conversations.some(c => c === null) ? "pointer" : "not-allowed", border: "1px solid rgba(99,102,241,0.3)", background: "rgba(99,102,241,0.1)", color: "#818cf8", fontFamily: "'DM Sans', sans-serif", opacity: page.conversations.some(c => c === null) ? 1 : 0.4 }}>
