@@ -21539,7 +21539,7 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
         <div className="section-title"><div className="section-bar"></div>{fr?"Mes transactions":"My transactions"}</div>
         <div className="table-wrap">
           <table className="table" style={{fontSize:12}}>
-            <thead><tr><th>{t(lang,"date")}</th><th>Spender</th><th>Model</th><th>{t(lang,"amount")}</th><th>{t(lang,"status")}</th></tr></thead>
+            <thead><tr><th>{t(lang,"date")}</th><th>Spender</th><th>Model</th><th>{t(lang,"amount")}</th><th style={{fontSize:11,whiteSpace:"nowrap",textAlign:"center"}}>{fr?"Facture":"Invoice"}</th><th>{t(lang,"status")}</th></tr></thead>
             <tbody>
               {providerTxs.slice(0,30).map(tx=>(
                 <tr key={tx.id}>
@@ -21547,6 +21547,9 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
                   <td><Tag type="spender" label={tx.spender_handle} id={tx.spender_handle}/></td>
                   <td><Tag type="model" label={models.find(m=>m.id===tx.model_id)?.name||"?"} id={tx.model_id}/></td>
                   <td style={{fontWeight:700}}>{fmtAmount(tx.amount,tx.currency)}</td>
+                  <td style={{textAlign:"center"}}>{tx.invoice_url ? (
+                    <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                  ) : <span style={{color:"var(--text-quaternary)"}}>—</span>}</td>
                   <td><StatusPill status={tx.status} lang={lang}/></td>
                 </tr>
               ))}
@@ -43061,41 +43064,84 @@ const ScansTab = ({ user, lang, spenders, txs, models, profiles, products, provi
 // =============================================
 const ProviderConfirmations = ({ user, lang, spenders, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh }) => {
   const addToast = useToast();
+  const fr = lang === 'fr';
   const [saving, setSaving] = useState(false);
+  const [showInvoiceModal, setShowInvoiceModal] = useState(false);
+  const [pendingCheckData, setPendingCheckData] = useState(null);
   const pending = (screenshotChecks || []).filter(c => c.status === "awaiting_confirmation" && c.provider_id === user.id);
 
-  if (pending.length === 0) return null;
+  if (pending.length === 0 && !showInvoiceModal) return null;
 
-  const handleConfirm = async (check, confirmed) => {
+  const handleReject = async (check) => {
     setSaving(true);
     try {
       await sb.from("screenshot_checks").update({
-        provider_confirmed: confirmed,
+        provider_confirmed: false,
         provider_confirmed_at: new Date().toISOString(),
-        status: confirmed ? "validated" : "rejected"
+        status: "rejected"
       }).eq("id", check.id);
-      if (confirmed) {
-        const provTxPayload = {
-          spender_id: check.spender_id, model_id: check.model_id,
-          provider_id: check.provider_id, provider_payment_method_id: check.provider_payment_method_id,
-          amount: check.claimed_amount, currency: check.claimed_currency || "CHF",
-          payment_method: check.claimed_method, status: "pending", created_by: user.id,
-          notes: `Confirmé par provider (scan score: ${check.risk_score}/100)`
-        };
-        const { data: provTxInserted } = await sb.from("transactions").insert(provTxPayload).select();
-        _emitTxEvent('transaction_created', { ...provTxPayload, id: provTxInserted?.[0]?.id });
-        addToast("✅ Paiement confirmé — TX créée", "success");
-      } else {
-        const sp = spenders.find(s => s.id === check.spender_id);
-        if (sp) {
-          const newCount = (sp.scam_count || 0) + 1;
-          await sb.from("spenders").update({ scam_count: newCount, scam_flag: newCount >= 2 }).eq("id", sp.id);
-        }
-        addToast("❌ Paiement NON reçu — alerte envoyée", "warning");
+      const sp = spenders.find(s => s.id === check.spender_id);
+      if (sp) {
+        const newCount = (sp.scam_count || 0) + 1;
+        await sb.from("spenders").update({ scam_count: newCount, scam_flag: newCount >= 2 }).eq("id", sp.id);
       }
+      addToast("❌ Paiement NON reçu — alerte envoyée", "warning");
       if (onRefresh) onRefresh();
     } catch (e) { addToast("Erreur: " + e.message, "error"); }
     setSaving(false);
+  };
+
+  const handleConfirmYes = (check) => {
+    const sp = spenders.find(s => s.id === check.spender_id);
+    setPendingCheckData({
+      check,
+      spender_handle: sp?.handle || 'unknown',
+      spender_id: check.spender_id,
+      model_id: check.model_id,
+      amount: check.claimed_amount,
+      currency: check.claimed_currency || 'CHF',
+      payment_method: check.claimed_method,
+      provider_id: check.provider_id,
+      provider_payment_method_id: check.provider_payment_method_id,
+      notes: `Confirmé par provider (scan score: ${check.risk_score}/100)`,
+      date: new Date().toISOString(),
+    });
+    setShowInvoiceModal(true);
+  };
+
+  const handleInvoiceConfirm = async ({ clientPhone, clientName }) => {
+    if (!pendingCheckData) return { ok: false, error: 'No pending data' };
+    try {
+      const check = pendingCheckData.check;
+      await sb.from("screenshot_checks").update({
+        provider_confirmed: true,
+        provider_confirmed_at: new Date().toISOString(),
+        status: "validated"
+      }).eq("id", check.id);
+
+      const provTxPayload = {
+        spender_id: pendingCheckData.spender_id,
+        spender_handle: pendingCheckData.spender_handle,
+        model_id: pendingCheckData.model_id,
+        provider_id: pendingCheckData.provider_id,
+        provider_payment_method_id: pendingCheckData.provider_payment_method_id,
+        amount: pendingCheckData.amount,
+        currency: pendingCheckData.currency,
+        payment_method: pendingCheckData.payment_method,
+        status: "pending",
+        created_by: user.id,
+        notes: pendingCheckData.notes,
+        date: pendingCheckData.date,
+      };
+      const { data: provTxInserted, error: txErr } = await sb.from("transactions").insert(provTxPayload).select();
+      if (txErr) throw txErr;
+      const insertedId = provTxInserted?.[0]?.id;
+      _emitTxEvent('transaction_created', { ...provTxPayload, id: insertedId });
+
+      return { ok: true, txId: insertedId, spenderId: pendingCheckData.spender_id };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
   };
 
   const fmtTimeAgo = (d) => {
@@ -43109,6 +43155,7 @@ const ProviderConfirmations = ({ user, lang, spenders, models, profiles, screens
   };
 
   return (
+    <>
     <div style={{ marginBottom: 28 }}>
       <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 14 }}>{"\u{1F4CB}"} Confirmations en attente ({pending.length})</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -43123,14 +43170,32 @@ const ProviderConfirmations = ({ user, lang, spenders, models, profiles, screens
               <div style={{ fontSize: 12, color: "#9CA3AF", marginBottom: 12 }}>Spender: @{sp?.handle || "?"} {"→"} Modèle: {mo?.name || "?"}</div>
               <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, color: "#D1D5DB" }}>As-tu bien reçu ce paiement ?</div>
               <div style={{ display: "flex", gap: 10 }}>
-                <button onClick={() => handleConfirm(c, true)} disabled={saving} style={{ padding: "8px 18px", borderRadius: 10, border: "none", background: "#10B981", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"✅"} OUI, reçu</button>
-                <button onClick={() => handleConfirm(c, false)} disabled={saving} style={{ padding: "8px 18px", borderRadius: 10, border: "none", background: "#EF4444", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"❌"} NON, pas reçu</button>
+                <button onClick={() => handleConfirmYes(c)} disabled={saving} style={{ padding: "8px 18px", borderRadius: 10, border: "none", background: "#10B981", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"✅"} OUI, reçu</button>
+                <button onClick={() => handleReject(c)} disabled={saving} style={{ padding: "8px 18px", borderRadius: 10, border: "none", background: "#EF4444", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", fontFamily: "'DM Sans',sans-serif" }}>{"❌"} NON, pas reçu</button>
               </div>
             </div>
           );
         })}
       </div>
     </div>
+
+    {showInvoiceModal && pendingCheckData && (
+      <InvoiceGeneratorModal
+        open={showInvoiceModal}
+        onClose={() => {
+          setShowInvoiceModal(false);
+          setPendingCheckData(null);
+          if (onRefresh) onRefresh();
+        }}
+        txFormData={pendingCheckData}
+        user={user}
+        lang={lang}
+        models={models}
+        spenders={spenders}
+        onConfirm={handleInvoiceConfirm}
+      />
+    )}
+    </>
   );
 };
 
