@@ -4074,6 +4074,47 @@
     .grid-tx-field input:focus, .grid-tx-field select:focus, .grid-tx-field textarea:focus {
       border-color: rgba(99,102,241,0.4);
     }
+    /* IA Semi-Auto */
+    .ia-suggestions-panel { z-index: 100; }
+    .ia-suggestions-panel.grid-mode {
+      position: absolute; bottom: 70px; left: 8px; right: 8px;
+      max-height: 420px; animation: ia-slideUp 0.2s ease-out;
+    }
+    .ia-suggestions-panel.classic-mode {
+      position: fixed; right: 0; top: 80px; bottom: 0;
+      width: 360px; animation: ia-slideRight 0.3s ease-out;
+    }
+    @keyframes ia-slideUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes ia-slideRight { from { opacity:0; transform:translateX(100%); } to { opacity:1; transform:translateX(0); } }
+    .ia-suggestions-panel ::-webkit-scrollbar { width: 5px; }
+    .ia-suggestions-panel ::-webkit-scrollbar-track { background: #0f1117; }
+    .ia-suggestions-panel ::-webkit-scrollbar-thumb { background: #4a5568; border-radius: 3px; }
+    .ia-suggestions-panel ::-webkit-scrollbar-thumb:hover { background: #6366f1; }
+    .ia-toggle-btn {
+      width: 32px; height: 32px; border-radius: 6px; border: none;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px; cursor: pointer; transition: all 0.2s;
+      flex-shrink: 0; padding: 0; position: relative;
+    }
+    .ia-toggle-btn.off { background: rgba(45,55,72,0.8); color: #6b7280; }
+    .ia-toggle-btn.off:hover { background: rgba(99,102,241,0.15); color: #818cf8; }
+    .ia-toggle-btn.on {
+      background: rgba(99,102,241,0.3); color: #818cf8;
+      box-shadow: 0 0 10px rgba(99,102,241,0.3);
+    }
+    .ia-toggle-dot {
+      position: absolute; top: -2px; right: -2px;
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #22c55e; border: 2px solid #0f1117;
+      animation: ia-dot-pulse 2s ease-in-out infinite;
+    }
+    @keyframes ia-dot-pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+    .ia-sugg-card {
+      background: rgba(15,17,23,0.9); border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 9px; padding: 10px 12px; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .ia-sugg-card:hover { border-color: rgba(99,102,241,0.4); background: rgba(99,102,241,0.06); }
     .grid-toolbar {
       display: flex;
       align-items: center;
@@ -28342,6 +28383,110 @@ const SpenderFichePanel = ({ conv, spenders, models, txs, lang, user, onCreateSp
 };
 
 // =============================================
+// IA SEMI-AUTO — State Management + API Calls
+// =============================================
+
+const _IA_STATE_KEY = 'dadash_ia_state';
+
+const _iaStateCache = (() => {
+  try { return JSON.parse(localStorage.getItem(_IA_STATE_KEY) || '{}'); } catch { return {}; }
+})();
+
+const _saveIAState = () => { try { localStorage.setItem(_IA_STATE_KEY, JSON.stringify(_iaStateCache)); } catch {} };
+
+const getConvIAState = (spenderId, modelId) => {
+  const key = `s_${spenderId || 'x'}_m_${modelId || 'x'}`;
+  return _iaStateCache[key] || { enabled: false, suggestions: [], lastGenerated: null, autoSuggest: true };
+};
+
+const setConvIAState = (spenderId, modelId, updates) => {
+  const key = `s_${spenderId || 'x'}_m_${modelId || 'x'}`;
+  _iaStateCache[key] = { ...getConvIAState(spenderId, modelId), ...updates };
+  _saveIAState();
+};
+
+const toggleIAMode = (spenderId, modelId) => {
+  const cur = getConvIAState(spenderId, modelId);
+  setConvIAState(spenderId, modelId, { enabled: !cur.enabled });
+  return !cur.enabled;
+};
+
+const generateIASuggestions = async (spenderId, modelId, lastMessage, mediaUrl) => {
+  const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
+  const url = _DMSG_API + "/api/suggestions";
+  const body = { spender_id: spenderId, model_id: modelId, last_message: lastMessage || '' };
+  if (mediaUrl) body.media_url = mediaUrl;
+  const res = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': key }, body: JSON.stringify(body)
+  });
+  if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || 'API error ' + res.status); }
+  const data = await res.json();
+  setConvIAState(spenderId, modelId, { suggestions: data.suggestions || [], lastGenerated: new Date().toISOString() });
+  return data;
+};
+
+const detectPaymentIA = async (spenderId, modelId, mediaUrl) => {
+  const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
+  const url = _DMSG_API + "/api/detect-payment";
+  const res = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': key },
+    body: JSON.stringify({ spender_id: spenderId, model_id: modelId, media_url: mediaUrl })
+  });
+  if (!res.ok) throw new Error('API error ' + res.status);
+  return await res.json();
+};
+
+// =============================================
+// IA SEMI-AUTO — State Management + API
+// =============================================
+const _IA_STORAGE_KEY = 'dadash_ia_state';
+const _iaStateCache = JSON.parse(localStorage.getItem(_IA_STORAGE_KEY) || '{}');
+
+const _saveIAState = () => { try { localStorage.setItem(_IA_STORAGE_KEY, JSON.stringify(_iaStateCache)); } catch {} };
+
+const getConvIAState = (spenderId, modelId) => {
+  const key = `s_${spenderId || 'x'}_m_${modelId || 'x'}`;
+  return _iaStateCache[key] || { enabled: false, suggestions: [], lastGenerated: null, autoSuggest: true };
+};
+
+const setConvIAState = (spenderId, modelId, updates) => {
+  const key = `s_${spenderId || 'x'}_m_${modelId || 'x'}`;
+  _iaStateCache[key] = { ...getConvIAState(spenderId, modelId), ...updates };
+  _saveIAState();
+};
+
+const toggleIAMode = (spenderId, modelId) => {
+  const cur = getConvIAState(spenderId, modelId);
+  setConvIAState(spenderId, modelId, { enabled: !cur.enabled });
+  return !cur.enabled;
+};
+
+const generateIASuggestions = async (spenderId, modelId, lastMessage, mediaUrl) => {
+  const key = window.CRM_API_KEY || localStorage.getItem('crm_api_key') || '679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade';
+  const base = 'https://dadash-autofill-v2-production.up.railway.app';
+  const body = { spender_id: spenderId, model_id: modelId, last_message: lastMessage || '' };
+  if (mediaUrl) body.media_url = mediaUrl;
+  const res = await fetch(base + '/api/suggestions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': key }, body: JSON.stringify(body)
+  });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || 'API error ' + res.status); }
+  const data = await res.json();
+  setConvIAState(spenderId, modelId, { suggestions: data.suggestions || [], lastGenerated: new Date().toISOString() });
+  return data;
+};
+
+const detectPaymentIA = async (spenderId, modelId, mediaUrl) => {
+  const key = window.CRM_API_KEY || localStorage.getItem('crm_api_key') || '679aa382f5faa4668e7ba6570b8bb0038f2e0c10f815bf881090c7e02419cade';
+  const base = 'https://dadash-autofill-v2-production.up.railway.app';
+  const res = await fetch(base + '/api/detect-payment', {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-API-Key': key },
+    body: JSON.stringify({ spender_id: spenderId, model_id: modelId, media_url: mediaUrl })
+  });
+  if (!res.ok) throw new Error('API error ' + res.status);
+  return await res.json();
+};
+
+// =============================================
 // DADASH MESSAGERIE — Live Chat 3 colonnes
 // API: https://dadash-autofill-v2-production.up.railway.app
 // =============================================
@@ -47551,6 +47696,138 @@ const PushPageV1 = ({ user, lang, models, spenders, botStats, onRefresh }) => {
 };
 
 // =============================================
+// IA SEMI-AUTO — React Components
+// =============================================
+const IAToggleButton = ({ spenderId, modelId, onToggle }) => {
+  const [enabled, setEnabled] = React.useState(() => getConvIAState(spenderId, modelId).enabled);
+
+  const handle = () => {
+    const next = toggleIAMode(spenderId, modelId);
+    setEnabled(next);
+    if (onToggle) onToggle(next);
+  };
+
+  return (
+    <button className={`ia-toggle-btn ${enabled ? 'on' : 'off'}`} onClick={handle}
+      title={enabled ? "Mode IA activé" : "Activer Mode IA"}>
+      🤖
+      {enabled && <span className="ia-toggle-dot" />}
+    </button>
+  );
+};
+
+const IASuggestionsPanel = ({ spenderId, modelId, lastMessage, isGridMode, onUseSuggestion, onClose }) => {
+  const fr = true;
+  const [suggestions, setSuggestions] = React.useState(() => getConvIAState(spenderId, modelId).suggestions || []);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState(null);
+
+  const toneEmoji = (t) => ({ tease:'😏', direct:'💜', push:'💰', confirm:'✅', business:'💼', flirt:'😘', relance:'🔥' }[t] || '💬');
+  const toneLabel = (t) => ({ tease:'Tease', direct:'Direct', push:'Push contenu', confirm:'Confirmation', business:'Business', flirt:'Flirt', relance:'Relance' }[t] || t || 'Message');
+
+  const regenerate = async () => {
+    setLoading(true); setError(null);
+    try {
+      const data = await generateIASuggestions(spenderId, modelId, lastMessage || "");
+      setSuggestions(data.suggestions || []);
+    } catch (e) { setError(e.message); }
+    setLoading(false);
+  };
+
+  const useSugg = (idx) => {
+    if (onUseSuggestion && suggestions[idx]) onUseSuggestion(suggestions[idx].text, idx);
+  };
+
+  const copySugg = (idx, e) => {
+    e.stopPropagation();
+    if (suggestions[idx]) navigator.clipboard.writeText(suggestions[idx].text).catch(() => {});
+  };
+
+  return (
+    <div className={`ia-suggestions-panel ${isGridMode ? 'grid-mode' : 'classic-mode'}`}
+      style={{ background: "rgba(13,15,30,0.97)", border: "1px solid rgba(99,102,241,0.25)", borderRadius: isGridMode ? 10 : 0, overflow: "hidden" }}>
+      {/* Header */}
+      <div style={{ background: "rgba(8,11,20,0.9)", padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: "#818cf8", display: "flex", alignItems: "center", gap: 6 }}>🤖 Suggestions IA</span>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button onClick={regenerate} disabled={loading}
+            style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: "transparent", color: "#6b7280", fontSize: 14, cursor: loading ? "not-allowed" : "pointer" }}>
+            <span style={loading ? { display: "inline-block", animation: "spin 0.8s linear infinite" } : {}}>🔄</span>
+          </button>
+          <button onClick={onClose}
+            style={{ width: 28, height: 28, borderRadius: 6, border: "none", background: "transparent", color: "#6b7280", fontSize: 16, cursor: "pointer" }}>×</button>
+        </div>
+      </div>
+
+      {/* Loading */}
+      {loading && (
+        <div style={{ padding: "36px 0", textAlign: "center" }}>
+          <div style={{ width: 28, height: 28, border: "3px solid rgba(99,102,241,0.2)", borderTopColor: "#6366f1", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }} />
+          <div style={{ fontSize: 12, color: "#6b7280" }}>Venice réfléchit...</div>
+        </div>
+      )}
+
+      {/* Error */}
+      {error && !loading && (
+        <div style={{ padding: "10px 14px", background: "rgba(239,68,68,0.08)", borderLeft: "3px solid #ef4444", color: "#fca5a5", fontSize: 12 }}>
+          ❌ {error}
+          <button onClick={regenerate} style={{ marginLeft: 8, color: "#818cf8", background: "none", border: "none", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>Réessayer</button>
+        </div>
+      )}
+
+      {/* Suggestions */}
+      {!loading && suggestions.length > 0 && (
+        <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 8, maxHeight: 360, overflowY: "auto" }}>
+          {suggestions.map((s, i) => (
+            <div key={i} className="ia-sugg-card" onClick={() => useSugg(i)}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: "#6b7280", display: "flex", alignItems: "center", gap: 4 }}>
+                  {toneEmoji(s.tone)} {toneLabel(s.tone)}
+                </span>
+                {s.quality && <span style={{ fontSize: 10, color: "#4b5563" }}>{'⭐'.repeat(Math.min(s.quality, 5))}</span>}
+              </div>
+              <div style={{ fontSize: 12, color: "#d1d5db", lineHeight: 1.5, marginBottom: 8, wordBreak: "break-word" }}>{s.text}</div>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button onClick={(e) => copySugg(i, e)}
+                  style={{ flex: 1, padding: "4px 0", borderRadius: 6, border: "1px solid rgba(255,255,255,0.06)", background: "rgba(255,255,255,0.03)", color: "#9ca3af", fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+                  📋 Copier
+                </button>
+                <button onClick={(e) => { e.stopPropagation(); useSugg(i); }}
+                  style={{ flex: 1, padding: "4px 0", borderRadius: 6, border: "none", background: "#6366f1", color: "#fff", fontSize: 10, fontWeight: 600, cursor: "pointer" }}>
+                  ✓ Utiliser
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Empty */}
+      {!loading && !error && suggestions.length === 0 && (
+        <div style={{ padding: "28px 16px", textAlign: "center", color: "#6b7280" }}>
+          <div style={{ fontSize: 28, marginBottom: 8, opacity: 0.4 }}>🤖</div>
+          <div style={{ fontSize: 12, marginBottom: 12 }}>Aucune suggestion générée</div>
+          <button onClick={regenerate}
+            style={{ padding: "6px 16px", borderRadius: 8, border: "none", background: "#6366f1", color: "#fff", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+            Générer suggestions
+          </button>
+        </div>
+      )}
+
+      {/* Footer auto-suggest toggle */}
+      <div style={{ background: "rgba(8,11,20,0.9)", padding: "8px 14px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "#6b7280", cursor: "pointer" }}>
+          <input type="checkbox" defaultChecked={getConvIAState(spenderId, modelId).autoSuggest}
+            onChange={e => setConvIAState(spenderId, modelId, { autoSuggest: e.target.checked })}
+            style={{ accentColor: "#6366f1" }} />
+          Auto-suggest sur nouveau message
+        </label>
+      </div>
+    </div>
+  );
+};
+
+// =============================================
 // GRID CONVERSATION CELL — Compact messaging per grid slot
 // =============================================
 const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders, models, onClose, onNewMessage, visible = true }) => {
@@ -47586,6 +47863,36 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
   const [txForm, setTxForm] = useState({ amount: "", currency: "CHF", product: "", payment_method: "", note: "" });
   const [txSaving, setTxSaving] = useState(false);
   const [txLastAmount, setTxLastAmount] = useState(null);
+
+  // IA Semi-Auto state
+  const [iaEnabled, setIaEnabled] = useState(() => getConvIAState(convData?.spender_id, modelId).enabled);
+  const [showIAPanel, setShowIAPanel] = useState(false);
+  const lastIncomingRef = React.useRef("");
+
+  const handleIAToggle = (enabled) => {
+    setIaEnabled(enabled);
+    if (enabled) setShowIAPanel(true);
+    else setShowIAPanel(false);
+  };
+
+  const handleUseSuggestion = (text) => {
+    setMsgInput(text);
+    setShowIAPanel(false);
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  // Auto-suggest on new incoming message when IA enabled + autoSuggest on
+  useEffect(() => {
+    if (!iaEnabled || !messages.length) return;
+    const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing && m.sender_type !== "chatter" && m.sender_type !== "bot");
+    if (!last) return;
+    const key = _msgKey(last);
+    if (key && key !== lastIncomingRef.current) {
+      lastIncomingRef.current = key;
+      const state = getConvIAState(convData?.spender_id, modelId);
+      if (state.autoSuggest) setShowIAPanel(true);
+    }
+  }, [messages, iaEnabled]);
 
   // Spender info popup state
   const [showSpenderInfo, setShowSpenderInfo] = useState(false);
@@ -48112,11 +48419,30 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
           </div>
         )}
 
+        {/* IA Suggestions panel */}
+        {showIAPanel && iaEnabled && (
+          <IASuggestionsPanel
+            spenderId={convData?.spender_id}
+            modelId={modelId}
+            lastMessage={(() => { const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing); return last?.text || last?.content || ""; })()}
+            isGridMode={true}
+            onUseSuggestion={handleUseSuggestion}
+            onClose={() => setShowIAPanel(false)}
+          />
+        )}
+
         {/* Input bar */}
         <div className="grid-case-input">
           <button className={`grid-btn-icon ${showScriptsPanel ? 'active' : ''}`} onClick={toggleScriptsPanel} title="Scripts">📜</button>
           <button className={`grid-btn-icon ${showMediaPanel ? 'active' : ''}`} onClick={toggleMediaPanel} title={fr ? "Médias" : "Media"}>📷</button>
           <button className="grid-btn-icon grid-btn-tx" onClick={openTxModal} title={fr ? "Ajouter transaction" : "Add transaction"}>+ TX</button>
+          <IAToggleButton spenderId={convData?.spender_id} modelId={modelId} onToggle={handleIAToggle} />
+          {iaEnabled && (
+            <button className={`grid-btn-icon ${showIAPanel ? 'active' : ''}`} onClick={() => setShowIAPanel(p => !p)}
+              title={fr ? "Suggestions IA" : "AI suggestions"} style={{ fontSize: 12, width: "auto", padding: "0 8px", color: "#818cf8" }}>
+              💡
+            </button>
+          )}
           <textarea
             ref={inputRef}
             value={msgInput}
