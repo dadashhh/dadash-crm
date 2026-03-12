@@ -4026,11 +4026,6 @@
       0%, 100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
       50% { box-shadow: 0 0 8px 2px rgba(99,102,241,0.3); }
     }
-    .grid-unread-badge {
-      background: #ef4444; color: #fff; font-size: 10px; font-weight: 800;
-      padding: 1px 6px; border-radius: 8px; min-width: 16px; text-align: center;
-      line-height: 1.4;
-    }
     .grid-btn-unread {
       display: flex; align-items: center; gap: 6px;
       padding: 4px 12px; border-radius: 7px; font-size: 11px; font-weight: 600;
@@ -4048,6 +4043,36 @@
       background: #ef4444; color: #fff; font-size: 10px; font-weight: 800;
       padding: 1px 6px; border-radius: 8px; min-width: 16px; text-align: center;
       line-height: 1.4;
+    }
+    .grid-btn-icon.grid-btn-tx {
+      background: rgba(16,185,129,0.2); color: #10b981;
+      font-size: 10px; font-weight: 800; width: auto; padding: 0 8px;
+      border: 1px solid rgba(16,185,129,0.3); letter-spacing: 0.3px;
+    }
+    .grid-btn-icon.grid-btn-tx:hover { background: rgba(16,185,129,0.35); color: #34d399; }
+    .grid-tx-modal {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 10001;
+      display: flex; align-items: center; justify-content: center;
+      backdrop-filter: blur(3px);
+    }
+    .grid-tx-form {
+      background: var(--bg-modal, #12121F); border: 1px solid rgba(99,102,241,0.25);
+      border-radius: 14px; width: 440px; max-width: 95vw; max-height: 85vh;
+      overflow-y: auto; box-shadow: 0 16px 48px rgba(0,0,0,0.5); padding: 20px;
+    }
+    .grid-tx-field { margin-bottom: 12px; }
+    .grid-tx-field label {
+      display: block; font-size: 10px; font-weight: 700; color: #6b7280;
+      text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;
+    }
+    .grid-tx-field input, .grid-tx-field select, .grid-tx-field textarea {
+      width: 100%; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.04);
+      color: #e5e7eb; font-size: 13px; font-family: 'Inter', sans-serif;
+      outline: none; box-sizing: border-box;
+    }
+    .grid-tx-field input:focus, .grid-tx-field select:focus, .grid-tx-field textarea:focus {
+      border-color: rgba(99,102,241,0.4);
     }
     .grid-toolbar {
       display: flex;
@@ -47556,6 +47581,18 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
   const [sendingMedia, setSendingMedia] = useState(false);
   const mediaFileRef = React.useRef(null);
 
+  // TX modal state
+  const [showTxModal, setShowTxModal] = useState(false);
+  const [txForm, setTxForm] = useState({ amount: "", currency: "CHF", product: "", payment_method: "", note: "" });
+  const [txSaving, setTxSaving] = useState(false);
+  const [txLastAmount, setTxLastAmount] = useState(null);
+
+  // TX modal state
+  const [showTxModal, setShowTxModal] = useState(false);
+  const [txForm, setTxForm] = useState({ amount: "", currency: "CHF", product: "", payment_method: "", note: "" });
+  const [txSaving, setTxSaving] = useState(false);
+  const [txLastAmount, setTxLastAmount] = useState(null);
+
   // Spender info popup state
   const [showSpenderInfo, setShowSpenderInfo] = useState(false);
   const [spenderData, setSpenderData] = useState(null);
@@ -47856,9 +47893,61 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     setSavingNotes(false);
   };
 
+  // ── TX modal ──
+  const openTxModal = async () => {
+    setTxForm({ amount: "", currency: "CHF", product: "", payment_method: "", note: "" });
+    setShowTxModal(true);
+    try {
+      const spId = resolvedSpender?.id || spenderData?.id;
+      const handle = resolvedSpender?.handle || resolvedSpender?.name || spenderData?.handle;
+      if (spId || handle) {
+        let q = sb.from("transactions").select("amount").order("created_at", { ascending: false }).limit(1);
+        if (spId) q = q.eq("spender_id", spId); else q = q.eq("spender_handle", handle);
+        const { data } = await q.maybeSingle();
+        if (data?.amount) setTxLastAmount(data.amount);
+      }
+    } catch (_) {}
+  };
+
+  const submitTx = async () => {
+    if (!txForm.amount || isNaN(Number(txForm.amount)) || Number(txForm.amount) <= 0) {
+      addToast(fr ? "Montant invalide" : "Invalid amount", "error"); return;
+    }
+    setTxSaving(true);
+    try {
+      const payload = {
+        spender_id: resolvedSpender?.id || spenderData?.id || null,
+        spender_handle: resolvedSpender?.handle || resolvedSpender?.name || spenderData?.handle || spName,
+        telegram_id: resolvedSpender?.tg_user_id || resolvedSpender?.telegram_id || chatId || null,
+        model_id: modelId || null,
+        amount: parseFloat(txForm.amount),
+        currency: txForm.currency || "CHF",
+        product: txForm.product || null,
+        payment_method: txForm.payment_method || null,
+        notes: txForm.note || null,
+        created_at: new Date().toISOString(),
+        chatter_id: user?.id || null,
+        status: "pending",
+      };
+      const { error, data: txInserted } = await sb.from("transactions").insert(payload).select();
+      if (error) throw new Error(error.message);
+      _emitTxEvent('transaction_created', {
+        id: txInserted?.[0]?.id, amount: payload.amount, spender_id: payload.spender_id,
+        spender_name: spName, chat_id: chatId, model_id: payload.model_id,
+        model_name: modelName, chatter_id: payload.chatter_id,
+        chatter_name: user?.name || null, status: 'pending', created_at: payload.created_at,
+      });
+      addToast(`${fr ? "Transaction" : "Transaction"} ${payload.amount} ${payload.currency} ✅`, "success");
+      setShowTxModal(false);
+    } catch (e) {
+      addToast((fr ? "Erreur: " : "Error: ") + (e.message || e), "error");
+    }
+    setTxSaving(false);
+  };
+
   // Close panels on Escape
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") { setShowScriptsPanel(false); setShowMediaPanel(false); setShowSpenderInfo(false); } };
+    const onKey = (e) => { if (e.key === "Escape") { setShowScriptsPanel(false); setShowMediaPanel(false); setShowSpenderInfo(false); setShowTxModal(false); } };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
@@ -48033,6 +48122,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
         <div className="grid-case-input">
           <button className={`grid-btn-icon ${showScriptsPanel ? 'active' : ''}`} onClick={toggleScriptsPanel} title="Scripts">📜</button>
           <button className={`grid-btn-icon ${showMediaPanel ? 'active' : ''}`} onClick={toggleMediaPanel} title={fr ? "Médias" : "Media"}>📷</button>
+          <button className="grid-btn-icon grid-btn-tx" onClick={openTxModal} title={fr ? "Ajouter transaction" : "Add transaction"}>+ TX</button>
           <textarea
             ref={inputRef}
             value={msgInput}
@@ -48200,6 +48290,81 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* TX Modal */}
+      {showTxModal && (
+        <div className="grid-tx-modal" onClick={(e) => { if (e.target === e.currentTarget) setShowTxModal(false); }}>
+          <div className="grid-tx-form" onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "#e5e7eb" }}>💳 {fr ? "Nouvelle Transaction" : "New Transaction"}</div>
+              <button onClick={() => setShowTxModal(false)} style={{ background: "none", border: "none", color: "#6b7280", fontSize: 20, cursor: "pointer" }}>✕</button>
+            </div>
+            {/* Spender pre-filled */}
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: 9, background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)", marginBottom: 14 }}>
+              <span style={{ fontSize: 18 }}>{tierEmoji}</span>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#e5e7eb" }}>{spName}</div>
+                <div style={{ fontSize: 10, color: "#6b7280" }}>
+                  TG: {chatId}{modelName && <span style={{ marginLeft: 6, color: modelColor.bg }}>{modelEmoji} {modelName}</span>}
+                </div>
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div className="grid-tx-field">
+                <label>{fr ? "Montant" : "Amount"} *</label>
+                <div style={{ display: "flex", gap: 4 }}>
+                  <input type="number" min="0" step="0.01" value={txForm.amount} onChange={e => setTxForm(f => ({ ...f, amount: e.target.value }))}
+                    placeholder={txLastAmount ? String(txLastAmount) : "0.00"} autoFocus
+                    style={{ flex: 1 }} />
+                  <div style={{ display: "flex", borderRadius: 8, overflow: "hidden", flexShrink: 0, border: "1px solid rgba(255,255,255,0.08)" }}>
+                    {["CHF", "EUR"].map(c => (
+                      <button key={c} type="button" onClick={() => setTxForm(f => ({ ...f, currency: c }))}
+                        style={{ padding: "0 8px", border: "none", fontSize: 10, fontWeight: 700, cursor: "pointer",
+                          background: txForm.currency === c ? (c === "CHF" ? "#6366f1" : "#f97316") : "rgba(255,255,255,0.04)",
+                          color: txForm.currency === c ? "#fff" : "#6b7280" }}>{c}</button>
+                    ))}
+                  </div>
+                </div>
+                {txLastAmount && !txForm.amount && <div style={{ fontSize: 9, color: "#6b7280", marginTop: 2 }}>{fr ? "Dernier" : "Last"}: {txLastAmount} CHF</div>}
+              </div>
+              <div className="grid-tx-field">
+                <label>{fr ? "Produit" : "Product"}</label>
+                <select value={txForm.product} onChange={e => setTxForm(f => ({ ...f, product: e.target.value }))}>
+                  <option value="">— {fr ? "Choisir" : "Select"} —</option>
+                  <option value="Photo">📸 Photo</option>
+                  <option value="Video">🎥 Vidéo</option>
+                  <option value="Cam">💻 Cam</option>
+                  <option value="Custom">🎁 Custom</option>
+                  <option value="Tip">💰 Tip</option>
+                  <option value="Subscription">💳 Abo</option>
+                  <option value="Autre">📦 Autre</option>
+                </select>
+              </div>
+              <div className="grid-tx-field">
+                <label>{fr ? "Méthode paiement" : "Payment method"}</label>
+                <select value={txForm.payment_method} onChange={e => setTxForm(f => ({ ...f, payment_method: e.target.value }))}>
+                  <option value="">— {fr ? "Choisir" : "Select"} —</option>
+                  {PAYMENT_METHODS.map(pm => <option key={pm} value={pm}>{pm}</option>)}
+                </select>
+              </div>
+              <div className="grid-tx-field" style={{ gridColumn: "1 / -1" }}>
+                <label>Notes</label>
+                <textarea value={txForm.note} onChange={e => setTxForm(f => ({ ...f, note: e.target.value }))} placeholder={fr ? "Contexte, remarque…" : "Context, note…"} rows={2} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+              <button onClick={submitTx} disabled={txSaving || !txForm.amount}
+                style={{ flex: 1, padding: "10px 0", borderRadius: 9, border: "none", background: txSaving || !txForm.amount ? "#374151" : "#10b981", color: "#fff", fontSize: 13, fontWeight: 700, cursor: txSaving || !txForm.amount ? "not-allowed" : "pointer" }}>
+                {txSaving ? "⏳ …" : "✅ " + (fr ? "Créer" : "Create")}
+              </button>
+              <button onClick={() => setShowTxModal(false)}
+                style={{ flex: 1, padding: "10px 0", borderRadius: 9, border: "1px solid rgba(255,255,255,0.08)", background: "transparent", color: "#9ca3af", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+                {fr ? "Annuler" : "Cancel"}
+              </button>
+            </div>
           </div>
         </div>
       )}
