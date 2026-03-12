@@ -30,6 +30,7 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cfilter id='g'%3E%3CfeGaussianBlur stdDeviation='1' result='blur'/%3E%3C/filter%3E%3Cpath d='M4 2 L4 18 L8 14 L12 22 L14 21 L10 13 L16 13 Z' fill='%236366f1' filter='url(%23g)' opacity='0.5'/%3E%3Cpath d='M4 2 L4 18 L8 14 L12 22 L14 21 L10 13 L16 13 Z' fill='%23fff' stroke='%236366f1' stroke-width='1'/%3E%3C/svg%3E") 4 2, default; }
@@ -20144,6 +20145,795 @@ const BillingInfoModal = ({ open, onClose, user, lang }) => {
 };
 
 // =============================================
+// INVOICE GENERATOR MODAL — PDF facture provider
+// =============================================
+const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, spenders, onConfirm }) => {
+  const addToast = useToast();
+  const fr = lang === 'fr';
+
+  const [providerInfo, setProviderInfo]   = useState(null);
+  const [loadingInfo, setLoadingInfo]     = useState(false);
+  const [clientPhone, setClientPhone]     = useState('');
+  const [clientName, setClientName]       = useState('');
+  const [clientErrors, setClientErrors]  = useState({});
+  const [generating, setGenerating]       = useState(false);
+  const [showEditBilling, setShowEditBilling] = useState(false);
+
+  // Fetch provider billing info + spender existing billing fields
+  useEffect(() => {
+    if (!open || !user?.id) return;
+    setClientErrors({});
+    setGenerating(false);
+    setLoadingInfo(true);
+
+    const run = async () => {
+      const { data: prof } = await sb.from('profiles')
+        .select('billing_company_name, billing_address, billing_siret, billing_vat_number, name, full_name')
+        .eq('id', user.id).single();
+      setProviderInfo(prof || {});
+
+      // Pré-remplir depuis spender existant si dispo
+      if (txFormData?.spender_id) {
+        const { data: sp } = await sb.from('spenders')
+          .select('billing_phone, billing_full_name, name, whatsapp_phone')
+          .eq('id', txFormData.spender_id).maybeSingle();
+        if (sp) {
+          if (sp.billing_phone)     setClientPhone(sp.billing_phone);
+          else if (sp.whatsapp_phone) setClientPhone(sp.whatsapp_phone);
+          if (sp.billing_full_name) setClientName(sp.billing_full_name);
+          else if (sp.name)         setClientName(sp.name);
+        }
+      } else if (txFormData?.spender_handle) {
+        const { data: sp } = await sb.from('spenders')
+          .select('billing_phone, billing_full_name, name, whatsapp_phone')
+          .eq('handle', txFormData.spender_handle).maybeSingle();
+        if (sp) {
+          if (sp.billing_phone)     setClientPhone(sp.billing_phone);
+          else if (sp.whatsapp_phone) setClientPhone(sp.whatsapp_phone);
+          if (sp.billing_full_name) setClientName(sp.billing_full_name);
+          else if (sp.name)         setClientName(sp.name);
+        }
+      }
+      setLoadingInfo(false);
+    };
+    run();
+  }, [open, user?.id, txFormData?.spender_id, txFormData?.spender_handle]);
+
+  const validateClient = () => {
+    const e = {};
+    if (!clientPhone.trim()) e.phone = fr ? 'Le téléphone est obligatoire.' : 'Phone is required.';
+    if (!clientName.trim())  e.name  = fr ? 'Le nom complet est obligatoire.' : 'Full name is required.';
+    return e;
+  };
+
+  const generateInvoicePDF = (invoiceData) => {
+    const { jspdf } = window.jspdf || {};
+    const JsPDF = (window.jspdf && window.jspdf.jsPDF) || (window.jsPDF);
+    if (!JsPDF) { addToast('jsPDF non disponible', 'error'); return false; }
+
+    const doc = new JsPDF({ unit: 'mm', format: 'a4' });
+    const W = 210, marginL = 20, marginR = 20, contentW = W - marginL - marginR;
+    const accentColor = [99, 102, 241]; // indigo
+    const darkColor   = [15, 18, 40];
+    const grayColor   = [100, 110, 130];
+    let y = 20;
+
+    const fmtCurrency = (amount, currency) => {
+      const sym = currency === 'EUR' ? '€' : currency === 'CHF' ? ' CHF' : ` ${currency}`;
+      return `${Number(amount).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${sym}`;
+    };
+    const fmtDate = (d) => d ? new Date(d).toLocaleDateString('fr-FR', { day:'2-digit', month:'long', year:'numeric' }) : '';
+    const invNumber = `FACT-${new Date().getFullYear()}-${String(Date.now()).slice(-5)}`;
+
+    // ── Bandeau haut indigo ──
+    doc.setFillColor(...accentColor);
+    doc.rect(0, 0, W, 12, 'F');
+    doc.setTextColor(255, 255, 255);
+    doc.setFontSize(8);
+    doc.setFont('helvetica', 'bold');
+    doc.text('FACTURE', W - marginR, 8, { align: 'right' });
+
+    y = 22;
+    // ── Logo / Titre ──
+    doc.setTextColor(...darkColor);
+    doc.setFontSize(22);
+    doc.setFont('helvetica', 'bold');
+    const companyDisplay = invoiceData.provider.billing_company_name ||
+      invoiceData.provider.full_name || invoiceData.provider.name || 'Prestataire';
+    doc.text(companyDisplay, marginL, y);
+
+    // N° facture + date — aligné droite
+    doc.setFontSize(10);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(...grayColor);
+    doc.text(`N° ${invNumber}`, W - marginR, y - 6, { align: 'right' });
+    doc.text(`Date : ${fmtDate(invoiceData.date)}`, W - marginR, y, { align: 'right' });
+    doc.text(`Échéance : ${fmtDate(invoiceData.date)}`, W - marginR, y + 6, { align: 'right' });
+
+    y += 12;
+    // ── Ligne séparatrice ──
+    doc.setDrawColor(...accentColor);
+    doc.setLineWidth(0.5);
+    doc.line(marginL, y, W - marginR, y);
+
+    y += 10;
+    // ── Bloc ÉMETTEUR (gauche) ──
+    doc.setFontSize(8);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(...accentColor);
+    doc.text('ÉMETTEUR (PRESTATAIRE)', marginL, y);
+    y += 5;
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(...darkColor);
+    const provLines = [
+      companyDisplay,
+      invoiceData.provider.billing_address || '',
+      invoiceData.provider.billing_siret ? `SIRET : ${invoiceData.provider.billing_siret}` : '',
+      invoiceData.provider.billing_vat_number ? `TVA : ${invoiceData.provider.billing_vat_number}` : '',
+    ].filter(Boolean);
+    provLines.forEach(l => { doc.text(l, marginL, y); y += 5; });
+
+    // ── Bloc CLIENT (droite) ──
+    let yClient = y - provLines.length * 5 - 5;
+    doc.setFontSize(8);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(...accentColor);
+    doc.text('CLIENT', W - marginR - 60, yClient);
+    yClient += 5;
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(...darkColor);
+    [
+      invoiceData.client.full_name,
+      invoiceData.client.phone,
+    ].filter(Boolean).forEach(l => { doc.text(l, W - marginR - 60, yClient); yClient += 5; });
+
+    y = Math.max(y, yClient) + 8;
+
+    // ── Ligne séparatrice ──
+    doc.setDrawColor(220, 222, 240);
+    doc.setLineWidth(0.3);
+    doc.line(marginL, y, W - marginR, y);
+    y += 8;
+
+    // ── En-tête tableau ──
+    doc.setFillColor(240, 241, 255);
+    doc.rect(marginL, y - 4, contentW, 8, 'F');
+    doc.setFontSize(9);
+    doc.setFont('helvetica', 'bold');
+    doc.setTextColor(...accentColor);
+    doc.text('DESCRIPTION', marginL + 2, y + 1);
+    doc.text('DATE', marginL + 85, y + 1);
+    doc.text('QTÉ', marginL + 115, y + 1, { align: 'center' });
+    doc.text('P.U.', marginL + 135, y + 1, { align: 'center' });
+    doc.text('TOTAL', W - marginR - 2, y + 1, { align: 'right' });
+    y += 10;
+
+    // ── Ligne transaction ──
+    doc.setFontSize(9);
+    doc.setFont('helvetica', 'normal');
+    doc.setTextColor(...darkColor);
+    const descText = invoiceData.notes || (fr ? 'Prestation de service' : 'Service delivery');
+    const descLines = doc.splitTextToSize(descText, 80);
+    doc.text(descLines, marginL + 2, y);
+    doc.text(fmtDate(invoiceData.date), marginL + 85, y);
+    doc.text('1', marginL + 115, y, { align: 'center' });
+    doc.text(fmtCurrency(invoiceData.amount, invoiceData.currency), marginL + 135, y, { align: 'center' });
+    doc.text(fmtCurrency(invoiceData.amount, invoiceData.currency), W - marginR - 2, y, { align: 'right' });
+    y += Math.max(descLines.length * 5, 8) + 4;
+
+    // ── Ligne séparatrice ──
+    doc.setDrawColor(220, 222, 240);
+    doc.line(marginL, y, W - marginR, y);
+    y += 8;
+
+    // ── Total HT / TVA / TTC ──
+    const tvaApplicable = !!invoiceData.provider.billing_vat_number;
+    const tvaRate = 0.20;
+    const ht  = tvaApplicable ? invoiceData.amount / (1 + tvaRate) : invoiceData.amount;
+    const tva = tvaApplicable ? invoiceData.amount - ht : 0;
+
+    const totals = [
+      { label: fr ? 'Sous-total HT' : 'Subtotal excl. VAT', val: fmtCurrency(ht, invoiceData.currency) },
+      tvaApplicable && { label: `TVA (20%)`, val: fmtCurrency(tva, invoiceData.currency) },
+      { label: fr ? 'TOTAL TTC' : 'TOTAL', val: fmtCurrency(invoiceData.amount, invoiceData.currency), bold: true },
+    ].filter(Boolean);
+
+    totals.forEach(row => {
+      doc.setFont('helvetica', row.bold ? 'bold' : 'normal');
+      doc.setFontSize(row.bold ? 11 : 9);
+      doc.setTextColor(row.bold ? ...accentColor : ...grayColor);
+      doc.text(row.label, W - marginR - 50, y);
+      doc.text(row.val, W - marginR, y, { align: 'right' });
+      y += row.bold ? 8 : 6;
+    });
+
+    if (!tvaApplicable) {
+      y += 2;
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(8);
+      doc.setTextColor(...grayColor);
+      doc.text('TVA non applicable — Art. 293 B du CGI', marginL, y);
+      y += 6;
+    }
+
+    // ── Pied de page ──
+    doc.setFillColor(...accentColor);
+    doc.rect(0, 285, W, 12, 'F');
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7);
+    doc.setTextColor(255, 255, 255);
+    doc.text(`${companyDisplay}  •  ${fr ? 'Document généré le' : 'Generated on'} ${fmtDate(new Date())}`, W / 2, 291, { align: 'center' });
+
+    // ── Téléchargement ──
+    doc.save(`Facture_${invNumber}_${(invoiceData.client.full_name || 'client').replace(/\s+/g,'_')}.pdf`);
+    return true;
+  };
+
+  const handleGenerate = async () => {
+    const e = validateClient();
+    if (Object.keys(e).length > 0) { setClientErrors(e); return; }
+    setGenerating(true);
+    try {
+      // 1. Insert la transaction
+      const insertResult = await onConfirm({
+        clientPhone: clientPhone.trim(),
+        clientName:  clientName.trim(),
+      });
+      if (!insertResult?.ok) {
+        addToast(insertResult?.error || 'Erreur lors de la création de la transaction', 'error');
+        setGenerating(false);
+        return;
+      }
+      const insertedTxId = insertResult.txId;
+
+      // 2. Update billing info du spender
+      const spenderId = txFormData?.spender_id || insertResult?.spenderId;
+      if (spenderId) {
+        await sb.from('spenders').update({
+          billing_phone:     clientPhone.trim(),
+          billing_full_name: clientName.trim(),
+        }).eq('id', spenderId);
+      }
+
+      // 3. Génère le PDF
+      const modelName = (models || []).find(m => m.id === txFormData?.model_id)?.name || '';
+      const ok = generateInvoicePDF({
+        provider: providerInfo || {},
+        client:   { phone: clientPhone.trim(), full_name: clientName.trim() },
+        amount:   txFormData?.amount,
+        currency: txFormData?.currency || 'CHF',
+        date:     txFormData?.date || new Date().toISOString(),
+        notes:    txFormData?.notes || (modelName ? `Prestation — ${modelName}` : ''),
+      });
+
+      if (ok) addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
+      onClose();
+    } catch (err) {
+      addToast('Erreur: ' + err.message, 'error');
+    }
+    setGenerating(false);
+  };
+
+  const inputStyle = {
+    width: '100%', boxSizing: 'border-box',
+    background: 'var(--input-bg, rgba(255,255,255,0.05))',
+    border: '1px solid var(--border-default)',
+    borderRadius: 10, padding: '10px 14px',
+    color: 'var(--text-primary)', fontSize: 14, outline: 'none', fontFamily: 'inherit',
+  };
+  const labelStyle = {
+    display: 'block', fontSize: 12, fontWeight: 700,
+    color: 'var(--text-secondary)', marginBottom: 6,
+    letterSpacing: 0.3, textTransform: 'uppercase',
+  };
+  const errStyle = { color: '#f43f5e', fontSize: 12, marginTop: 4, display: 'block' };
+
+  return (
+    <>
+      <ModalShell open={!!open} onClose={onClose} closeOnBackdrop={false} closeOnEsc={true}>
+        <div style={{
+          background: 'var(--bg-modal, #0a0c12)',
+          border: '1px solid var(--border-default)',
+          borderRadius: _isMobile ? '16px 16px 0 0' : 16,
+          width: _isMobile ? '100%' : 520,
+          maxWidth: '96vw',
+          maxHeight: _isMobile ? '94vh' : '88vh',
+          overflowY: 'auto',
+          boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+        }}>
+          {/* Header */}
+          <div style={{
+            padding: '18px 24px',
+            borderBottom: '1px solid var(--border-default)',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            position: 'sticky', top: 0,
+            background: 'var(--bg-modal, #0a0c12)', zIndex: 2,
+          }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--text-primary)' }}>
+                📄 {fr ? 'Générer facture' : 'Generate invoice'}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 3 }}>
+                {fr ? 'La transaction sera créée et la facture téléchargée.' : 'Transaction will be saved and invoice downloaded.'}
+              </div>
+            </div>
+            <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 8 }}>✕</button>
+          </div>
+
+          <div style={{ padding: '20px 24px' }}>
+            {loadingInfo ? (
+              <div style={{ textAlign: 'center', padding: '32px 0', color: 'var(--text-tertiary)', fontSize: 14 }}>
+                {fr ? 'Chargement…' : 'Loading…'}
+              </div>
+            ) : (
+              <>
+                {/* ── Section 1 : Infos prestataire ── */}
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                    <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--text-primary)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                      🏢 {fr ? 'Mes informations prestataire' : 'My provider information'}
+                    </div>
+                    <button
+                      onClick={() => setShowEditBilling(true)}
+                      style={{
+                        fontSize: 11, fontWeight: 700, color: 'var(--accent)',
+                        background: 'var(--accent-muted, rgba(99,102,241,0.12))',
+                        border: '1px solid var(--accent)', borderRadius: 8,
+                        padding: '4px 10px', cursor: 'pointer',
+                      }}
+                    >
+                      ✏️ {fr ? 'Modifier mes infos' : 'Edit my info'}
+                    </button>
+                  </div>
+                  <div style={{
+                    background: 'var(--bg-raised, rgba(255,255,255,0.03))',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: 12, padding: '14px 16px',
+                  }}>
+                    {providerInfo ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 16px', fontSize: 13 }}>
+                        {[
+                          { l: fr ? 'Société' : 'Company', v: providerInfo.billing_company_name || providerInfo.full_name || providerInfo.name || '—' },
+                          { l: 'SIRET', v: providerInfo.billing_siret || <span style={{color:'var(--warning)',fontSize:11}}>⚠ Non renseigné</span> },
+                          { l: fr ? 'Adresse' : 'Address', v: providerInfo.billing_address || <span style={{color:'var(--warning)',fontSize:11}}>⚠ Non renseignée</span> },
+                          { l: 'N° TVA', v: providerInfo.billing_vat_number || <span style={{color:'var(--text-quaternary)',fontSize:11}}>{fr?'Non renseigné':'N/A'}</span> },
+                        ].map(row => (
+                          <div key={row.l}>
+                            <div style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase', marginBottom: 2 }}>{row.l}</div>
+                            <div style={{ color: 'var(--text-primary)', fontWeight: 600 }}>{row.v}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ color: 'var(--warning)', fontSize: 13 }}>
+                        ⚠ {fr ? 'Infos de facturation manquantes. Cliquez "Modifier mes infos".' : 'Missing billing info. Click "Edit my info".'}
+                      </div>
+                    )}
+                  </div>
+                  {(!providerInfo?.billing_address || !providerInfo?.billing_siret) && (
+                    <div style={{ fontSize: 11, color: 'var(--warning)', marginTop: 6 }}>
+                      ⚠ {fr ? 'L\'adresse et le SIRET sont requis pour générer la facture.' : 'Address and SIRET are required to generate the invoice.'}
+                    </div>
+                  )}
+                </div>
+
+                {/* ── Section 2 : Infos client ── */}
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--text-primary)', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 }}>
+                    👤 {fr ? 'Informations client' : 'Client information'}
+                  </div>
+
+                  <div style={{ marginBottom: 14 }}>
+                    <label style={labelStyle}>
+                      {fr ? 'Téléphone' : 'Phone'} <span style={{ color: '#f43f5e' }}>*</span>
+                    </label>
+                    <input
+                      type="tel"
+                      value={clientPhone}
+                      onChange={e => { setClientPhone(e.target.value); if (clientErrors.phone) setClientErrors(er => ({ ...er, phone: null })); }}
+                      placeholder="+41 XX XXX XX XX"
+                      style={{ ...inputStyle, borderColor: clientErrors.phone ? '#f43f5e' : 'var(--border-default)' }}
+                      onFocus={e => e.target.style.borderColor = clientErrors.phone ? '#f43f5e' : 'var(--accent)'}
+                      onBlur={e => e.target.style.borderColor = clientErrors.phone ? '#f43f5e' : 'var(--border-default)'}
+                    />
+                    {clientErrors.phone && <span style={errStyle}>{clientErrors.phone}</span>}
+                  </div>
+
+                  <div style={{ marginBottom: 14 }}>
+                    <label style={labelStyle}>
+                      {fr ? 'Nom complet' : 'Full name'} <span style={{ color: '#f43f5e' }}>*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={clientName}
+                      onChange={e => { setClientName(e.target.value); if (clientErrors.name) setClientErrors(er => ({ ...er, name: null })); }}
+                      placeholder={fr ? 'Prénom Nom' : 'First Last'}
+                      style={{ ...inputStyle, borderColor: clientErrors.name ? '#f43f5e' : 'var(--border-default)' }}
+                      onFocus={e => e.target.style.borderColor = clientErrors.name ? '#f43f5e' : 'var(--accent)'}
+                      onBlur={e => e.target.style.borderColor = clientErrors.name ? '#f43f5e' : 'var(--border-default)'}
+                    />
+                    {clientErrors.name && <span style={errStyle}>{clientErrors.name}</span>}
+                  </div>
+                </div>
+
+                {/* ── Récap transaction ── */}
+                {txFormData && (
+                  <div style={{
+                    background: 'rgba(99,102,241,0.07)', border: '1px solid rgba(99,102,241,0.2)',
+                    borderRadius: 10, padding: '10px 14px', marginBottom: 20, fontSize: 12,
+                    color: 'var(--text-secondary)',
+                  }}>
+                    <div style={{ fontWeight: 700, marginBottom: 6, color: 'var(--accent)' }}>
+                      💸 {fr ? 'Transaction à créer' : 'Transaction to create'}
+                    </div>
+                    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+                      <span><b>{fr ? 'Montant' : 'Amount'}:</b> {txFormData.amount} {txFormData.currency || 'CHF'}</span>
+                      {txFormData.spender_handle && <span><b>Spender:</b> @{txFormData.spender_handle}</span>}
+                      {txFormData.notes && <span><b>{fr ? 'Notes' : 'Notes'}:</b> {txFormData.notes}</span>}
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Boutons ── */}
+                <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+                  <button className="btn" onClick={onClose} disabled={generating} style={{ minWidth: 100 }}>
+                    {fr ? 'Annuler' : 'Cancel'}
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={handleGenerate}
+                    disabled={generating || !providerInfo?.billing_address || !providerInfo?.billing_siret}
+                    style={{ minWidth: 170, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+                  >
+                    {generating ? (
+                      <>
+                        <span style={{ width: 14, height: 14, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+                        {fr ? 'Génération…' : 'Generating…'}
+                      </>
+                    ) : `📄 ${fr ? 'Générer facture' : 'Generate invoice'}`}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </ModalShell>
+
+      {/* Sous-modal édition billing */}
+      {showEditBilling && (
+        <BillingInfoModal
+          open={showEditBilling}
+          onClose={() => {
+            setShowEditBilling(false);
+            // Recharger les infos billing après modif
+            if (user?.id) {
+              sb.from('profiles')
+                .select('billing_company_name, billing_address, billing_siret, billing_vat_number, name, full_name')
+                .eq('id', user.id).single()
+                .then(({ data }) => { if (data) setProviderInfo(data); });
+            }
+          }}
+          user={user}
+          lang={lang}
+        />
+      )}
+    </>
+  );
+};
+
+// =============================================
+// PROVIDER NEW TX MODAL — Formulaire saisie transaction
+// =============================================
+const ProviderNewTxModal = ({ open, onClose, user, lang, models, spenders: spendersList, profiles, onRefresh, onNotify }) => {
+  const addToast = useToast();
+  const { currencySymbol } = useCurrency();
+  const fr = lang === 'fr';
+
+  const [form, setForm] = useState({
+    spender_handle: '', spender_id: '', amount: '', currency: 'CHF',
+    model_id: '', notes: '', payment_method: '',
+  });
+  const [formErrors, setFormErrors]   = useState({});
+  const [saving, setSaving]           = useState(false);
+  const [showInvoiceModal, setShowInvoiceModal] = useState(false);
+  const [pendingTxData, setPendingTxData]       = useState(null);
+  const [spenderSuggestions, setSpenderSuggestions] = useState([]);
+  const [showSugg, setShowSugg] = useState(false);
+
+  // Filtrage suggestions spenders
+  useEffect(() => {
+    if (!form.spender_handle.trim()) { setSpenderSuggestions([]); return; }
+    const q = form.spender_handle.toLowerCase();
+    setSpenderSuggestions(
+      (spendersList || []).filter(s =>
+        (s.handle || '').toLowerCase().includes(q) || (s.name || '').toLowerCase().includes(q)
+      ).slice(0, 6)
+    );
+  }, [form.spender_handle, spendersList]);
+
+  // Modèles accessibles à ce provider
+  const myModels = (models || []).filter(m => m.provider_id === user?.id || !m.provider_id);
+
+  const validateForm = () => {
+    const e = {};
+    if (!form.spender_handle.trim()) e.spender_handle = fr ? 'Le spender est requis.' : 'Spender is required.';
+    if (!form.amount || isNaN(parseFloat(form.amount)) || parseFloat(form.amount) <= 0)
+      e.amount = fr ? 'Montant invalide (> 0).' : 'Invalid amount (> 0).';
+    return e;
+  };
+
+  const handleSubmit = () => {
+    const e = validateForm();
+    if (Object.keys(e).length > 0) { setFormErrors(e); return; }
+
+    const spenderObj = (spendersList || []).find(
+      s => s.handle === form.spender_handle.replace(/^@/, '') || s.id === form.spender_id
+    );
+    setPendingTxData({
+      ...form,
+      spender_handle: form.spender_handle.replace(/^@/, ''),
+      spender_id: spenderObj?.id || form.spender_id || null,
+      provider_id: user.id,
+      date: new Date().toISOString(),
+    });
+    setShowInvoiceModal(true);
+  };
+
+  // Callback passé à InvoiceGeneratorModal pour créer la TX
+  const handleInvoiceConfirm = async ({ clientPhone, clientName }) => {
+    try {
+      const txRow = {
+        date: pendingTxData.date,
+        spender_handle: pendingTxData.spender_handle,
+        amount: parseFloat(pendingTxData.amount),
+        currency: pendingTxData.currency || 'CHF',
+        amount_original: parseFloat(pendingTxData.amount),
+        currency_original: pendingTxData.currency || 'CHF',
+        status: 'pending',
+        provider_id: user.id,
+        notes: pendingTxData.notes || null,
+      };
+      const isUUID = v => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+      if (isUUID(pendingTxData.spender_id))  txRow.spender_id  = pendingTxData.spender_id;
+      if (isUUID(pendingTxData.model_id))    txRow.model_id    = pendingTxData.model_id;
+      if (pendingTxData.payment_method)      txRow.payment_method = pendingTxData.payment_method;
+
+      const res = await safeInsertTx(txRow, {
+        provider_name: user.name || user.email || null,
+        status: 'pending',
+        created_at: txRow.date,
+        created_by: user.name || null,
+      });
+
+      if (res.error) return { ok: false, error: res.error.message };
+
+      const insertedId = res.data?.[0]?.id;
+      // Notif gérants
+      if (onNotify) {
+        (profiles || []).filter(p => p.role === 'gerant').forEach(g =>
+          onNotify(g.id, 'tx_created', 'Nouvelle vente provider',
+            `${pendingTxData.amount} ${pendingTxData.currency || 'CHF'} de @${pendingTxData.spender_handle} (provider: ${user.name || user.email})`, insertedId)
+        );
+      }
+
+      // Reset form
+      setForm({ spender_handle: '', spender_id: '', amount: '', currency: 'CHF', model_id: '', notes: '', payment_method: '' });
+      setFormErrors({});
+      if (onRefresh) onRefresh();
+      onClose();
+
+      return { ok: true, txId: insertedId, spenderId: pendingTxData.spender_id };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  };
+
+  const inputStyle = {
+    width: '100%', boxSizing: 'border-box',
+    background: 'var(--input-bg, rgba(255,255,255,0.05))',
+    border: '1px solid var(--border-default)',
+    borderRadius: 10, padding: '10px 14px',
+    color: 'var(--text-primary)', fontSize: 14, outline: 'none', fontFamily: 'inherit',
+  };
+  const labelStyle = {
+    display: 'block', fontSize: 12, fontWeight: 700,
+    color: 'var(--text-secondary)', marginBottom: 6,
+    letterSpacing: 0.3, textTransform: 'uppercase',
+  };
+  const errStyle = { color: '#f43f5e', fontSize: 12, marginTop: 4, display: 'block' };
+
+  return (
+    <>
+      <ModalShell open={!!open && !showInvoiceModal} onClose={onClose} closeOnBackdrop={true} closeOnEsc={true}>
+        <div style={{
+          background: 'var(--bg-modal, #0a0c12)',
+          border: '1px solid var(--border-default)',
+          borderRadius: _isMobile ? '16px 16px 0 0' : 16,
+          width: _isMobile ? '100%' : 480,
+          maxWidth: '96vw',
+          maxHeight: _isMobile ? '92vh' : '85vh',
+          overflowY: 'auto',
+          boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+        }}>
+          {/* Header */}
+          <div style={{
+            padding: '18px 24px', borderBottom: '1px solid var(--border-default)',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            position: 'sticky', top: 0, background: 'var(--bg-modal, #0a0c12)', zIndex: 2,
+          }}>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 800, color: 'var(--text-primary)' }}>
+                💸 {fr ? 'Nouvelle transaction' : 'New transaction'}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 3 }}>
+                {fr ? 'Une facture PDF sera générée après validation.' : 'A PDF invoice will be generated after validation.'}
+              </div>
+            </div>
+            <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 8 }}>✕</button>
+          </div>
+
+          <div style={{ padding: '20px 24px' }}>
+            {/* Spender handle */}
+            <div style={{ marginBottom: 16, position: 'relative' }}>
+              <label style={labelStyle}>
+                Spender <span style={{ color: '#f43f5e' }}>*</span>
+              </label>
+              <input
+                type="text"
+                value={form.spender_handle}
+                onChange={e => {
+                  setForm(f => ({ ...f, spender_handle: e.target.value, spender_id: '' }));
+                  if (formErrors.spender_handle) setFormErrors(er => ({ ...er, spender_handle: null }));
+                  setShowSugg(true);
+                }}
+                onBlur={() => setTimeout(() => setShowSugg(false), 150)}
+                onFocus={() => setShowSugg(true)}
+                placeholder="@handle ou nom"
+                style={{ ...inputStyle, borderColor: formErrors.spender_handle ? '#f43f5e' : 'var(--border-default)' }}
+              />
+              {formErrors.spender_handle && <span style={errStyle}>{formErrors.spender_handle}</span>}
+              {showSugg && spenderSuggestions.length > 0 && (
+                <div style={{
+                  position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 100,
+                  background: 'var(--bg-raised, #111827)', border: '1px solid var(--border-default)',
+                  borderRadius: 10, boxShadow: '0 8px 24px rgba(0,0,0,0.4)', overflow: 'hidden',
+                }}>
+                  {spenderSuggestions.map(s => (
+                    <div
+                      key={s.id}
+                      onMouseDown={() => {
+                        setForm(f => ({ ...f, spender_handle: s.handle, spender_id: s.id }));
+                        setShowSugg(false);
+                      }}
+                      style={{
+                        padding: '10px 14px', cursor: 'pointer', fontSize: 13,
+                        display: 'flex', alignItems: 'center', gap: 8,
+                        borderBottom: '1px solid var(--border-subtle)',
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'var(--bg-hover)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                    >
+                      <span style={{ fontWeight: 700, color: 'var(--text-primary)' }}>@{s.handle}</span>
+                      {s.name && s.name !== s.handle && (
+                        <span style={{ color: 'var(--text-tertiary)', fontSize: 11 }}>{s.name}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Montant + Devise */}
+            <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, marginBottom: 16 }}>
+              <div>
+                <label style={labelStyle}>
+                  {fr ? 'Montant' : 'Amount'} <span style={{ color: '#f43f5e' }}>*</span>
+                </label>
+                <input
+                  type="number" min="0" step="0.01"
+                  value={form.amount}
+                  onChange={e => { setForm(f => ({ ...f, amount: e.target.value })); if (formErrors.amount) setFormErrors(er => ({ ...er, amount: null })); }}
+                  placeholder="0.00"
+                  style={{ ...inputStyle, borderColor: formErrors.amount ? '#f43f5e' : 'var(--border-default)' }}
+                />
+                {formErrors.amount && <span style={errStyle}>{formErrors.amount}</span>}
+              </div>
+              <div>
+                <label style={labelStyle}>{fr ? 'Devise' : 'Currency'}</label>
+                <select
+                  value={form.currency}
+                  onChange={e => setForm(f => ({ ...f, currency: e.target.value }))}
+                  style={{ ...inputStyle, cursor: 'pointer' }}
+                >
+                  {['CHF', 'EUR', 'USD', 'GBP'].map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+
+            {/* Modèle */}
+            {myModels.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <label style={labelStyle}>{fr ? 'Modèle' : 'Model'}</label>
+                <select
+                  value={form.model_id}
+                  onChange={e => setForm(f => ({ ...f, model_id: e.target.value }))}
+                  style={{ ...inputStyle, cursor: 'pointer' }}
+                >
+                  <option value="">{fr ? '— Sélectionner un modèle —' : '— Select a model —'}</option>
+                  {myModels.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                </select>
+              </div>
+            )}
+
+            {/* Notes / description */}
+            <div style={{ marginBottom: 16 }}>
+              <label style={labelStyle}>
+                {fr ? 'Description / Notes' : 'Description / Notes'}
+                <span style={{ color: 'var(--text-quaternary)', fontWeight: 400, marginLeft: 6, textTransform: 'none', fontSize: 11 }}>
+                  ({fr ? 'optionnel' : 'optional'})
+                </span>
+              </label>
+              <textarea
+                value={form.notes}
+                onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
+                placeholder={fr ? 'Prestation de service, type de contenu…' : 'Service description, content type…'}
+                style={{ ...inputStyle, minHeight: 72, resize: 'vertical' }}
+              />
+            </div>
+
+            {/* Moyen de paiement */}
+            <div style={{ marginBottom: 20 }}>
+              <label style={labelStyle}>
+                {fr ? 'Moyen de paiement' : 'Payment method'}
+                <span style={{ color: 'var(--text-quaternary)', fontWeight: 400, marginLeft: 6, textTransform: 'none', fontSize: 11 }}>
+                  ({fr ? 'optionnel' : 'optional'})
+                </span>
+              </label>
+              <select
+                value={form.payment_method}
+                onChange={e => setForm(f => ({ ...f, payment_method: e.target.value }))}
+                style={{ ...inputStyle, cursor: 'pointer' }}
+              >
+                {['', 'virement', 'Twint', 'Revolut', 'PayPal', 'Stripe', 'Carte bancaire', 'Espèces', 'Autre'].map(v => (
+                  <option key={v} value={v}>{v || (fr ? '— Non précisé —' : '— Not specified —')}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Boutons */}
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={onClose} style={{ minWidth: 100 }}>
+                {fr ? 'Annuler' : 'Cancel'}
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={handleSubmit}
+                style={{ minWidth: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
+              >
+                📄 {fr ? 'Suivant — Facture' : 'Next — Invoice'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </ModalShell>
+
+      {showInvoiceModal && pendingTxData && (
+        <InvoiceGeneratorModal
+          open={showInvoiceModal}
+          onClose={() => { setShowInvoiceModal(false); onClose(); }}
+          txFormData={pendingTxData}
+          user={user}
+          lang={lang}
+          models={models}
+          spenders={spendersList}
+          onConfirm={handleInvoiceConfirm}
+        />
+      )}
+    </>
+  );
+};
+
+// =============================================
 // PROVIDER COMPTA TAB — Full Provider Dashboard
 // =============================================
 // =============================================
@@ -20423,7 +21213,7 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
   );
 };
 
-const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, onRefresh, onNotify, invoices, providerPaymentMethods}) => {
+const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, spenders, onRefresh, onNotify, invoices, providerPaymentMethods}) => {
   const addToast = useToast();
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const fr = lang === "fr";
@@ -20431,6 +21221,7 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
   const [saving, setSaving] = useState(false);
   const [provSubTab, setProvSubTab] = useState("paiements");
   const [showBillingModal, setShowBillingModal] = useState(false);
+  const [showNewTxModal, setShowNewTxModal] = useState(false);
   const [form, setForm] = useState({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
 
   // TX stats
@@ -20598,9 +21389,34 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
       </div>
 
       {/* Declare payment button */}
-      <button className="btn btn-primary" style={{marginBottom:20,width:"auto"}} onClick={()=>setShowForm(!showForm)}>
-        + {fr?"Déclarer un paiement":"Declare a payment"}
-      </button>
+      <div style={{display:'flex',gap:10,marginBottom:20,flexWrap:'wrap'}}>
+        <button className="btn btn-primary" style={{width:"auto"}} onClick={()=>setShowForm(!showForm)}>
+          + {fr?"Déclarer un paiement":"Declare a payment"}
+        </button>
+        <button
+          style={{
+            display:'flex',alignItems:'center',gap:6,width:"auto",
+            padding:'9px 16px',borderRadius:10,border:'1px solid var(--success)',
+            background:'rgba(34,197,94,0.1)',
+            color:'var(--success)',fontSize:13,fontWeight:700,cursor:'pointer',
+          }}
+          onClick={()=>setShowNewTxModal(true)}
+        >
+          💸 {fr?'Nouvelle transaction + Facture':'New transaction + Invoice'}
+        </button>
+      </div>
+
+      <ProviderNewTxModal
+        open={showNewTxModal}
+        onClose={()=>setShowNewTxModal(false)}
+        user={user}
+        lang={lang}
+        models={models}
+        spenders={spenders||[]}
+        profiles={profiles}
+        onRefresh={onRefresh}
+        onNotify={onNotify}
+      />
 
       {/* Declare form */}
       {showForm&&(
@@ -47908,7 +48724,7 @@ const App = () => {
           {(!["provider_dashboard","transactions","provider_compta","provider_notif"].includes(tab))&&user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
           {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} txSummary={txSummary} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} />}
           {tab==="provider_compta"&&user.role==="provider"&&(<>
-            <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
+            <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} spenders={spenders} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
             <div style={{marginTop:24}}>
               <ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />
             </div>
