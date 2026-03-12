@@ -20376,9 +20376,11 @@ const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, 
     doc.setTextColor(255, 255, 255);
     doc.text(`${companyDisplay}  •  ${fr ? 'Document généré le' : 'Generated on'} ${fmtDate(new Date())}`, W / 2, 291, { align: 'center' });
 
-    // ── Téléchargement ──
-    doc.save(`Facture_${invNumber}_${(invoiceData.client.full_name || 'client').replace(/\s+/g,'_')}.pdf`);
-    return true;
+    // ── Téléchargement local + retour blob pour upload Storage ──
+    const fileName = `Facture_${invNumber}_${(invoiceData.client.full_name || 'client').replace(/\s+/g,'_')}.pdf`;
+    doc.save(fileName);
+    const pdfBlob = doc.output('blob');
+    return { ok: true, blob: pdfBlob, invNumber, fileName };
   };
 
   const handleGenerate = async () => {
@@ -20386,13 +20388,13 @@ const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, 
     if (Object.keys(e).length > 0) { setClientErrors(e); return; }
     setGenerating(true);
     try {
-      // 1. Insert la transaction
+      // 1. Insert la transaction via callback parent
       const insertResult = await onConfirm({
         clientPhone: clientPhone.trim(),
         clientName:  clientName.trim(),
       });
       if (!insertResult?.ok) {
-        addToast(insertResult?.error || 'Erreur lors de la création de la transaction', 'error');
+        addToast(insertResult?.error || (fr ? 'Erreur lors de la création de la transaction' : 'Transaction creation error'), 'error');
         setGenerating(false);
         return;
       }
@@ -20407,9 +20409,9 @@ const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, 
         }).eq('id', spenderId);
       }
 
-      // 3. Génère le PDF
+      // 3. Génère le PDF (téléchargement local + blob)
       const modelName = (models || []).find(m => m.id === txFormData?.model_id)?.name || '';
-      const ok = generateInvoicePDF({
+      const pdfResult = generateInvoicePDF({
         provider: providerInfo || {},
         client:   { phone: clientPhone.trim(), full_name: clientName.trim() },
         amount:   txFormData?.amount,
@@ -20418,10 +20420,30 @@ const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, 
         notes:    txFormData?.notes || (modelName ? `Prestation — ${modelName}` : ''),
       });
 
-      if (ok) addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
+      // 4. Upload PDF → Supabase Storage bucket "invoices" + update invoice_url
+      if (pdfResult?.ok && pdfResult.blob && insertedTxId) {
+        const storagePath = `invoice_${insertedTxId}.pdf`;
+        const { error: uploadErr } = await sb.storage
+          .from('invoices')
+          .upload(storagePath, pdfResult.blob, { contentType: 'application/pdf', upsert: true });
+
+        if (uploadErr) {
+          console.warn('[Invoice] Storage upload error:', uploadErr.message);
+          addToast(fr ? 'PDF téléchargé mais upload cloud échoué' : 'PDF downloaded but cloud upload failed', 'warning');
+        } else {
+          const { data: urlData } = sb.storage.from('invoices').getPublicUrl(storagePath);
+          if (urlData?.publicUrl) {
+            await sb.from('transactions').update({ invoice_url: urlData.publicUrl }).eq('id', insertedTxId);
+          }
+        }
+      }
+
+      if (pdfResult?.ok) addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
+      else addToast(fr ? 'Erreur génération PDF' : 'PDF generation error', 'error');
+
       onClose();
     } catch (err) {
-      addToast('Erreur: ' + err.message, 'error');
+      addToast('Erreur: ' + (err.message || err), 'error');
     }
     setGenerating(false);
   };
@@ -20692,6 +20714,7 @@ const ProviderNewTxModal = ({ open, onClose, user, lang, models, spenders: spend
   };
 
   // Callback passé à InvoiceGeneratorModal pour créer la TX
+  // NE PAS appeler onClose/onRefresh ici — c'est handleGenerate qui gère le lifecycle
   const handleInvoiceConfirm = async ({ clientPhone, clientName }) => {
     try {
       const txRow = {
@@ -20727,12 +20750,6 @@ const ProviderNewTxModal = ({ open, onClose, user, lang, models, spenders: spend
             `${pendingTxData.amount} ${pendingTxData.currency || 'CHF'} de @${pendingTxData.spender_handle} (provider: ${user.name || user.email})`, insertedId)
         );
       }
-
-      // Reset form
-      setForm({ spender_handle: '', spender_id: '', amount: '', currency: 'CHF', model_id: '', notes: '', payment_method: '' });
-      setFormErrors({});
-      if (onRefresh) onRefresh();
-      onClose();
 
       return { ok: true, txId: insertedId, spenderId: pendingTxData.spender_id };
     } catch (err) {
@@ -20932,7 +20949,14 @@ const ProviderNewTxModal = ({ open, onClose, user, lang, models, spenders: spend
       {showInvoiceModal && pendingTxData && (
         <InvoiceGeneratorModal
           open={showInvoiceModal}
-          onClose={() => { setShowInvoiceModal(false); onClose(); }}
+          onClose={() => {
+            setShowInvoiceModal(false);
+            setPendingTxData(null);
+            setForm({ spender_handle: '', spender_id: '', amount: '', currency: 'CHF', model_id: '', notes: '', payment_method: '' });
+            setFormErrors({});
+            if (onRefresh) onRefresh();
+            onClose();
+          }}
           txFormData={pendingTxData}
           user={user}
           lang={lang}
