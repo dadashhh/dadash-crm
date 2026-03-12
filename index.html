@@ -3867,7 +3867,7 @@
     .grid-case-input textarea:focus {
       border-color: rgba(99,102,241,0.4);
     }
-    .grid-case-input button {
+    .grid-case-input .grid-send-btn {
       padding: 6px 12px;
       border-radius: 8px;
       border: none;
@@ -3879,9 +3879,66 @@
       flex-shrink: 0;
       transition: opacity 0.15s;
     }
-    .grid-case-input button:disabled {
+    .grid-case-input .grid-send-btn:disabled {
       background: rgba(255,255,255,0.08);
       cursor: not-allowed;
+    }
+    .grid-btn-icon {
+      width: 32px;
+      height: 32px;
+      border: none;
+      background: rgba(45,55,72,0.8);
+      color: #a0aec0;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 15px;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      padding: 0;
+    }
+    .grid-btn-icon:hover { background: #4a5568; color: #fff; }
+    .grid-btn-icon.active { background: rgba(99,102,241,0.25); color: #818cf8; border: 1px solid rgba(99,102,241,0.4); }
+    .grid-scripts-panel {
+      position: absolute;
+      bottom: 100%;
+      left: 0;
+      right: 0;
+      max-height: 280px;
+      overflow-y: auto;
+      background: rgba(13,15,30,0.97);
+      border: 1px solid rgba(99,102,241,0.3);
+      border-radius: 10px 10px 0 0;
+      box-shadow: 0 -4px 20px rgba(0,0,0,0.5);
+      z-index: 50;
+      backdrop-filter: blur(12px);
+    }
+    .grid-media-panel {
+      position: absolute;
+      bottom: 100%;
+      left: 0;
+      right: 0;
+      max-height: 300px;
+      overflow-y: auto;
+      background: rgba(13,15,30,0.97);
+      border: 1px solid rgba(99,102,241,0.3);
+      border-radius: 10px 10px 0 0;
+      box-shadow: 0 -4px 20px rgba(0,0,0,0.5);
+      z-index: 50;
+      backdrop-filter: blur(12px);
+    }
+    .grid-pending-media {
+      padding: 6px 8px;
+      background: rgba(99,102,241,0.1);
+      border-top: 1px solid rgba(99,102,241,0.2);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #e2e8f0;
+      flex-shrink: 0;
     }
     .grid-toolbar {
       display: flex;
@@ -47376,6 +47433,19 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
   const isUserScrollRef = React.useRef(false);
   const pollRef = React.useRef(null);
   const mountedRef = React.useRef(true);
+  const inputRef = React.useRef(null);
+
+  // Scripts state
+  const [showScriptsPanel, setShowScriptsPanel] = useState(false);
+  const [availableScripts, setAvailableScripts] = useState([]);
+  const [scriptsLoading, setScriptsLoading] = useState(false);
+
+  // Media state
+  const [showMediaPanel, setShowMediaPanel] = useState(false);
+  const [mediaPanelTab, setMediaPanelTab] = useState("photo");
+  const [pendingMedia, setPendingMedia] = useState(null);
+  const [sendingMedia, setSendingMedia] = useState(false);
+  const mediaFileRef = React.useRef(null);
 
   const scrollToBottom = (behavior) => {
     setTimeout(() => { msgEndRef.current?.scrollIntoView({ behavior: behavior || 'auto' }); }, 50);
@@ -47487,6 +47557,99 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     setSending(false);
   };
 
+  // ── Scripts ──
+  const loadScripts = async () => {
+    setScriptsLoading(true);
+    try {
+      let query = sb.from('scripts').select('*').eq('is_active', true);
+      if (modelId) query = query.eq('model_id', modelId);
+      const { data } = await query.order('title', { ascending: true });
+      setAvailableScripts(data || []);
+    } catch (err) {
+      console.warn('[GRID-SCRIPTS] error:', err);
+    }
+    setScriptsLoading(false);
+  };
+
+  const toggleScriptsPanel = () => {
+    if (!showScriptsPanel) { loadScripts(); setShowMediaPanel(false); }
+    setShowScriptsPanel(p => !p);
+  };
+
+  const insertScript = (text) => {
+    const spName_ = spenders?.find(x => String(x.tg_user_id || x.telegram_id || "") === String(chatId));
+    const prenom = spName_?.first_name || convData?.name || 'bébé';
+    const replaced = (text || '').replace(/\{prenom\}/gi, prenom).replace(/\{nom\}/gi, spName_?.last_name || '');
+    setMsgInput(replaced);
+    setShowScriptsPanel(false);
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  // ── Media ──
+  const toggleMediaPanel = () => {
+    if (!showMediaPanel) setShowScriptsPanel(false);
+    setShowMediaPanel(p => !p);
+  };
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    let mediaType = "photo";
+    if (file.type.startsWith("video/")) mediaType = "video";
+    else if (file.type.startsWith("audio/")) mediaType = "audio";
+    const url = URL.createObjectURL(file);
+    setPendingMedia({ type: mediaType, file, url, name: file.name });
+    setShowMediaPanel(false);
+    e.target.value = "";
+  };
+
+  const selectMediaItem = (item) => {
+    setPendingMedia({ id: item.id, url: item.url, name: item.name || item.filename || "média", type: item.type });
+    setShowMediaPanel(false);
+  };
+
+  const sendPendingMedia = async () => {
+    if (!pendingMedia || sendingMedia) return;
+    setSendingMedia(true);
+    const mName = modelName?.toLowerCase() || "";
+    const localId = "media-" + Date.now();
+    setMessages(prev => [...prev, {
+      id: localId, text: "", direction: "out", is_outgoing: true, sender_type: "chatter",
+      created_at: new Date().toISOString(), _pending: true,
+      media_url: pendingMedia.url, media_type: pendingMedia.type === "video" ? "video" : "photo"
+    }]);
+    isUserScrollRef.current = false;
+    scrollToBottom('smooth');
+    try {
+      let mediaUrl = pendingMedia.url;
+      if (pendingMedia.file) {
+        const ext = pendingMedia.file.name.split('.').pop();
+        const path = `grid-media/${chatId}/${Date.now()}.${ext}`;
+        const { error: upErr } = await sb.storage.from("media").upload(path, pendingMedia.file, { contentType: pendingMedia.file.type, upsert: true });
+        if (upErr) throw new Error(upErr.message);
+        const { data: pub } = sb.storage.from("media").getPublicUrl(path);
+        mediaUrl = pub.publicUrl;
+      }
+      const endpoint = pendingMedia.type === 'video' ? '/send-video' : '/send-media';
+      const body = pendingMedia.type === 'video'
+        ? { chat_id: chatId, video_url: mediaUrl, caption: "", model_id: mName }
+        : { chat_id: chatId, media_url: mediaUrl, caption: "", model_id: mName };
+      const res = await _dmsgFetch(endpoint, { method: "POST", body: JSON.stringify(body), timeout: pendingMedia.type === 'video' ? 120000 : 30000 });
+      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, media_url: mediaUrl } : m));
+      if (pendingMedia.id) {
+        await sb.from("media_sends").insert({ media_id: pendingMedia.id, chat_id: chatId, model: mName }).catch(() => {});
+      }
+      setPendingMedia(null);
+      setTimeout(() => loadMessages(false), 2000);
+    } catch (e) {
+      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, _error: true } : m));
+      addToast("Erreur média: " + e.message, "error");
+    }
+    setSendingMedia(false);
+  };
+
+  const cancelPendingMedia = () => { if (!sendingMedia) setPendingMedia(null); };
+
   const spName = React.useMemo(() => {
     if (convData?.name) return convData.name;
     const allSp = spenders || [];
@@ -47501,6 +47664,13 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     const m = (models || []).find(x => x.id === modelId);
     return m ? m.name : null;
   }, [modelId, models]);
+
+  // Close panels on Escape
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") { setShowScriptsPanel(false); setShowMediaPanel(false); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <div className="grid-case" style={{ position: "relative" }}>
@@ -47561,17 +47731,122 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
         })}
         <div ref={msgEndRef} />
       </div>
-      <div className="grid-case-input">
-        <textarea
-          value={msgInput}
-          onChange={e => setMsgInput(e.target.value)}
-          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } }}
-          placeholder={fr ? "Message..." : "Message..."}
-          rows={1}
-        />
-        <button onClick={sendMsg} disabled={!msgInput.trim() || sending}>
-          {sending ? "⏳" : "➤"}
-        </button>
+
+      {/* Pending media bar */}
+      {pendingMedia && (
+        <div className="grid-pending-media">
+          {pendingMedia.type === "photo" || pendingMedia.type === "image" ? "🖼️" : pendingMedia.type === "video" ? "🎥" : "🎵"}
+          <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pendingMedia.name}</span>
+          <button onClick={sendPendingMedia} disabled={sendingMedia}
+            style={{ padding: "3px 10px", borderRadius: 6, border: "none", background: sendingMedia ? "#374151" : "#6366f1", color: "#fff", fontSize: 10, fontWeight: 700, cursor: sendingMedia ? "not-allowed" : "pointer" }}>
+            {sendingMedia ? "⏳" : "✓"}
+          </button>
+          <button onClick={cancelPendingMedia} disabled={sendingMedia}
+            style={{ padding: "3px 6px", borderRadius: 6, border: "none", background: "rgba(255,255,255,0.08)", color: "#9ca3af", fontSize: 10, cursor: sendingMedia ? "not-allowed" : "pointer" }}>
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Scripts + Media panels */}
+      <div style={{ position: "relative", flexShrink: 0 }}>
+        {showScriptsPanel && (
+          <div className="grid-scripts-panel">
+            <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: "#818cf8" }}>📜 Scripts</span>
+              <button onClick={() => setShowScriptsPanel(false)} style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 14 }}>✕</button>
+            </div>
+            {/* Quick scripts */}
+            {Object.entries(_DMSG_SCRIPTS).map(([category, scripts]) => (
+              <div key={category} style={{ padding: "6px 8px 2px" }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.05em", padding: "0 2px 4px" }}>{category}</div>
+                {scripts.map((s, idx) => (
+                  <div key={idx} onClick={() => insertScript(s.text)}
+                    style={{ padding: "5px 8px", borderRadius: 6, cursor: "pointer", fontSize: 11, color: "#d1d5db", transition: "background 0.1s", marginBottom: 2 }}
+                    onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.12)"}
+                    onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                    {s.label}
+                  </div>
+                ))}
+              </div>
+            ))}
+            {/* DB scripts */}
+            {scriptsLoading && (
+              <div style={{ padding: 12, textAlign: "center", fontSize: 10, color: "#6b7280" }}>Chargement scripts...</div>
+            )}
+            {!scriptsLoading && availableScripts.length > 0 && (
+              <div style={{ padding: "6px 8px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: "#10b981", textTransform: "uppercase", letterSpacing: "0.05em", padding: "0 2px 4px" }}>🎬 Scripts DB</div>
+                {availableScripts.map(script => (
+                  <div key={script.id}
+                    onClick={() => {
+                      const firstText = (script.sequence || []).find(s => s.type === 'text');
+                      if (firstText) insertScript(firstText.content);
+                      else addToast("Ce script n'a pas d'étape texte", "info");
+                    }}
+                    style={{ padding: "5px 8px", borderRadius: 6, cursor: "pointer", fontSize: 11, color: "#d1d5db", transition: "background 0.1s", marginBottom: 2, display: "flex", alignItems: "center", gap: 6 }}
+                    onMouseEnter={e => e.currentTarget.style.background = "rgba(16,185,129,0.12)"}
+                    onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                    <span style={{ fontSize: 10, fontWeight: 600 }}>{script.title || script.name}</span>
+                    <span style={{ fontSize: 9, color: "#6b7280" }}>({(script.sequence || []).length} étapes)</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {showMediaPanel && (
+          <div className="grid-media-panel">
+            <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", gap: 4 }}>
+                {["photo", "video"].map(t => (
+                  <button key={t} onClick={() => setMediaPanelTab(t)}
+                    style={{ padding: "3px 10px", borderRadius: 5, border: "none", fontSize: 10, fontWeight: 700, cursor: "pointer",
+                      background: mediaPanelTab === t ? "rgba(99,102,241,0.2)" : "transparent",
+                      color: mediaPanelTab === t ? "#818cf8" : "#6b7280" }}>
+                    {t === "photo" ? "📸 Photos" : "🎥 Vidéos"}
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => setShowMediaPanel(false)} style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 14 }}>✕</button>
+            </div>
+            {/* Upload button */}
+            <div style={{ padding: "8px 10px", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+              <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "8px", borderRadius: 8, border: "1px dashed rgba(99,102,241,0.3)", cursor: "pointer", fontSize: 11, color: "#818cf8", transition: "background 0.15s" }}
+                onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.08)"}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                <input ref={mediaFileRef} type="file" accept={mediaPanelTab === "photo" ? "image/*" : "video/*"} onChange={handleFileSelect} style={{ display: "none" }} />
+                📤 {fr ? "Uploader depuis l'appareil" : "Upload from device"}
+              </label>
+            </div>
+            {/* Media library grid */}
+            <MediaPanelGrid
+              mediaType={mediaPanelTab}
+              modelName={modelName?.toLowerCase() || ""}
+              sentMediaIds={[]}
+              soldMediaIds={[]}
+              onSelect={selectMediaItem}
+            />
+          </div>
+        )}
+
+        {/* Input bar */}
+        <div className="grid-case-input">
+          <button className={`grid-btn-icon ${showScriptsPanel ? 'active' : ''}`} onClick={toggleScriptsPanel} title="Scripts">📜</button>
+          <button className={`grid-btn-icon ${showMediaPanel ? 'active' : ''}`} onClick={toggleMediaPanel} title={fr ? "Médias" : "Media"}>📷</button>
+          <textarea
+            ref={inputRef}
+            value={msgInput}
+            onChange={e => setMsgInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); } }}
+            placeholder={fr ? "Message..." : "Message..."}
+            rows={1}
+          />
+          <button className="grid-send-btn" onClick={sendMsg} disabled={!msgInput.trim() || sending}>
+            {sending ? "⏳" : "➤"}
+          </button>
+        </div>
       </div>
     </div>
   );
