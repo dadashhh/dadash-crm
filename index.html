@@ -30515,7 +30515,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const convsCache = React.useRef({ data: [], lastFetch: 0 });
   const CACHE_TTL = 30000;
 
-  // ── Load conversations: cache + Carlos API + fallback Supabase ──
+  // ── Load conversations: Carlos API + Supabase merge (ensures ALL models visible) ──
   const loadConversations = useCallback(async (force = false) => {
     const now = Date.now();
     if (!force && convsCache.current.data.length > 0
@@ -30542,58 +30542,94 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     } else {
       setConvLoading(true);
     }
+
+    let apiList = [];
+    let apiOk_ = false;
+
+    // 1. Fetch from Carlos API
     try {
       const data = await _dmsgFetch("/conversations");
-      let list = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      // Filtrage sécurité côté client pour les chatters
-      if (userProfile?.role === 'chatter') {
-        const assigned = userProfile.assigned_models || [];
-        if (assigned.length > 0) {
-          list = list.filter(c => assigned.includes(c.model_id));
-          console.log(`[CONV] Filtre chatter appliqué: ${list.length} convs (modèles: ${assigned.join(', ')})`);
-        } else {
-          list = [];
-          console.warn('[CONV] Chatter sans modèle assigné — aucune conversation visible');
-        }
-      }
-      convsCache.current = { data: list, lastFetch: now };
-      _DMSG_CONV_CACHE.list = list;
-      _DMSG_CONV_CACHE.ts = now;
-      setConversations(prev => {
-        const isSame = prev.length === list.length &&
-          prev.every((c, i) => c.id === list[i]?.id && c.last_message_at === list[i]?.last_message_at && c.unread_count === list[i]?.unread_count);
-        return isSame ? prev : list;
-      });
-      setApiOk(true);
+      apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      apiOk_ = true;
     } catch (e) {
-      console.error("loadConversations error:", e);
-      if (_DMSG_CONV_CACHE.list.length === 0) {
-        try {
-          let q = sb.from("tg_conversations").select("*");
-          if (userProfile?.role === "chatter") {
-            const assigned = userProfile.assigned_models || [];
-            if (assigned.length > 0) q = q.in("model_id", assigned);
-          }
-          const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
-          if (error) throw new Error(error.message);
-          const fallback = sbData || [];
-          convsCache.current = { data: fallback, lastFetch: now };
-          _DMSG_CONV_CACHE.list = fallback;
-          setConversations(prev => {
-            const isSame = prev.length === fallback.length &&
-              prev.every((c, i) => c.id === fallback[i]?.id && c.last_message_at === fallback[i]?.last_message_at && c.unread_count === fallback[i]?.unread_count);
-            return isSame ? prev : fallback;
-          });
-          setApiOk(true);
-        } catch (e2) {
-          setApiOk(false);
-          setApiError(e2.message || "Erreur");
-        }
-      }
-    } finally {
-      convLoadedRef.current = true;
-      setConvLoading(false);
+      console.warn("[CONV] Carlos API error, will use Supabase only:", e.message);
     }
+
+    // 2. Always fetch from Supabase to catch conversations the API might miss
+    let sbList = [];
+    try {
+      let q = sb.from("tg_conversations").select("*");
+      if (userProfile?.role === "chatter") {
+        const assigned = userProfile.assigned_models || [];
+        if (assigned.length > 0) q = q.in("model_id", assigned);
+      }
+      const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
+      if (!error && sbData) sbList = sbData;
+    } catch (_) {}
+
+    // 3. Merge: API results take priority, Supabase fills gaps
+    const idSet = new Set();
+    const chatIdSet = new Set();
+    const merged = [];
+    for (const c of apiList) {
+      const cid = c.id || c.tg_chat_id || c.chat_id;
+      if (cid && !idSet.has(String(cid))) {
+        idSet.add(String(cid));
+        if (c.tg_chat_id) chatIdSet.add(String(c.tg_chat_id));
+        if (c.chat_id) chatIdSet.add(String(c.chat_id));
+        merged.push(c);
+      }
+    }
+    let sbAdded = 0;
+    for (const c of sbList) {
+      const cid = String(c.id || "");
+      const chatId = String(c.tg_chat_id || c.chat_id || "");
+      if (!idSet.has(cid) && !chatIdSet.has(chatId)) {
+        idSet.add(cid);
+        if (chatId) chatIdSet.add(chatId);
+        merged.push(c);
+        sbAdded++;
+      }
+    }
+
+    let list = merged;
+
+    // Debug: log model distribution
+    const byModel = {};
+    list.forEach(c => { const mid = c.model_id || "unknown"; byModel[mid] = (byModel[mid] || 0) + 1; });
+    console.log(`[CONV] Loaded ${list.length} conversations (API: ${apiList.length}, Supabase added: ${sbAdded})`, byModel);
+
+    // Filtrage sécurité côté client pour les chatters
+    if (userProfile?.role === 'chatter') {
+      const assigned = userProfile.assigned_models || [];
+      if (assigned.length > 0) {
+        list = list.filter(c => assigned.includes(c.model_id));
+        console.log(`[CONV] Filtre chatter appliqué: ${list.length} convs (modèles: ${assigned.join(', ')})`);
+      } else {
+        list = [];
+        console.warn('[CONV] Chatter sans modèle assigné — aucune conversation visible');
+      }
+    }
+
+    // Sort by last_message_at desc
+    list.sort((a, b) => {
+      const da = new Date(a.last_message_at || 0).getTime();
+      const db = new Date(b.last_message_at || 0).getTime();
+      return db - da;
+    });
+
+    convsCache.current = { data: list, lastFetch: now };
+    _DMSG_CONV_CACHE.list = list;
+    _DMSG_CONV_CACHE.ts = now;
+    setConversations(prev => {
+      const isSame = prev.length === list.length &&
+        prev.every((c, i) => c.id === list[i]?.id && c.last_message_at === list[i]?.last_message_at && c.unread_count === list[i]?.unread_count);
+      return isSame ? prev : list;
+    });
+    setApiOk(apiOk_ || sbList.length > 0);
+    if (!apiOk_ && sbList.length === 0) setApiError("Erreur chargement");
+    convLoadedRef.current = true;
+    setConvLoading(false);
   }, [userProfile]);
 
   // Charger conversations quand profil est prêt
@@ -31232,11 +31268,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     // Filtre modèle
     if (filterModel && filterModel !== "all") {
-      const fm = filterModel.toLowerCase();
+      const fmId = filterModel;
+      const fmModel = (models || []).find(m => m.id === fmId);
+      const fmName = (fmModel?.name || filterModel).toLowerCase();
       result = result.filter(c =>
-        (c.model_id && c.model_id === filterModel) ||
-        (c.model_name && c.model_name.toLowerCase() === fm) ||
-        (c.username && c.username.toLowerCase().includes(fm))
+        (c.model_id && (c.model_id === fmId || String(c.model_id).toLowerCase() === fmName)) ||
+        (c.model_name && c.model_name.toLowerCase() === fmName)
       );
     }
 
