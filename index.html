@@ -29036,6 +29036,12 @@ const mergeMessages = (prev, serverList) => {
   );
 };
 
+const _escapeHtml = (text) => {
+  const d = document.createElement("div");
+  d.textContent = text;
+  return d.innerHTML;
+};
+
 const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user }) => {
   const fr = lang === "fr";
   const addToast = useToast();
@@ -29050,6 +29056,11 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   const [isSending, setIsSending]               = useState(false);
   const [sendProgress, setSendProgress]         = useState(null);
   const fileInputRef = React.useRef(null);
+
+  // ── Variants IA state ──────────────────────────────────────
+  const [messageVariants, setMessageVariants]     = useState([]);
+  const [variantsLoading, setVariantsLoading]     = useState(false);
+  const [variantsGenerated, setVariantsGenerated] = useState(false);
 
   // ── Analytics state ───────────────────────────────────────
   const [broadcasts, setBroadcasts]             = useState([]);
@@ -29141,16 +29152,60 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
     e.target.value = "";
   };
 
+  const generateMessageVariants = async () => {
+    const msg = broadcastMessage.trim();
+    if (!msg) { addToast("Écris un message d'abord !", "error"); return; }
+    setVariantsLoading(true);
+    setVariantsGenerated(false);
+    try {
+      const carlosModelId = (models.find(m => m.id === broadcastModel)?.name || "").toLowerCase();
+      console.log("[VARIANTS] Generating for model", carlosModelId);
+      const res = await _dmsgFetch("/api/broadcast/generate-variants", {
+        method: "POST",
+        body: JSON.stringify({ message: msg, model_id: carlosModelId }),
+        timeout: 30000,
+      });
+      if (!res.success) throw new Error(res.error || "Génération échouée");
+      const variants = res.variants || [];
+      console.log("[VARIANTS] Generated", variants.length, "variants");
+      setMessageVariants(variants);
+      setVariantsGenerated(true);
+      addToast(`✨ ${variants.length} variantes générées !`, "success");
+    } catch (err) {
+      console.error("[VARIANTS] Error:", err);
+      addToast("Erreur génération variantes : " + err.message, "error");
+    } finally {
+      setVariantsLoading(false);
+    }
+  };
+
   const sendBroadcast = async () => {
     if (!broadcastMessage.trim() && !broadcastMedia) { addToast("Message ou média requis", "error"); return; }
     if (selectedConvIds.size === 0) { addToast("Aucun destinataire", "error"); return; }
+
+    const hasVariants = messageVariants.length > 0;
+    if (!hasVariants && broadcastMessage.trim()) {
+      const goAhead = window.confirm(
+        "⚠️ Aucune variante générée !\n\n" +
+        "Envoyer le même message à tout le monde augmente le risque de ban Telegram.\n\n" +
+        "Recommandation : Génère des variantes IA d'abord.\n\n" +
+        "Continuer quand même ?"
+      );
+      if (!goAhead) return;
+    }
+
+    const variantsToSend = hasVariants
+      ? messageVariants
+      : [{ variant: 0, text: broadcastMessage.trim(), length: "original" }];
+
+    console.log("[BROADCAST] Starting with", variantsToSend.length, "variant(s)");
+
     setIsSending(true);
     const chatIds = Array.from(selectedConvIds);
     const carlosModelId = (models.find(m => m.id === broadcastModel)?.name || "").toLowerCase();
     let ok = 0, fail = 0;
     setSendProgress({ current: 0, total: chatIds.length, ok: 0, fail: 0 });
     try {
-      // Upload vers Supabase si le média est un fichier local (vidéo compressée ou photo)
       let resolvedMediaUrl = broadcastMedia?.url || null;
       if (broadcastMedia?.file) {
         let uploadFile = broadcastMedia.file;
@@ -29167,13 +29222,14 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
         resolvedMediaUrl = urlData.publicUrl;
       }
       for (let i = 0; i < chatIds.length; i++) {
+        const variantText = variantsToSend[i % variantsToSend.length].text;
         try {
           if (resolvedMediaUrl && broadcastMedia) {
             const ep = { photo: "/send-photo", video: "/send-video", audio: "/send-audio" }[broadcastMedia.type] || "/send-message";
             const bcMediaTimeout = broadcastMedia.type === 'video' ? 600000 : broadcastMedia.type === 'audio' ? 120000 : 30000;
-            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: resolvedMediaUrl, caption: broadcastMessage.trim() || "", model_id: carlosModelId }), timeout: bcMediaTimeout });
+            await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: resolvedMediaUrl, caption: variantText, model_id: carlosModelId }), timeout: bcMediaTimeout });
           } else {
-            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: carlosModelId }), timeout: 8000 });
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: variantText, model_id: carlosModelId }), timeout: 8000 });
           }
           ok++;
         } catch (_) { fail++; }
@@ -29190,10 +29246,11 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
         has_media: !!broadcastMedia, media_type: broadcastMedia?.type || null,
         total_recipients: chatIds.length, sent_count: ok, failed_count: fail,
         read_count: 0, reply_count: 0, revenue_generated: 0,
-        metadata: { tier: selectedTier, spacing: scheduleSpacing },
+        metadata: { tier: selectedTier, spacing: scheduleSpacing, variants_count: variantsToSend.length, used_variants: hasVariants },
       }).catch(() => {});
-      addToast(`✅ ${ok}/${chatIds.length} envoyés${fail > 0 ? ` · ❌ ${fail} erreurs` : ""}`, ok > 0 ? "success" : "error");
+      addToast(`✅ ${ok}/${chatIds.length} envoyés${hasVariants ? ` (${variantsToSend.length} variantes)` : ""}${fail > 0 ? ` · ❌ ${fail} erreurs` : ""}`, ok > 0 ? "success" : "error");
       setBroadcastMessage(""); setBroadcastMedia(null); setSelectedTier("all");
+      setMessageVariants([]); setVariantsGenerated(false);
       loadAnalytics();
     } catch (_) { addToast("❌ Erreur broadcast", "error"); }
     finally { setIsSending(false); setTimeout(() => setSendProgress(null), 3000); }
@@ -29368,10 +29425,67 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
               <span style={{ fontSize: 14, fontWeight: 700 }}>Message</span>
               <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-tertiary)" }}>{broadcastMessage.length} car.</span>
             </div>
-            <textarea value={broadcastMessage} onChange={e => setBroadcastMessage(e.target.value)}
+            <textarea value={broadcastMessage} onChange={e => { setBroadcastMessage(e.target.value); if (variantsGenerated) { setVariantsGenerated(false); setMessageVariants([]); } }}
               placeholder="Écris ton message… Variables : {prenom}, {budget}"
               style={{ width: "100%", minHeight: 120, padding: 12, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, color: "var(--text-primary)", fontSize: 13, resize: "vertical", fontFamily: "'Inter',sans-serif", lineHeight: 1.7, boxSizing: "border-box", outline: "none" }} />
+
+            {/* Bouton générer variantes IA */}
+            <div style={{ marginTop: 14 }}>
+              <button onClick={generateMessageVariants} disabled={variantsLoading || !broadcastMessage.trim()}
+                style={{
+                  padding: "12px 20px",
+                  background: variantsGenerated
+                    ? "linear-gradient(135deg, #10b981 0%, #059669 100%)"
+                    : "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                  color: "white", border: "none", borderRadius: 8, fontWeight: 700, cursor: variantsLoading || !broadcastMessage.trim() ? "not-allowed" : "pointer",
+                  fontSize: 13, display: "flex", alignItems: "center", gap: 8,
+                  opacity: variantsLoading || !broadcastMessage.trim() ? 0.5 : 1, transition: "all 0.2s",
+                }}>
+                <span>{variantsLoading ? "⏳" : variantsGenerated ? "✅" : "✨"}</span>
+                <span>{variantsLoading ? "Génération en cours…" : variantsGenerated ? "Variantes générées ! Regénérer ?" : "Générer 5 variantes IA anti-spam"}</span>
+              </button>
+            </div>
           </div>
+
+          {/* Variantes IA */}
+          {messageVariants.length > 0 && (
+            <div style={{
+              background: "rgba(255,255,255,0.03)", padding: "22px 24px", borderRadius: 16,
+              border: "2px solid rgba(99,102,241,0.4)",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+                <span style={{ fontSize: 18 }}>✨</span>
+                <span style={{ fontSize: 14, fontWeight: 700 }}>{messageVariants.length} variantes générées</span>
+                <span style={{
+                  background: "rgba(99,102,241,0.2)", color: "#a5b4fc",
+                  padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                  border: "1px solid rgba(99,102,241,0.3)",
+                }}>Anti-spam activé</span>
+              </div>
+              <p style={{ margin: "0 0 14px 0", color: "var(--text-tertiary)", fontSize: 12 }}>
+                Les variantes seront alternées automatiquement lors de l'envoi pour éviter la détection spam de Telegram.
+              </p>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {messageVariants.map((v, i) => {
+                  const lengthBadge = { original: "📝 Original", short: "⚡ Court", medium: "📄 Moyen", long: "📖 Long" }[v.length] || "📝";
+                  return (
+                    <div key={i} style={{
+                      background: i === 0 ? "rgba(0,0,0,0.3)" : "rgba(255,255,255,0.02)",
+                      border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: 14,
+                    }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                        <span style={{ color: "var(--text-tertiary)", fontSize: 11, fontWeight: 700 }}>VARIANTE {i + 1}</span>
+                        <span style={{ background: "rgba(255,255,255,0.05)", color: "var(--text-tertiary)", padding: "3px 8px", borderRadius: 6, fontSize: 11 }}>{lengthBadge}</span>
+                      </div>
+                      <div style={{ color: "var(--text-primary)", fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}
+                        dangerouslySetInnerHTML={{ __html: _escapeHtml(v.text) }} />
+                      <div style={{ marginTop: 8, color: "var(--text-tertiary)", fontSize: 11 }}>{v.text.length} caractères</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Option espacement */}
           <div style={{ ...card, padding: "12px 18px" }}>
@@ -29403,7 +29517,14 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
               <div><span style={{ color: "var(--text-tertiary)" }}>Modèle : </span><strong>{selectedModel?.name || "—"}</strong></div>
               <div><span style={{ color: "var(--text-tertiary)" }}>Segment : </span><strong>{TIERS.find(t => t.id === selectedTier)?.emoji} {TIERS.find(t => t.id === selectedTier)?.label}</strong></div>
               <div><span style={{ color: "var(--text-tertiary)" }}>Type : </span><strong>{broadcastMedia ? broadcastMedia.type + " + texte" : "texte seul"}</strong></div>
+              <div><span style={{ color: "var(--text-tertiary)" }}>Variantes : </span><strong style={{ color: messageVariants.length > 0 ? "#10b981" : "var(--text-tertiary)" }}>{messageVariants.length > 0 ? `✨ ${messageVariants.length} variantes IA` : "Aucune"}</strong></div>
             </div>
+            {messageVariants.length > 0 && !sendProgress && (
+              <div style={{ marginBottom: 12, padding: "8px 12px", background: "rgba(16,185,129,0.08)", borderRadius: 8, border: "1px solid rgba(16,185,129,0.2)", fontSize: 11, color: "#10b981", fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+                <span>✨</span>
+                <span>Anti-spam : {messageVariants.length} variantes en rotation</span>
+              </div>
+            )}
             {sendProgress && (
               <div style={{ marginBottom: 12, padding: 10, background: "rgba(99,102,241,0.08)", borderRadius: 10, border: "1px solid rgba(99,102,241,0.2)" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6, fontWeight: 600 }}>
@@ -29421,7 +29542,7 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
                 color: canSend ? "#fff" : "var(--text-tertiary)",
                 fontSize: 14, fontWeight: 800, cursor: canSend ? "pointer" : "not-allowed",
                 boxShadow: canSend ? "0 6px 20px rgba(99,102,241,0.35)" : "none", transition: "all 0.2s" }}>
-              {isSending ? "⏳ Envoi en cours…" : `📡 Envoyer à ${selectedConvIds.size} fan${selectedConvIds.size > 1 ? "s" : ""}`}
+              {isSending ? "⏳ Envoi en cours…" : `📡 Envoyer à ${selectedConvIds.size} fan${selectedConvIds.size > 1 ? "s" : ""}${messageVariants.length > 0 ? ` (${messageVariants.length} variantes)` : ""}`}
             </button>
             {!canSend && !isSending && (
               <p style={{ margin: "6px 0 0", fontSize: 11, color: "var(--text-tertiary)", textAlign: "center" }}>
