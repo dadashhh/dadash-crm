@@ -29062,6 +29062,10 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   const [variantsLoading, setVariantsLoading]     = useState(false);
   const [variantsGenerated, setVariantsGenerated] = useState(false);
 
+  // ── Warm-up status state ──────────────────────────────────
+  const [modelsStatus, setModelsStatus]           = useState({});
+  const [statusLoading, setStatusLoading]         = useState(true);
+
   // ── Analytics state ───────────────────────────────────────
   const [broadcasts, setBroadcasts]             = useState([]);
   const [analyticsLoading, setAnalyticsLoading] = useState(true);
@@ -29073,6 +29077,25 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   }, [models]);
 
   useEffect(() => { loadAnalytics(); }, [filterModel, filterDateRange]);
+
+  useEffect(() => { loadModelsStatus(); }, []);
+
+  const loadModelsStatus = async () => {
+    setStatusLoading(true);
+    try {
+      console.log("[MODELS_STATUS] Loading...");
+      const data = await _dmsgFetch("/api/models/status", { timeout: 10000 });
+      if (data.success && data.models) {
+        const map = {};
+        data.models.forEach(m => { map[m.id] = m; });
+        setModelsStatus(map);
+        console.log("[MODELS_STATUS] Loaded", data.models.length, "models");
+      }
+    } catch (err) {
+      console.error("[MODELS_STATUS] Error:", err);
+    }
+    setStatusLoading(false);
+  };
 
   const loadAnalytics = async () => {
     setAnalyticsLoading(true);
@@ -29109,6 +29132,24 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   };
   const getModelClr = (name) => MODEL_COLORS[(name||"").toLowerCase()] || { bg: "#6366f1", glow: "rgba(99,102,241,0.3)" };
   const rateColor = (r) => r >= 90 ? "#10b981" : r >= 70 ? "#f59e0b" : "#ef4444";
+
+  const WARMUP_CONFIG = {
+    hot:  { emoji: "🔥", label: "COMPTE CHAUD", color: "#10b981", bg: "rgba(16,185,129,0.1)",  desc: "Prêt pour broadcast illimité" },
+    warm: { emoji: "⚡", label: "COMPTE TIÈDE", color: "#f59e0b", bg: "rgba(245,158,11,0.1)",  desc: "Broadcast modéré recommandé" },
+    cold: { emoji: "❄️", label: "COMPTE FROID", color: "#ef4444", bg: "rgba(239,68,68,0.1)",   desc: "Warm-up requis" },
+  };
+
+  const currentModelStatus = modelsStatus[broadcastModel] || null;
+
+  const lastActivityText = React.useMemo(() => {
+    if (!currentModelStatus?.last_activity_at) return "Jamais";
+    const diffMs = Date.now() - new Date(currentModelStatus.last_activity_at).getTime();
+    const h = Math.floor(diffMs / 3600000);
+    const d = Math.floor(diffMs / 86400000);
+    if (h < 1) return "Il y a moins d'1h";
+    if (h < 24) return `Il y a ${h}h`;
+    return `Il y a ${d}j`;
+  }, [currentModelStatus]);
 
   const modelConvs = React.useMemo(() => {
     if (!broadcastModel) return conversations;
@@ -29182,6 +29223,30 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   const sendBroadcast = async () => {
     if (!broadcastMessage.trim() && !broadcastMedia) { addToast("Message ou média requis", "error"); return; }
     if (selectedConvIds.size === 0) { addToast("Aucun destinataire", "error"); return; }
+
+    const mStatus = modelsStatus[broadcastModel];
+    if (mStatus && !mStatus.can_broadcast) {
+      window.alert(
+        "❌ BROADCAST BLOQUÉ\n\n" +
+        "Ce compte est trop froid pour broadcaster.\n\n" +
+        "Warm-up requis :\n" +
+        "1. Envoyer 10-20 messages manuels aujourd'hui\n" +
+        "2. Attendre 24-48h\n" +
+        "3. Broadcaster petit volume (20-50 msgs)\n" +
+        "4. Augmenter progressivement"
+      );
+      return;
+    }
+
+    if (mStatus && selectedConvIds.size > mStatus.max_volume) {
+      const goVolume = window.confirm(
+        `⚠️ Volume élevé !\n\n` +
+        `Tu essaies d'envoyer à ${selectedConvIds.size} destinataires.\n` +
+        `Le max recommandé pour ce compte (${mStatus.status.toUpperCase()}) est ${mStatus.max_volume}.\n\n` +
+        `Continuer quand même ?`
+      );
+      if (!goVolume) return;
+    }
 
     const hasVariants = messageVariants.length > 0;
     if (!hasVariants && broadcastMessage.trim()) {
@@ -29348,10 +29413,57 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
                     </div>
                     <div style={{ fontWeight: 800, fontSize: 13 }}>{m.name}</div>
                     <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{convCount} fans</div>
+                    {modelsStatus[m.id] && (() => {
+                      const ws = WARMUP_CONFIG[modelsStatus[m.id].status] || WARMUP_CONFIG.cold;
+                      return <div style={{ fontSize: 9, marginTop: 4, color: ws.color, fontWeight: 700 }}>{ws.emoji} {modelsStatus[m.id].status.toUpperCase()}</div>;
+                    })()}
                   </button>
                 );
               })}
             </div>
+
+            {/* Badge statut warm-up du modèle sélectionné */}
+            {currentModelStatus && (() => {
+              const wc = WARMUP_CONFIG[currentModelStatus.status] || WARMUP_CONFIG.cold;
+              const coldDesc = currentModelStatus.can_broadcast ? "Petit volume uniquement" : "Warm-up requis";
+              const desc = currentModelStatus.status === "cold" ? coldDesc : wc.desc;
+              return (
+                <div style={{ marginTop: 14, background: wc.bg, border: `2px solid ${wc.color}`, borderRadius: 12, padding: 16 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+                    <span style={{ fontSize: 28 }}>{wc.emoji}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ color: wc.color, fontWeight: 700, fontSize: 13, marginBottom: 3 }}>{wc.label}</div>
+                      <div style={{ color: "var(--text-primary)", fontSize: 12 }}>{desc}</div>
+                    </div>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, paddingTop: 12, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
+                    <div>
+                      <div style={{ color: "var(--text-tertiary)", fontSize: 10, fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Max volume</div>
+                      <div style={{ color: "var(--text-primary)", fontWeight: 800, fontSize: 18 }}>{currentModelStatus.max_volume}</div>
+                    </div>
+                    <div>
+                      <div style={{ color: "var(--text-tertiary)", fontSize: 10, fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Délai</div>
+                      <div style={{ color: "var(--text-primary)", fontWeight: 800, fontSize: 18 }}>{currentModelStatus.delay}s</div>
+                    </div>
+                    <div>
+                      <div style={{ color: "var(--text-tertiary)", fontSize: 10, fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Msgs 7j</div>
+                      <div style={{ color: "var(--text-primary)", fontWeight: 800, fontSize: 18 }}>{currentModelStatus.message_count_7d}</div>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.08)", color: "var(--text-tertiary)", fontSize: 11 }}>
+                    Dernière activité : {lastActivityText}
+                  </div>
+                  {!currentModelStatus.can_broadcast && (
+                    <div style={{ marginTop: 10, background: "rgba(239,68,68,0.15)", border: "1px solid rgba(239,68,68,0.4)", borderRadius: 8, padding: 12, color: "#ef4444", fontSize: 12, fontWeight: 700 }}>
+                      ⚠️ Broadcast bloqué — Warm-up requis (24-48h activité manuelle)
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+            {statusLoading && !currentModelStatus && (
+              <div style={{ marginTop: 10, fontSize: 11, color: "var(--text-tertiary)" }}>⏳ Chargement statut warm-up…</div>
+            )}
           </div>
 
           {/* ÉTAPE 2 — Segment */}
@@ -29518,7 +29630,16 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
               <div><span style={{ color: "var(--text-tertiary)" }}>Segment : </span><strong>{TIERS.find(t => t.id === selectedTier)?.emoji} {TIERS.find(t => t.id === selectedTier)?.label}</strong></div>
               <div><span style={{ color: "var(--text-tertiary)" }}>Type : </span><strong>{broadcastMedia ? broadcastMedia.type + " + texte" : "texte seul"}</strong></div>
               <div><span style={{ color: "var(--text-tertiary)" }}>Variantes : </span><strong style={{ color: messageVariants.length > 0 ? "#10b981" : "var(--text-tertiary)" }}>{messageVariants.length > 0 ? `✨ ${messageVariants.length} variantes IA` : "Aucune"}</strong></div>
+              {currentModelStatus && (
+                <div><span style={{ color: "var(--text-tertiary)" }}>Statut : </span><strong style={{ color: (WARMUP_CONFIG[currentModelStatus.status] || WARMUP_CONFIG.cold).color }}>{(WARMUP_CONFIG[currentModelStatus.status] || WARMUP_CONFIG.cold).emoji} {currentModelStatus.status.toUpperCase()}</strong></div>
+              )}
             </div>
+            {currentModelStatus && !currentModelStatus.can_broadcast && !sendProgress && (
+              <div style={{ marginBottom: 12, padding: "8px 12px", background: "rgba(239,68,68,0.08)", borderRadius: 8, border: "1px solid rgba(239,68,68,0.2)", fontSize: 11, color: "#ef4444", fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+                <span>❄️</span>
+                <span>Broadcast bloqué — warm-up requis</span>
+              </div>
+            )}
             {messageVariants.length > 0 && !sendProgress && (
               <div style={{ marginBottom: 12, padding: "8px 12px", background: "rgba(16,185,129,0.08)", borderRadius: 8, border: "1px solid rgba(16,185,129,0.2)", fontSize: 11, color: "#10b981", fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
                 <span>✨</span>
