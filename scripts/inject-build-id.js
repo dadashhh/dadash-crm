@@ -59,6 +59,18 @@ if (supabaseAnonKey && supabaseAnonKey.startsWith('eyJ')) {
   }
 }
 
+// CRM API key: inject from env var at build time (used for Railway API auth)
+const crmApiKey = process.env.CRM_API_KEY || process.env.DADASH_INTERNAL_API_KEY || '';
+if (crmApiKey) {
+  indexHtml = indexHtml.replace(
+    /window\.CRM_API_KEY\s*=\s*window\.CRM_API_KEY\s*\|\|\s*window\.DADASH_INTERNAL_API_KEY\s*\|\|\s*""/,
+    `window.CRM_API_KEY = "${crmApiKey}"`
+  );
+  console.log('[inject-build-id] CRM_API_KEY injected from env (' + crmApiKey.substring(0, 8) + '...)');
+} else {
+  console.warn('[inject-build-id] WARNING: CRM_API_KEY env var not set. Messaging API calls will fail.');
+}
+
 fs.writeFileSync(indexPath, indexHtml);
 console.log('[inject-build-id] index.html: __buildId=' + shortSha + ' __buildDate=' + buildDate);
 
