@@ -4004,9 +4004,9 @@
     .grid-page-tab-add:hover { background: rgba(99,102,241,0.1); border-style: solid; }
     .grid-page-close {
       margin-left: 6px; font-size: 11px; opacity: 0; transition: opacity 0.15s;
-      cursor: pointer; color: inherit;
+      cursor: pointer; color: inherit; pointer-events: none;
     }
-    .grid-page-tab:hover .grid-page-close { opacity: 0.7; }
+    .grid-page-tab:hover .grid-page-close { opacity: 0.7; pointer-events: auto; }
     .grid-page-close:hover { opacity: 1 !important; color: #ef4444; }
     .grid-btn-unread {
       padding: 4px 12px; border-radius: 7px; font-size: 11px; font-weight: 600;
@@ -4123,6 +4123,8 @@
       background: rgba(8,11,20,0.95);
       border-bottom: 1px solid rgba(99,102,241,0.2);
       flex-shrink: 0;
+      position: relative;
+      z-index: 10;
     }
     @media (max-width: 1200px) and (min-width: 769px) {
       .messagerie-grid-container.layout-2x3,
@@ -48000,17 +48002,32 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
   const [spenderTxCount, setSpenderTxCount] = useState(0);
   const [spenderLastTx, setSpenderLastTx] = useState(null);
 
+  const isProgrammaticScrollRef = React.useRef(false);
+
   const scrollToBottom = (behavior) => {
-    setTimeout(() => { msgEndRef.current?.scrollIntoView({ behavior: behavior || 'auto' }); }, 50);
+    isProgrammaticScrollRef.current = true;
+    const el = msgContainerRef.current;
+    if (el) {
+      el.scrollTo({ top: el.scrollHeight, behavior: behavior || 'auto' });
+    }
+    if (msgEndRef.current) {
+      msgEndRef.current.scrollIntoView({ behavior: behavior || 'auto', block: 'end' });
+    }
+    const delay = behavior === 'smooth' ? 600 : 100;
+    setTimeout(() => {
+      isProgrammaticScrollRef.current = false;
+      isUserScrollRef.current = false;
+    }, delay);
   };
 
   const isAtBottom = () => {
     const el = msgContainerRef.current;
     if (!el) return true;
-    return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   };
 
   const handleScroll = () => {
+    if (isProgrammaticScrollRef.current) return;
     if (isAtBottom()) { setHasNewBadge(0); isUserScrollRef.current = false; }
     else { isUserScrollRef.current = true; }
   };
@@ -48068,6 +48085,15 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     loadMessages(true);
     return () => { mountedRef.current = false; };
   }, [chatId]);
+
+  // Auto-scroll when messages change and user hasn't scrolled up
+  const prevMsgCountRef = React.useRef(0);
+  useEffect(() => {
+    if (messages.length > 0 && messages.length > prevMsgCountRef.current && !isUserScrollRef.current) {
+      setTimeout(() => scrollToBottom(prevMsgCountRef.current === 0 ? 'auto' : 'smooth'), 80);
+    }
+    prevMsgCountRef.current = messages.length;
+  }, [messages]);
 
   // Polling: only active when visible
   useEffect(() => {
@@ -48845,7 +48871,12 @@ const MessagerieGridApp = ({ user, lang, spenders, models, profiles, txs }) => {
     else if (currentPage > idx) setCurrentPage(prev => prev - 1);
   };
 
-  const switchPage = (idx) => { if (idx >= 0 && idx < pages.length) setCurrentPage(idx); };
+  const switchPage = (idx) => {
+    if (idx >= 0 && idx < pages.length && idx !== currentPage) {
+      console.log('[GRID] switchPage:', currentPage, '->', idx);
+      setCurrentPage(idx);
+    }
+  };
 
   const loadModalConvs = async () => {
     setModalLoading(true);
@@ -48952,55 +48983,76 @@ const MessagerieGridApp = ({ user, lang, spenders, models, profiles, txs }) => {
     setLoadingUnread(true);
     try {
       const unreadConvs = await fetchUnreadConvs();
-      const openIds = new Set();
-      pages.forEach(p => p.conversations.forEach(c => { if (c) openIds.add(c.chat_id); }));
-      const newUnread = unreadConvs.filter(c => !openIds.has(String(_dmsgChatId(c))));
-
-      if (newUnread.length === 0) {
-        addToast(fr ? "Aucune conversation non lue à charger ✓" : "No unread conversations to load ✓", "success");
-        setLoadingUnread(false);
-        return;
-      }
-
-      const curPage = pages[currentPage];
-      const curMax = layoutMap[curPage.layout] || 9;
-      const emptySlots = [];
-      curPage.conversations.slice(0, curMax).forEach((c, i) => { if (!c) emptySlots.push(i); });
-
-      if (emptySlots.length === 0) {
-        if (pages.length < MAX_PAGES) {
-          addPage();
-          setTimeout(() => loadUnreadConversations(), 100);
-        } else {
-          addToast(fr ? "Toutes les pages sont pleines (max 5 pages)" : "All pages full (max 5 pages)", "warning");
-        }
-        setLoadingUnread(false);
-        return;
-      }
-
-      const toLoad = newUnread.slice(0, emptySlots.length);
       const allSp = spenders || [];
 
-      setPages(prev => {
-        const next = prev.map(p => ({ ...p, conversations: [...p.conversations] }));
-        const pg = next[currentPage];
-        toLoad.forEach((conv, i) => {
-          const chatId = String(_dmsgChatId(conv));
-          const sp = (conv.spender_id && allSp.find(x => x.id === conv.spender_id))
-            || allSp.find(x => String(x.tg_user_id || x.telegram_id || "") === chatId) || null;
-          const name = sp ? (sp.first_name || sp.handle || sp.name) : (conv.display_name || conv.username || conv.tg_username || "Conversation");
-          pg.conversations[emptySlots[i]] = { chat_id: chatId, model_id: conv.model_id || '', name: name || 'Conversation', spender_id: conv.spender_id || '' };
-        });
+      setPages(prevPages => {
+        const openIds = new Set();
+        prevPages.forEach(p => p.conversations.forEach(c => { if (c) openIds.add(c.chat_id); }));
+        const newUnread = unreadConvs.filter(c => !openIds.has(String(_dmsgChatId(c))));
+
+        if (newUnread.length === 0) {
+          addToast(fr ? "Aucune conversation non lue à charger ✓" : "No unread conversations to load ✓", "success");
+          return prevPages;
+        }
+
+        console.log(`[GRID] Loading ${newUnread.length} unread conversations across pages`);
+
+        const next = prevPages.map(p => ({ ...p, conversations: [...p.conversations] }));
+        let loaded = 0;
+        let convIdx = 0;
+
+        for (let pageIdx = 0; pageIdx < next.length && convIdx < newUnread.length; pageIdx++) {
+          const pg = next[pageIdx];
+          const pgMax = layoutMap[pg.layout] || 9;
+          for (let slotIdx = 0; slotIdx < pgMax && convIdx < newUnread.length; slotIdx++) {
+            if (pg.conversations[slotIdx] === null || pg.conversations[slotIdx] === undefined) {
+              const conv = newUnread[convIdx];
+              const chatId = String(_dmsgChatId(conv));
+              const sp = (conv.spender_id && allSp.find(x => x.id === conv.spender_id))
+                || allSp.find(x => String(x.tg_user_id || x.telegram_id || "") === chatId) || null;
+              const name = sp ? (sp.first_name || sp.handle || sp.name) : (conv.display_name || conv.username || conv.tg_username || "Conversation");
+              pg.conversations[slotIdx] = { chat_id: chatId, model_id: conv.model_id || '', name: name || 'Conversation', spender_id: conv.spender_id || '' };
+              convIdx++;
+              loaded++;
+            }
+          }
+        }
+
+        while (convIdx < newUnread.length && next.length < MAX_PAGES) {
+          const newPage = { layout: '3x3', conversations: Array(9).fill(null) };
+          const pgMax = 9;
+          for (let slotIdx = 0; slotIdx < pgMax && convIdx < newUnread.length; slotIdx++) {
+            const conv = newUnread[convIdx];
+            const chatId = String(_dmsgChatId(conv));
+            const sp = (conv.spender_id && allSp.find(x => x.id === conv.spender_id))
+              || allSp.find(x => String(x.tg_user_id || x.telegram_id || "") === chatId) || null;
+            const name = sp ? (sp.first_name || sp.handle || sp.name) : (conv.display_name || conv.username || conv.tg_username || "Conversation");
+            newPage.conversations[slotIdx] = { chat_id: chatId, model_id: conv.model_id || '', name: name || 'Conversation', spender_id: conv.spender_id || '' };
+            convIdx++;
+            loaded++;
+          }
+          next.push(newPage);
+        }
+
+        const remaining = newUnread.length - loaded;
+        if (remaining > 0) {
+          addToast(`${loaded} ${fr ? "chargées" : "loaded"} · ${remaining} ${fr ? "restantes (pages pleines)" : "remaining (pages full)"}`, "info");
+        } else {
+          addToast(`${loaded} ${fr ? "conversations non lues chargées" : "unread conversations loaded"} ✓`, "success");
+        }
+
+        console.log(`[GRID] Loaded ${loaded} unread across ${next.length} pages`);
         return next;
       });
 
-      const remaining = newUnread.length - toLoad.length;
-      if (remaining > 0 && pages.length < MAX_PAGES) {
-        addToast(`${toLoad.length} ${fr ? "chargées" : "loaded"} · ${remaining} ${fr ? "restantes" : "remaining"}`, "info");
-      } else {
-        addToast(`${toLoad.length} ${fr ? "conversations non lues chargées" : "unread conversations loaded"} ✓`, "success");
-      }
-      setUnreadCount(Math.max(0, unreadCount - toLoad.length));
+      const finalUnread = await fetchUnreadConvs();
+      setPages(latestPages => {
+        const openIds = new Set();
+        latestPages.forEach(p => p.conversations.forEach(c => { if (c) openIds.add(c.chat_id); }));
+        const stillUnread = finalUnread.filter(c => !openIds.has(String(_dmsgChatId(c))));
+        setUnreadCount(stillUnread.length);
+        return latestPages;
+      });
     } catch (e) {
       addToast("Erreur: " + e.message, "error");
     }
@@ -49029,14 +49081,15 @@ const MessagerieGridApp = ({ user, lang, spenders, models, profiles, txs }) => {
         {/* Page tabs */}
         <div className="grid-page-tabs" style={{ marginLeft: 12 }}>
           {pages.map((p, idx) => (
-            <button key={idx} className={`grid-page-tab ${idx === currentPage ? 'active' : ''}`} onClick={() => switchPage(idx)}>
+            <button key={idx} type="button" className={`grid-page-tab ${idx === currentPage ? 'active' : ''}`}
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); switchPage(idx); }}>
               Page {idx + 1}
               {pageConvCount(p) > 0 && idx !== currentPage && <span style={{ marginLeft: 4, fontSize: 9, opacity: 0.7 }}>({pageConvCount(p)})</span>}
-              {pages.length > 1 && <span className="grid-page-close" onClick={(e) => { e.stopPropagation(); removePage(idx); }}>×</span>}
+              {pages.length > 1 && <span className="grid-page-close" onClick={(e) => { e.preventDefault(); e.stopPropagation(); removePage(idx); }}>×</span>}
             </button>
           ))}
           {pages.length < MAX_PAGES && (
-            <button className="grid-page-tab-add" onClick={addPage} title={fr ? "Ajouter une page" : "Add page"}>+</button>
+            <button type="button" className="grid-page-tab-add" onClick={addPage} title={fr ? "Ajouter une page" : "Add page"}>+</button>
           )}
         </div>
 
