@@ -4,14 +4,12 @@
 // Roles supportes : gerant | chatter | model | provider
 //
 // Flows:
-//   A. Gerant -> chatter/model   : salary/bonus/adjustment
-//   B. Provider -> gerant        : provider_deposit / declaration
-//   Sur status=confirmed: ledger_entries (debit + credit), notif emetteur
-//   Sur status=rejected/cancelled: notif emetteur, pas de ledger
+//   A. Gerant -> chatter/model   : commission/bonus/remboursement
+//   B. Provider -> gerant        : reversement_ca / declaration
 //
 // Onglets:
-//   Resume     -- ledger_entries (solde)
-//   Paiements  -- payment_events avec boutons Confirmer/Refuser
+//   Resume     -- solde calcule depuis paiements_internes (validated)
+//   Paiements  -- paiements_internes avec boutons Contester
 //              -- formulaire de declaration pour provider
 //   Notifs     -- 3 categories: Paiements | TX | Spenders
 //
@@ -40,32 +38,25 @@ interface UserProfile {
   timezone: string | null;
 }
 
-interface PaymentEvent {
+interface PaiementInterne {
   id: string;
   created_at: string;
-  created_by: string | null;
-  from_user_id: string;
-  to_user_id: string;
-  amount: number;
-  currency: string;
-  kind: string;
-  title: string | null;
-  note: string;
-  status: 'pending' | 'confirmed' | 'rejected' | 'cancelled' | 'paid' | 'validated' | 'declared';
-  confirmed_at: string | null;
-  rejected_at: string | null;
-  rejected_reason: string;
-}
-
-interface LedgerEntry {
-  id: string;
-  created_at: string;
-  entry_type: string;
-  amount: number;
-  currency: string;
-  title: string | null;
-  counterparty_user_id: string | null;
-  payment_event_id: string | null;
+  createur_id: string;
+  createur_role: string;
+  createur_name: string | null;
+  destinataire_id: string;
+  destinataire_type: string;
+  destinataire_name: string | null;
+  type: string;
+  montant: number;
+  devise: string;
+  note: string | null;
+  statut: 'draft' | 'pending' | 'validated' | 'contested' | 'cancelled';
+  validated_at: string | null;
+  contested_at: string | null;
+  contestation_message: string | null;
+  calcul_detail: Record<string, unknown>;
+  facture_numero: string | null;
 }
 
 interface Notification {
@@ -79,14 +70,6 @@ interface Notification {
   kind: 'tx' | 'spender' | 'payment' | null;
 }
 
-interface PaymentKpis {
-  pending_incoming_count: number;
-  pending_incoming_amount: number;
-  pending_outgoing_count: number;
-  received_30d: number;
-  paid_30d: number;
-}
-
 type NotifCategory = 'tx' | 'spender' | 'payment';
 type MainTab = 'resume' | 'paiements' | 'notifs';
 
@@ -94,27 +77,23 @@ type MainTab = 'resume' | 'paiements' | 'notifs';
 // Helpers
 // =============================================================================
 
-const KIND_LABELS: Record<string, string> = {
-  salary:           'Salaire',
-  bonus:            'Bonus',
-  adjustment:       'Ajustement',
-  provider_deposit: 'Depot provider',
-  provider_payment: 'Paiement provider',
-  declaration:      'Declaration',
-  payment:          'Paiement',
+const TYPE_LABELS: Record<string, string> = {
+  commission:      'Commission',
+  bonus:           'Bonus',
+  remboursement:   'Remboursement',
+  reversement_ca:  'Reversement CA',
+  autre:           'Autre',
 };
 
 const STATUS_LABELS: Record<string, string> = {
+  draft:     'Brouillon',
   pending:   'En attente',
-  confirmed: 'Confirme',
-  rejected:  'Refuse',
-  cancelled: 'Annule',
-  paid:      'Paye',
   validated: 'Valide',
-  declared:  'Declare',
+  contested: 'Conteste',
+  cancelled: 'Annule',
 };
 
-const fmtAmount = (amount: number, currency = 'EUR') =>
+const fmtAmount = (amount: number, currency = 'CHF') =>
   new Intl.NumberFormat('fr-FR', { style: 'currency', currency }).format(amount);
 
 /** Format date with optional viewer timezone */
@@ -144,10 +123,8 @@ export function ComptaTab() {
 
   // Data
   const [soldeNet, setSoldeNet] = useState(0);
-  const [ledger, setLedger] = useState<LedgerEntry[]>([]);
-  const [payments, setPayments] = useState<PaymentEvent[]>([]);
+  const [payments, setPayments] = useState<PaiementInterne[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
-  const [kpis, setKpis] = useState<PaymentKpis | null>(null);
   const [gerantProfiles, setGerantProfiles] = useState<UserProfile[]>([]);
 
   // UI
@@ -158,20 +135,19 @@ export function ComptaTab() {
 
   // Action state
   const [actingOn, setActingOn] = useState<Set<string>>(new Set());
-  const [rejectingId, setRejectingId] = useState<string | null>(null);
-  const [rejectReason, setRejectReason] = useState('');
+  const [contestingId, setContestingId] = useState<string | null>(null);
+  const [contestMessage, setContestMessage] = useState('');
   const [showDeclareForm, setShowDeclareForm] = useState(false);
   const [declareForm, setDeclareForm] = useState({
     to_user_id: '',
     amount: '',
-    currency: 'EUR',
-    kind: 'provider_deposit',
+    currency: 'CHF',
     note: '',
   });
   const [declareError, setDeclareError] = useState<string | null>(null);
   const [declareLoading, setDeclareLoading] = useState(false);
 
-  const rejectInputRef = useRef<HTMLInputElement>(null);
+  const contestInputRef = useRef<HTMLInputElement>(null);
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
@@ -181,22 +157,20 @@ export function ComptaTab() {
 
     const isGerant = ['gerant','admin','ceo'].includes(role);
 
-    const [ledgerRes, paymentsRes, notifsRes, kpisRes] = await Promise.all([
-      // Ledger entries for balance
-      supabase
-        .from('ledger_entries')
-        .select('id, created_at, entry_type, amount, currency, title, counterparty_user_id, payment_event_id')
-        .eq('owner_user_id', uid)
-        .order('created_at', { ascending: false })
-        .limit(100),
+    // Build paiements_internes query -- RLS handles row filtering
+    let paymentsQuery = supabase
+      .from('paiements_internes')
+      .select('id, created_at, createur_id, createur_role, createur_name, destinataire_id, destinataire_type, destinataire_name, type, montant, devise, note, statut, validated_at, contested_at, contestation_message, calcul_detail, facture_numero')
+      .order('created_at', { ascending: false })
+      .limit(200);
 
-      // Payment events (gerant sees all, others see only their own via RLS)
-      supabase
-        .from('payment_events')
-        .select('id, created_at, created_by, from_user_id, to_user_id, amount, currency, kind, title, note, status, confirmed_at, rejected_at, rejected_reason')
-        .or(isGerant ? 'status.neq.deleted' : `from_user_id.eq.${uid},to_user_id.eq.${uid}`)
-        .order('created_at', { ascending: false })
-        .limit(100),
+    // Gerant sees all (RLS already handles this), but we filter out cancelled for cleaner view
+    if (isGerant) {
+      paymentsQuery = paymentsQuery.neq('statut', 'draft');
+    }
+
+    const [paymentsRes, notifsRes] = await Promise.all([
+      paymentsQuery,
 
       // Notifications
       supabase
@@ -205,24 +179,23 @@ export function ComptaTab() {
         .eq('user_id', uid)
         .order('created_at', { ascending: false })
         .limit(100),
-
-      // KPIs
-      supabase.rpc('rpc_my_payment_kpis'),
     ]);
 
-    if (ledgerRes.error)   { setError(ledgerRes.error.message);   setLoading(false); return; }
     if (paymentsRes.error) { setError(paymentsRes.error.message); setLoading(false); return; }
     if (notifsRes.error)   { setError(notifsRes.error.message);   setLoading(false); return; }
 
-    // Balance
-    const entries = (ledgerRes.data ?? []) as LedgerEntry[];
-    const net = entries.reduce(
-      (acc, e) => acc + (e.entry_type === 'receiver_credit' ? e.amount : -e.amount), 0
-    );
-    setSoldeNet(net);
-    setLedger(entries);
+    const paiements = (paymentsRes.data ?? []) as PaiementInterne[];
+    setPayments(paiements);
 
-    setPayments((paymentsRes.data ?? []) as PaymentEvent[]);
+    // Calculate balance from validated payments
+    const validated = paiements.filter((p) => p.statut === 'validated');
+    const totalReceived = validated
+      .filter((p) => p.destinataire_id === uid)
+      .reduce((acc, p) => acc + p.montant, 0);
+    const totalSent = validated
+      .filter((p) => p.createur_id === uid)
+      .reduce((acc, p) => acc + p.montant, 0);
+    setSoldeNet(totalReceived - totalSent);
 
     // Normalize notifications
     const rawNotifs = (notifsRes.data ?? []) as Array<Notification & { is_read?: boolean }>;
@@ -231,8 +204,6 @@ export function ComptaTab() {
       is_read: n.is_read ?? n.read ?? false,
       read:    n.read    ?? n.is_read ?? false,
     })));
-
-    if (kpisRes.data) setKpis(kpisRes.data as PaymentKpis);
 
     setLoading(false);
   }, []);
@@ -271,10 +242,16 @@ export function ComptaTab() {
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
-  // Payments pending my action (I am the receiver)
+  // Payments pending my action (I am the receiver, status=pending)
   const pendingToConfirm = payments.filter(
-    (p) => p.to_user_id === userId && p.status === 'pending'
+    (p) => p.destinataire_id === userId && p.statut === 'pending'
   );
+
+  // Counts
+  const pendingCount = payments.filter((p) => p.statut === 'pending').length;
+  const validatedTotal = payments
+    .filter((p) => p.statut === 'validated' && p.destinataire_id === userId)
+    .reduce((acc, p) => acc + p.montant, 0);
 
   // Notification counts
   const txUnread      = notifications.filter((n) => notifEffectiveKind(n) === 'tx'      && !n.is_read).length;
@@ -291,69 +268,97 @@ export function ComptaTab() {
   const setActing = (id: string, on: boolean) =>
     setActingOn((prev) => { const s = new Set(prev); on ? s.add(id) : s.delete(id); return s; });
 
-  const confirm = async (id: string) => {
+  const validatePayment = async (id: string) => {
     setActing(id, true);
-    const { error: e } = await supabase.rpc('rpc_confirm_payment_event', { p_id: id });
+    const { error: e } = await supabase
+      .from('paiements_internes')
+      .update({ statut: 'validated', validated_at: new Date().toISOString() })
+      .eq('id', id);
     if (e) { alert('Erreur: ' + e.message); setActing(id, false); return; }
     setPayments((prev) =>
-      prev.map((p) => p.id === id ? { ...p, status: 'confirmed', confirmed_at: new Date().toISOString() } : p)
+      prev.map((p) => p.id === id ? { ...p, statut: 'validated', validated_at: new Date().toISOString() } : p)
     );
     setActing(id, false);
-    if (userId && userRole) load(userId, userRole); // refresh kpis + ledger
+    if (userId && userRole) load(userId, userRole);
   };
 
-  const openReject = (id: string) => {
-    setRejectingId(id);
-    setRejectReason('');
-    setTimeout(() => rejectInputRef.current?.focus(), 50);
+  const openContest = (id: string) => {
+    setContestingId(id);
+    setContestMessage('');
+    setTimeout(() => contestInputRef.current?.focus(), 50);
   };
 
-  const submitReject = async () => {
-    if (!rejectingId) return;
-    setActing(rejectingId, true);
-    const { error: e } = await supabase.rpc('rpc_reject_payment_event', {
-      p_id: rejectingId, p_reason: rejectReason,
-    });
-    if (e) { alert('Erreur: ' + e.message); setActing(rejectingId, false); return; }
+  const submitContest = async () => {
+    if (!contestingId) return;
+    setActing(contestingId, true);
+    const { error: e } = await supabase
+      .from('paiements_internes')
+      .update({
+        statut: 'contested',
+        contested_at: new Date().toISOString(),
+        contestation_message: contestMessage || null,
+      })
+      .eq('id', contestingId);
+    if (e) { alert('Erreur: ' + e.message); setActing(contestingId, false); return; }
     setPayments((prev) =>
-      prev.map((p) => p.id === rejectingId ? { ...p, status: 'rejected', rejected_at: new Date().toISOString(), rejected_reason: rejectReason } : p)
+      prev.map((p) => p.id === contestingId ? {
+        ...p,
+        statut: 'contested',
+        contested_at: new Date().toISOString(),
+        contestation_message: contestMessage || null,
+      } : p)
     );
-    setActing(rejectingId, false);
-    setRejectingId(null);
-    setRejectReason('');
+    setActing(contestingId, false);
+    setContestingId(null);
+    setContestMessage('');
   };
 
   const cancelPayment = async (id: string) => {
-    if (!confirm('Annuler ce paiement ?')) return;
+    if (!window.confirm('Annuler ce paiement ?')) return;
     setActing(id, true);
-    const { error: e } = await supabase.rpc('rpc_cancel_payment_event', { p_id: id });
+    const { error: e } = await supabase
+      .from('paiements_internes')
+      .update({ statut: 'cancelled' })
+      .eq('id', id);
     if (e) { alert('Erreur: ' + e.message); setActing(id, false); return; }
     setPayments((prev) =>
-      prev.map((p) => p.id === id ? { ...p, status: 'cancelled' } : p)
+      prev.map((p) => p.id === id ? { ...p, statut: 'cancelled' } : p)
     );
     setActing(id, false);
   };
 
   const submitDeclare = async () => {
     setDeclareError(null);
+    if (!userId) return;
     const amt = parseFloat(declareForm.amount);
     if (!declareForm.to_user_id) { setDeclareError('Selectionnez un destinataire'); return; }
     if (isNaN(amt) || amt <= 0)  { setDeclareError('Montant invalide');             return; }
 
+    const recipient = gerantProfiles.find((g) => g.id === declareForm.to_user_id);
+
     setDeclareLoading(true);
-    const { error: e } = await supabase.rpc('rpc_create_payment_event', {
-      p_to_user_id: declareForm.to_user_id,
-      p_amount:     amt,
-      p_currency:   declareForm.currency,
-      p_kind:       declareForm.kind,
-      p_note:       declareForm.note,
-    });
+    const { error: e } = await supabase
+      .from('paiements_internes')
+      .insert({
+        createur_id:       userId,
+        createur_role:     'provider',
+        createur_name:     profile?.name ?? null,
+        destinataire_id:   declareForm.to_user_id,
+        destinataire_type: 'gerant',
+        destinataire_name: recipient?.name ?? null,
+        type:              'reversement_ca',
+        montant:           amt,
+        devise:            declareForm.currency,
+        note:              declareForm.note || null,
+        statut:            'pending',
+        calcul_detail:     {},
+      });
     setDeclareLoading(false);
 
     if (e) { setDeclareError(e.message); return; }
 
     setShowDeclareForm(false);
-    setDeclareForm({ to_user_id: '', amount: '', currency: 'EUR', kind: 'provider_deposit', note: '' });
+    setDeclareForm({ to_user_id: '', amount: '', currency: 'CHF', note: '' });
     if (userId && userRole) load(userId, userRole);
   };
 
@@ -411,24 +416,24 @@ export function ComptaTab() {
           </p>
         </div>
 
-        {/* Pending incoming */}
+        {/* Pending */}
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-700">
           <p className="text-xs text-zinc-400 uppercase tracking-wide mb-1">En attente</p>
           <p className="text-lg font-bold text-amber-400">
-            {kpis ? fmtAmount(kpis.pending_incoming_amount) : '...'}
+            {pendingCount}
           </p>
-          {kpis && kpis.pending_incoming_count > 0 && (
+          {pendingCount > 0 && (
             <p className="text-xs text-zinc-500">
-              {kpis.pending_incoming_count} paiement{kpis.pending_incoming_count > 1 ? 's' : ''}
+              paiement{pendingCount > 1 ? 's' : ''}
             </p>
           )}
         </div>
 
-        {/* Received 30d */}
+        {/* Validated total (received) */}
         <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-700">
-          <p className="text-xs text-zinc-400 uppercase tracking-wide mb-1">Recu 30j</p>
+          <p className="text-xs text-zinc-400 uppercase tracking-wide mb-1">Recu (valide)</p>
           <p className="text-lg font-bold text-violet-400">
-            {kpis ? fmtAmount(kpis.received_30d) : '...'}
+            {fmtAmount(validatedTotal)}
           </p>
         </div>
       </div>
@@ -530,9 +535,9 @@ export function ComptaTab() {
                         onChange={(e) => setDeclareForm((f) => ({ ...f, currency: e.target.value }))}
                         className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
                       >
+                        <option>CHF</option>
                         <option>EUR</option>
                         <option>USD</option>
-                        <option>CHF</option>
                         <option>GBP</option>
                       </select>
                     </div>
@@ -574,29 +579,29 @@ export function ComptaTab() {
             </div>
           )}
 
-          {/* Rejection reason input (inline, when rejecting) */}
-          {rejectingId && (
+          {/* Contestation reason input (inline, when contesting) */}
+          {contestingId && (
             <div className="bg-zinc-900 rounded-xl border border-red-700/50 p-4 flex flex-col gap-3">
-              <p className="text-sm font-medium text-white">Motif du refus (optionnel)</p>
+              <p className="text-sm font-medium text-white">Motif de la contestation (optionnel)</p>
               <input
-                ref={rejectInputRef}
+                ref={contestInputRef}
                 type="text"
-                value={rejectReason}
-                onChange={(e) => setRejectReason(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && submitReject()}
+                value={contestMessage}
+                onChange={(e) => setContestMessage(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && submitContest()}
                 placeholder="Ex: montant incorrect, periode en attente..."
                 className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
               />
               <div className="flex gap-2">
                 <button
-                  onClick={submitReject}
-                  disabled={actingOn.has(rejectingId)}
+                  onClick={submitContest}
+                  disabled={actingOn.has(contestingId)}
                   className="flex-1 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-500 disabled:opacity-50 transition-colors"
                 >
-                  {actingOn.has(rejectingId) ? '...' : 'Confirmer le refus'}
+                  {actingOn.has(contestingId) ? '...' : 'Confirmer la contestation'}
                 </button>
                 <button
-                  onClick={() => setRejectingId(null)}
+                  onClick={() => setContestingId(null)}
                   className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-400 text-sm hover:text-white transition-colors"
                 >
                   Annuler
@@ -605,7 +610,7 @@ export function ComptaTab() {
             </div>
           )}
 
-          {/* Pending to confirm section */}
+          {/* Pending to confirm section (for destinataire) */}
           {pendingToConfirm.length > 0 && (
             <div className="flex flex-col gap-2">
               <p className="text-xs text-zinc-400 uppercase tracking-wide">
@@ -619,30 +624,36 @@ export function ComptaTab() {
                   <div className="flex justify-between items-start gap-2">
                     <div className="flex flex-col gap-0.5 min-w-0">
                       <span className="text-sm font-medium text-white">
-                        {p.title ?? KIND_LABELS[p.kind] ?? p.kind}
+                        {TYPE_LABELS[p.type] ?? p.type}
+                        {p.destinataire_name ? ` - ${p.destinataire_name}` : ''}
                       </span>
                       <span className="text-sm text-emerald-400 font-semibold">
-                        +{fmtAmount(p.amount, p.currency)}
+                        +{fmtAmount(p.montant, p.devise)}
                       </span>
                       {p.note && (
                         <span className="text-xs text-zinc-400 italic">{p.note}</span>
                       )}
+                      {p.createur_name && (
+                        <span className="text-xs text-zinc-500">De: {p.createur_name}</span>
+                      )}
                       <span className="text-xs text-zinc-500">{fmtDate(p.created_at, userTz)}</span>
                     </div>
                     <div className="flex gap-1.5 shrink-0">
+                      {isGerant && (
+                        <button
+                          onClick={() => validatePayment(p.id)}
+                          disabled={actingOn.has(p.id)}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-500 disabled:opacity-50 transition-colors"
+                        >
+                          {actingOn.has(p.id) ? '...' : 'Valider'}
+                        </button>
+                      )}
                       <button
-                        onClick={() => confirm(p.id)}
-                        disabled={actingOn.has(p.id)}
-                        className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-medium hover:bg-emerald-500 disabled:opacity-50 transition-colors"
-                      >
-                        {actingOn.has(p.id) ? '...' : 'Confirmer'}
-                      </button>
-                      <button
-                        onClick={() => openReject(p.id)}
-                        disabled={actingOn.has(p.id) || rejectingId === p.id}
+                        onClick={() => openContest(p.id)}
+                        disabled={actingOn.has(p.id) || contestingId === p.id}
                         className="px-3 py-1.5 rounded-lg bg-red-700/60 text-red-300 text-xs font-medium hover:bg-red-600/60 disabled:opacity-50 transition-colors"
                       >
-                        Refuser
+                        Contester
                       </button>
                     </div>
                   </div>
@@ -656,44 +667,46 @@ export function ComptaTab() {
             {pendingToConfirm.length > 0 && (
               <p className="text-xs text-zinc-400 uppercase tracking-wide">Historique</p>
             )}
-            {payments.filter((p) => p.status !== 'pending' || p.to_user_id !== userId).length === 0
+            {payments.filter((p) => p.statut !== 'pending' || p.destinataire_id !== userId).length === 0
               && pendingToConfirm.length === 0 && (
               <p className="text-zinc-500 text-center py-6">Aucun paiement.</p>
             )}
             {payments
-              .filter((p) => !(p.status === 'pending' && p.to_user_id === userId))
+              .filter((p) => !(p.statut === 'pending' && p.destinataire_id === userId))
               .map((p) => {
-                const isReceiver  = p.to_user_id === userId;
-                const isSender    = p.from_user_id === userId;
-                const isConfirmed = ['confirmed','paid','validated'].includes(p.status);
-                const isRejected  = ['rejected','cancelled'].includes(p.status);
-                const isPending   = p.status === 'pending';
-                const canCancel   =
-                  isPending &&
-                  (p.created_by === userId || p.from_user_id === userId) &&
-                  !isReceiver;
+                const isReceiver  = p.destinataire_id === userId;
+                const isSender    = p.createur_id === userId;
+                const isValidated = p.statut === 'validated';
+                const isContested = p.statut === 'contested';
+                const isCancelled = p.statut === 'cancelled';
+                const isPending   = p.statut === 'pending';
+                const canCancel   = isPending && isGerant;
 
                 return (
                   <div
                     key={p.id}
                     className={`rounded-lg px-4 py-3 border ${
-                      isRejected ? 'bg-zinc-900 border-zinc-800 opacity-60' : 'bg-zinc-900 border-zinc-800'
+                      isCancelled || isContested ? 'bg-zinc-900 border-zinc-800 opacity-60' : 'bg-zinc-900 border-zinc-800'
                     }`}
                   >
                     <div className="flex justify-between items-start gap-2">
                       <div className="flex flex-col gap-0.5 min-w-0">
                         <span className="text-sm font-medium text-white truncate">
-                          {p.title ?? KIND_LABELS[p.kind] ?? p.kind}
+                          {TYPE_LABELS[p.type] ?? p.type}
+                          {isGerant && p.destinataire_name ? ` - ${p.destinataire_name}` : ''}
                         </span>
                         {p.note && (
                           <span className="text-xs text-zinc-400 italic">{p.note}</span>
                         )}
-                        {isRejected && p.rejected_reason && (
-                          <span className="text-xs text-red-400">Motif: {p.rejected_reason}</span>
+                        {isContested && p.contestation_message && (
+                          <span className="text-xs text-red-400">Motif: {p.contestation_message}</span>
+                        )}
+                        {p.facture_numero && (
+                          <span className="text-xs text-zinc-500">Facture: {p.facture_numero}</span>
                         )}
                         <span className="text-xs text-zinc-500">
                           {fmtDate(
-                            isConfirmed && p.confirmed_at ? p.confirmed_at : p.created_at,
+                            isValidated && p.validated_at ? p.validated_at : p.created_at,
                             userTz
                           )}
                         </span>
@@ -708,17 +721,18 @@ export function ComptaTab() {
                           }`}
                         >
                           {isReceiver ? '+' : isSender ? '-' : ''}
-                          {fmtAmount(p.amount, p.currency)}
+                          {fmtAmount(p.montant, p.devise)}
                         </span>
                         <span
                           className={`text-xs px-1.5 py-0.5 rounded-full ${
-                            isConfirmed  ? 'bg-emerald-900/40 text-emerald-400'
-                            : isRejected ? 'bg-red-900/40    text-red-400'
-                            : isPending  ? 'bg-amber-900/40  text-amber-400'
+                            isValidated  ? 'bg-emerald-900/40 text-emerald-400'
+                            : isContested ? 'bg-red-900/40    text-red-400'
+                            : isCancelled ? 'bg-red-900/40    text-red-400'
+                            : isPending   ? 'bg-amber-900/40  text-amber-400'
                             : 'text-zinc-400'
                           }`}
                         >
-                          {STATUS_LABELS[p.status] ?? p.status}
+                          {STATUS_LABELS[p.statut] ?? p.statut}
                         </span>
                         {canCancel && (
                           <button
@@ -739,34 +753,42 @@ export function ComptaTab() {
       )}
 
       {/* ================================================================ */}
-      {/* Tab: Resume (ledger)                                              */}
+      {/* Tab: Resume (solde from validated paiements)                      */}
       {/* ================================================================ */}
       {activeTab === 'resume' && (
         <div className="flex flex-col gap-2">
-          {ledger.length === 0 && (
-            <p className="text-zinc-500 text-center py-6">Aucun mouvement enregistre.</p>
+          {payments.filter((p) => p.statut === 'validated').length === 0 && (
+            <p className="text-zinc-500 text-center py-6">Aucun mouvement valide.</p>
           )}
-          {ledger.map((e) => (
-            <div
-              key={e.id}
-              className="flex items-center justify-between bg-zinc-900 rounded-lg px-4 py-3 border border-zinc-800"
-            >
-              <div className="flex flex-col">
-                <span className="text-sm text-white">
-                  {e.title ?? KIND_LABELS[e.entry_type] ?? e.entry_type}
-                </span>
-                <span className="text-xs text-zinc-500">{fmtDate(e.created_at, userTz)}</span>
-              </div>
-              <span
-                className={`font-semibold text-sm ${
-                  e.entry_type === 'receiver_credit' ? 'text-emerald-400' : 'text-red-400'
-                }`}
-              >
-                {e.entry_type === 'receiver_credit' ? '+' : '-'}
-                {fmtAmount(Math.abs(e.amount), e.currency)}
-              </span>
-            </div>
-          ))}
+          {payments
+            .filter((p) => p.statut === 'validated')
+            .map((p) => {
+              const isReceiver = p.destinataire_id === userId;
+              return (
+                <div
+                  key={p.id}
+                  className="flex items-center justify-between bg-zinc-900 rounded-lg px-4 py-3 border border-zinc-800"
+                >
+                  <div className="flex flex-col">
+                    <span className="text-sm text-white">
+                      {TYPE_LABELS[p.type] ?? p.type}
+                      {isGerant && p.destinataire_name ? ` - ${p.destinataire_name}` : ''}
+                    </span>
+                    <span className="text-xs text-zinc-500">
+                      {fmtDate(p.validated_at ?? p.created_at, userTz)}
+                    </span>
+                  </div>
+                  <span
+                    className={`font-semibold text-sm ${
+                      isReceiver ? 'text-emerald-400' : 'text-red-400'
+                    }`}
+                  >
+                    {isReceiver ? '+' : '-'}
+                    {fmtAmount(p.montant, p.devise)}
+                  </span>
+                </div>
+              );
+            })}
         </div>
       )}
 
