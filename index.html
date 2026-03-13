@@ -29078,22 +29078,66 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
 
   useEffect(() => { loadAnalytics(); }, [filterModel, filterDateRange]);
 
-  useEffect(() => { loadModelsStatus(); }, []);
+  useEffect(() => { if (models.length > 0) loadModelsStatus(); }, [models, conversations]);
+
+  const computeLocalModelStatus = React.useCallback((modelId) => {
+    const mConvs = conversations.filter(c => c.model_id === modelId);
+    const now = Date.now();
+    const _7d = 7 * 86400000;
+    const _30d = 30 * 86400000;
+
+    let lastAct = null;
+    let msgs7d = 0;
+    mConvs.forEach(c => {
+      const ts = c.last_message_at || c.last_message_timestamp || c.updated_at;
+      if (ts) {
+        const t = new Date(ts).getTime();
+        if (!lastAct || t > lastAct) lastAct = t;
+        if (now - t < _7d) msgs7d++;
+      }
+    });
+
+    const daysSinceActivity = lastAct ? (now - lastAct) / 86400000 : 9999;
+    let status, maxVol, delay, canBroadcast;
+
+    if (msgs7d >= 30 && daysSinceActivity < 2) {
+      status = "hot"; maxVol = 500; delay = 2; canBroadcast = true;
+    } else if (msgs7d >= 10 && daysSinceActivity < 7) {
+      status = "warm"; maxVol = 100; delay = 5; canBroadcast = true;
+    } else {
+      status = "cold"; maxVol = 20; delay = 10;
+      canBroadcast = daysSinceActivity <= 7;
+    }
+
+    const modelName = models.find(m => m.id === modelId)?.name || "";
+    return {
+      id: modelId, name: modelName, status, can_broadcast: canBroadcast,
+      max_volume: maxVol, delay, message_count_7d: msgs7d,
+      last_activity_at: lastAct ? new Date(lastAct).toISOString() : null,
+    };
+  }, [conversations, models]);
 
   const loadModelsStatus = async () => {
     setStatusLoading(true);
     try {
-      console.log("[MODELS_STATUS] Loading...");
+      console.log("[MODELS_STATUS] Loading from API...");
       const data = await _dmsgFetch("/api/models/status", { timeout: 10000 });
-      if (data.success && data.models) {
+      if (data.success && data.models && data.models.length > 0) {
         const map = {};
         data.models.forEach(m => { map[m.id] = m; });
         setModelsStatus(map);
-        console.log("[MODELS_STATUS] Loaded", data.models.length, "models");
+        console.log("[MODELS_STATUS] Loaded", data.models.length, "from API");
+        setStatusLoading(false);
+        return;
       }
     } catch (err) {
-      console.error("[MODELS_STATUS] Error:", err);
+      console.warn("[MODELS_STATUS] API unavailable, using local computation:", err.message);
     }
+    // Fallback : calcul local
+    const localMap = {};
+    models.forEach(m => { localMap[m.id] = computeLocalModelStatus(m.id); });
+    setModelsStatus(localMap);
+    console.log("[MODELS_STATUS] Computed locally for", Object.keys(localMap).length, "models");
     setStatusLoading(false);
   };
 
@@ -29139,7 +29183,7 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
     cold: { emoji: "❄️", label: "COMPTE FROID", color: "#ef4444", bg: "rgba(239,68,68,0.1)",   desc: "Warm-up requis" },
   };
 
-  const currentModelStatus = modelsStatus[broadcastModel] || null;
+  const currentModelStatus = modelsStatus[broadcastModel] || (broadcastModel ? computeLocalModelStatus(broadcastModel) : null);
 
   const lastActivityText = React.useMemo(() => {
     if (!currentModelStatus?.last_activity_at) return "Jamais";
@@ -29224,7 +29268,7 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
     if (!broadcastMessage.trim() && !broadcastMedia) { addToast("Message ou média requis", "error"); return; }
     if (selectedConvIds.size === 0) { addToast("Aucun destinataire", "error"); return; }
 
-    const mStatus = modelsStatus[broadcastModel];
+    const mStatus = modelsStatus[broadcastModel] || computeLocalModelStatus(broadcastModel);
     if (mStatus && !mStatus.can_broadcast) {
       window.alert(
         "❌ BROADCAST BLOQUÉ\n\n" +
@@ -29413,9 +29457,10 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
                     </div>
                     <div style={{ fontWeight: 800, fontSize: 13 }}>{m.name}</div>
                     <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{convCount} fans</div>
-                    {modelsStatus[m.id] && (() => {
-                      const ws = WARMUP_CONFIG[modelsStatus[m.id].status] || WARMUP_CONFIG.cold;
-                      return <div style={{ fontSize: 9, marginTop: 4, color: ws.color, fontWeight: 700 }}>{ws.emoji} {modelsStatus[m.id].status.toUpperCase()}</div>;
+                    {(() => {
+                      const mSt = modelsStatus[m.id] || computeLocalModelStatus(m.id);
+                      const ws = WARMUP_CONFIG[mSt.status] || WARMUP_CONFIG.cold;
+                      return <div style={{ fontSize: 9, marginTop: 4, color: ws.color, fontWeight: 700 }}>{ws.emoji} {mSt.status.toUpperCase()}</div>;
                     })()}
                   </button>
                 );
