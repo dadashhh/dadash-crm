@@ -29572,6 +29572,273 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   );
 };
 
+// =====================================================================
+// TLG PRO — Telegram Pro Grid : input dans chaque slot
+// =====================================================================
+const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv }) => {
+  const addToast = useToast();
+
+  const [tLayout, setTLayout]           = useState("3x3");
+  const [tModelFilter, setTModelFilter] = useState("all");
+  const [tSlots, setTSlots]             = useState([]);
+  const [tSlotMsgs, setTSlotMsgs]       = useState({});
+  const [tLoadingSlots, setTLoadingSlots] = useState({});
+  const [tActiveSlot, setTActiveSlot]   = useState(null);
+  const [tInputs, setTInputs]           = useState({});
+  const [tSending, setTSending]         = useState({});
+  const [tShowScripts, setTShowScripts] = useState({});
+  const tRefreshRef = React.useRef(null);
+
+  const tLayoutCfg = GRID_LAYOUTS[tLayout] || GRID_LAYOUTS["3x3"];
+
+  const tUnreadSorted = React.useMemo(() => {
+    let pool = conversations.filter(c => c.unread_count && c.unread_count > 0);
+    if (tModelFilter !== "all") {
+      const target = models.find(m => (m.name || "").toLowerCase() === tModelFilter);
+      if (target) pool = pool.filter(c => c.model_id === target.id);
+    }
+    pool.sort((a, b) => {
+      const lA = convTotalsMap[String(_dmsgChatId(a) || "")] ?? Number(a.total_spent || 0);
+      const lB = convTotalsMap[String(_dmsgChatId(b) || "")] ?? Number(b.total_spent || 0);
+      return lB - lA;
+    });
+    return pool;
+  }, [conversations, tModelFilter, models, convTotalsMap]);
+
+  const tLoadUnread = React.useCallback(() => {
+    const s = [];
+    for (let i = 0; i < tLayoutCfg.slots; i++) s.push(tUnreadSorted[i] || null);
+    setTSlots(s);
+    if (s[0] && tActiveSlot === null) setTActiveSlot(0);
+  }, [tUnreadSorted, tLayoutCfg.slots]);
+
+  useEffect(() => { tLoadUnread(); }, [tLoadUnread]);
+
+  const tLoadMsgs = React.useCallback(async (conv, idx, silent) => {
+    if (!conv) return;
+    const cid = _dmsgChatId(conv);
+    if (!cid) return;
+    if (!silent) setTLoadingSlots(p => ({ ...p, [idx]: true }));
+    try {
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=30", { timeout: 8000 });
+      const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
+    } catch (_) {}
+    setTLoadingSlots(p => ({ ...p, [idx]: false }));
+  }, []);
+
+  useEffect(() => {
+    tSlots.forEach((c, i) => { if (c) tLoadMsgs(c, i, false); });
+  }, [tSlots]);
+
+  useEffect(() => {
+    if (tRefreshRef.current) clearInterval(tRefreshRef.current);
+    tRefreshRef.current = setInterval(() => {
+      tSlots.forEach((c, i) => { if (c) tLoadMsgs(c, i, true); });
+    }, GRID_REFRESH_MS);
+    return () => { if (tRefreshRef.current) clearInterval(tRefreshRef.current); };
+  }, [tSlots, tLoadMsgs]);
+
+  const tCloseSlot = (idx) => {
+    setTSlots(p => { const n = [...p]; n[idx] = null; return n; });
+    if (tActiveSlot === idx) setTActiveSlot(null);
+  };
+
+  const modelEmoji = (mid) => {
+    const n = (models.find(m => m.id === mid)?.name || "").toLowerCase();
+    return n === "carla" ? "💜" : n === "sophie" ? "🩷" : n === "bella" ? "💛" : n === "nadia" ? "✨" : "👤";
+  };
+  const getLtv = (conv) => convTotalsMap[String(_dmsgChatId(conv) || "")] ?? Number(conv.total_spent || 0);
+  const ltvColor = (v) => v >= 500 ? "#10b981" : v >= 50 ? "#f59e0b" : "#6b7280";
+  const tierLabel = (v) => v >= 500 ? "🦈 Shark" : v >= 350 ? "🐋 Baleine" : v >= 200 ? "🦍 Gorille" : v >= 100 ? "🦧 Orang" : v >= 50 ? "🐵 Ouistiti" : v >= 1 ? "🐟 Poisson" : "🆓 Free";
+  const totalUnread = tUnreadSorted.length;
+
+  const tSendMessage = async (idx) => {
+    const conv = tSlots[idx];
+    const text = (tInputs[idx] || "").trim();
+    if (!conv || !text) return;
+    const cid = _dmsgChatId(conv);
+    setTSending(p => ({ ...p, [idx]: true }));
+    try {
+      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: conv.model_id || "" }), timeout: 8000 });
+      setTInputs(p => ({ ...p, [idx]: "" }));
+      addToast("Envoyé", "success");
+      setTimeout(() => tLoadMsgs(conv, idx, true), 800);
+    } catch (err) {
+      addToast("Erreur : " + err.message, "error");
+    }
+    setTSending(p => ({ ...p, [idx]: false }));
+  };
+
+  const tApplyScript = (idx, scriptText) => {
+    const conv = tSlots[idx];
+    const name = conv?.first_name || conv?.spender?.first_name || conv?.username || "bébé";
+    const filled = scriptText.replace(/\{prenom\}/g, name).replace(/\{budget\}/g, String(getLtv(conv) || 0));
+    setTInputs(p => ({ ...p, [idx]: filled }));
+    setTShowScripts(p => ({ ...p, [idx]: false }));
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 120px)", background: "#0a0b0f" }}>
+
+      {/* HEADER */}
+      <div style={{ padding: "10px 20px", background: "#1a1b26", borderBottom: "2px solid rgba(255,255,255,0.06)", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ color: "#818cf8", fontSize: 14, fontWeight: 800, marginRight: 4 }}>⚡</span>
+          <span style={{ color: "#818cf8", fontSize: 13, fontWeight: 800, marginRight: 8 }}>TLG PRO</span>
+          <span style={{ color: "#6b7280", fontSize: 11, fontWeight: 700, marginRight: 6 }}>MODÈLE</span>
+          {["all", "carla", "sophie", "bella", "nadia"].map(m => {
+            const labels = { all: "🎯 Tous", carla: "💜 Carla", sophie: "🩷 Sophie", bella: "💛 Bella", nadia: "✨ Nadia" };
+            const active = tModelFilter === m;
+            return (
+              <button key={m} onClick={() => setTModelFilter(m)}
+                style={{ padding: "6px 12px", background: active ? "#6366f1" : "rgba(255,255,255,0.04)", color: active ? "#fff" : "#9ca3af", border: `1px solid ${active ? "#6366f1" : "rgba(255,255,255,0.08)"}`, borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" }}>
+                {labels[m]}
+              </button>
+            );
+          })}
+          <span style={{ marginLeft: 8, background: totalUnread > 0 ? "rgba(239,68,68,0.15)" : "rgba(255,255,255,0.04)", color: totalUnread > 0 ? "#ef4444" : "#6b7280", padding: "4px 9px", borderRadius: 8, fontSize: 10, fontWeight: 700, border: totalUnread > 0 ? "1px solid rgba(239,68,68,0.3)" : "1px solid rgba(255,255,255,0.06)" }}>
+            {totalUnread} non-lu{totalUnread > 1 ? "s" : ""}
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ color: "#6b7280", fontSize: 11, fontWeight: 700, marginRight: 4 }}>LAYOUT</span>
+          {Object.keys(GRID_LAYOUTS).map(l => (
+            <button key={l} onClick={() => setTLayout(l)}
+              style={{ padding: "5px 10px", background: tLayout === l ? "#6366f1" : "rgba(255,255,255,0.04)", color: tLayout === l ? "#fff" : "#9ca3af", border: "none", borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+              {l.replace("x", "×")}
+            </button>
+          ))}
+          <div style={{ width: 1, height: 20, background: "rgba(255,255,255,0.08)", margin: "0 4px" }} />
+          <button onClick={tLoadUnread}
+            style={{ padding: "6px 12px", background: "linear-gradient(135deg,#10b981,#059669)", color: "#fff", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+            <span>🔄</span><span>Load Unread</span>
+          </button>
+        </div>
+      </div>
+
+      {/* GRID — chaque slot a son propre input */}
+      <div style={{ flex: 1, display: "grid", gridTemplateColumns: `repeat(${tLayoutCfg.cols}, 1fr)`, gap: 8, padding: 8, overflow: "auto" }}>
+        {tSlots.map((conv, idx) => conv ? (
+          <div key={idx + "-" + _dmsgChatId(conv)}
+            onClick={() => setTActiveSlot(idx)}
+            style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: `2px solid ${tActiveSlot === idx ? "#6366f1" : getLtv(conv) >= 500 ? "rgba(16,185,129,0.4)" : getLtv(conv) >= 50 ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.05)"}`, boxShadow: tActiveSlot === idx ? "0 0 16px rgba(99,102,241,0.4)" : "0 2px 6px rgba(0,0,0,0.3)", position: "relative", display: "flex", flexDirection: "column", overflow: "hidden", transition: "all 0.2s" }}>
+
+            {tActiveSlot === idx && <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: "linear-gradient(90deg,#6366f1,#818cf8)", zIndex: 5 }} />}
+
+            {/* Slot header */}
+            <div style={{ padding: "8px 10px", background: "linear-gradient(90deg,rgba(99,102,241,0.08) 0%,transparent 100%)", borderBottom: "1px solid rgba(255,255,255,0.04)", cursor: "pointer" }}
+              onDoubleClick={e => { e.stopPropagation(); if (onSelectConv) onSelectConv(conv); }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 16 }}>{modelEmoji(conv.model_id)}</span>
+                  <div>
+                    <div style={{ color: "#fff", fontWeight: 700, fontSize: 12 }}>{conv.first_name || conv.spender?.first_name || conv.username || "?"}</div>
+                    <div style={{ color: "#6b7280", fontSize: 9, fontWeight: 600 }}>{tierLabel(getLtv(conv))}</div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <span style={{ background: `linear-gradient(90deg,${ltvColor(getLtv(conv))},transparent)`, color: "#fff", padding: "3px 7px", borderRadius: 5, fontSize: 10, fontWeight: 800 }}>{getLtv(conv)} CHF</span>
+                  {conv.unread_count > 0 && <span style={{ background: "#ef4444", color: "#fff", padding: "2px 5px", borderRadius: 5, fontSize: 9, fontWeight: 800, animation: "gridPulse 2s infinite" }}>{conv.unread_count}</span>}
+                </div>
+              </div>
+            </div>
+
+            {/* Messages */}
+            <div style={{ flex: 1, padding: "6px 8px", overflowY: "auto", fontSize: 11, minHeight: 80 }} className="grid-slot-scroller">
+              {tLoadingSlots[idx] ? (
+                <div style={{ color: "#6366f1", textAlign: "center", padding: 12, fontSize: 11 }}>Chargement…</div>
+              ) : (tSlotMsgs[idx] || []).length === 0 ? (
+                <div style={{ color: "#4b5563", textAlign: "center", padding: 12, fontSize: 11 }}>Aucun message</div>
+              ) : (
+                [...(tSlotMsgs[idx] || [])].sort((a, b) => new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)).slice(-12).map((msg, mi) => {
+                  const isOut = msg.is_outgoing || msg.direction === "out";
+                  return (
+                    <div key={mi} style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
+                      <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
+                        {_escapeHtml(msg.text || msg.content || msg.message || "[média]")}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Scripts panel (toggle per slot) */}
+            {tShowScripts[idx] && (
+              <div style={{ maxHeight: 140, overflowY: "auto", borderTop: "1px solid rgba(255,255,255,0.04)", background: "rgba(0,0,0,0.2)" }} className="grid-slot-scroller">
+                {Object.entries(_DMSG_SCRIPTS).map(([cat, scripts]) => (
+                  <div key={cat} style={{ padding: "4px 8px 2px" }}>
+                    <div style={{ fontSize: 8, fontWeight: 700, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.05em", padding: "0 2px 3px" }}>{cat}</div>
+                    {scripts.map((s, si) => (
+                      <div key={si} onClick={e => { e.stopPropagation(); tApplyScript(idx, s.text); }}
+                        style={{ padding: "4px 6px", borderRadius: 5, cursor: "pointer", fontSize: 10, color: "#d1d5db", marginBottom: 1 }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.12)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                        <span style={{ fontWeight: 700, color: "#818cf8" }}>{s.label}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Toolbar */}
+            <div style={{ padding: "4px 6px", borderTop: "1px solid rgba(255,255,255,0.04)", background: "rgba(0,0,0,0.15)", display: "flex", gap: 4 }}>
+              <button onClick={e => { e.stopPropagation(); setTShowScripts(p => ({ ...p, [idx]: !p[idx] })); }}
+                style={{ flex: 1, padding: "5px 0", background: tShowScripts[idx] ? "rgba(99,102,241,0.15)" : "rgba(255,255,255,0.04)", color: tShowScripts[idx] ? "#a5b4fc" : "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer" }}>📝</button>
+              <button onClick={e => { e.stopPropagation(); if (onSelectConv) onSelectConv(conv); }}
+                style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer" }}>🔍</button>
+            </div>
+
+            {/* Input + Send */}
+            <div style={{ padding: "6px 8px 8px", borderTop: "1px solid rgba(255,255,255,0.04)" }} onClick={e => e.stopPropagation()}>
+              <div style={{ display: "flex", gap: 6 }}>
+                <textarea value={tInputs[idx] || ""} onChange={e => setTInputs(p => ({ ...p, [idx]: e.target.value }))}
+                  placeholder="Message…"
+                  onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); tSendMessage(idx); } }}
+                  onClick={e => { e.stopPropagation(); setTActiveSlot(idx); }}
+                  style={{ flex: 1, padding: "7px 9px", background: "rgba(0,0,0,0.3)", border: `1px solid ${tActiveSlot === idx ? "rgba(99,102,241,0.4)" : "rgba(255,255,255,0.06)"}`, borderRadius: 7, color: "#fff", fontSize: 11, resize: "none", fontFamily: "'Inter',sans-serif", lineHeight: 1.5, outline: "none", height: 36 }} />
+                <button onClick={e => { e.stopPropagation(); tSendMessage(idx); }} disabled={tSending[idx] || !(tInputs[idx] || "").trim()}
+                  style={{ padding: "7px 12px", background: tSending[idx] || !(tInputs[idx] || "").trim() ? "rgba(255,255,255,0.04)" : "linear-gradient(135deg,#6366f1,#818cf8)", color: tSending[idx] || !(tInputs[idx] || "").trim() ? "#4b5563" : "#fff", border: "none", borderRadius: 7, fontWeight: 800, fontSize: 12, cursor: tSending[idx] || !(tInputs[idx] || "").trim() ? "not-allowed" : "pointer", transition: "all 0.15s", whiteSpace: "nowrap" }}>
+                  {tSending[idx] ? "⏳" : "📤"}
+                </button>
+              </div>
+            </div>
+
+            {/* Close */}
+            <button onClick={e => { e.stopPropagation(); tCloseSlot(idx); }}
+              style={{ position: "absolute", top: 5, right: 5, background: "rgba(239,68,68,0.85)", color: "#fff", border: "none", borderRadius: 5, width: 20, height: 20, fontSize: 11, cursor: "pointer", opacity: 0, transition: "all 0.2s", zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center" }}
+              onMouseEnter={e => e.currentTarget.style.opacity = "1"}
+              onMouseLeave={e => e.currentTarget.style.opacity = "0"}>×</button>
+
+            {/* LIVE */}
+            {conv.unread_count > 0 && (
+              <div style={{ position: "absolute", top: 8, right: 30, background: "#ef4444", color: "#fff", padding: "2px 5px", borderRadius: 4, fontSize: 7, fontWeight: 800, display: "flex", alignItems: "center", gap: 3, pointerEvents: "none" }}>
+                <span style={{ width: 4, height: 4, background: "#fff", borderRadius: "50%", animation: "gridPulse 2s infinite" }} />LIVE
+              </div>
+            )}
+          </div>
+        ) : (
+          <div key={"empty-" + idx} style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: "2px dashed rgba(255,255,255,0.07)", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 140 }}>
+            <div style={{ textAlign: "center", color: "#4b5563" }}>
+              <div style={{ fontSize: 28, opacity: 0.2 }}>+</div>
+              <div style={{ fontSize: 10, fontWeight: 600 }}>Vide</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <style dangerouslySetInnerHTML={{ __html: `
+        @keyframes gridPulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        .grid-slot-scroller::-webkit-scrollbar { width: 5px; }
+        .grid-slot-scroller::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); border-radius: 3px; }
+        .grid-slot-scroller::-webkit-scrollbar-thumb { background: #6366f1; border-radius: 3px; }
+      ` }} />
+    </div>
+  );
+};
+
 const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user }) => {
   const fr = lang === "fr";
   const addToast = useToast();
@@ -34649,6 +34916,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         <button onClick={() => setActiveTab("conversations")} style={tabNavStyle("conversations")}>💬 Conversations</button>
         <button onClick={() => setActiveTab("grid")} style={tabNavStyle("grid")}>📺 Grid Pro</button>
         <button onClick={() => setActiveTab("gridpremium")} style={tabNavStyle("gridpremium")}>⭐ Grid Premium</button>
+        <button onClick={() => setActiveTab("tlgpro")} style={tabNavStyle("tlgpro")}>⚡ TLG Pro</button>
         <button onClick={() => setActiveTab("dadacast")} style={tabNavStyle("dadacast")}>📡 Dadacast</button>
         {isManager && <button onClick={() => setActiveTab("ressources")} style={tabNavStyle("ressources")}>🎬 Ressources</button>}
         {isManager && <button onClick={() => setActiveTab("gestion")} style={tabNavStyle("gestion")}>⚙️ Gestion</button>}
@@ -34685,6 +34953,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           )}
           {activeTab === "grid" && <GridMessagerieSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
           {activeTab === "gridpremium" && <GridPremiumSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
+          {activeTab === "tlgpro" && <TlgProSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
           {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
           {activeTab === "ressources" && isManager && <RessourcesPage user={user} lang={lang} />}
           {activeTab === "gestion" && <GestionSubpage models={models} lang={lang} user={user} />}
@@ -34708,6 +34977,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         )}
         {activeTab === "grid" && <GridMessagerieSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
         {activeTab === "gridpremium" && <GridPremiumSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
+        {activeTab === "tlgpro" && <TlgProSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
         {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
         {activeTab === "ressources" && isManager && <RessourcesPage user={user} lang={lang} />}
         {activeTab === "gestion" && <GestionSubpage models={models} lang={lang} user={user} />}
