@@ -29357,7 +29357,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
 // =====================================================================
 // TLG PRO — Telegram Pro Grid : input dans chaque slot
 // =====================================================================
-const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia, _onShowInfo, _onMediaLib, _onSuggestions, _onEmoji, _onGif }) => {
+const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia, _onShowInfo, _onMediaLib, spenders = [] }) => {
   const addToast = useToast();
 
   const [tLayout, setTLayout]           = useState("3x3");
@@ -29369,17 +29369,50 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const [tInputs, setTInputs]           = useState({});
   const [tSending, setTSending]         = useState({});
   const tRefreshRef = React.useRef(null);
+  const [tPopup, setTPopup] = useState({});
+  const [tSuggestData, setTSuggestData] = useState({});
 
-  useEffect(() => {
-    const handler = (e) => {
-      const { slot, text, append } = e.detail || {};
-      if (slot !== undefined && text) {
-        setTInputs(p => ({ ...p, [slot]: append ? (p[slot] || "") + text : text }));
+  const tTogglePopup = (idx, type) => {
+    setTPopup(p => ({ ...p, [idx]: p[idx] === type ? null : type }));
+    if (type === "suggest" && !tSuggestData[idx]) tLoadSuggestions(idx);
+  };
+
+  const tLoadSuggestions = async (idx) => {
+    setTSuggestData(p => ({ ...p, [idx]: { loading: true, items: [] } }));
+    try {
+      const conv = tSlots[idx];
+      if (!conv) throw new Error("No conv");
+      const cid = _dmsgChatId(conv);
+      const msgsData = await _dmsgFetch("/conversations/" + cid + "/messages?limit=5", { timeout: 8000 });
+      const msgs = Array.isArray(msgsData) ? msgsData : msgsData.messages || msgsData.data || [];
+      const lastInbound = [...msgs].reverse().find(m => !m.is_outgoing && m.direction !== "out");
+      const lastText = lastInbound?.text || lastInbound?.content || "";
+      const sp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === String(cid));
+      const res = await _dmsgFetch("/api/suggestions", {
+        method: "POST",
+        body: JSON.stringify({ spender_id: sp?.id || null, model_id: conv.model_id || "", last_message: lastText }),
+        timeout: 20000,
+      });
+      if (res.success && res.suggestions) {
+        setTSuggestData(p => ({ ...p, [idx]: { loading: false, items: res.suggestions } }));
+      } else {
+        throw new Error(res.error || "No suggestions");
       }
-    };
-    window.addEventListener("tlgpro-use-suggestion", handler);
-    return () => window.removeEventListener("tlgpro-use-suggestion", handler);
-  }, []);
+    } catch (err) {
+      setTSuggestData(p => ({ ...p, [idx]: { loading: false, items: [{ text: "Erreur : " + err.message, _error: true }] } }));
+    }
+  };
+
+  const tSendGif = async (idx, gifUrl) => {
+    const conv = tSlots[idx];
+    if (!conv) return;
+    try {
+      const cid = _dmsgChatId(conv);
+      await _dmsgFetch("/send-photo", { method: "POST", body: JSON.stringify({ chat_id: cid, photo_url: gifUrl, caption: "", model_id: conv.model_id || "" }), timeout: 30000 });
+      addToast("GIF envoyé", "success");
+    } catch (err) { addToast("Erreur : " + err.message, "error"); }
+    setTPopup(p => ({ ...p, [idx]: null }));
+  };
 
   const tLayoutCfg = GRID_LAYOUTS[tLayout] || GRID_LAYOUTS["3x3"];
 
@@ -29573,15 +29606,73 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
               {_standalone && _onMediaLib && <button onClick={e => { e.stopPropagation(); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onMediaLib(idx); }}
                 style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="Médias">🎬</button>}
 
-              {_standalone && _onEmoji && <button onClick={e => { e.stopPropagation(); _onEmoji(idx); }}
-                style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="Emojis">😊</button>}
-              {_standalone && _onGif && <button onClick={e => { e.stopPropagation(); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onGif(idx); }}
-                style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="GIF">🎁</button>}
-              {_standalone && _onSuggestions && <button onClick={e => { e.stopPropagation(); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onSuggestions(idx); }}
-                style={{ flex: 1, padding: "5px 0", background: "linear-gradient(135deg,rgba(102,126,234,0.2),rgba(118,75,162,0.2))", color: "#a5b4fc", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="Suggestions IA">✨</button>}
+              {_standalone && <button onClick={e => { e.stopPropagation(); tTogglePopup(idx, "emoji"); }}
+                style={{ flex: 1, padding: "5px 0", background: tPopup[idx] === "emoji" ? "rgba(99,102,241,0.15)" : "rgba(255,255,255,0.04)", color: tPopup[idx] === "emoji" ? "#a5b4fc" : "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="Emojis">😊</button>}
+              {_standalone && <button onClick={e => { e.stopPropagation(); tTogglePopup(idx, "gif"); }}
+                style={{ flex: 1, padding: "5px 0", background: tPopup[idx] === "gif" ? "rgba(99,102,241,0.15)" : "rgba(255,255,255,0.04)", color: tPopup[idx] === "gif" ? "#a5b4fc" : "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="GIF">🎁</button>}
+              {_standalone && <button onClick={e => { e.stopPropagation(); tTogglePopup(idx, "suggest"); }}
+                style={{ flex: 1, padding: "5px 0", background: tPopup[idx] === "suggest" ? "rgba(99,102,241,0.15)" : "linear-gradient(135deg,rgba(102,126,234,0.2),rgba(118,75,162,0.2))", color: "#a5b4fc", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }} title="Suggestions IA">✨</button>}
               {onSelectConv && <button onClick={e => { e.stopPropagation(); onSelectConv(conv); }}
                 style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer", minWidth: 28 }}>🔍</button>}
             </div>
+
+            {/* Inline Popup — Emoji / GIF / Suggestions */}
+            {tPopup[idx] && (
+              <div style={{ maxHeight: 200, overflowY: "auto", borderTop: "1px solid rgba(255,255,255,0.1)", background: "rgba(15,15,30,0.95)", padding: "8px 10px" }} className="grid-slot-scroller" onClick={e => e.stopPropagation()}>
+                {tPopup[idx] === "emoji" && (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: 3 }}>
+                    {["😊","😘","🥰","😍","🔥","💋","👅","🍑","🍆","💦","😈","😏","🤤","🥴","💕","💖","❤️","🖤","💜","💙","👀","😳","🙈","🙊","😇","🤭","🫦","💅","🎁","⭐"].map((em, ei) => (
+                      <button key={ei} onClick={() => { setTInputs(p => ({ ...p, [idx]: (p[idx] || "") + em })); setTPopup(p => ({ ...p, [idx]: null })); }}
+                        style={{ padding: 3, background: "transparent", border: "none", borderRadius: 4, fontSize: 18, cursor: "pointer", transition: "background 0.1s" }}
+                        onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.2)"}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                        {em}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {tPopup[idx] === "gif" && (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
+                    {[
+                      { url: "https://media.giphy.com/media/3o7aD2saalBwwftBIY/giphy.gif", label: "Kiss" },
+                      { url: "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif", label: "Wink" },
+                      { url: "https://media.giphy.com/media/26gsjCZpPolPr3sBy/giphy.gif", label: "Heart" },
+                      { url: "https://media.giphy.com/media/xT9IgG50Fb7Mi0prBC/giphy.gif", label: "Fire" },
+                      { url: "https://media.giphy.com/media/l0HlNQ03J5JxX6lva/giphy.gif", label: "Love" },
+                      { url: "https://media.giphy.com/media/3oz8xIsloV7zOmt81G/giphy.gif", label: "Cute" },
+                    ].map((g, gi) => (
+                      <div key={gi} onClick={() => tSendGif(idx, g.url)}
+                        style={{ borderRadius: 6, border: "1px solid rgba(255,255,255,0.06)", overflow: "hidden", cursor: "pointer", transition: "border-color 0.15s" }}
+                        onMouseEnter={e => e.currentTarget.style.borderColor = "#6366f1"}
+                        onMouseLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"}>
+                        <img src={g.url} alt={g.label} style={{ width: "100%", height: 60, objectFit: "cover" }} loading="lazy" />
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {tPopup[idx] === "suggest" && (() => {
+                  const sd = tSuggestData[idx] || { loading: false, items: [] };
+                  return sd.loading ? (
+                    <div style={{ textAlign: "center", padding: 12, color: "#6366f1", fontSize: 11 }}>Génération…</div>
+                  ) : sd.items.length === 0 ? (
+                    <div style={{ textAlign: "center", padding: 12, color: "#6b7280", fontSize: 11 }}>Aucune suggestion</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      {sd.items.map((s, si) => (
+                        <div key={si} onClick={() => { if (!s._error) { setTInputs(p => ({ ...p, [idx]: s.text })); setTPopup(p => ({ ...p, [idx]: null })); } }}
+                          style={{ padding: "6px 8px", background: "rgba(0,0,0,0.3)", borderRadius: 6, border: "1px solid rgba(255,255,255,0.06)", cursor: s._error ? "default" : "pointer", color: s._error ? "#ef4444" : "#d1d5db", fontSize: 10, lineHeight: 1.4, transition: "border-color 0.15s" }}
+                          onMouseEnter={e => { if (!s._error) e.currentTarget.style.borderColor = "#6366f1"; }}
+                          onMouseLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"}>
+                          {s.text}
+                        </div>
+                      ))}
+                      <button onClick={() => tLoadSuggestions(idx)}
+                        style={{ padding: "4px 8px", background: "rgba(99,102,241,0.1)", color: "#a5b4fc", border: "none", borderRadius: 5, fontSize: 10, fontWeight: 700, cursor: "pointer", marginTop: 2 }}>🔄 Régénérer</button>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
 
             {/* Input + Send */}
             <div style={{ padding: "6px 8px 8px", borderTop: "1px solid rgba(255,255,255,0.04)" }} onClick={e => e.stopPropagation()}>
@@ -29651,11 +29742,6 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   const [mediaLibSlot, setMediaLibSlot]       = useState(null);
   const [mediaLibTab, setMediaLibTab]         = useState("photo");
   const mediaLibFileRef = React.useRef(null);
-  const [suggestSlot, setSuggestSlot]     = useState(null);
-  const [suggestions, setSuggestions]     = useState([]);
-  const [suggestLoading, setSuggestLoading] = useState(false);
-  const [emojiSlot, setEmojiSlot]         = useState(null);
-  const [gifSlot, setGifSlot]             = useState(null);
   const mediaInputRef = React.useRef(null);
 
   const convTotalsMap = React.useMemo(() => {
@@ -29817,40 +29903,6 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
     }
   };
 
-  const loadSuggestions = async (slotIdx) => {
-    setSuggestSlot(slotIdx);
-    setSuggestLoading(true);
-    setSuggestions([]);
-    try {
-      const convRef = window._tlgProSlotsRef?.[slotIdx];
-      if (!convRef) throw new Error("No conv");
-      const cid = _dmsgChatId(convRef);
-      const msgsData = await _dmsgFetch("/conversations/" + cid + "/messages?limit=5", { timeout: 8000 });
-      const msgs = Array.isArray(msgsData) ? msgsData : msgsData.messages || msgsData.data || [];
-      const lastInbound = [...msgs].reverse().find(m => !m.is_outgoing && m.direction !== "out");
-      const lastText = lastInbound?.text || lastInbound?.content || "";
-      const sp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === String(cid));
-      const res = await _dmsgFetch("/api/suggestions", {
-        method: "POST",
-        body: JSON.stringify({ spender_id: sp?.id || null, model_id: convRef.model_id || "", last_message: lastText }),
-        timeout: 20000,
-      });
-      if (res.success && res.suggestions) {
-        setSuggestions(res.suggestions);
-      } else {
-        throw new Error(res.error || "No suggestions");
-      }
-    } catch (err) {
-      console.error("[SUGGESTIONS]", err);
-      setSuggestions([{ text: "Erreur : " + err.message, _error: true }]);
-    }
-    setSuggestLoading(false);
-  };
-
-  const useSuggestion = (text) => {
-    window.dispatchEvent(new CustomEvent("tlgpro-use-suggestion", { detail: { slot: suggestSlot, text } }));
-    setSuggestSlot(null);
-  };
 
 
   if (convLoading) {
@@ -29875,9 +29927,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         _onSendMedia={(slotIdx) => { setMediaSlot(slotIdx); setTimeout(() => mediaInputRef.current?.click(), 50); }}
         _onShowInfo={(slotIdx) => setInfoSlot(slotIdx)}
         _onMediaLib={(slotIdx) => openMediaLib(slotIdx)}
-        _onSuggestions={(slotIdx) => loadSuggestions(slotIdx)}
-        _onEmoji={(slotIdx) => setEmojiSlot(slotIdx)}
-        _onGif={(slotIdx) => setGifSlot(slotIdx)}
+        spenders={spenders}
       />
 
       {/* TX Modal */}
@@ -29940,63 +29990,6 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         </div>
       )}
 
-      {/* Emoji Picker Modal */}
-      {emojiSlot !== null && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setEmojiSlot(null)}>
-          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 20, width: 380, border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: "0 0 14px", color: "#fff", fontSize: 15, fontWeight: 800 }}>😊 Emojis</h3>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(10, 1fr)", gap: 6, marginBottom: 14 }}>
-              {["😊","😘","🥰","😍","🔥","💋","👅","🍑","🍆","💦","😈","😏","🤤","🥴","💕","💖","❤️","🖤","💜","💙","👀","😳","🙈","🙊","😇","🤭","🫦","💅","🎁","⭐"].map((em, ei) => (
-                <button key={ei} onClick={() => { window.dispatchEvent(new CustomEvent("tlgpro-use-suggestion", { detail: { slot: emojiSlot, text: em, append: true } })); setEmojiSlot(null); }}
-                  style={{ padding: 6, background: "rgba(255,255,255,0.04)", border: "none", borderRadius: 6, fontSize: 20, cursor: "pointer", transition: "all 0.1s" }}
-                  onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.2)"}
-                  onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.04)"}>
-                  {em}
-                </button>
-              ))}
-            </div>
-            <button onClick={() => setEmojiSlot(null)} style={{ width: "100%", padding: 8, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Fermer</button>
-          </div>
-        </div>
-      )}
-
-      {/* GIF Picker Modal */}
-      {gifSlot !== null && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setGifSlot(null)}>
-          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 20, width: 500, maxHeight: "80vh", overflowY: "auto", border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: "0 0 14px", color: "#fff", fontSize: 15, fontWeight: 800 }}>🎁 GIFs</h3>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
-              {[
-                { url: "https://media.giphy.com/media/3o7aD2saalBwwftBIY/giphy.gif", label: "Kiss" },
-                { url: "https://media.giphy.com/media/l0MYt5jPR6QX5pnqM/giphy.gif", label: "Wink" },
-                { url: "https://media.giphy.com/media/26gsjCZpPolPr3sBy/giphy.gif", label: "Heart" },
-                { url: "https://media.giphy.com/media/xT9IgG50Fb7Mi0prBC/giphy.gif", label: "Fire" },
-                { url: "https://media.giphy.com/media/l0HlNQ03J5JxX6lva/giphy.gif", label: "Love" },
-                { url: "https://media.giphy.com/media/3oz8xIsloV7zOmt81G/giphy.gif", label: "Cute" },
-              ].map((g, gi) => (
-                <div key={gi} onClick={async () => {
-                  const convRef = window._tlgProSlotsRef?.[gifSlot];
-                  if (!convRef) return;
-                  try {
-                    const cid = _dmsgChatId(convRef);
-                    await _dmsgFetch("/send-photo", { method: "POST", body: JSON.stringify({ chat_id: cid, photo_url: g.url, caption: "", model_id: convRef.model_id || "" }), timeout: 30000 });
-                    addToast("GIF envoyé", "success");
-                  } catch (err) { addToast("Erreur : " + err.message, "error"); }
-                  setGifSlot(null);
-                }}
-                  style={{ borderRadius: 8, border: "2px solid rgba(255,255,255,0.06)", overflow: "hidden", cursor: "pointer", transition: "all 0.15s" }}
-                  onMouseEnter={e => e.currentTarget.style.borderColor = "#6366f1"}
-                  onMouseLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"}>
-                  <img src={g.url} alt={g.label} style={{ width: "100%", height: 100, objectFit: "cover" }} loading="lazy" />
-                  <div style={{ padding: "4px 8px", fontSize: 10, color: "#9ca3af", textAlign: "center" }}>{g.label}</div>
-                </div>
-              ))}
-            </div>
-            <button onClick={() => setGifSlot(null)} style={{ width: "100%", padding: 8, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Fermer</button>
-          </div>
-        </div>
-      )}
-
       {/* Media Library Modal (Photos + Vidéos) — uses MediaPanelGrid */}
       {mediaLibSlot !== null && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setMediaLibSlot(null)}>
@@ -30030,67 +30023,6 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
                 soldMediaIds={[]}
                 onSelect={selectMediaLibItem}
               />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Suggestions IA Modal */}
-      {suggestSlot !== null && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setSuggestSlot(null)}>
-          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 480, maxHeight: "80vh", overflowY: "auto", border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: "0 0 6px", color: "#fff", fontSize: 16, fontWeight: 800 }}>✨ Suggestions IA</h3>
-            <p style={{ margin: "0 0 16px", color: "#6b7280", fontSize: 12 }}>Clique sur une suggestion pour la copier dans l'input</p>
-            {suggestLoading ? (
-              <div style={{ textAlign: "center", padding: 40, color: "#6366f1", fontSize: 13 }}>Génération en cours…</div>
-            ) : suggestions.length === 0 ? (
-              <div style={{ textAlign: "center", padding: 40, color: "#6b7280", fontSize: 13 }}>Aucune suggestion</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {suggestions.map((s, i) => (
-                  <div key={i} onClick={() => useSuggestion(s.text)}
-                    style={{ padding: "12px 14px", background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", cursor: "pointer", color: "#d1d5db", fontSize: 13, lineHeight: 1.5, transition: "all 0.15s" }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = "#6366f1"; e.currentTarget.style.background = "rgba(99,102,241,0.08)"; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; e.currentTarget.style.background = "rgba(0,0,0,0.3)"; }}>
-                    {_escapeHtml(s.text)}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-              <button onClick={() => loadSuggestions(suggestSlot)} style={{ flex: 1, padding: 10, background: "linear-gradient(135deg,rgba(102,126,234,0.2),rgba(118,75,162,0.2))", color: "#a5b4fc", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>🔄 Régénérer</button>
-              <button onClick={() => setSuggestSlot(null)} style={{ flex: 1, padding: 10, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Fermer</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-
-      {/* Suggestions IA Modal */}
-      {suggestSlot !== null && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setSuggestSlot(null)}>
-          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 480, maxHeight: "80vh", overflowY: "auto", border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: "0 0 6px", color: "#fff", fontSize: 16, fontWeight: 800 }}>✨ Suggestions IA</h3>
-            <p style={{ margin: "0 0 16px", color: "#6b7280", fontSize: 12 }}>Clique sur une suggestion pour la coller dans l'input</p>
-            {suggestLoading ? (
-              <div style={{ textAlign: "center", padding: 40, color: "#6366f1", fontSize: 14 }}>Génération…</div>
-            ) : suggestions.length === 0 ? (
-              <div style={{ textAlign: "center", padding: 40, color: "#6b7280", fontSize: 13 }}>Aucune suggestion</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
-                {suggestions.map((s, si) => (
-                  <div key={si} onClick={() => useSuggestion(s.text)}
-                    style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", cursor: "pointer", color: "#d1d5db", fontSize: 13, lineHeight: 1.5, transition: "all 0.15s" }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = "#6366f1"; e.currentTarget.style.background = "rgba(99,102,241,0.08)"; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; e.currentTarget.style.background = "rgba(0,0,0,0.3)"; }}>
-                    {s.text}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={() => loadSuggestions(suggestSlot)} style={{ flex: 1, padding: 10, background: "linear-gradient(135deg,rgba(102,126,234,0.2),rgba(118,75,162,0.2))", color: "#a5b4fc", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>🔄 Regénérer</button>
-              <button onClick={() => setSuggestSlot(null)} style={{ flex: 1, padding: 10, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Fermer</button>
             </div>
           </div>
         </div>
