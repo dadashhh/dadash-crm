@@ -29357,7 +29357,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
 // =====================================================================
 // TLG PRO — Telegram Pro Grid : input dans chaque slot
 // =====================================================================
-const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia, _onShowInfo, _onMediaLib, spenders = [] }) => {
+const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia, _onShowInfo, _onMediaLib, _onTxHist, spenders = [] }) => {
   const addToast = useToast();
 
   const [tLayout, setTLayout]           = useState("3x3");
@@ -29572,7 +29572,10 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                   {conv.unread_count > 0 && <span style={{ background: "#ef4444", color: "#fff", padding: "2px 5px", borderRadius: 4, fontSize: 7, fontWeight: 800, display: "flex", alignItems: "center", gap: 3 }}><span style={{ width: 4, height: 4, background: "#fff", borderRadius: "50%", animation: "gridPulse 2s infinite" }} />LIVE</span>}
-                  <span style={{ background: `linear-gradient(90deg,${ltvColor(getLtv(conv))},transparent)`, color: "#fff", padding: "3px 7px", borderRadius: 5, fontSize: 10, fontWeight: 800 }}>{getLtv(conv)} CHF</span>
+                  <span onClick={e => { e.stopPropagation(); if (_standalone && _onTxHist) { window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onTxHist(idx); } }}
+                    style={{ background: `linear-gradient(90deg,${ltvColor(getLtv(conv))},transparent)`, color: "#fff", padding: "3px 7px", borderRadius: 5, fontSize: 10, fontWeight: 800, cursor: _standalone && _onTxHist ? "pointer" : "default", transition: "filter 0.15s" }}
+                    onMouseEnter={e => { if (_standalone && _onTxHist) e.currentTarget.style.filter = "brightness(1.3)"; }}
+                    onMouseLeave={e => e.currentTarget.style.filter = ""}>{getLtv(conv)} CHF</span>
                   {conv.unread_count > 0 && <span style={{ background: "#ef4444", color: "#fff", padding: "2px 5px", borderRadius: 5, fontSize: 9, fontWeight: 800 }}>{conv.unread_count}</span>}
                   {_standalone && _onCreateTx && <button onClick={e => { e.stopPropagation(); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onCreateTx(idx); }}
                     style={{ padding: "3px 7px", background: "#10b981", color: "#fff", border: "none", borderRadius: 5, fontSize: 9, fontWeight: 800, cursor: "pointer" }}>+TX</button>}
@@ -29744,6 +29747,10 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   const [mediaSlot, setMediaSlot]         = useState(null);
   const [pendingMedia, setPendingMedia]   = useState(null);
   const [infoSlot, setInfoSlot]           = useState(null);
+  const [infoSpender, setInfoSpender]     = useState(null);
+  const [infoLoading, setInfoLoading]     = useState(false);
+  const [txHistSlot, setTxHistSlot]       = useState(null);
+  const [txHistSpender, setTxHistSpender] = useState(null);
   const [mediaSending, setMediaSending]   = useState(false);
   const [mediaLibSlot, setMediaLibSlot]       = useState(null);
   const [mediaLibTab, setMediaLibTab]         = useState("photo");
@@ -29864,6 +29871,88 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
     setTxSaving(false);
   };
 
+  // ── Resolve full spender from Supabase for info modal ──
+  const resolveInfoSpender = async (slotIdx) => {
+    setInfoSlot(slotIdx);
+    setInfoSpender(null);
+    setInfoLoading(true);
+    const convRef = window._tlgProSlotsRef?.[slotIdx];
+    if (!convRef) { setInfoLoading(false); return; }
+    const cid = String(_dmsgChatId(convRef) || "");
+    // Quick match from props
+    const quickSp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === cid);
+    if (quickSp) setInfoSpender(quickSp);
+    // Full hydration from Supabase
+    try {
+      let full = null;
+      if (quickSp?.id) {
+        const { data } = await sb.from("spenders").select("*").eq("id", quickSp.id).maybeSingle();
+        if (data) full = data;
+      }
+      if (!full && cid) {
+        const { data } = await sb.from("spenders").select("*").or(`tg_user_id.eq.${cid},telegram_id.eq.${cid}`).maybeSingle();
+        if (data) full = data;
+      }
+      if (full) setInfoSpender(full);
+      else if (!quickSp) setInfoSpender(convRef.spender || { first_name: convRef.first_name || convRef.username || "?" });
+    } catch (_) {
+      if (!quickSp) setInfoSpender(convRef.spender || { first_name: convRef.first_name || convRef.username || "?" });
+    }
+    setInfoLoading(false);
+  };
+
+  // ── Computed values for info spender ──
+  const infoConvRef = infoSlot !== null ? window._tlgProSlotsRef?.[infoSlot] : null;
+  const infoSpenderTxs = React.useMemo(() => {
+    if (!infoSpender || !txs) return [];
+    return (txs || []).filter(tx =>
+      (infoSpender.id && tx.spender_id === infoSpender.id) ||
+      (infoSpender.handle && tx.spender_handle === infoSpender.handle) ||
+      (infoSpender.name && tx.spender_handle === infoSpender.name)
+    );
+  }, [infoSpender?.id, infoSpender?.handle, txs]);
+
+  const infoKpis = React.useMemo(() => {
+    const valid = infoSpenderTxs.filter(tx => ["validated","validée","confirmee","payee"].includes(tx.status));
+    const pending = infoSpenderTxs.filter(tx => tx.status === "pending");
+    const ltv = valid.reduce((s, tx) => s + Number(tx.amount_chf || tx.amount || 0), 0);
+    const pendingAmt = pending.reduce((s, tx) => s + Number(tx.amount_chf || tx.amount || 0), 0);
+    const aov = valid.length > 0 ? ltv / valid.length : 0;
+    return { ltv, aov, cnt: infoSpenderTxs.length, validAmt: ltv, pendingAmt };
+  }, [infoSpenderTxs]);
+
+  const infoBadges = React.useMemo(() =>
+    infoSpender ? computeSpenderBadges({ ...infoSpender, txs: infoSpenderTxs, ltv: infoKpis.ltv, cnt: infoKpis.cnt }) : []
+  , [infoSpender?.id, infoSpenderTxs, infoKpis.ltv, infoKpis.cnt]);
+
+  const infoVipScore = React.useMemo(() =>
+    infoSpender ? computeVIPScore({ ...infoSpender, txs: infoSpenderTxs, ltv: infoKpis.ltv, cnt: infoKpis.cnt }) : 0
+  , [infoSpender?.id, infoSpenderTxs, infoKpis.ltv, infoKpis.cnt]);
+
+  const infoModelName = infoConvRef?.model_id
+    ? ((models || []).find(m => m.id === infoConvRef.model_id)?.name || null)
+    : null;
+
+  // ── TX History modal helpers ──
+  const openTxHist = (slotIdx) => {
+    const convRef = window._tlgProSlotsRef?.[slotIdx];
+    if (!convRef) return;
+    const cid = String(_dmsgChatId(convRef) || "");
+    const sp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === cid) || convRef.spender || {};
+    setTxHistSlot(slotIdx);
+    setTxHistSpender(sp);
+  };
+
+  const txHistConvRef = txHistSlot !== null ? window._tlgProSlotsRef?.[txHistSlot] : null;
+  const txHistTxs = React.useMemo(() => {
+    if (!txHistSpender || !txs) return [];
+    return (txs || []).filter(tx =>
+      (txHistSpender.id && tx.spender_id === txHistSpender.id) ||
+      (txHistSpender.handle && tx.spender_handle === txHistSpender.handle) ||
+      (txHistSpender.name && tx.spender_handle === txHistSpender.name)
+    );
+  }, [txHistSpender?.id, txHistSpender?.handle, txs]);
+
   const handleSendMedia = async () => {
     if (mediaSlot === null || !pendingMedia) return;
     const convRef = window._tlgProSlotsRef?.[mediaSlot];
@@ -29972,8 +30061,9 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         _standalone={true}
         _onCreateTx={(slotIdx) => setTxModalSlot(slotIdx)}
         _onSendMedia={(slotIdx) => { setMediaSlot(slotIdx); setTimeout(() => mediaInputRef.current?.click(), 50); }}
-        _onShowInfo={(slotIdx) => setInfoSlot(slotIdx)}
+        _onShowInfo={(slotIdx) => resolveInfoSpender(slotIdx)}
         _onMediaLib={(slotIdx) => openMediaLib(slotIdx)}
+        _onTxHist={(slotIdx) => openTxHist(slotIdx)}
         spenders={spenders}
       />
 
@@ -30193,61 +30283,271 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         </div>
       )}
 
-      {/* Spender Info Modal */}
-      {infoSlot !== null && (() => {
-        const infoConv = window._tlgProSlotsRef?.[infoSlot];
-        if (!infoConv) return null;
-        const sp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === String(_dmsgChatId(infoConv))) || infoConv.spender || {};
-        const infoLtv = convTotalsMap[String(_dmsgChatId(infoConv) || "")] ?? Number(infoConv.total_spent || sp.total_spent || 0);
-        const seg = sp.segment || (infoLtv >= 500 ? "whale" : infoLtv >= 50 ? "spender" : "free");
-        const segEmoji = seg === "whale" ? "🐋" : seg.includes("spend") ? "💰" : "🆓";
-        const segColor = seg === "whale" ? "#10b981" : seg.includes("spend") ? "#f59e0b" : "#6b7280";
-        const mName = (models.find(m => m.id === infoConv.model_id)?.name) || "?";
-        return (
-          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setInfoSlot(null)}>
-            <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 420, maxHeight: "80vh", overflowY: "auto", border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
-              <div style={{ marginBottom: 16 }}>
-                <h3 style={{ margin: "0 0 6px", color: "#fff", fontSize: 18, fontWeight: 800 }}>👤 {sp.first_name || sp.name || infoConv.first_name || "Unknown"}</h3>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  <span style={{ background: segColor + "33", color: segColor, padding: "3px 10px", borderRadius: 6, fontSize: 11, fontWeight: 700 }}>{segEmoji} {seg.replace("_", " ").toUpperCase()}</span>
-                  <span style={{ color: "#6b7280", fontSize: 11 }}>Modèle : {mName}</span>
-                </div>
-              </div>
-              <div style={{ padding: 16, background: "linear-gradient(135deg,#6366f1,#818cf8)", borderRadius: 10, marginBottom: 16 }}>
-                <div style={{ color: "rgba(255,255,255,0.7)", fontSize: 10, fontWeight: 700, textTransform: "uppercase", marginBottom: 4 }}>Lifetime Value</div>
-                <div style={{ color: "#fff", fontSize: 28, fontWeight: 800 }}>{infoLtv} CHF</div>
-              </div>
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
-                <div style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div style={{ color: "#6b7280", fontSize: 10, fontWeight: 700, marginBottom: 3 }}>LANGUE</div>
-                  <div style={{ color: "#fff", fontSize: 14, fontWeight: 700 }}>{sp.langue || sp.language || "N/A"}</div>
-                </div>
-                <div style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div style={{ color: "#6b7280", fontSize: 10, fontWeight: 700, marginBottom: 3 }}>HANDLE</div>
-                  <div style={{ color: "#fff", fontSize: 14, fontWeight: 700 }}>@{sp.handle || sp.username || infoConv.username || "?"}</div>
-                </div>
-                <div style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div style={{ color: "#6b7280", fontSize: 10, fontWeight: 700, marginBottom: 3 }}>CLASSIFICATION</div>
-                  <div style={{ color: "#fff", fontSize: 14, fontWeight: 700 }}>{sp.classification || "N/A"}</div>
-                </div>
-                <div style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)" }}>
-                  <div style={{ color: "#6b7280", fontSize: 10, fontWeight: 700, marginBottom: 3 }}>RISQUE</div>
-                  <div style={{ color: "#fff", fontSize: 14, fontWeight: 700 }}>{sp.risk_level || "safe"}</div>
-                </div>
-              </div>
-              {(sp.chatter_notes || sp.notes || sp.personality_notes) && (
-                <div style={{ marginBottom: 16 }}>
-                  <div style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, marginBottom: 6 }}>📝 NOTES</div>
-                  <div style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", color: "#d1d5db", fontSize: 12, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
-                    {sp.chatter_notes || sp.notes || sp.personality_notes}
-                  </div>
-                </div>
-              )}
-              <button onClick={() => setInfoSlot(null)} style={{ width: "100%", padding: 12, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Fermer</button>
+      {/* ══ Complete Spender Profile Modal ══ */}
+      {infoSlot !== null && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+          onClick={e => { if (e.target === e.currentTarget) setInfoSlot(null); }}>
+          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 480, maxWidth: "95vw", maxHeight: "85vh", overflowY: "auto", border: "1px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }}
+            className="grid-slot-scroller" onClick={e => e.stopPropagation()}>
+
+            {/* Close button */}
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
+              <button onClick={() => setInfoSlot(null)} style={{ background: "none", border: "none", color: "#9ca3af", fontSize: 22, cursor: "pointer", padding: "0 4px" }}>×</button>
             </div>
+
+            {infoLoading && !infoSpender && (
+              <div style={{ textAlign: "center", padding: "40px 0", color: "#6366f1", fontSize: 13 }}>Chargement…</div>
+            )}
+
+            {infoSpender && (() => {
+              const sp = infoSpender;
+              const _labelSt = { fontSize: 9, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 2, fontWeight: 600 };
+              return (
+                <>
+                  {/* ── Avatar + Name + TG ID ── */}
+                  <div style={{ marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                      <SpenderAvatar sp={sp} size={40} radius="50%" />
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div style={{ fontSize: 19, fontWeight: 800, color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          {sp.first_name || sp.handle || sp.name || "—"}
+                          {sp.age && <span style={{ fontSize: 11, fontWeight: 400, color: "#6b7280", marginLeft: 5 }}>{sp.age} ans</span>}
+                        </div>
+                        <div style={{ fontSize: 10, color: "#4b5563", marginTop: 2 }}>
+                          TG {infoConvRef ? _dmsgChatId(infoConvRef) : "—"}
+                          {(sp.telegram_username || sp.handle) && " · @" + String(sp.telegram_username || sp.handle).replace(/^@/, "")}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Badges */}
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 8 }}>
+                      {infoBadges.map((b, i) => (
+                        <span key={i} style={{ padding: "3px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                          background: b.label === "GORILLE" || b.label === "WHALE" ? "rgba(124,58,237,0.25)" : "rgba(255,255,255,0.07)",
+                          color: b.label === "GORILLE" || b.label === "WHALE" ? "#c084fc" : "#9ca3af" }}>
+                          {b.icon} {b.label}
+                        </span>
+                      ))}
+                      {sp.langue && (
+                        <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, background: "#1e3a8a", color: "#93c5fd" }}>
+                          {LANG_FLAGS[String(sp.langue).toUpperCase()] || "🌐"} {sp.langue}
+                        </span>
+                      )}
+                      {sp.relationship_status && (
+                        <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700,
+                          background: sp.relationship_status === "new" ? "#be185d" : "rgba(255,255,255,0.07)",
+                          color: sp.relationship_status === "new" ? "#fce7f3" : "#9ca3af" }}>
+                          {sp.relationship_status}
+                        </span>
+                      )}
+                      {(infoModelName || sp.ai_model_used) && (
+                        <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, background: "#2d1b4e", color: "#c084fc" }}>
+                          👤 {sp.ai_model_used || infoModelName}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* VIP bar */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 9, color: "#4b5563", fontWeight: 600, textTransform: "uppercase", flexShrink: 0 }}>VIP</span>
+                      <div style={{ flex: 1, height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+                        <div style={{ width: Math.min(infoVipScore, 100) + "%", height: "100%", background: infoVipScore >= 70 ? "#22c55e" : infoVipScore >= 40 ? "#f59e0b" : "#ef4444", borderRadius: 2, transition: "width 0.3s" }} />
+                      </div>
+                      <span style={{ fontSize: 9, color: "#4b5563", flexShrink: 0 }}>{infoVipScore}/100</span>
+                    </div>
+                  </div>
+
+                  {/* ── Action buttons ── */}
+                  <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                    <button onClick={() => { setInfoSlot(null); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[infoSlot] = infoConvRef; setTxModalSlot(infoSlot); }}
+                      style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "none", background: "linear-gradient(135deg,#6366f1,#818cf8)", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 12px rgba(99,102,241,0.3)" }}>
+                      ➕ Créer TX
+                    </button>
+                    <button onClick={async () => {
+                      if (!sp.id) return;
+                      try {
+                        await _dmsgFetch("/enrich/" + sp.id, { method: "POST", timeout: 15000 });
+                        addToast("Enrichissement lancé ✓", "success");
+                        resolveInfoSpender(infoSlot);
+                      } catch(e) { addToast("Erreur: " + (e.message || e), "error"); }
+                    }}
+                      style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", background: "transparent", color: "#9ca3af", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+                      📝 Modifier
+                    </button>
+                  </div>
+
+                  {/* ── KPIs ── */}
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 4, marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
+                    {[
+                      { label: "LTV",  value: infoKpis.ltv.toFixed(0) + " ₣",        color: "#22c55e" },
+                      { label: "AOV",  value: infoKpis.aov.toFixed(0) + " ₣",        color: "#fff" },
+                      { label: "TX",   value: String(infoKpis.cnt),                   color: "#fff" },
+                      { label: "✅",   value: infoKpis.validAmt.toFixed(0) + " ₣",   color: "#22c55e" },
+                      { label: "⏳",   value: infoKpis.pendingAmt.toFixed(0) + " ₣", color: "#f59e0b" },
+                    ].map(k => (
+                      <div key={k.label} style={{ textAlign: "center", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10, padding: "10px 12px" }}>
+                        <div style={{ fontSize: 11, color: "#4b5563", textTransform: "uppercase", marginBottom: 2, fontWeight: 600 }}>{k.label}</div>
+                        <div style={{ fontSize: 18, fontWeight: 700, color: k.color }}>{k.value}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* ── Profile fields ── */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {[
+                      { label: "BUDGET",      value: sp.budget_range },
+                      { label: "RELATION",    value: sp.relationship_status },
+                      { label: "LANGUE",      value: sp.langue ? ((LANG_FLAGS[String(sp.langue).toUpperCase()] || "") + " " + sp.langue).trim() : null },
+                      { label: "PRÉNOM",      value: sp.first_name || sp.name || sp.handle },
+                      { label: "ÂGE",         value: sp.age ? String(sp.age) + " ans" : null },
+                      { label: "VILLE / PAYS",value: [sp.city, sp.country].filter(Boolean).join(", ") || null },
+                      { label: "MÉTIER",      value: sp.job },
+                      { label: "SOURCE",      value: sp.source },
+                    ].map(({ label, value }) => (
+                      <div key={label} style={{ display: "grid", gridTemplateColumns: "84px 1fr", gap: 6, alignItems: "start" }}>
+                        <div style={_labelSt}>{label}</div>
+                        <div style={{ fontSize: 13, color: "#fff", fontWeight: 500, wordBreak: "break-word", lineHeight: 1.4 }}>{value || "—"}</div>
+                      </div>
+                    ))}
+
+                    {/* ── ANALYSE IA ── */}
+                    {(() => {
+                      const personality = sp.ai_personality || sp.personality_notes;
+                      const interests   = sp.ai_interests   || sp.interest_notes;
+                      const strategy    = sp.ai_strategy    || sp.strategy_notes;
+                      const risks       = sp.ai_risks       || sp.risk_notes;
+                      const modelUsed   = sp.ai_model_used  || infoModelName;
+                      if (!personality && !interests && !strategy && !risks && !modelUsed) return null;
+
+                      const sectionBox = (color, bg, border) => ({
+                        fontSize: 13, lineHeight: 1.55, color,
+                        background: bg, padding: "10px 12px",
+                        borderRadius: 7, border: "1px solid " + border,
+                      });
+
+                      return (
+                        <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 12, marginTop: 4, display: "flex", flexDirection: "column", gap: 14 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <span style={{ fontSize: 11, fontWeight: 700, color: "#c084fc", textTransform: "uppercase", letterSpacing: "0.05em" }}>🧠 ANALYSE</span>
+                            {modelUsed && (
+                              <span style={{ padding: "2px 8px", borderRadius: 5, background: "#2d1b4e", color: "#c084fc", fontSize: 10, fontWeight: 600 }}>
+                                👤 {modelUsed}
+                              </span>
+                            )}
+                          </div>
+                          {personality && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: "#c084fc", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>🧠 PERSONNALITÉ</div>
+                              <div style={sectionBox("#d1d5db", "rgba(15,17,23,0.85)", "rgba(99,102,241,0.2)")}>{personality}</div>
+                            </div>
+                          )}
+                          {interests && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: "#c084fc", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>❤️ INTÉRÊTS</div>
+                              <div style={sectionBox("#d1d5db", "rgba(15,17,23,0.85)", "rgba(99,102,241,0.2)")}>{interests}</div>
+                            </div>
+                          )}
+                          {strategy && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: "#c084fc", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>💡 STRATÉGIE</div>
+                              <div style={sectionBox("#d1d5db", "rgba(15,17,23,0.85)", "rgba(99,102,241,0.2)")}>{strategy}</div>
+                            </div>
+                          )}
+                          {risks && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 700, color: "#fb923c", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>⚠️ RISQUES</div>
+                              <div style={sectionBox("#fed7aa", "rgba(28,15,10,0.9)", "#431407")}>{risks}</div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Notes chatter (read-only) */}
+                    {sp.chatter_notes && (
+                      <div style={{ marginTop: 12 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>📝 NOTES CHATTER</div>
+                        <div style={{ fontSize: 13, lineHeight: 1.55, color: "#9ca3af", background: "rgba(15,17,23,0.85)", padding: "10px 12px", borderRadius: 7, fontStyle: "italic" }}>
+                          {sp.chatter_notes}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Editable notes */}
+                    <div style={{ borderTop: "1px solid rgba(255,255,255,0.06)", paddingTop: 10, marginTop: 4 }}>
+                      <div style={_labelSt}>📝 Notes chatter (éditable)</div>
+                      <textarea
+                        key={sp.id || "no-id"}
+                        defaultValue={sp.notes || ""}
+                        onBlur={async e => {
+                          if (!sp.id) return;
+                          try { await sb.from("spenders").update({ notes: e.target.value }).eq("id", sp.id); }
+                          catch (_) { addToast("Erreur sauvegarde note", "error"); }
+                        }}
+                        placeholder="Ajouter une note…"
+                        style={{ width: "100%", minHeight: 80, padding: "8px 10px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", background: "rgba(0,0,0,0.3)", color: "#fff", fontSize: 11, resize: "vertical", fontFamily: "'Inter',sans-serif", boxSizing: "border-box", marginTop: 4, lineHeight: 1.5 }}
+                      />
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </div>
-        );
-      })()}
+        </div>
+      )}
+
+      {/* ══ TX History Modal ══ */}
+      {txHistSlot !== null && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
+          onClick={e => { if (e.target === e.currentTarget) { setTxHistSlot(null); setTxHistSpender(null); } }}>
+          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 440, maxWidth: "95vw", maxHeight: "80vh", overflowY: "auto", border: "1px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }}
+            className="grid-slot-scroller" onClick={e => e.stopPropagation()}>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: "#fff" }}>📜 Historique TX — {txHistSpender?.first_name || txHistSpender?.name || txHistSpender?.handle || "?"}</div>
+              <button onClick={() => { setTxHistSlot(null); setTxHistSpender(null); }} style={{ background: "none", border: "none", color: "#9ca3af", fontSize: 22, cursor: "pointer" }}>×</button>
+            </div>
+
+            {txHistTxs.length === 0 ? (
+              <div style={{ textAlign: "center", color: "#4b5563", fontSize: 12, padding: "24px 0" }}>Aucune transaction</div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {[...txHistTxs]
+                  .sort((a, b) => new Date(b.date || b.created_at || 0) - new Date(a.date || a.created_at || 0))
+                  .map((tx, i) => {
+                    const isValid = ["validated","validée","confirmee","payee"].includes(tx.status);
+                    const isPending = tx.status === "pending";
+                    return (
+                      <div key={tx.id || i} style={{ padding: "8px 10px", borderRadius: 8, background: "rgba(0,0,0,0.3)", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                        <div style={{ minWidth: 0 }}>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: "#fff", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {tx.type || tx.product || "TX"}
+                            {tx.note && <span style={{ fontSize: 9, color: "#6b7280", fontWeight: 400, marginLeft: 4 }}>{tx.note}</span>}
+                          </div>
+                          <div style={{ fontSize: 9, color: "#4b5563" }}>
+                            {(tx.date || tx.created_at) ? new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH") : "—"}
+                          </div>
+                        </div>
+                        <div style={{ textAlign: "right", flexShrink: 0 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: isValid ? "#22c55e" : isPending ? "#f59e0b" : "#6b7280" }}>
+                            {Number(tx.amount_chf || tx.amount || 0).toFixed(0)} CHF
+                          </div>
+                          <div style={{ fontSize: 9, color: "#4b5563", textTransform: "uppercase" }}>{tx.status || "—"}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+
+            <button onClick={() => { setTxHistSlot(null); setTxHistSpender(null); }}
+              style={{ width: "100%", padding: 10, marginTop: 16, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+              Fermer
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
