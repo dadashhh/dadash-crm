@@ -52484,6 +52484,7 @@ const App = () => {
   const [loadTimeout, setLoadTimeout] = useState(false); /* DB FIX — timeout flag */
   const [loadError, setLoadError] = useState(null); /* DB FIX — error message */
   const [retryCount, setRetryCount] = useState(0); /* DB FIX — triggers re-init */
+  const [dataLoading, setDataLoading] = useState(true); /* SAFARI FIX — background data loading indicator */
   const _loadVersion = useRef(0); // race condition guard: discard stale loadData results
   // Deep link: /#/spenders/:uuid — captured once at init from the URL hash
   const [deepLinkSpenderId, setDeepLinkSpenderId] = useState(() => {
@@ -52563,7 +52564,17 @@ const App = () => {
   useEffect(() => {
     if (!loading) { setLoadTimeout(false); return; }
     const timer = setTimeout(() => { setLoadTimeout(true); }, 5000);
-    return () => clearTimeout(timer);
+    /* SAFARI FIX — 3s force-bypass: if auth is still stuck after 3s, force loading=false.
+       The app will render with empty data (components handle empty state gracefully).
+       If the user has been authenticated before, Supabase has a cached session. */
+    const forceTimer = setTimeout(() => {
+      if (loading) {
+        console.warn("[SAFARI FIX] Auth stuck for 3s — forcing app to render");
+        setLoading(false);
+        setLoadTimeout(false);
+      }
+    }, 3000);
+    return () => { clearTimeout(timer); clearTimeout(forceTimer); };
   }, [loading]);
 
   // Keep global _tz in sync with state
@@ -53047,7 +53058,14 @@ const App = () => {
             setUser(fullUser);
             if(fullUser.role === "provider") setTab("provider_dashboard");
             if(fullUser.role === "modele") setTab("model_checklist");
-            await loadData(fullUser);
+            /* SAFARI FIX — don't block app render on data loading.
+               Set loading=false immediately so the app renders,
+               then load data in background. */
+            setLoading(false);
+            setDataLoading(true);
+            loadData(fullUser).catch(e => {
+              console.error("[DADASH] Background loadData failed:", e.message || e);
+            }).finally(() => setDataLoading(false));
           }
         }
         setAuthState('done');
@@ -53066,7 +53084,11 @@ const App = () => {
                 setUser(fullUser);
                 if(fullUser.role === "provider") setTab("provider_dashboard");
                 if(fullUser.role === "modele") setTab("model_checklist");
-                await loadData(fullUser);
+                /* SAFARI FIX — non-blocking loadData on lock-error retry path */
+                setDataLoading(true);
+                loadData(fullUser).catch(e => {
+                  console.error("[DADASH] Background loadData (lock retry) failed:", e.message || e);
+                }).finally(() => setDataLoading(false));
               }
             }
             setAuthState('done');
@@ -53384,20 +53406,18 @@ const App = () => {
   }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
 
   /* DB FIX — handleLogin with error resilience */
+  /* SAFARI FIX — non-blocking: render app immediately, load data in background */
   const handleLogin = async (u) => {
     setUser(u);
     if(u.role === "provider") setTab("provider_dashboard");
     if(u.role === "modele") setTab("model_checklist");
     if(u.role === "chatter") setTab("chatter_dashboard");
-    setLoading(true);
-    setLoadError(null);
-    try {
-      await loadData(u);
-    } catch(e) {
-      console.error("[DADASH] Post-login loadData failed:", e.message || e);
-      setLoadError(e.message || "Erreur de chargement des données");
-    }
     setLoading(false);
+    setLoadError(null);
+    setDataLoading(true);
+    loadData(u).catch(e => {
+      console.error("[DADASH] Post-login loadData failed:", e.message || e);
+    }).finally(() => setDataLoading(false));
   };
 
   const handleLogout = async () => {
@@ -53579,8 +53599,10 @@ const App = () => {
     ];
   }, [lang, user?.role]);
 
-  /* RESILIENT AUTH — reconnection overlay (never a hard error screen) */
-  if(loading || (!user && loadError)) {
+  /* RESILIENT AUTH — reconnection overlay (never a hard error screen)
+     SAFARI FIX — only show full-screen overlay during initial auth (no user yet).
+     Once user is set (or force-bypass fires), app renders with a non-blocking banner. */
+  if(loading && !user) {
     const isErr = !!loadError;
     const isLockRelated = isErr && (/lock/i.test(loadError) || /LockManager/i.test(loadError) || /timed out/i.test(loadError));
     return (
@@ -53647,10 +53669,14 @@ const App = () => {
     );
   }
 
+  /* SAFARI FIX — non-blocking data loading banner for all views */
+  const _dataLoadingBanner = dataLoading ? React.createElement("div", {style:{position:"fixed",top:0,left:0,right:0,zIndex:9999,background:"linear-gradient(90deg,var(--accent),var(--accent-hover,var(--accent)))",padding:"4px 16px",textAlign:"center",fontSize:12,color:"#fff",fontWeight:500}}, React.createElement("span",{className:"spinner",style:{width:12,height:12,borderWidth:2,display:"inline-block",verticalAlign:"middle",marginRight:8}}), "Chargement des données...") : null;
+
   if (tab === "messagerie-multi") {
     return (
       <CurrencyContext.Provider value={currencyCtx}>
       <TimezoneContext.Provider value={timezone}>
+        {_dataLoadingBanner}
         <MultiTabMessagerieApp user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />
       </TimezoneContext.Provider>
       </CurrencyContext.Provider>
@@ -53661,6 +53687,7 @@ const App = () => {
     return (
       <CurrencyContext.Provider value={currencyCtx}>
       <TimezoneContext.Provider value={timezone}>
+        {_dataLoadingBanner}
         <MessagerieGridApp user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />
       </TimezoneContext.Provider>
       </CurrencyContext.Provider>
@@ -53672,6 +53699,7 @@ const App = () => {
       <CurrencyContext.Provider value={currencyCtx}>
       <TimezoneContext.Provider value={timezone}>
       <ToastProvider>
+        {_dataLoadingBanner}
         <TlgProStandalonePage user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />
       </ToastProvider>
       </TimezoneContext.Provider>
@@ -53845,6 +53873,7 @@ const App = () => {
     <CurrencyContext.Provider value={currencyCtx}>
     <TimezoneContext.Provider value={timezone}>
     <div className="app-wrap" style={{background:"var(--bg-base)"}}>
+      {_dataLoadingBanner}
       {/* ═══ DESKTOP SIDEBAR Design A (hidden on mobile via CSS) ═══ */}
       {isGerant ? (
         <div className="sidebar sidebar-desktop" style={{ transform: topbarVisible ? 'translateX(0)' : 'translateX(-100%)', transition: 'transform 0.25s ease' }}>
