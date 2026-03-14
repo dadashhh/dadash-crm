@@ -6096,7 +6096,7 @@ const TAB_TO_FEATURE = {
   transactions:"transactions", provider_compta:"compta", provider_notif:"compta", model_compta:"compta",
 };
 // canSeeWithPerms — checks user-specific perms first, then role defaults, then ROLE_ACCESS
-const STANDALONE_TABS = new Set(["messagerie-grid", "messagerie-multi"]);
+const STANDALONE_TABS = new Set(["messagerie-grid", "messagerie-multi", "messagerie-tlg-pro"]);
 const canSeeWithPerms = (role, tabId, myPerms) => {
   if (role === "gerant") return true;
   if (STANDALONE_TABS.has(tabId)) return true; // standalone windows, accessible to all roles
@@ -29575,7 +29575,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
 // =====================================================================
 // TLG PRO — Telegram Pro Grid : input dans chaque slot
 // =====================================================================
-const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv }) => {
+const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia }) => {
   const addToast = useToast();
 
   const [tLayout, setTLayout]           = useState("3x3");
@@ -29787,8 +29787,12 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
             <div style={{ padding: "4px 6px", borderTop: "1px solid rgba(255,255,255,0.04)", background: "rgba(0,0,0,0.15)", display: "flex", gap: 4 }}>
               <button onClick={e => { e.stopPropagation(); setTShowScripts(p => ({ ...p, [idx]: !p[idx] })); }}
                 style={{ flex: 1, padding: "5px 0", background: tShowScripts[idx] ? "rgba(99,102,241,0.15)" : "rgba(255,255,255,0.04)", color: tShowScripts[idx] ? "#a5b4fc" : "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer" }}>📝</button>
-              <button onClick={e => { e.stopPropagation(); if (onSelectConv) onSelectConv(conv); }}
-                style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer" }}>🔍</button>
+              {_standalone && _onSendMedia && <button onClick={e => { e.stopPropagation(); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onSendMedia(idx); }}
+                style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer" }} title="Média">📸</button>}
+              {_standalone && _onCreateTx && <button onClick={e => { e.stopPropagation(); window._tlgProSlotsRef = window._tlgProSlotsRef || {}; window._tlgProSlotsRef[idx] = conv; _onCreateTx(idx); }}
+                style={{ flex: 1, padding: "5px 0", background: "rgba(16,185,129,0.15)", color: "#10b981", border: "none", borderRadius: 5, fontSize: 11, fontWeight: 800, cursor: "pointer" }} title="Transaction">+TX</button>}
+              {onSelectConv && <button onClick={e => { e.stopPropagation(); onSelectConv(conv); }}
+                style={{ flex: 1, padding: "5px 0", background: "rgba(255,255,255,0.04)", color: "#6b7280", border: "none", borderRadius: 5, fontSize: 11, cursor: "pointer" }}>🔍</button>}
             </div>
 
             {/* Input + Send */}
@@ -29835,6 +29839,207 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
         .grid-slot-scroller::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); border-radius: 3px; }
         .grid-slot-scroller::-webkit-scrollbar-thumb { background: #6366f1; border-radius: 3px; }
       ` }} />
+    </div>
+  );
+};
+
+// =====================================================================
+// TLG PRO STANDALONE PAGE — Fenetre separee avec tous les boutons
+// =====================================================================
+const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles = [], txs = [] }) => {
+  const addToast = useToast();
+
+  const [conversations, setConversations] = useState([]);
+  const [convLoading, setConvLoading]     = useState(true);
+  const [txModalSlot, setTxModalSlot]     = useState(null);
+  const [txForm, setTxForm]               = useState({ amount: "", currency: "CHF", method: "crypto", note: "" });
+  const [txSending, setTxSending]         = useState(false);
+  const [mediaSlot, setMediaSlot]         = useState(null);
+  const [pendingMedia, setPendingMedia]   = useState(null);
+  const [mediaSending, setMediaSending]   = useState(false);
+  const mediaInputRef = React.useRef(null);
+
+  const convTotalsMap = React.useMemo(() => {
+    const map = {};
+    const handleToTgId = {};
+    const idToTgId = {};
+    (spenders || []).forEach(sp => {
+      const tgId = String(sp.tg_user_id || sp.telegram_id || "");
+      if (!tgId) return;
+      if (sp.handle) handleToTgId[String(sp.handle).toLowerCase()] = tgId;
+      if (sp.name) handleToTgId[String(sp.name).toLowerCase()] = tgId;
+      if (sp.id) idToTgId[sp.id] = tgId;
+    });
+    (txs || []).forEach(tx => {
+      const isValid = ["validated","validée","confirmee","payee"].includes(tx.status);
+      if (!isValid) return;
+      const amt = Number(tx.amount || 0);
+      if (!amt) return;
+      let tgId = null;
+      if (tx.spender_id) tgId = idToTgId[tx.spender_id];
+      if (!tgId && tx.spender_handle) tgId = handleToTgId[String(tx.spender_handle).toLowerCase()];
+      if (!tgId) return;
+      map[tgId] = (map[tgId] || 0) + amt;
+    });
+    return map;
+  }, [spenders, txs]);
+
+  useEffect(() => {
+    (async () => {
+      setConvLoading(true);
+      try {
+        const data = await _dmsgFetch("/conversations", { timeout: 15000 });
+        const list = Array.isArray(data) ? data : data.conversations || data.data || [];
+        setConversations(list);
+      } catch (err) {
+        console.error("[TLG_PRO_STANDALONE] Load error:", err);
+      }
+      setConvLoading(false);
+    })();
+  }, []);
+
+  const getSlotConv = (slot) => {
+    if (!slot || !slot._tlgSlots) return null;
+    return slot;
+  };
+
+  const handleCreateTx = async () => {
+    if (txModalSlot === null) return;
+    const convRef = window._tlgProSlotsRef?.[txModalSlot];
+    if (!convRef) { addToast("Slot invalide", "error"); return; }
+    const amt = parseFloat(txForm.amount);
+    if (!amt || amt <= 0) { addToast("Montant invalide", "error"); return; }
+    setTxSending(true);
+    try {
+      const cid = _dmsgChatId(convRef);
+      const sp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === String(cid));
+      await sb.from("transactions").insert({
+        spender_id: sp?.id || null,
+        amount: amt,
+        currency: txForm.currency,
+        method: txForm.method,
+        status: "pending",
+        notes: txForm.note || "",
+        model_id: convRef.model_id || null,
+        tg_chat_id: String(cid),
+      });
+      addToast(`TX ${amt} ${txForm.currency} créée`, "success");
+      setTxModalSlot(null);
+      setTxForm({ amount: "", currency: "CHF", method: "crypto", note: "" });
+    } catch (err) {
+      addToast("Erreur TX : " + err.message, "error");
+    }
+    setTxSending(false);
+  };
+
+  const handleSendMedia = async () => {
+    if (mediaSlot === null || !pendingMedia) return;
+    const convRef = window._tlgProSlotsRef?.[mediaSlot];
+    if (!convRef) return;
+    setMediaSending(true);
+    try {
+      const cid = _dmsgChatId(convRef);
+      let uploadFile = pendingMedia.file;
+      const ext = uploadFile.name.split(".").pop() || "jpg";
+      const path = `tlgpro/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const { error: upErr } = await sb.storage.from("media-library").upload(path, uploadFile, { upsert: false, contentType: uploadFile.type });
+      if (upErr) throw upErr;
+      const { data: urlData } = sb.storage.from("media-library").getPublicUrl(path);
+      const mediaUrl = urlData.publicUrl;
+      const isVideo = uploadFile.type.startsWith("video/");
+      const ep = isVideo ? "/send-video" : "/send-photo";
+      const bodyKey = isVideo ? "video_url" : "photo_url";
+      await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: cid, [bodyKey]: mediaUrl, caption: "", model_id: convRef.model_id || "" }), timeout: isVideo ? 120000 : 30000 });
+      addToast("Média envoyé", "success");
+      setMediaSlot(null);
+      setPendingMedia(null);
+    } catch (err) {
+      addToast("Erreur média : " + err.message, "error");
+    }
+    setMediaSending(false);
+  };
+
+  if (convLoading) {
+    return (
+      <div style={{ width: "100vw", height: "100vh", background: "#0a0b0f", display: "flex", alignItems: "center", justifyContent: "center", color: "#6366f1", fontSize: 18, fontWeight: 700 }}>
+        ⚡ TLG Pro — Chargement conversations…
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ width: "100vw", height: "100vh", display: "flex", flexDirection: "column", background: "#0a0b0f", overflow: "hidden" }}>
+      <TlgProSubpage
+        conversations={conversations}
+        convTotalsMap={convTotalsMap}
+        models={models}
+        lang={lang}
+        user={user}
+        onSelectConv={null}
+        _standalone={true}
+        _onCreateTx={(slotIdx) => setTxModalSlot(slotIdx)}
+        _onSendMedia={(slotIdx) => { setMediaSlot(slotIdx); setTimeout(() => mediaInputRef.current?.click(), 50); }}
+      />
+
+      {/* TX Modal */}
+      {txModalSlot !== null && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setTxModalSlot(null)}>
+          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 380, border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 16px", color: "#fff", fontSize: 16, fontWeight: 800 }}>💰 Nouvelle Transaction</h3>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, display: "block", marginBottom: 4 }}>MONTANT</label>
+              <input type="number" value={txForm.amount} onChange={e => setTxForm(p => ({ ...p, amount: e.target.value }))} placeholder="0.00"
+                style={{ width: "100%", padding: 10, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, color: "#fff", fontSize: 16, fontWeight: 700, outline: "none", boxSizing: "border-box" }} />
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, display: "block", marginBottom: 4 }}>DEVISE</label>
+                <select value={txForm.currency} onChange={e => setTxForm(p => ({ ...p, currency: e.target.value }))}
+                  style={{ width: "100%", padding: 8, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, color: "#fff", fontSize: 13, outline: "none" }}>
+                  <option value="CHF">CHF</option><option value="EUR">EUR</option><option value="USD">USD</option>
+                </select>
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, display: "block", marginBottom: 4 }}>MÉTHODE</label>
+                <select value={txForm.method} onChange={e => setTxForm(p => ({ ...p, method: e.target.value }))}
+                  style={{ width: "100%", padding: 8, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, color: "#fff", fontSize: 13, outline: "none" }}>
+                  <option value="crypto">Crypto</option><option value="paypal">PayPal</option><option value="revolut">Revolut</option><option value="twint">Twint</option>
+                </select>
+              </div>
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ color: "#9ca3af", fontSize: 11, fontWeight: 700, display: "block", marginBottom: 4 }}>NOTE</label>
+              <input value={txForm.note} onChange={e => setTxForm(p => ({ ...p, note: e.target.value }))} placeholder="Optionnel"
+                style={{ width: "100%", padding: 8, background: "rgba(0,0,0,0.3)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, color: "#fff", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setTxModalSlot(null)} style={{ flex: 1, padding: 10, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Annuler</button>
+              <button onClick={handleCreateTx} disabled={txSending} style={{ flex: 1, padding: 10, background: txSending ? "#4b5563" : "#10b981", color: "#fff", border: "none", borderRadius: 8, fontWeight: 800, cursor: txSending ? "not-allowed" : "pointer" }}>{txSending ? "⏳…" : "✅ Créer TX"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Media upload */}
+      <input ref={mediaInputRef} type="file" accept="image/*,video/*" style={{ display: "none" }} onChange={e => {
+        const file = e.target.files?.[0];
+        if (file) { setPendingMedia({ file, type: file.type.startsWith("video/") ? "video" : "photo", name: file.name }); }
+        e.target.value = "";
+      }} />
+      {pendingMedia && mediaSlot !== null && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => { setPendingMedia(null); setMediaSlot(null); }}>
+          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 380, border: "2px solid rgba(99,102,241,0.3)" }} onClick={e => e.stopPropagation()}>
+            <h3 style={{ margin: "0 0 12px", color: "#fff", fontSize: 16, fontWeight: 800 }}>📸 Envoyer média</h3>
+            <div style={{ padding: 12, background: "rgba(0,0,0,0.3)", borderRadius: 8, marginBottom: 16, fontSize: 13, color: "#d1d5db" }}>
+              {pendingMedia.type === "video" ? "🎥" : "🖼️"} {pendingMedia.name}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => { setPendingMedia(null); setMediaSlot(null); }} style={{ flex: 1, padding: 10, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Annuler</button>
+              <button onClick={handleSendMedia} disabled={mediaSending} style={{ flex: 1, padding: 10, background: mediaSending ? "#4b5563" : "#6366f1", color: "#fff", border: "none", borderRadius: 8, fontWeight: 800, cursor: mediaSending ? "not-allowed" : "pointer" }}>{mediaSending ? "⏳…" : "📤 Envoyer"}</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
@@ -34916,7 +35121,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         <button onClick={() => setActiveTab("conversations")} style={tabNavStyle("conversations")}>💬 Conversations</button>
         <button onClick={() => setActiveTab("grid")} style={tabNavStyle("grid")}>📺 Grid Pro</button>
         <button onClick={() => setActiveTab("gridpremium")} style={tabNavStyle("gridpremium")}>⭐ Grid Premium</button>
-        <button onClick={() => setActiveTab("tlgpro")} style={tabNavStyle("tlgpro")}>⚡ TLG Pro</button>
+        <button onClick={() => window.open('/#/messagerie-tlg-pro', '_blank', 'width=1920,height=1080')}
+          style={{ marginLeft: 4, padding: "6px 14px", borderRadius: 8, border: "1px solid rgba(99,102,241,0.3)", background: "linear-gradient(135deg,rgba(99,102,241,0.15),rgba(129,140,248,0.1))", color: "#818cf8", fontSize: 12, fontWeight: 700, cursor: "pointer", transition: "all 0.2s", whiteSpace: "nowrap" }}>⚡ TLG Pro</button>
         <button onClick={() => setActiveTab("dadacast")} style={tabNavStyle("dadacast")}>📡 Dadacast</button>
         {isManager && <button onClick={() => setActiveTab("ressources")} style={tabNavStyle("ressources")}>🎬 Ressources</button>}
         {isManager && <button onClick={() => setActiveTab("gestion")} style={tabNavStyle("gestion")}>⚙️ Gestion</button>}
@@ -34953,7 +35159,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           )}
           {activeTab === "grid" && <GridMessagerieSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
           {activeTab === "gridpremium" && <GridPremiumSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
-          {activeTab === "tlgpro" && <TlgProSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
           {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
           {activeTab === "ressources" && isManager && <RessourcesPage user={user} lang={lang} />}
           {activeTab === "gestion" && <GestionSubpage models={models} lang={lang} user={user} />}
@@ -34977,7 +35182,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         )}
         {activeTab === "grid" && <GridMessagerieSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
         {activeTab === "gridpremium" && <GridPremiumSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
-        {activeTab === "tlgpro" && <TlgProSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} onSelectConv={(conv) => { setActiveTab("conversations"); setTimeout(() => selectConv(conv), 150); }} />}
         {activeTab === "dadacast" && <DadacastSubpage conversations={conversations} convTotalsMap={convTotalsMap} models={models} lang={lang} user={user} />}
         {activeTab === "ressources" && isManager && <RessourcesPage user={user} lang={lang} />}
         {activeTab === "gestion" && <GestionSubpage models={models} lang={lang} user={user} />}
@@ -51271,6 +51475,11 @@ const App = () => {
         _setTab("messagerie-grid");
         window.history.replaceState({tab: "messagerie-grid"}, "", `#/messagerie-grid`);
       }
+      // Route: /#/messagerie-tlg-pro → TLG Pro fullscreen grid
+      else if (hash === "/messagerie-tlg-pro" || hash === "messagerie-tlg-pro") {
+        _setTab("messagerie-tlg-pro");
+        window.history.replaceState({tab: "messagerie-tlg-pro"}, "", `#/messagerie-tlg-pro`);
+      }
       // Deep link: /#/spenders/:uuid → clean URL and let the global modal handle it
       else if (/^\/spenders\/[0-9a-f-]{8,}$/i.test(hash)) {
         const def = (user && user.role === "gerant") ? "business" : (user && DEFAULT_TAB[user.role]) || "dashboard";
@@ -52449,6 +52658,18 @@ const App = () => {
       <CurrencyContext.Provider value={currencyCtx}>
       <TimezoneContext.Provider value={timezone}>
         <MessagerieGridApp user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />
+      </TimezoneContext.Provider>
+      </CurrencyContext.Provider>
+    );
+  }
+
+  if (tab === "messagerie-tlg-pro") {
+    return (
+      <CurrencyContext.Provider value={currencyCtx}>
+      <TimezoneContext.Provider value={timezone}>
+      <ToastProvider>
+        <TlgProStandalonePage user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} />
+      </ToastProvider>
       </TimezoneContext.Provider>
       </CurrencyContext.Provider>
     );
