@@ -29357,7 +29357,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
 // =====================================================================
 // TLG PRO — Telegram Pro Grid : input dans chaque slot
 // =====================================================================
-const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia, _onShowInfo, _onMediaLib, _onTxHist, spenders = [] }) => {
+const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv, _standalone, _onCreateTx, _onSendMedia, _onShowInfo, _onMediaLib, _onTxHist, spenders = [], txs = [] }) => {
   const addToast = useToast();
 
   const [tLayout, setTLayout]           = useState("3x3");
@@ -29375,6 +29375,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const [tPickSlotIdx, setTPickSlotIdx] = useState(null);
   const [tPickFilter, setTPickFilter] = useState("all");
   const [tPickSearch, setTPickSearch] = useState("");
+  const [tSmartLoading, setTSmartLoading] = useState(false);
 
   const tTogglePopup = (idx, type) => {
     setTPopup(p => ({ ...p, [idx]: p[idx] === type ? null : type }));
@@ -29442,6 +29443,142 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   }, [tUnreadSorted, tLayoutCfg.slots]);
 
   useEffect(() => { tLoadUnread(); }, [tLoadUnread]);
+
+  // ── Smart Load: scoring + fill empty slots ──
+  const tCalcSmartScore = (conv, sp, hoursAgo) => {
+    let score = 0;
+    const dir = conv.last_message_direction || conv.last_direction || "";
+    const senderType = (conv.last_sender_type || conv.last_from || "").toLowerCase();
+    const isOutgoing = dir === "out" || senderType === "bot" || senderType === "chatter" || senderType === "gerant";
+    const isIncoming = dir === "in" || dir === "incoming" || senderType === "user" || senderType === "client" || senderType === "fan" || senderType === "spender";
+    const lastText = (conv.last_message || conv.preview || "").toLowerCase();
+
+    // Critère 1: Proposition de prix sans réponse (+60 max)
+    if (isOutgoing && hoursAgo >= 2 && hoursAgo <= 72) {
+      const priceRx = /(\d+)\s*[\.\-]*\s*(chf|francs?|fr\.?|€|\$)/i;
+      const priceKw = ["prix", "pack", "offre", "promo", "spécial", ".-", "vidéo", "photo", "sextape", "custom", "pour toi"];
+      const hasPrice = priceRx.test(lastText) || priceKw.some(kw => lastText.includes(kw)) || /\b\d{2,3}\b/.test(lastText);
+      if (hasPrice) {
+        if (hoursAgo <= 12) score += 60;
+        else if (hoursAgo <= 24) score += 50;
+        else if (hoursAgo <= 48) score += 40;
+        else score += 30;
+      }
+    }
+
+    // Critère 2: Dernier msg sortant sans réponse (pas prix) (+35)
+    if (isOutgoing && hoursAgo >= 12 && hoursAgo <= 72 && score === 0) {
+      score += 35;
+    }
+
+    // Critère 3: Haut LTV qui revient (+40 max)
+    const ltv = convTotalsMap[String(_dmsgChatId(conv) || "")] ?? Number(conv.total_spent || sp?.total_spent || sp?.ltv || 0);
+    if (isIncoming && hoursAgo < 48 && ltv > 50) {
+      if (ltv > 200) score += 40;
+      else if (ltv > 100) score += 35;
+      else score += 30;
+    }
+
+    // Critère 4: Message entrant sans réponse (+25 max)
+    if (isIncoming && hoursAgo < 48) {
+      if (hoursAgo < 2) score += 25;
+      else if (hoursAgo < 12) score += 20;
+      else if (hoursAgo < 24) score += 15;
+      else score += 10;
+    }
+
+    // Critère 5: TX pending (+20)
+    if (sp?.id && hoursAgo < 168) {
+      const hasPending = (txs || []).some(tx => tx.status === "pending" && tx.spender_id === sp.id);
+      if (hasPending) score += 20;
+    }
+
+    // Critère 6: Nouveau lead (+15)
+    const isNew = (conv.message_count || 999) < 5 || sp?.classification === "new" || sp?.status === "lead" || sp?.badge === "LEAD";
+    if (isNew && hoursAgo < 168) score += 15;
+
+    return score;
+  };
+
+  const tLoadSmart = async () => {
+    const emptyIdxs = [];
+    const currentSlots = [...tSlots];
+    for (let i = 0; i < tLayoutCfg.slots; i++) {
+      if (i >= currentSlots.length) currentSlots.push(null);
+      if (!currentSlots[i]) emptyIdxs.push(i);
+    }
+    if (emptyIdxs.length === 0) { addToast("Aucune case vide", "info"); return; }
+
+    setTSmartLoading(true);
+    try {
+      // Fetch fresh conversations
+      let allConvs = conversations;
+      if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < 30000) {
+        allConvs = _DMSG_CONV_CACHE.list;
+      } else {
+        try {
+          const data = await _dmsgFetch("/conversations", { timeout: 15000 });
+          const list = Array.isArray(data) ? data : data.conversations || data.data || [];
+          if (list.length > 0) { _DMSG_CONV_CACHE.list = list; _DMSG_CONV_CACHE.ts = Date.now(); allConvs = list; }
+        } catch (_) {}
+      }
+
+      const now = Date.now();
+      const openCids = currentSlots.filter(Boolean).map(c => String(_dmsgChatId(c)));
+
+      // Apply model filter
+      let pool = allConvs.filter(c => {
+        const cid = String(_dmsgChatId(c));
+        if (openCids.includes(cid)) return false;
+        const lastAt = c.last_message_at || c.updated_at;
+        if (!lastAt) return false;
+        const daysAgo = (now - new Date(lastAt).getTime()) / (1000 * 60 * 60 * 24);
+        if (daysAgo > 30) return false;
+        return true;
+      });
+
+      if (tModelFilter !== "all") {
+        const target = models.find(m => (m.name || "").toLowerCase() === tModelFilter);
+        if (target) pool = pool.filter(c => c.model_id === target.id);
+      }
+
+      // Score each conversation
+      const scored = pool.map(conv => {
+        const cid = String(_dmsgChatId(conv) || "");
+        const sp = (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === cid);
+        const lastAt = conv.last_message_at || conv.updated_at;
+        const hoursAgo = lastAt ? (now - new Date(lastAt).getTime()) / (1000 * 60 * 60) : 9999;
+        const score = tCalcSmartScore(conv, sp, hoursAgo);
+        return { conv, score, lastAt };
+      });
+
+      // Sort by score DESC, then by recency
+      scored.sort((a, b) => b.score - a.score || new Date(b.lastAt || 0) - new Date(a.lastAt || 0));
+
+      // Pick top N for empty slots
+      const picks = scored.slice(0, emptyIdxs.length);
+
+      if (picks.length === 0) {
+        addToast("Toutes les conversations prioritaires sont déjà traitées 🎉", "success");
+        setTSmartLoading(false);
+        return;
+      }
+
+      // Fill empty slots
+      const newSlots = [...currentSlots];
+      picks.forEach((p, i) => {
+        if (i < emptyIdxs.length) newSlots[emptyIdxs[i]] = p.conv;
+      });
+      setTSlots(newSlots);
+      if (tActiveSlot === null && picks.length > 0) setTActiveSlot(emptyIdxs[0]);
+
+      const topScore = picks[0]?.score || 0;
+      addToast(`${picks.length} conv${picks.length > 1 ? "s" : ""} chargée${picks.length > 1 ? "s" : ""} (score max: ${topScore})`, "success");
+    } catch (err) {
+      addToast("Erreur Smart Load: " + err.message, "error");
+    }
+    setTSmartLoading(false);
+  };
 
   const tLoadMsgs = React.useCallback(async (conv, idx, silent) => {
     if (!conv) return;
@@ -29598,6 +29735,12 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
           <button onClick={tLoadUnread}
             style={{ padding: "6px 12px", background: "linear-gradient(135deg,#10b981,#059669)", color: "#fff", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
             <span>🔄</span><span>Load Unread</span>
+          </button>
+          <button onClick={tLoadSmart} disabled={tSmartLoading}
+            style={{ padding: "6px 12px", background: tSmartLoading ? "#4b5563" : "linear-gradient(135deg,#7c3aed,#4f46e5)", color: "#fff", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 11, cursor: tSmartLoading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", gap: 5, transition: "filter 0.15s" }}
+            onMouseEnter={e => { if (!tSmartLoading) e.currentTarget.style.filter = "brightness(1.15)"; }}
+            onMouseLeave={e => e.currentTarget.style.filter = ""}>
+            <span>⚡</span><span>{tSmartLoading ? "Chargement…" : "Load Smart"}</span>
           </button>
         </div>
       </div>
@@ -30187,6 +30330,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         _onMediaLib={(slotIdx) => openMediaLib(slotIdx)}
         _onTxHist={(slotIdx) => openTxHist(slotIdx)}
         spenders={spenders}
+        txs={txs}
       />
 
       {/* TX Modal — Complete version */}
