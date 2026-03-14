@@ -4571,13 +4571,22 @@
       if (!window.supabase || !window.supabase.createClient) {
         throw new Error("Supabase JS library not loaded. Check CDN or network.");
       }
+      /* SAFARI FIX — custom storage adapter: safe for Safari private browsing (localStorage throws)
+         and prevents any hidden lock usage in Supabase internals */
+      var _safariSafeStorage = {
+        getItem: function(key) { try { return localStorage.getItem(key); } catch(e) { return null; } },
+        setItem: function(key, value) { try { localStorage.setItem(key, value); } catch(e) {} },
+        removeItem: function(key) { try { localStorage.removeItem(key); } catch(e) {} }
+      };
       window.sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
         auth: {
           lock: false,
           persistSession: true,
           storageKey: 'dadash-auth',
+          storage: _safariSafeStorage,
           autoRefreshToken: true,
-          detectSessionInUrl: false
+          detectSessionInUrl: false,
+          flowType: 'implicit'
         }
       });
       window.__sbReady = true;
@@ -52576,6 +52585,37 @@ const App = () => {
     }, 3000);
     return () => { clearTimeout(timer); clearTimeout(forceTimer); };
   }, [loading]);
+
+  /* SAFARI FIX — onAuthStateChange: auto-recover user if session resolves late
+     (e.g. after the 3s force-bypass showed the login page, if getSession eventually completes,
+     this listener catches the SIGNED_IN event and logs the user in automatically) */
+  useEffect(() => {
+    const { data: { subscription } } = sb.auth.onAuthStateChange(async (event, session) => {
+      if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session && !user) {
+        try {
+          const { data: profile } = await sb.from("profiles").select("*").eq("id", session.user.id).single();
+          if (profile) {
+            const fullUser = { ...profile, email: session.user.email };
+            console.log("[SAFARI FIX] onAuthStateChange recovered user:", event);
+            setUser(fullUser);
+            if (fullUser.role === "provider") _setTab("provider_dashboard");
+            if (fullUser.role === "modele") _setTab("model_checklist");
+            setLoading(false);
+            setDataLoading(true);
+            loadData(fullUser).catch(e => {
+              console.error("[DADASH] onAuthStateChange loadData failed:", e.message || e);
+            }).finally(() => setDataLoading(false));
+          }
+        } catch (e) {
+          console.warn("[AUTH] onAuthStateChange profile fetch failed:", e?.message);
+        }
+      }
+      if (event === 'SIGNED_OUT') {
+        setUser(null);
+      }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
   // Keep global _tz in sync with state
   useEffect(() => { _tz.current = timezone; }, [timezone]);
