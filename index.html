@@ -30651,10 +30651,15 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
 
   const refreshRef = useRef(null);
   const msgsEndRef = useRef(null);
+  const msgsAreaRef = useRef(null);
   const inputRef = useRef(null);
   const mountedRef = useRef(true);
   const currentChatIdRef = useRef(null);
-  const processedIdsRef = useRef(new Set());
+  const currentIdxRef = useRef(0);
+  const unreadConvsRef = useRef([]);
+  const lastUnreadCountRef = useRef(0);
+  const isEmptyRef = useRef(false);
+  const refreshInFlightRef = useRef(false);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => { if (msgsEndRef.current) msgsEndRef.current.scrollIntoView({ behavior: "smooth" }); }, 100);
@@ -30703,78 +30708,172 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     return d.toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" }) + " " + d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
   }, []);
 
-  const loadMessages = useCallback(async (chatId) => {
+  const isUserNearBottom = useCallback(() => {
+    const el = msgsAreaRef.current;
+    if (!el) return true;
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - 60;
+  }, []);
+
+  const loadMessages = useCallback(async (chatId, isSilent = false) => {
     if (!chatId) return;
-    setMsgLoading(true);
+    if (!isSilent) setMsgLoading(true);
+
+    const wasNearBottom = isUserNearBottom();
+    const prevScrollTop = msgsAreaRef.current?.scrollTop || 0;
+    const prevScrollHeight = msgsAreaRef.current?.scrollHeight || 0;
+
     try {
       const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=30", { timeout: 8000 });
       if (!mountedRef.current) return;
+      if (String(currentChatIdRef.current) !== String(chatId)) return;
+
       const raw = Array.isArray(data) ? data : data.messages || data.data || [];
       const sorted = [...raw].sort((a, b) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
       setMessages(sorted);
-      scrollToBottom();
+
+      if (isSilent) {
+        setTimeout(() => {
+          const el = msgsAreaRef.current;
+          if (!el) return;
+          if (wasNearBottom) {
+            el.scrollTop = el.scrollHeight;
+          } else {
+            const heightDiff = el.scrollHeight - prevScrollHeight;
+            el.scrollTop = prevScrollTop + heightDiff;
+          }
+        }, 50);
+      } else {
+        scrollToBottom();
+      }
     } catch (err) {
       console.error("[TINDADA] Load messages error:", err);
     } finally {
-      if (mountedRef.current) setMsgLoading(false);
+      if (!isSilent && mountedRef.current) setMsgLoading(false);
     }
-  }, [scrollToBottom]);
+  }, [scrollToBottom, isUserNearBottom]);
 
   const loadUnread = useCallback(async (isRefresh = false) => {
+    if (isRefresh && refreshInFlightRef.current) return;
+    if (isRefresh) refreshInFlightRef.current = true;
+
     try {
       const data = await _dmsgFetch("/conversations", { timeout: 15000 });
       if (!mountedRef.current) return;
       const list = Array.isArray(data) ? data : data.conversations || data.data || [];
-      const unreads = list.filter(c => (c.unread_count || 0) > 0 && !processedIdsRef.current.has(String(_dmsgChatId(c))));
+      const freshUnreads = list.filter(c => (c.unread_count || 0) > 0);
 
-      unreads.sort((a, b) => {
-        const lA = Number(a.total_spent || 0);
-        const lB = Number(b.total_spent || 0);
-        return lB - lA;
-      });
+      freshUnreads.sort((a, b) => Number(b.total_spent || 0) - Number(a.total_spent || 0));
 
       if (isRefresh) {
-        setUnreadConvs(prev => {
-          const existingIds = new Set(prev.map(c => String(_dmsgChatId(c))));
-          const newConvs = unreads.filter(c => !existingIds.has(String(_dmsgChatId(c))));
+        // --- REFRESH MERGE : ne JAMAIS casser la conv actuelle ---
+        const prev = unreadConvsRef.current;
+        const curCid = currentChatIdRef.current;
+        const curIdx = currentIdxRef.current;
 
-          if (newConvs.length > 0) {
-            console.log("[TINDADA] " + newConvs.length + " nouvelles conversations non lues");
-            showToast(newConvs.length + " nouveau" + (newConvs.length > 1 ? "x" : "") + " non lu" + (newConvs.length > 1 ? "s" : "") + " !");
-            return [...prev, ...newConvs];
+        // 1) Conversations totalement nouvelles (jamais vues dans la stack)
+        const existingIds = new Set(prev.map(c => String(_dmsgChatId(c))));
+        const brandNewConvs = freshUnreads.filter(c => !existingIds.has(String(_dmsgChatId(c))));
+
+        // 2) Conversations déjà swipées (index < curIdx) qui ont de NOUVEAUX non lus
+        //    = le spender a répondu après qu'on l'ait traité → re-ajouter en fin de stack
+        const comebackConvs = [];
+        const futureIds = new Set();
+        for (let i = curIdx; i < prev.length; i++) {
+          futureIds.add(String(_dmsgChatId(prev[i])));
+        }
+        for (const fc of freshUnreads) {
+          const fcId = String(_dmsgChatId(fc));
+          if (existingIds.has(fcId) && !futureIds.has(fcId)) {
+            comebackConvs.push(fc);
+          }
+        }
+
+        const toAdd = [...brandNewConvs, ...comebackConvs];
+        let updated = prev;
+
+        if (toAdd.length > 0) {
+          const addedNew = brandNewConvs.length;
+          const addedBack = comebackConvs.length;
+          updated = [...prev, ...toAdd];
+          unreadConvsRef.current = updated;
+          setUnreadConvs(updated);
+
+          if (addedNew > 0) {
+            console.log("[TINDADA] " + addedNew + " nouvelles conversations non lues détectées");
+          }
+          if (addedBack > 0) {
+            console.log("[TINDADA] " + addedBack + " conversation(s) revenue(s) avec nouveaux messages");
           }
 
-          // Also check if current conversation has new messages
-          const curCid = currentChatIdRef.current;
-          if (curCid) {
-            const freshConv = unreads.find(c => String(_dmsgChatId(c)) === String(curCid));
-            if (freshConv && (freshConv.unread_count || 0) > 0) {
-              loadMessages(curCid);
+          const totalAdded = toAdd.length;
+          showToast(totalAdded + " nouveau" + (totalAdded > 1 ? "x" : "") + " non lu" + (totalAdded > 1 ? "s" : "") + " !");
+
+          if (isEmptyRef.current) {
+            const firstNew = toAdd[0];
+            const firstCid = _dmsgChatId(firstNew);
+            currentChatIdRef.current = firstCid;
+            currentIdxRef.current = prev.length;
+            lastUnreadCountRef.current = firstNew.unread_count || 0;
+            setCurrentIdx(prev.length);
+            setIsEmpty(false);
+            isEmptyRef.current = false;
+            loadMessages(firstCid);
+          }
+        }
+
+        // 3) Conversation actuelle : vérifier nouveaux messages (silent reload)
+        if (curCid) {
+          const freshCurrent = freshUnreads.find(c => String(_dmsgChatId(c)) === String(curCid));
+          if (freshCurrent) {
+            const freshCount = freshCurrent.unread_count || 0;
+            const prevCount = lastUnreadCountRef.current;
+
+            if (freshCount > prevCount) {
+              console.log("[TINDADA] Conv actuelle: " + (freshCount - prevCount) + " nouveau(x) message(s) (" + prevCount + " -> " + freshCount + ")");
+              lastUnreadCountRef.current = freshCount;
+
+              if (curIdx < updated.length) {
+                const updatedStack = [...updated];
+                updatedStack[curIdx] = { ...updatedStack[curIdx], unread_count: freshCount };
+                unreadConvsRef.current = updatedStack;
+                setUnreadConvs(updatedStack);
+              }
+
+              loadMessages(curCid, true);
               showToast("Nouveau message reçu ! 💬");
             }
+          } else {
+            console.log("[TINDADA] Conv actuelle n'a plus de non lus — conservée jusqu'au swipe");
           }
+        }
 
-          return prev;
-        });
       } else {
-        setUnreadConvs(unreads);
-        if (unreads.length > 0) {
+        // --- PREMIER CHARGEMENT ---
+        unreadConvsRef.current = freshUnreads;
+        setUnreadConvs(freshUnreads);
+        if (freshUnreads.length > 0) {
+          currentIdxRef.current = 0;
           setCurrentIdx(0);
           setIsEmpty(false);
-          const firstCid = _dmsgChatId(unreads[0]);
+          isEmptyRef.current = false;
+          const firstCid = _dmsgChatId(freshUnreads[0]);
           currentChatIdRef.current = firstCid;
+          lastUnreadCountRef.current = freshUnreads[0].unread_count || 0;
           await loadMessages(firstCid);
         } else {
           setIsEmpty(true);
+          isEmptyRef.current = true;
         }
         setLoading(false);
       }
     } catch (err) {
       console.error("[TINDADA] Load error:", err);
       if (!isRefresh && mountedRef.current) setLoading(false);
+    } finally {
+      if (isRefresh) refreshInFlightRef.current = false;
     }
   }, [loadMessages, showToast]);
 
@@ -30813,22 +30912,27 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     setSwipping(direction);
     setTimeout(() => {
       setSwipping(null);
-      setCurrentIdx(prev => {
-        const next = prev + 1;
-        if (next >= unreadConvs.length) {
-          setIsEmpty(true);
-          currentChatIdRef.current = null;
-          setMessages([]);
-          return prev;
-        }
-        const nextConv = unreadConvs[next];
-        const nextCid = _dmsgChatId(nextConv);
-        currentChatIdRef.current = nextCid;
-        loadMessages(nextCid);
-        return next;
-      });
+      const stack = unreadConvsRef.current;
+      const next = currentIdxRef.current + 1;
+
+      if (next >= stack.length) {
+        setIsEmpty(true);
+        isEmptyRef.current = true;
+        currentChatIdRef.current = null;
+        lastUnreadCountRef.current = 0;
+        setMessages([]);
+        return;
+      }
+
+      const nextConv = stack[next];
+      const nextCid = _dmsgChatId(nextConv);
+      currentChatIdRef.current = nextCid;
+      currentIdxRef.current = next;
+      lastUnreadCountRef.current = nextConv.unread_count || 0;
+      setCurrentIdx(next);
+      loadMessages(nextCid);
     }, 400);
-  }, [unreadConvs, loadMessages]);
+  }, [loadMessages]);
 
   const handleSend = useCallback(async () => {
     if (!msgInput.trim() || !currentConv || sending) return;
@@ -30844,7 +30948,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
         timeout: 8000
       });
       setMsgInput("");
-      processedIdsRef.current.add(String(cid));
+      lastUnreadCountRef.current = 0;
       setStats(prev => ({ ...prev, treated: prev.treated + 1, streak: prev.streak + 1 }));
       showToast("Message envoyé ✅");
       goToNext("right");
@@ -30864,8 +30968,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
 
   const handleMarkRead = useCallback(async () => {
     if (!currentConv) return;
-    const cid = _dmsgChatId(currentConv);
-    processedIdsRef.current.add(String(cid));
+    lastUnreadCountRef.current = 0;
     setStats(prev => ({ ...prev, treated: prev.treated + 1, streak: prev.streak + 1 }));
     showToast("Marqué comme lu ✅");
     goToNext("right");
@@ -31037,7 +31140,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
               </div>
 
               {/* MESSAGES */}
-              <div className="tindada-messages-area">
+              <div className="tindada-messages-area" ref={msgsAreaRef}>
                 {msgLoading ? (
                   <div style={{ display: "flex", justifyContent: "center", padding: 40 }}>
                     <span className="spinner" style={{ width: 24, height: 24, borderWidth: 2 }} />
