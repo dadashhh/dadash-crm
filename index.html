@@ -170,6 +170,27 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js" defer></script>
+  <!-- Safari WebSocket crash guard — swallow WS errors globally so they NEVER crash the app -->
+  <script>
+    window.addEventListener('error', function(e) {
+      var msg = String(e && e.message || '').toLowerCase();
+      if (msg.indexOf('websocket') !== -1 || msg.indexOf('the operation is insecure') !== -1 || msg.indexOf('insecure') !== -1) {
+        console.warn('[WS-GUARD] Caught global WebSocket error (app continues normally):', e.message);
+        window.__dadashSocketWsFailed = true;
+        e.preventDefault();
+        return true;
+      }
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      var msg = String(e && e.reason && e.reason.message || e && e.reason || '').toLowerCase();
+      if (msg.indexOf('websocket') !== -1 || msg.indexOf('the operation is insecure') !== -1 || msg.indexOf('insecure') !== -1) {
+        console.warn('[WS-GUARD] Caught unhandled WebSocket rejection (app continues normally):', msg);
+        window.__dadashSocketWsFailed = true;
+        e.preventDefault();
+        return true;
+      }
+    });
+  </script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cfilter id='g'%3E%3CfeGaussianBlur stdDeviation='1' result='blur'/%3E%3C/filter%3E%3Cpath d='M4 2 L4 18 L8 14 L12 22 L14 21 L10 13 L16 13 Z' fill='%236366f1' filter='url(%23g)' opacity='0.5'/%3E%3Cpath d='M4 2 L4 18 L8 14 L12 22 L14 21 L10 13 L16 13 Z' fill='%23fff' stroke='%236366f1' stroke-width='1'/%3E%3C/svg%3E") 4 2, default; }
     html { scroll-behavior: smooth; }
@@ -7548,8 +7569,21 @@ const _formatRelTime = (ts) => {
 // =============================================
 class ErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = {hasError:false, error:null, info:null}; }
-  static getDerivedStateFromError(error) { return {hasError:true, error}; }
+  static getDerivedStateFromError(error) {
+    // Never crash the app for WebSocket/Socket errors — these are handled gracefully via polling fallback
+    const msg = String(error?.message || error || "").toLowerCase();
+    if (msg.includes("websocket") || msg.includes("socket") || msg.includes("the operation is insecure") || msg.includes("insecure")) {
+      console.warn("[ErrorBoundary] Swallowed WebSocket error (polling fallback active):", error?.message || error);
+      return null; // do NOT set hasError — let the app continue
+    }
+    return {hasError:true, error};
+  }
   componentDidCatch(error, info) {
+    const msg = String(error?.message || error || "").toLowerCase();
+    if (msg.includes("websocket") || msg.includes("socket") || msg.includes("the operation is insecure") || msg.includes("insecure")) {
+      console.warn("[ErrorBoundary] Swallowed WebSocket error in componentDidCatch");
+      return; // do NOT show error screen
+    }
     this.setState({info});
     console.error("[ErrorBoundary]", this.props.name||"App", error, info?.componentStack||"");
   }
@@ -52602,12 +52636,21 @@ const App = () => {
   }, [user]);
 
   // ═══ GLOBAL WEBSOCKET — init at boot so _emitTxEvent works from ANY tab ═══
+  // Safari-safe: detects WebSocket restrictions and falls back to polling-only
   useEffect(() => {
     if (!user) return;
     if (window.__dadashSocket && window.__dadashSocket.connected) return;
+
+    // Safari detection — Safari is stricter with WebSocket (blocks ws:// and sometimes wss://)
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    // If WebSocket previously failed, force polling-only
+    const wsBlocked = window.__dadashSocketWsFailed === true;
+    const transports = (isSafari || wsBlocked) ? ['polling'] : ['polling', 'websocket'];
+
     try {
       const socket = io(CARLOS_WS_URL, {
-        transports: ['polling', 'websocket'],
+        transports: transports,
+        upgrade: !(isSafari || wsBlocked), // don't try upgrading to WS if blocked
         secure: true,
         rejectUnauthorized: false,
         reconnection: true,
@@ -52619,7 +52662,15 @@ const App = () => {
         console.log('[SOCKET] Connected successfully via', socket.io.engine.transport.name);
       });
       socket.on('connect_error', (error) => {
-        console.warn('[SOCKET] Connection error, using fallback:', error.message);
+        const msg = String(error?.message || "").toLowerCase();
+        if (msg.includes("websocket") || msg.includes("insecure")) {
+          console.warn('[SOCKET] WebSocket blocked (Safari?), forcing polling-only:', error.message);
+          window.__dadashSocketWsFailed = true;
+          // Reconfigure to polling-only to prevent further WS attempts
+          try { socket.io.opts.transports = ['polling']; } catch (_) {}
+        } else {
+          console.warn('[SOCKET] Connection error, using fallback:', error.message);
+        }
       });
       socket.on('disconnect', (reason) => {
         console.log('[SOCKET] Disconnected:', reason);
@@ -52627,8 +52678,20 @@ const App = () => {
       socket.on('reconnect', (attempt) => {
         console.log('[SOCKET] Reconnected after', attempt, 'attempts');
       });
+      // Catch upgrade errors (when polling→websocket upgrade fails in Safari)
+      socket.io.on('error', (error) => {
+        const msg = String(error?.message || error || "").toLowerCase();
+        if (msg.includes("websocket") || msg.includes("insecure")) {
+          console.warn('[SOCKET] Engine error (WebSocket blocked), staying on polling:', error);
+          window.__dadashSocketWsFailed = true;
+          try { socket.io.opts.transports = ['polling']; socket.io.opts.upgrade = false; } catch (_) {}
+        }
+      });
     } catch (e) {
-      console.warn('[WS-GLOBAL] Erreur init socket:', e);
+      console.warn('[WS-GLOBAL] Erreur init socket (using app without realtime):', e?.message || e);
+      window.__dadashSocket = null;
+      window.__dadashSocketWsFailed = true;
+      // App continues without realtime — existing polling intervals in components handle data refresh
     }
     return () => {
       if (window.__dadashSocket) {
