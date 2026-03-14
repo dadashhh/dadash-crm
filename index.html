@@ -29361,8 +29361,110 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const addToast = useToast();
 
   const [tLayout, setTLayout]           = useState("3x3");
-  const [tModelFilter, setTModelFilter] = useState("all");
-  const [tSlots, setTSlots]             = useState([]);
+
+  // ── Multi-tab state ──
+  const _defaultTabs = () => ({
+    all:    [{ id: "all-1", slots: [] }],
+    carla:  [{ id: "carla-1", slots: [] }],
+    sophie: [{ id: "sophie-1", slots: [] }],
+    bella:  [{ id: "bella-1", slots: [] }],
+    nadia:  [{ id: "nadia-1", slots: [] }],
+  });
+  const [tTabs, setTTabs] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("tlg_pro_model_tabs"));
+      if (saved && saved.tabs && saved.activeTabId) return saved.tabs;
+    } catch (_) {}
+    return _defaultTabs();
+  });
+  const [tActiveTabId, setTActiveTabId] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("tlg_pro_model_tabs"));
+      if (saved && saved.activeTabId) return saved.activeTabId;
+    } catch (_) {}
+    return "all-1";
+  });
+
+  // Persist tabs to localStorage
+  React.useEffect(() => {
+    try {
+      // Save only chat_ids, not full conv objects (they're transient)
+      const saveable = {};
+      Object.keys(tTabs).forEach(mk => {
+        saveable[mk] = tTabs[mk].map(tab => ({
+          id: tab.id,
+          slotCids: (tab.slots || []).map(c => c ? String(_dmsgChatId(c) || "") : null),
+        }));
+      });
+      localStorage.setItem("tlg_pro_model_tabs", JSON.stringify({ tabs: tTabs, activeTabId: tActiveTabId, slotCids: saveable }));
+    } catch (_) {}
+  }, [tTabs, tActiveTabId]);
+
+  // Derive model filter from active tab
+  const tModelFilter = tActiveTabId.split("-")[0];
+  const setTModelFilter = (mk) => {
+    // Switch to first tab of this model
+    const tabs = tTabs[mk] || [];
+    if (tabs.length > 0) setTActiveTabId(tabs[0].id);
+  };
+
+  // Active tab's slots (virtual getter/setter)
+  const _getActiveTab = () => {
+    const mk = tActiveTabId.split("-")[0];
+    const tabs = tTabs[mk] || [];
+    return tabs.find(t => t.id === tActiveTabId) || tabs[0] || { id: tActiveTabId, slots: [] };
+  };
+  const tSlots = _getActiveTab().slots || [];
+  const setTSlots = (updater) => {
+    setTTabs(prev => {
+      const mk = tActiveTabId.split("-")[0];
+      const next = { ...prev };
+      next[mk] = (next[mk] || []).map(tab => {
+        if (tab.id !== tActiveTabId) return tab;
+        const newSlots = typeof updater === "function" ? updater(tab.slots || []) : updater;
+        return { ...tab, slots: newSlots };
+      });
+      return next;
+    });
+  };
+
+  // Tab management functions
+  const tAddTab = (modelKey) => {
+    if (modelKey === "all") return;
+    const tabs = tTabs[modelKey] || [];
+    if (tabs.length >= 3) return;
+    const newId = `${modelKey}-${tabs.length + 1}`;
+    setTTabs(prev => {
+      const next = { ...prev };
+      next[modelKey] = [...(next[modelKey] || []), { id: newId, slots: [] }];
+      return next;
+    });
+    setTActiveTabId(newId);
+  };
+
+  const tRemoveTab = (tabId) => {
+    const [mk, num] = tabId.split("-");
+    if (num === "1") return;
+    const tabs = tTabs[mk] || [];
+    const tabIdx = tabs.findIndex(t => t.id === tabId);
+    if (tabIdx === -1) return;
+    const hasConvs = (tabs[tabIdx].slots || []).some(c => c !== null);
+    if (hasConvs && !confirm("Fermer cet onglet ? Les conversations seront libérées.")) return;
+    setTTabs(prev => {
+      const next = { ...prev };
+      const remaining = (next[mk] || []).filter(t => t.id !== tabId);
+      // Renumber
+      remaining.forEach((t, i) => { t.id = `${mk}-${i + 1}`; });
+      next[mk] = remaining;
+      return next;
+    });
+    if (tActiveTabId === tabId) {
+      const remaining = tabs.filter(t => t.id !== tabId);
+      const newActive = remaining[Math.min(tabIdx - 1, remaining.length - 1)]?.id || `${mk}-1`;
+      setTActiveTabId(newActive);
+    }
+  };
+
   const [tSlotMsgs, setTSlotMsgs]       = useState({});
   const [tLoadingSlots, setTLoadingSlots] = useState({});
   const [tActiveSlot, setTActiveSlot]   = useState(null);
@@ -29376,6 +29478,21 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const [tPickFilter, setTPickFilter] = useState("all");
   const [tPickSearch, setTPickSearch] = useState("");
   const [tSmartLoading, setTSmartLoading] = useState(false);
+
+  // Reset transient state when switching tabs
+  const tPrevTabRef = React.useRef(tActiveTabId);
+  React.useEffect(() => {
+    if (tPrevTabRef.current !== tActiveTabId) {
+      setTSlotMsgs({});
+      setTLoadingSlots({});
+      setTActiveSlot(null);
+      setTInputs({});
+      setTSending({});
+      setTPopup({});
+      setTSuggestData({});
+      tPrevTabRef.current = tActiveTabId;
+    }
+  }, [tActiveTabId]);
 
   const tTogglePopup = (idx, type) => {
     setTPopup(p => ({ ...p, [idx]: p[idx] === type ? null : type }));
@@ -29442,7 +29559,14 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     if (s[0] && tActiveSlot === null) setTActiveSlot(0);
   }, [tUnreadSorted, tLayoutCfg.slots]);
 
-  useEffect(() => { tLoadUnread(); }, [tLoadUnread]);
+  // Auto-load unread only if current tab has no conversations
+  const tAutoLoadedRef = React.useRef({});
+  useEffect(() => {
+    if (!tAutoLoadedRef.current[tActiveTabId] && tSlots.filter(Boolean).length === 0) {
+      tLoadUnread();
+      tAutoLoadedRef.current[tActiveTabId] = true;
+    }
+  }, [tActiveTabId, tLoadUnread]);
 
   // ── Smart Load: scoring + fill empty slots ──
   const tCalcSmartScore = (conv, sp, hoursAgo) => {
@@ -29524,7 +29648,8 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       }
 
       const now = Date.now();
-      const openCids = currentSlots.filter(Boolean).map(c => String(_dmsgChatId(c)));
+      const openCids = [];
+      Object.values(tTabs).forEach(tabs => tabs.forEach(tab => (tab.slots || []).forEach(c => { if (c) openCids.push(String(_dmsgChatId(c))); })));
 
       // Apply model filter
       let pool = allConvs.filter(c => {
@@ -29619,7 +29744,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
 
   const tOpenPicker = (idx) => {
     setTPickSlotIdx(idx);
-    setTPickFilter("all");
+    setTPickFilter(tModelFilter !== "all" ? tModelFilter : "all");
     setTPickSearch("");
     setTShowPicker(true);
   };
@@ -29632,7 +29757,11 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     setTPickSlotIdx(null);
   };
 
-  const tOpenChatIds = React.useMemo(() => tSlots.filter(Boolean).map(c => String(_dmsgChatId(c))), [tSlots]);
+  const tOpenChatIds = React.useMemo(() => {
+    const ids = [];
+    Object.values(tTabs).forEach(tabs => tabs.forEach(tab => (tab.slots || []).forEach(c => { if (c) ids.push(String(_dmsgChatId(c))); })));
+    return ids;
+  }, [tTabs]);
 
   const tPickerConvs = React.useMemo(() => {
     let list = [...conversations];
@@ -29708,17 +29837,42 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <span style={{ color: "#818cf8", fontSize: 14, fontWeight: 800, marginRight: 4 }}>⚡</span>
           <span style={{ color: "#818cf8", fontSize: 13, fontWeight: 800, marginRight: 8 }}>TLG PRO</span>
-          <span style={{ color: "#6b7280", fontSize: 11, fontWeight: 700, marginRight: 6 }}>MODÈLE</span>
-          {["all", "carla", "sophie", "bella", "nadia"].map(m => {
-            const labels = { all: "🎯 Tous", carla: "💜 Carla", sophie: "🩷 Sophie", bella: "💛 Bella", nadia: "✨ Nadia" };
-            const active = tModelFilter === m;
-            return (
-              <button key={m} onClick={() => setTModelFilter(m)}
-                style={{ padding: "6px 12px", background: active ? "#6366f1" : "rgba(255,255,255,0.04)", color: active ? "#fff" : "#9ca3af", border: `1px solid ${active ? "#6366f1" : "rgba(255,255,255,0.08)"}`, borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" }}>
-                {labels[m]}
-              </button>
-            );
-          })}
+          {(() => {
+            const modelKeys = ["all", "carla", "sophie", "bella", "nadia"];
+            const emojis = { all: "🎯", carla: "💜", sophie: "🩷", bella: "💛", nadia: "✨" };
+            const tabColors = { all: "#6366f1", carla: "#a78bfa", sophie: "#f472b6", bella: "#fb923c", nadia: "#9ca3af" };
+            return modelKeys.map(mk => {
+              const tabs = tTabs[mk] || [];
+              const multiTab = tabs.length > 1;
+              return (
+                <React.Fragment key={mk}>
+                  {tabs.map((tab, ti) => {
+                    const isActive = tActiveTabId === tab.id;
+                    const tabLabel = `${emojis[mk]} ${mk === "all" ? "Tous" : mk.charAt(0).toUpperCase() + mk.slice(1)}${multiTab ? " " + (ti + 1) : ""}`;
+                    const clr = tabColors[mk];
+                    return (
+                      <button key={tab.id} onClick={() => setTActiveTabId(tab.id)}
+                        style={{ padding: "6px 12px", background: isActive ? clr : "rgba(255,255,255,0.04)", color: isActive ? "#fff" : "#9ca3af", border: `1px solid ${isActive ? clr : "rgba(255,255,255,0.08)"}`, borderRadius: 8, fontSize: 11, fontWeight: 700, cursor: "pointer", transition: "all 0.15s", position: "relative" }}
+                        onMouseEnter={e => { const x = e.currentTarget.querySelector("._tab-close"); if (x) x.style.opacity = "1"; }}
+                        onMouseLeave={e => { const x = e.currentTarget.querySelector("._tab-close"); if (x) x.style.opacity = "0"; }}>
+                        {tabLabel}
+                        {ti > 0 && (
+                          <span className="_tab-close" onClick={e => { e.stopPropagation(); tRemoveTab(tab.id); }}
+                            style={{ position: "absolute", top: -4, right: -4, width: 14, height: 14, borderRadius: "50%", background: "#ef4444", color: "#fff", fontSize: 8, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", opacity: 0, transition: "opacity 0.15s", lineHeight: 1 }}>×</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                  {mk !== "all" && tabs.length < 3 && (
+                    <button onClick={() => tAddTab(mk)}
+                      style={{ padding: "4px 6px", background: "transparent", color: tabColors[mk], border: `1px dashed ${tabColors[mk]}44`, borderRadius: 6, fontSize: 11, fontWeight: 700, cursor: "pointer", opacity: 0.4, transition: "opacity 0.15s" }}
+                      onMouseEnter={e => e.currentTarget.style.opacity = "1"}
+                      onMouseLeave={e => e.currentTarget.style.opacity = "0.4"}>+</button>
+                  )}
+                </React.Fragment>
+              );
+            });
+          })()}
           <span style={{ marginLeft: 8, background: totalUnread > 0 ? "rgba(239,68,68,0.15)" : "rgba(255,255,255,0.04)", color: totalUnread > 0 ? "#ef4444" : "#6b7280", padding: "4px 9px", borderRadius: 8, fontSize: 10, fontWeight: 700, border: totalUnread > 0 ? "1px solid rgba(239,68,68,0.3)" : "1px solid rgba(255,255,255,0.06)" }}>
             {totalUnread} non-lu{totalUnread > 1 ? "s" : ""}
           </span>
@@ -29747,7 +29901,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
 
       {/* GRID — chaque slot a son propre input */}
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: `repeat(${tLayoutCfg.cols}, 1fr)`, gridTemplateRows: `repeat(${Math.ceil(tLayoutCfg.slots / tLayoutCfg.cols)}, 1fr)`, gap: 8, padding: 8, overflow: "hidden" }}>
-        {tSlots.map((conv, idx) => conv ? (
+        {Array.from({ length: tLayoutCfg.slots }, (_, i) => tSlots[i] || null).map((conv, idx) => conv ? (
           <div key={idx + "-" + _dmsgChatId(conv)}
             onClick={() => setTActiveSlot(idx)}
             style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: `2px solid ${tActiveSlot === idx ? "#6366f1" : getLtv(conv) >= 500 ? "rgba(16,185,129,0.4)" : getLtv(conv) >= 50 ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.05)"}`, boxShadow: tActiveSlot === idx ? "0 0 16px rgba(99,102,241,0.4)" : "0 2px 6px rgba(0,0,0,0.3)", position: "relative", display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", transition: "all 0.2s" }}>
