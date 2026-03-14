@@ -29650,9 +29650,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   const [mediaSending, setMediaSending]   = useState(false);
   const [mediaLibSlot, setMediaLibSlot]       = useState(null);
   const [mediaLibTab, setMediaLibTab]         = useState("photo");
-  const [mediaLibPhotos, setMediaLibPhotos]   = useState([]);
-  const [mediaLibVideos, setMediaLibVideos]   = useState([]);
-  const [mediaLibLoading, setMediaLibLoading] = useState(false);
+  const mediaLibFileRef = React.useRef(null);
   const [suggestSlot, setSuggestSlot]     = useState(null);
   const [suggestions, setSuggestions]     = useState([]);
   const [suggestLoading, setSuggestLoading] = useState(false);
@@ -29760,49 +29758,62 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
     setMediaSending(false);
   };
 
-  const loadMediaLibrary = async (slotIdx) => {
+  const openMediaLib = (slotIdx) => {
     setMediaLibSlot(slotIdx);
     setMediaLibTab("photo");
-    setMediaLibLoading(true);
-    setMediaLibPhotos([]);
-    setMediaLibVideos([]);
-    try {
-      const convRef = window._tlgProSlotsRef?.[slotIdx];
-      const modelId = convRef?.model_id || "";
-      const mName = (models.find(m => m.id === modelId)?.name || "").toLowerCase();
-      const [photoRes, videoRes] = await Promise.all([
-        sb.storage.from("media-library").list(`photos/${mName}`, { limit: 100, sortBy: { column: "created_at", order: "desc" } }),
-        sb.storage.from("media-library").list(`videos/${mName}`, { limit: 100, sortBy: { column: "created_at", order: "desc" } })
-      ]);
-      const photos = (photoRes.data || []).filter(f => f.name && !f.name.startsWith(".")).map(f => {
-        const { data: urlD } = sb.storage.from("media-library").getPublicUrl(`photos/${mName}/${f.name}`);
-        return { name: f.name, url: urlD.publicUrl };
-      });
-      const videos = (videoRes.data || []).filter(f => f.name && !f.name.startsWith(".")).map(f => {
-        const { data: urlD } = sb.storage.from("media-library").getPublicUrl(`videos/${mName}/${f.name}`);
-        return { name: f.name, url: urlD.publicUrl };
-      });
-      setMediaLibPhotos(photos);
-      setMediaLibVideos(videos);
-    } catch (err) {
-      console.error("[MEDIA_LIB]", err);
-      addToast("Erreur chargement médias", "error");
-    }
-    setMediaLibLoading(false);
   };
 
-  const sendMediaLibItem = async (url, type) => {
+  const mediaLibModelName = React.useMemo(() => {
+    if (mediaLibSlot === null) return "";
+    const convRef = window._tlgProSlotsRef?.[mediaLibSlot];
+    const modelId = convRef?.model_id || "";
+    const m = models.find(x => x.id === modelId);
+    return m ? m.name.toLowerCase() : "";
+  }, [mediaLibSlot, models]);
+
+  const selectMediaLibItem = async (item) => {
     const convRef = window._tlgProSlotsRef?.[mediaLibSlot];
     if (!convRef) return;
     const cid = _dmsgChatId(convRef);
+    const mId = convRef.model_id || "";
+    setMediaLibSlot(null);
     try {
-      const ep = type === "video" ? "/send-video" : "/send-photo";
-      const key = type === "video" ? "video_url" : "photo_url";
-      await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: cid, [key]: url, caption: "", model_id: convRef.model_id || "" }), timeout: type === "video" ? 120000 : 30000 });
-      addToast(`${type === "video" ? "Vidéo" : "Photo"} envoyée`, "success");
-      setMediaLibSlot(null);
+      if (item.type === "video") {
+        await _dmsgFetch("/send-video", { method: "POST", body: JSON.stringify({ chat_id: cid, video_url: item.url, caption: "", model_id: mId }), timeout: 120000 });
+      } else {
+        await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: cid, media_url: item.url, caption: "", model_id: mId }), timeout: 30000 });
+      }
+      addToast("Média envoyé", "success");
     } catch (err) {
       addToast("Erreur envoi : " + err.message, "error");
+    }
+  };
+
+  const handleMediaLibFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = "";
+    const convRef = window._tlgProSlotsRef?.[mediaLibSlot];
+    if (!convRef) return;
+    const cid = _dmsgChatId(convRef);
+    const mId = convRef.model_id || "";
+    setMediaLibSlot(null);
+    try {
+      const ext = file.name.split(".").pop();
+      const path = `grid-media/${cid}/${Date.now()}.${ext}`;
+      const { error: upErr } = await sb.storage.from("media").upload(path, file, { contentType: file.type, upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      const { data: pub } = sb.storage.from("media").getPublicUrl(path);
+      const mediaUrl = pub.publicUrl;
+      const isVideo = file.type.startsWith("video/");
+      if (isVideo) {
+        await _dmsgFetch("/send-video", { method: "POST", body: JSON.stringify({ chat_id: cid, video_url: mediaUrl, caption: "", model_id: mId }), timeout: 120000 });
+      } else {
+        await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: cid, media_url: mediaUrl, caption: "", model_id: mId }), timeout: 30000 });
+      }
+      addToast("Média envoyé", "success");
+    } catch (err) {
+      addToast("Erreur upload : " + err.message, "error");
     }
   };
 
@@ -29863,7 +29874,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         _onCreateTx={(slotIdx) => setTxModalSlot(slotIdx)}
         _onSendMedia={(slotIdx) => { setMediaSlot(slotIdx); setTimeout(() => mediaInputRef.current?.click(), 50); }}
         _onShowInfo={(slotIdx) => setInfoSlot(slotIdx)}
-        _onMediaLib={(slotIdx) => loadMediaLibrary(slotIdx)}
+        _onMediaLib={(slotIdx) => openMediaLib(slotIdx)}
         _onSuggestions={(slotIdx) => loadSuggestions(slotIdx)}
         _onEmoji={(slotIdx) => setEmojiSlot(slotIdx)}
         _onGif={(slotIdx) => setGifSlot(slotIdx)}
@@ -29986,12 +29997,11 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         </div>
       )}
 
-      {/* Media Library Modal (Photos + Vidéos) */}
+      {/* Media Library Modal (Photos + Vidéos) — uses MediaPanelGrid */}
       {mediaLibSlot !== null && (
         <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setMediaLibSlot(null)}>
-          <div style={{ background: "#1e1f2e", borderRadius: 16, padding: 24, width: 700, maxHeight: "80vh", overflowY: "auto", border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)" }} onClick={e => e.stopPropagation()}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-              <h3 style={{ margin: 0, color: "#fff", fontSize: 16, fontWeight: 800 }}>🎬 Médias</h3>
+          <div style={{ background: "#1e1f2e", borderRadius: 16, width: 700, maxHeight: "80vh", display: "flex", flexDirection: "column", border: "2px solid rgba(99,102,241,0.3)", boxShadow: "0 20px 40px rgba(0,0,0,0.5)", overflow: "hidden" }} onClick={e => e.stopPropagation()}>
+            <div style={{ padding: "12px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ display: "flex", gap: 4 }}>
                 {["photo", "video"].map(t => (
                   <button key={t} onClick={() => setMediaLibTab(t)}
@@ -30002,41 +30012,25 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
                   </button>
                 ))}
               </div>
+              <button onClick={() => setMediaLibSlot(null)} style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 16, padding: "2px 6px" }}>✕</button>
             </div>
-            <p style={{ margin: "0 0 12px", color: "#6b7280", fontSize: 12 }}>Clique sur un média pour l'envoyer</p>
-            {mediaLibLoading ? (
-              <div style={{ textAlign: "center", padding: 40, color: "#6366f1", fontSize: 13 }}>Chargement…</div>
-            ) : mediaLibTab === "photo" ? (
-              mediaLibPhotos.length === 0 ? (
-                <div style={{ textAlign: "center", padding: 40, color: "#6b7280", fontSize: 13 }}>Aucune photo dans la library</div>
-              ) : (
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-                  {mediaLibPhotos.map((p, i) => (
-                    <div key={i} onClick={() => sendMediaLibItem(p.url, "photo")}
-                      style={{ aspectRatio: "1", background: `url(${p.url}) center/cover`, borderRadius: 8, border: "2px solid rgba(255,255,255,0.06)", cursor: "pointer", transition: "all 0.15s" }}
-                      onMouseEnter={e => { e.currentTarget.style.borderColor = "#6366f1"; e.currentTarget.style.transform = "scale(1.04)"; }}
-                      onMouseLeave={e => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; e.currentTarget.style.transform = ""; }} />
-                  ))}
-                </div>
-              )
-            ) : (
-              mediaLibVideos.length === 0 ? (
-                <div style={{ textAlign: "center", padding: 40, color: "#6b7280", fontSize: 13 }}>Aucune vidéo dans la library</div>
-              ) : (
-                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {mediaLibVideos.map((v, i) => (
-                    <div key={i} onClick={() => sendMediaLibItem(v.url, "video")}
-                      style={{ padding: "10px 14px", background: "rgba(0,0,0,0.3)", borderRadius: 8, border: "1px solid rgba(255,255,255,0.06)", cursor: "pointer", display: "flex", alignItems: "center", gap: 10, transition: "all 0.15s" }}
-                      onMouseEnter={e => e.currentTarget.style.borderColor = "#6366f1"}
-                      onMouseLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"}>
-                      <span style={{ fontSize: 20 }}>🎬</span>
-                      <span style={{ color: "#d1d5db", fontSize: 13 }}>{v.name}</span>
-                    </div>
-                  ))}
-                </div>
-              )
-            )}
-            <button onClick={() => setMediaLibSlot(null)} style={{ width: "100%", marginTop: 16, padding: 10, background: "rgba(255,255,255,0.04)", color: "#9ca3af", border: "none", borderRadius: 8, fontWeight: 700, cursor: "pointer" }}>Fermer</button>
+            <div style={{ padding: "8px 16px", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
+              <label style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: 8, borderRadius: 8, border: "1px dashed rgba(99,102,241,0.3)", cursor: "pointer", fontSize: 11, color: "#818cf8", transition: "background 0.15s" }}
+                onMouseEnter={e => e.currentTarget.style.background = "rgba(99,102,241,0.08)"}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                <input ref={mediaLibFileRef} type="file" accept={mediaLibTab === "photo" ? "image/*" : "video/*"} onChange={handleMediaLibFile} style={{ display: "none" }} />
+                📤 Uploader depuis l'appareil
+              </label>
+            </div>
+            <div style={{ flex: 1, overflowY: "auto" }}>
+              <MediaPanelGrid
+                mediaType={mediaLibTab}
+                modelName={mediaLibModelName}
+                sentMediaIds={[]}
+                soldMediaIds={[]}
+                onSelect={selectMediaLibItem}
+              />
+            </div>
           </div>
         </div>
       )}
