@@ -162,7 +162,7 @@
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1"></script>
 
   <!-- ═══ SCRIPTS NON-CRITIQUES — chargement différé ═══ -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js" defer></script>
@@ -26009,7 +26009,7 @@ const LoginPage = ({onLogin, lang, setLang}) => {
   const [pass, setPass] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [retryCount, setRetryCount] = useState(0);
+  const retryRef = React.useRef(0);
   const handleLogin = async () => {
     setError("");
     setLoading(true);
@@ -26020,20 +26020,20 @@ const LoginPage = ({onLogin, lang, setLang}) => {
         setLoading(false);
         return;
       }
-      const _loginTimeout = (ms) => new Promise((_, rej) => setTimeout(() => rej(new Error("Délai de connexion dépassé")), ms));
-      const {data, error: authErr} = await Promise.race([sb.auth.signInWithPassword({email, password: pass}), _loginTimeout(15000)]);
+      const _timeout = (ms, label) => new Promise((_, rej) => setTimeout(() => rej(new Error(label || "Délai dépassé")), ms));
+      const {data, error: authErr} = await Promise.race([sb.auth.signInWithPassword({email, password: pass}), _timeout(15000, "Délai de connexion dépassé")]);
       if(authErr) {
         const isLockErr = /lock/i.test(authErr.message) || /LockManager/i.test(authErr.message);
         if (isLockErr) {
           if (window.__authLog) window.__authLog('AUTH_LOGIN_LOCK_ERR', { msg: authErr.message });
           console.warn("[DADASH] Lock error on login — retrying...");
-          const retry = await sb.auth.signInWithPassword({email, password: pass});
+          const retry = await Promise.race([sb.auth.signInWithPassword({email, password: pass}), _timeout(15000, "Délai de connexion dépassé")]);
           if (retry.error) {
             setError(retry.error.message || t(lang,"login_error"));
             setLoading(false);
             return;
           }
-          const {data: profile} = await sb.from("profiles").select("*").eq("id", retry.data.user.id).single();
+          const {data: profile} = await Promise.race([sb.from("profiles").select("*").eq("id", retry.data.user.id).single(), _timeout(10000, "Délai chargement profil")]);
           setLoading(false);
           if (profile) { onLogin({...profile, email: retry.data.user.email}); return; }
         }
@@ -26042,7 +26042,7 @@ const LoginPage = ({onLogin, lang, setLang}) => {
         setLoading(false);
         return;
       }
-      const {data: profile, error: profileErr} = await sb.from("profiles").select("*").eq("id", data.user.id).single();
+      const {data: profile, error: profileErr} = await Promise.race([sb.from("profiles").select("*").eq("id", data.user.id).single(), _timeout(10000, "Délai chargement profil")]);
       setLoading(false);
       if(profileErr) {
         console.error("[DADASH] Profile error:", profileErr.message);
@@ -26062,9 +26062,9 @@ const LoginPage = ({onLogin, lang, setLang}) => {
       console.error("[DADASH] Login crash:", msg);
       if (isLockErr) {
         setError("Session en cours de synchronisation. Réessayez dans quelques secondes.");
-      } else if (isNetErr && retryCount < 3) {
-        setRetryCount(c => c + 1);
-        const delay = Math.min(2000 * Math.pow(2, retryCount), 16000);
+      } else if (isNetErr && retryRef.current < 3) {
+        retryRef.current += 1;
+        const delay = Math.min(2000 * Math.pow(2, retryRef.current - 1), 16000);
         setError("Connexion impossible — nouvelle tentative dans " + Math.round(delay/1000) + "s...");
         setTimeout(() => handleLogin(), delay);
       } else {
@@ -52331,6 +52331,9 @@ const App = () => {
   const {drillDown, closeDrill, openEntity} = useNav();
   const cardModal = useCardModal();
   const [user, setUser] = useState(null);
+  const userRef = React.useRef(null);
+  // Keep ref in sync for closures (onAuthStateChange etc.)
+  React.useEffect(() => { userRef.current = user; }, [user]);
   const [lang, setLang] = useState(() => { try { const s=localStorage.getItem("dadash-lang"); return s&&["fr","de","en","ru","uk","es"].includes(s)?s:"fr"; } catch { return "fr"; } });
   const [theme, setTheme] = useState(() => {
     try { const t = localStorage.getItem("dadash-theme"); return (!t || t === "original" || t === "indigo") ? "indigo-clair" : (["indigo-clair","light"].includes(t) ? t : "indigo-clair"); } catch { return "indigo-clair"; }
@@ -52592,7 +52595,7 @@ const App = () => {
      this listener catches the SIGNED_IN event and logs the user in automatically) */
   useEffect(() => {
     const { data: { subscription } } = sb.auth.onAuthStateChange(async (event, session) => {
-      if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session && !user) {
+      if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session && !userRef.current) {
         try {
           const { data: profile } = await sb.from("profiles").select("*").eq("id", session.user.id).single();
           if (profile) {
