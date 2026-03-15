@@ -33886,6 +33886,8 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   const [mediaSending, setMediaSending]   = useState(false);
   const [mediaLibSlot, setMediaLibSlot]       = useState(null);
   const [mediaLibTab, setMediaLibTab]         = useState("photo");
+  const [mediaLibSentIds, setMediaLibSentIds] = useState([]);
+  const [mediaLibSoldIds, setMediaLibSoldIds] = useState([]);
   const mediaLibFileRef = React.useRef(null);
   const mediaInputRef = React.useRef(null);
 
@@ -33938,6 +33940,25 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
     if (txModalSlot === null || txProducts.length > 0) return;
     sb.from("products").select("*").eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
   }, [txModalSlot]);
+
+  // Load sentMediaIds + soldMediaIds when media library opens for a slot
+  React.useEffect(() => {
+    if (mediaLibSlot === null) { setMediaLibSentIds([]); setMediaLibSoldIds([]); return; }
+    const convRef = window._tlgProSlotsRef?.[mediaLibSlot];
+    if (!convRef) return;
+    const cid = _dmsgChatId(convRef);
+    if (cid) {
+      sb.from("media_sends").select("media_id").eq("chat_id", cid)
+        .then(({ data }) => setMediaLibSentIds((data || []).map(r => r.media_id)))
+        .catch(() => {});
+      const spId = convRef.spender_id;
+      if (spId) {
+        sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
+          .then(({ data }) => setMediaLibSoldIds((data || []).map(r => r.media_id).filter(Boolean)))
+          .catch(() => {});
+      }
+    }
+  }, [mediaLibSlot]);
 
   // Resolve spender for the active TX slot
   const txSlotConv = txModalSlot !== null ? window._tlgProSlotsRef?.[txModalSlot] : null;
@@ -34139,8 +34160,12 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: cid, media_url: item.url, caption: "", model_id: mId }), timeout: 30000 });
       }
       addToast("Média envoyé", "success");
-      // Sync cross-pages
+      // Sync cross-pages + local graying
       if (convRef.spender_id && mId) window._markMediaAsSent(item.url, convRef.spender_id, mId, 'tlg_pro');
+      if (item.id) {
+        await sb.from("media_sends").insert({ media_id: item.id, chat_id: cid, model: mId }).catch(() => {});
+        setMediaLibSentIds(prev => prev.includes(item.id) ? prev : [...prev, item.id]);
+      }
     } catch (err) {
       addToast("Erreur envoi : " + err.message, "error");
     }
@@ -34412,8 +34437,8 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
               <MediaPanelGrid
                 mediaType={mediaLibTab}
                 modelName={mediaLibModelName}
-                sentMediaIds={[]}
-                soldMediaIds={[]}
+                sentMediaIds={mediaLibSentIds}
+                soldMediaIds={mediaLibSoldIds}
                 onSelect={selectMediaLibItem}
               />
             </div>
@@ -55194,6 +55219,8 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
   const [mediaPanelTab, setMediaPanelTab] = useState("photo");
   const [pendingMedia, setPendingMedia] = useState(null);
   const [sendingMedia, setSendingMedia] = useState(false);
+  const [sentMediaIds, setSentMediaIds] = useState([]);
+  const [soldMediaIds, setSoldMediaIds] = useState([]);
   const mediaFileRef = React.useRef(null);
 
   // TX modal state
@@ -55518,6 +55545,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
       setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, media_url: mediaUrl } : m));
       if (pendingMedia.id) {
         await sb.from("media_sends").insert({ media_id: pendingMedia.id, chat_id: chatId, model: mName }).catch(() => {});
+        setSentMediaIds(prev => prev.includes(pendingMedia.id) ? prev : [...prev, pendingMedia.id]);
       }
       setPendingMedia(null);
       setTimeout(() => loadMessages(false), 2000);
@@ -55553,6 +55581,20 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     const tier = CONV_TIERS.find(t => spLtv >= t.min && spLtv < t.max) || CONV_TIERS[6];
     return tier;
   }, [spLtv]);
+
+  // Load sentMediaIds + soldMediaIds for this cell's chat
+  useEffect(() => {
+    if (!chatId) return;
+    sb.from("media_sends").select("media_id").eq("chat_id", chatId)
+      .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)))
+      .catch(() => {});
+    const spId = resolvedSpender?.id || convData?.spender_id;
+    if (spId) {
+      sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
+        .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)))
+        .catch(() => {});
+    }
+  }, [chatId]);
 
   const modelName = React.useMemo(() => {
     if (!modelId) return null;
@@ -55862,8 +55904,8 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
             <MediaPanelGrid
               mediaType={mediaPanelTab}
               modelName={modelName?.toLowerCase() || ""}
-              sentMediaIds={[]}
-              soldMediaIds={[]}
+              sentMediaIds={sentMediaIds}
+              soldMediaIds={soldMediaIds}
               onSelect={selectMediaItem}
             />
           </div>
