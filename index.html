@@ -31951,6 +31951,14 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const [tPickFilter, setTPickFilter] = useState("all");
   const [tPickSearch, setTPickSearch] = useState("");
   const [tSmartLoading, setTSmartLoading] = useState(false);
+  const [tLightbox, setTLightbox]         = useState(null);
+  const [tLoadingMore, setTLoadingMore]   = useState({});
+  const [tHasMore, setTHasMore]           = useState({});
+  const tSlotScrollRefs  = React.useRef({});
+  const tTopSentinelRefs = React.useRef({});
+  const tAutoScrolled    = React.useRef({});
+  const _tlgLoadMoreFnRef = React.useRef(null);
+  const _tlgInFlight      = React.useRef(new Set());
 
   // Reset transient state when switching tabs
   const tPrevTabRef = React.useRef(tActiveTabId);
@@ -31963,6 +31971,11 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       setTSending({});
       setTPopup({});
       setTSuggestData({});
+      setTLoadingMore({});
+      setTHasMore({});
+      setTLightbox(null);
+      tAutoScrolled.current = {};
+      _tlgInFlight.current.clear();
       tPrevTabRef.current = tActiveTabId;
     }
   }, [tActiveTabId]);
@@ -32192,11 +32205,15 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     if (!conv) return;
     const cid = _dmsgChatId(conv);
     if (!cid) return;
-    if (!silent) setTLoadingSlots(p => ({ ...p, [idx]: true }));
+    if (!silent) {
+      setTLoadingSlots(p => ({ ...p, [idx]: true }));
+      tAutoScrolled.current[idx] = false;
+    }
     try {
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=30", { timeout: 8000 });
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200", { timeout: 10000 });
       const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
       setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
+      setTHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
     } catch (_) {}
     setTLoadingSlots(p => ({ ...p, [idx]: false }));
   }, []);
@@ -32213,15 +32230,83 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     return () => { if (tRefreshRef.current) clearInterval(tRefreshRef.current); };
   }, [tSlots, tLoadMsgs]);
 
+  // ── Auto-scroll vers le bas après chargement initial ──
   useEffect(() => {
-    Object.keys(tSlotMsgs).forEach(idx => {
-      const el = document.querySelector(`[data-tlg-slot="${idx}"]`);
-      if (el) setTimeout(() => { el.scrollTop = el.scrollHeight; }, 80);
+    tSlots.forEach((conv, idx) => {
+      if (!conv || tAutoScrolled.current[idx]) return;
+      const scroller = tSlotScrollRefs.current[idx];
+      const msgs = tSlotMsgs[idx] || [];
+      if (scroller && msgs.length > 0 && !tLoadingSlots[idx]) {
+        scroller.scrollTop = scroller.scrollHeight;
+        tAutoScrolled.current[idx] = true;
+      }
     });
-  }, [tSlotMsgs]);
+  }, [tSlotMsgs, tLoadingSlots]);
+
+  // ── Chargement historique (scroll infini) ──
+  const tlgLoadMoreMsgs = async (idx) => {
+    const currentMsgs = tSlotMsgs[idx] || [];
+    if (!tHasMore[idx] || currentMsgs.length === 0) return;
+    if (_tlgInFlight.current.has(idx)) return;
+    const conv = tSlots[idx];
+    if (!conv) return;
+    const cid = _dmsgChatId(conv);
+    if (!cid) return;
+    _tlgInFlight.current.add(idx);
+    setTLoadingMore(p => ({ ...p, [idx]: true }));
+    try {
+      const sorted = [...currentMsgs].sort((a, b) =>
+        new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
+      );
+      const oldest = sorted[0];
+      const beforeId = oldest?.id || oldest?.message_id;
+      const path = beforeId
+        ? "/conversations/" + cid + "/messages?limit=100&before=" + beforeId
+        : "/conversations/" + cid + "/messages?limit=100";
+      const data = await _dmsgFetch(path, { timeout: 12000 });
+      const newMsgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      if (newMsgs.length === 0) {
+        setTHasMore(p => ({ ...p, [idx]: false }));
+      } else {
+        setTSlotMsgs(p => {
+          const existing = p[idx] || [];
+          const ids = new Set(existing.map(m => m.id || m.message_id).filter(Boolean));
+          const toAdd = newMsgs.filter(m => !ids.has(m.id || m.message_id));
+          if (toAdd.length === 0) { setTHasMore(prev => ({ ...prev, [idx]: false })); return p; }
+          return { ...p, [idx]: [...toAdd, ...existing] };
+        });
+        setTHasMore(p => ({ ...p, [idx]: newMsgs.length >= 100 }));
+      }
+    } catch (_) { setTHasMore(p => ({ ...p, [idx]: false })); }
+    _tlgInFlight.current.delete(idx);
+    setTLoadingMore(p => ({ ...p, [idx]: false }));
+  };
+  _tlgLoadMoreFnRef.current = tlgLoadMoreMsgs;
+
+  // ── IntersectionObserver : sentinel en haut de chaque slot ──
+  useEffect(() => {
+    const obs = {};
+    tSlots.forEach((conv, idx) => {
+      if (!conv) return;
+      const sentinel = tTopSentinelRefs.current[idx];
+      const root = tSlotScrollRefs.current[idx];
+      if (!sentinel || !root) return;
+      const ob = new IntersectionObserver(
+        ([e]) => { if (e.isIntersecting) _tlgLoadMoreFnRef.current(idx); },
+        { root, rootMargin: "80px 0px 0px 0px" }
+      );
+      ob.observe(sentinel);
+      obs[idx] = ob;
+    });
+    return () => { Object.values(obs).forEach(o => o.disconnect()); };
+  }, [tSlots]);
 
   const tCloseSlot = (idx) => {
     setTSlots(p => { const n = [...p]; n[idx] = null; return n; });
+    setTHasMore(p => ({ ...p, [idx]: false }));
+    setTLoadingMore(p => ({ ...p, [idx]: false }));
+    _tlgInFlight.current.delete(idx);
+    tAutoScrolled.current[idx] = false;
     if (tActiveSlot === idx) setTActiveSlot(null);
   };
 
@@ -32310,6 +32395,42 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       addToast("Erreur : " + err.message, "error");
     }
     setTSending(p => ({ ...p, [idx]: false }));
+  };
+
+  // ── Rendu contenu message (médias, appels, emojis, texte) ──
+  const renderTlgMsgContent = (msg) => {
+    const rawText = msg.text || msg.content || msg.message || msg.message_text || "";
+    if (msg.type === "call" || msg.is_call || msg.message_type === "call") {
+      const dur = _gpFmtCallDur(msg.call_duration || msg.duration);
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 4, color: "#a5b4fc", fontSize: 10, fontStyle: "italic" }}>
+          <span style={{ fontSize: 13 }}>📞</span><span>{dur || "Appel"}</span>
+        </div>
+      );
+    }
+    if (msg.media_url || msg.photo_url) {
+      const url = msg.media_url || msg.photo_url;
+      return (
+        <img src={url} alt="Photo"
+          style={{ maxWidth: 120, maxHeight: 100, borderRadius: 5, cursor: "pointer", display: "block", objectFit: "cover" }}
+          onClick={e => { e.stopPropagation(); setTLightbox(url); }}
+          loading="lazy"
+          onError={e => { e.currentTarget.style.display = "none"; }} />
+      );
+    }
+    if (msg.video_url) {
+      return (
+        <video src={msg.video_url} controls preload="metadata"
+          style={{ maxWidth: 120, borderRadius: 5, display: "block" }}
+          onClick={e => e.stopPropagation()} />
+      );
+    }
+    if (rawText && _gpIsEmojisOnly(rawText)) {
+      const count = [...rawText.trim()].filter(c => /\S/.test(c)).length;
+      const fs = count <= 2 ? "1.8rem" : count <= 5 ? "1.4rem" : "1.1rem";
+      return <div style={{ fontSize: fs, lineHeight: 1.2, padding: "2px 0" }}>{rawText}</div>;
+    }
+    return <span>{rawText || "[média]"}</span>;
   };
 
   return (
@@ -32420,23 +32541,50 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
             </div>
 
             {/* Messages */}
-            <div data-tlg-slot={idx} style={{ flex: 1, padding: "6px 8px", overflowY: "auto", fontSize: 11, minHeight: 0, scrollBehavior: "smooth" }} className="grid-slot-scroller">
+            <div
+              ref={el => { tSlotScrollRefs.current[idx] = el; }}
+              style={{ flex: 1, padding: "6px 8px", overflowY: "auto", fontSize: 11, minHeight: 0, scrollBehavior: "smooth" }} className="grid-slot-scroller">
+              {/* Sentinel IntersectionObserver — haut du scroller */}
+              <div ref={el => { tTopSentinelRefs.current[idx] = el; }} style={{ height: 1 }} />
+              {tLoadingMore[idx] && (
+                <div style={{ textAlign: "center", color: "#6366f1", fontSize: 9, padding: "3px 0 5px", fontWeight: 600 }}>⏳ Ancien…</div>
+              )}
+              {!tLoadingMore[idx] && !tHasMore[idx] && (tSlotMsgs[idx] || []).length > 0 && (
+                <div style={{ textAlign: "center", color: "#374151", fontSize: 8, padding: "2px 0 4px" }}>— début —</div>
+              )}
               {tLoadingSlots[idx] ? (
                 <div style={{ color: "#6366f1", textAlign: "center", padding: 12, fontSize: 11 }}>Chargement…</div>
               ) : (tSlotMsgs[idx] || []).length === 0 ? (
                 <div style={{ color: "#4b5563", textAlign: "center", padding: 12, fontSize: 11 }}>Aucun message</div>
-              ) : (
-                [...(tSlotMsgs[idx] || [])].sort((a, b) => new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)).slice(-12).map((msg, mi) => {
+              ) : (() => {
+                const sorted = [...(tSlotMsgs[idx] || [])].sort((a, b) =>
+                  new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
+                );
+                return sorted.map((msg, mi) => {
                   const isOut = msg.is_outgoing || msg.direction === "out";
+                  const ts = msg.created_at || msg.timestamp;
+                  const showSep = _gpShouldSep(msg, mi > 0 ? sorted[mi - 1] : null);
                   return (
-                    <div key={mi} style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
-                      <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
-                        {_escapeHtml(msg.text || msg.content || msg.message || "[média]")}
+                    <React.Fragment key={msg.id || msg.message_id || mi}>
+                      {showSep && ts && (
+                        <div style={{ textAlign: "center", fontSize: 9, color: "#6b7280", margin: "5px 0 3px", fontWeight: 600 }}>
+                          {_gpFmtDateSep(ts)}
+                        </div>
+                      )}
+                      <div style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
+                        <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
+                          {renderTlgMsgContent(msg)}
+                        </div>
+                        {ts && (
+                          <div style={{ fontSize: 8, color: "#4b5563", marginTop: 1, textAlign: isOut ? "right" : "left" }}>
+                            {_gpFmtTime(ts)}
+                          </div>
+                        )}
                       </div>
-                    </div>
+                    </React.Fragment>
                   );
-                })
-              )}
+                });
+              })()}
             </div>
 
             {/* Toolbar */}
@@ -32613,6 +32761,18 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
               })}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ── LIGHTBOX PARTAGÉ ── */}
+      {tLightbox && (
+        <div onClick={() => setTLightbox(null)}
+          style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.92)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 99999, cursor: "pointer" }}>
+          <img src={tLightbox} alt="Aperçu"
+            style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 8, boxShadow: "0 20px 60px rgba(0,0,0,0.8)" }}
+            onClick={e => e.stopPropagation()} />
+          <button onClick={() => setTLightbox(null)}
+            style={{ position: "absolute", top: 20, right: 20, background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "50%", width: 40, height: 40, color: "#fff", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
         </div>
       )}
 
