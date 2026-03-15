@@ -30461,6 +30461,25 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
 };
 
 // =============================================
+// PERF MONITORING — window._perfStats / window._showPerfStats
+// =============================================
+window._perfStats = window._perfStats || {
+  loadMessages: [], sendMessage: [], sendMedia: [], sendVideo: [], poll: []
+};
+window._showPerfStats = () => {
+  console.log("=== DADASH PERFORMANCE STATS ===");
+  Object.keys(window._perfStats).forEach(k => {
+    const arr = window._perfStats[k];
+    if (!arr.length) return;
+    const avg = Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
+    const min = Math.min(...arr);
+    const max = Math.max(...arr);
+    console.log(`${k}: COUNT=${arr.length}  AVG=${avg}ms  MIN=${min}ms  MAX=${max}ms`);
+  });
+  console.log("=================================");
+};
+
+// =============================================
 // CARLOS API — helpers pour la messagerie TG complète
 // =============================================
 const CARLOS_API_BASE = () => (window.CARLOS_API_URL || window.BOT_CAM_URL || "").replace(/\/$/, "");
@@ -30470,8 +30489,30 @@ const carlosHeaders = () => ({ "Content-Type": "application/json", "X-API-Key": 
 const carlosFetch = async (path, opts = {}) => {
   const base = CARLOS_API_BASE();
   if (!base) throw new Error("CARLOS_API_URL non configurée");
-  const res = await fetch(base + path, { headers: carlosHeaders(), ...opts });
-  if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error(`HTTP ${res.status}: ${t || res.statusText}`); }
+  const t0 = performance.now();
+  const label = (opts.method || "GET") + " " + path;
+  console.log(`⏱️ [PERF] carlosFetch START — ${label}`);
+  let res;
+  try {
+    res = await fetch(base + path, { headers: carlosHeaders(), ...opts });
+  } catch (err) {
+    const dur = Math.round(performance.now() - t0);
+    console.error(`❌ [PERF] carlosFetch EXCEPTION — ${dur}ms — ${label}`, err.message);
+    throw err;
+  }
+  const dur = Math.round(performance.now() - t0);
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    console.error(`❌ [PERF] carlosFetch FAILED — ${dur}ms — ${label} — HTTP ${res.status}`);
+    throw new Error(`HTTP ${res.status}: ${t || res.statusText}`);
+  }
+  const perfKey = path.includes("send-video") ? "sendVideo" : path.includes("send-media") || path.includes("send-photo") ? "sendMedia" : path.includes("send-message") ? "sendMessage" : "loadMessages";
+  (window._perfStats[perfKey] || (window._perfStats[perfKey] = [])).push(dur);
+  if (dur > (perfKey === "sendVideo" ? 15000 : perfKey === "sendMedia" ? 10000 : perfKey === "sendMessage" ? 3000 : 2000)) {
+    console.warn(`⚠️ [PERF] carlosFetch SLOW — ${dur}ms — ${label}`);
+  } else {
+    console.log(`✅ [PERF] carlosFetch OK — ${dur}ms — ${label}`);
+  }
   return res.json().catch(() => ({}));
 };
 
@@ -31085,7 +31126,9 @@ const _dmsgFetch = async (path, opts = {}) => {
   const { headers: extraHeaders, timeout: timeoutMs = 10000, signal: callerSignal, ...restOpts } = opts;
   const reqHeaders = { "Content-Type": "application/json", "X-API-Key": key, ...(extraHeaders || {}) };
 
-  console.log("[DMSG] ▶ fetch", opts.method || "GET", url, `(timeout: ${timeoutMs}ms)`);
+  const _t0 = performance.now();
+  const _label = (opts.method || "GET") + " " + path;
+  console.log(`⏱️ [PERF] _dmsgFetch START — ${_label} (timeout: ${timeoutMs}ms)`);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -31102,15 +31145,17 @@ const _dmsgFetch = async (path, opts = {}) => {
   try {
     res = await fetch(url, { headers: reqHeaders, signal: controller.signal, ...restOpts });
   } catch (networkErr) {
+    const _errDur = Math.round(performance.now() - _t0);
     if (networkErr.name === "AbortError") {
       // Distinguish caller-initiated abort from timeout
       if (callerSignal?.aborted) throw networkErr;
+      console.error(`❌ [PERF] _dmsgFetch TIMEOUT — ${_errDur}ms — ${_label}`);
       throw new Error("Carlos timeout après " + timeoutMs + "ms (" + (opts.method || "GET") + " " + path + ")");
     }
     // Network-level failure (CORS blocked, DNS, offline…)
     const isCors = networkErr.message && (networkErr.message.toLowerCase().includes("cors") || networkErr.message.toLowerCase().includes("blocked") || networkErr.message.toLowerCase().includes("failed to fetch"));
     const detail = isCors ? "Erreur CORS ou réseau — vérifier les origines autorisées côté serveur." : networkErr.message;
-    console.error("[DMSG] ✖ network error:", networkErr.message, "\n       URL:", url);
+    console.error(`❌ [PERF] _dmsgFetch EXCEPTION — ${_errDur}ms — ${_label} —`, networkErr.message, "\n       URL:", url);
     throw new Error("NETWORK:" + detail);
   } finally {
     clearTimeout(timer);
@@ -31118,10 +31163,20 @@ const _dmsgFetch = async (path, opts = {}) => {
   }
 
   const text = await res.text().catch(() => "");
-  console.log("[DMSG] ◀ status:", res.status, res.statusText, "— body:", text.slice(0, 300));
+  const _dur = Math.round(performance.now() - _t0);
+  console.log(`[DMSG] ◀ status: ${res.status} ${res.statusText} — ${_dur}ms — body:`, text.slice(0, 300));
 
   if (!res.ok) {
+    console.error(`❌ [PERF] _dmsgFetch FAILED — ${_dur}ms — ${_label} — HTTP ${res.status}`);
     throw new Error("HTTP " + res.status + " " + res.statusText + (text ? ": " + text.slice(0, 200) : ""));
+  }
+  const _pk = path.includes("send-video") ? "sendVideo" : path.includes("send-media") || path.includes("send-photo") ? "sendMedia" : path.includes("send-message") ? "sendMessage" : path.includes("/messages") ? "loadMessages" : "poll";
+  (window._perfStats[_pk] || (window._perfStats[_pk] = [])).push(_dur);
+  const _threshold = _pk === "sendVideo" ? 15000 : _pk === "sendMedia" ? 10000 : _pk === "sendMessage" ? 3000 : 2000;
+  if (_dur > _threshold) {
+    console.warn(`⚠️ [PERF] _dmsgFetch SLOW — ${_dur}ms (seuil ${_threshold}ms) — ${_label}`);
+  } else {
+    console.log(`✅ [PERF] _dmsgFetch OK — ${_dur}ms — ${_label}`);
   }
   try { return JSON.parse(text); } catch (_) { return {}; }
 };
@@ -31585,12 +31640,20 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       setGpLoadingSlots(p => ({ ...p, [idx]: true }));
       gpAutoScrolled.current[idx] = false;
     }
+    const _lt0 = performance.now();
+    console.log(`⏱️ [PERF] gpLoadMsgs START — slot ${idx} — chatId: ${cid}`);
     try {
       const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200", { timeout: 10000 });
       const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      const _ldur = Math.round(performance.now() - _lt0);
+      console.log(`✅ [PERF] gpLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
+      if (_ldur > 2000) console.warn(`⚠️ [PERF] gpLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
       setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setGpHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
-    } catch (_) {}
+    } catch (e) {
+      const _ldur = Math.round(performance.now() - _lt0);
+      console.error(`❌ [PERF] gpLoadMsgs FAILED — ${_ldur}ms — slot ${idx}`, e.message);
+    }
     setGpLoadingSlots(p => ({ ...p, [idx]: false }));
   }, []);
 
@@ -32744,12 +32807,20 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       setTLoadingSlots(p => ({ ...p, [idx]: true }));
       tAutoScrolled.current[idx] = false;
     }
+    const _lt0 = performance.now();
+    console.log(`⏱️ [PERF] tLoadMsgs START — slot ${idx} — chatId: ${cid}`);
     try {
       const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200", { timeout: 10000 });
       const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      const _ldur = Math.round(performance.now() - _lt0);
+      console.log(`✅ [PERF] tLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
+      if (_ldur > 2000) console.warn(`⚠️ [PERF] tLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
       setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setTHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
-    } catch (_) {}
+    } catch (e) {
+      const _ldur = Math.round(performance.now() - _lt0);
+      console.error(`❌ [PERF] tLoadMsgs FAILED — ${_ldur}ms — slot ${idx}`, e.message);
+    }
     setTLoadingSlots(p => ({ ...p, [idx]: false }));
   }, []);
 
@@ -33108,7 +33179,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
             {/* Slot header */}
             <div style={{ padding: "8px 10px", background: "linear-gradient(90deg,rgba(99,102,241,0.08) 0%,transparent 100%)", borderBottom: "1px solid rgba(255,255,255,0.04)", cursor: "pointer" }}
               onDoubleClick={e => { e.stopPropagation(); if (onSelectConv) onSelectConv(conv); }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingRight: 28 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ fontSize: 16 }}>{modelEmoji(conv.model_id)}</span>
                   <div>
@@ -33259,9 +33330,9 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
 
             {/* Close */}
             <button onClick={e => { e.stopPropagation(); tCloseSlot(idx); }}
-              style={{ position: "absolute", top: 5, right: 5, background: "rgba(239,68,68,0.85)", color: "#fff", border: "none", borderRadius: 5, width: 20, height: 20, fontSize: 11, cursor: "pointer", opacity: 0, transition: "all 0.2s", zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center" }}
-              onMouseEnter={e => e.currentTarget.style.opacity = "1"}
-              onMouseLeave={e => e.currentTarget.style.opacity = "0"}>×</button>
+              style={{ position: "absolute", top: 6, right: 6, background: "rgba(239,68,68,0.9)", color: "#fff", border: "none", borderRadius: "50%", width: 22, height: 22, fontSize: 12, fontWeight: 700, cursor: "pointer", opacity: 1, transition: "all 0.2s", zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center" }}
+              onMouseEnter={e => { e.currentTarget.style.background = "#dc2626"; e.currentTarget.style.transform = "scale(1.1)"; }}
+              onMouseLeave={e => { e.currentTarget.style.background = "rgba(239,68,68,0.9)"; e.currentTarget.style.transform = "scale(1)"; }}>×</button>
 
           </div>
         ) : (
