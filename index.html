@@ -30492,14 +30492,23 @@ const carlosFetch = async (path, opts = {}) => {
   const t0 = performance.now();
   const label = (opts.method || "GET") + " " + path;
   console.log(`⏱️ [PERF] carlosFetch START — ${label}`);
+  // ── 0.1 Timeout 15s via AbortController ──────────────────────────────────
+  const _cfController = new AbortController();
+  const _cfTimer = setTimeout(() => _cfController.abort(), 15000);
   let res;
   try {
-    res = await fetch(base + path, { headers: carlosHeaders(), ...opts });
+    res = await fetch(base + path, { headers: carlosHeaders(), signal: _cfController.signal, ...opts });
   } catch (err) {
+    clearTimeout(_cfTimer);
     const dur = Math.round(performance.now() - t0);
+    if (err.name === "AbortError") {
+      console.error(`❌ [PERF] carlosFetch TIMEOUT — ${dur}ms — ${label}`);
+      throw new Error("Timeout Carlos 15s (" + label + ")");
+    }
     console.error(`❌ [PERF] carlosFetch EXCEPTION — ${dur}ms — ${label}`, err.message);
     throw err;
   }
+  clearTimeout(_cfTimer);
   const dur = Math.round(performance.now() - t0);
   if (!res.ok) {
     const t = await res.text().catch(() => "");
@@ -31636,6 +31645,14 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     if (!conv) return;
     const cid = _dmsgChatId(conv);
     if (!cid) return;
+    // ── 0.2 Cache hit — skip fetch si données fraîches (TTL 60s) ────────────
+    if (silent) {
+      const _gpCached = _DMSG_MSG_CACHE[String(cid)];
+      if (_gpCached && Date.now() - _gpCached.ts < 60000) {
+        console.log(`[PERF] gpLoadMsgs CACHE HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_gpCached.ts)/1000)}s)`);
+        return;
+      }
+    }
     if (!silent) {
       setGpLoadingSlots(p => ({ ...p, [idx]: true }));
       gpAutoScrolled.current[idx] = false;
@@ -31648,17 +31665,37 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] gpLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
       if (_ldur > 2000) console.warn(`⚠️ [PERF] gpLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
+      // ── 0.2 Write cache ──────────────────────────────────────────────────
+      _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
       setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setGpHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
     } catch (e) {
       const _ldur = Math.round(performance.now() - _lt0);
       console.error(`❌ [PERF] gpLoadMsgs FAILED — ${_ldur}ms — slot ${idx}`, e.message);
+      // ── 0.6 Fallback Supabase ─────────────────────────────────────────────
+      try {
+        console.warn(`[GP] Fallback Supabase — slot ${idx} chatId: ${cid}`);
+        const { data: _gpConvRow } = await sb.from("tg_conversations").select("id").eq("tg_chat_id", String(cid)).maybeSingle();
+        if (_gpConvRow?.id) {
+          const { data: _gpSbMsgs } = await sb.from("tg_messages").select("*")
+            .eq("conversation_id", _gpConvRow.id)
+            .order("created_at", { ascending: true })
+            .limit(200);
+          const msgs = _gpSbMsgs || [];
+          if (msgs.length > 0) _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+          setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
+          console.log(`✅ [GP] Supabase fallback OK — slot ${idx} — ${msgs.length} msgs`);
+        }
+      } catch (_gpSbErr) {
+        console.error(`❌ [GP] Supabase fallback failed — slot ${idx}`, _gpSbErr.message);
+      }
     }
     setGpLoadingSlots(p => ({ ...p, [idx]: false }));
   }, []);
 
   useEffect(() => {
-    gpSlots.forEach((c, i) => { if (c) gpLoadMsgs(c, i, false); });
+    // ── 0.5 Stagger load : 100ms entre cellules pour éviter les rafales ──────
+    gpSlots.forEach((c, i) => { if (c) setTimeout(() => gpLoadMsgs(c, i, false), i * 100); });
   }, [gpSlots]);
 
   useEffect(() => {
@@ -32803,6 +32840,14 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     if (!conv) return;
     const cid = _dmsgChatId(conv);
     if (!cid) return;
+    // ── 0.2 Cache hit — skip fetch si données fraîches (TTL 60s) ────────────
+    if (silent) {
+      const _tCached = _DMSG_MSG_CACHE[String(cid)];
+      if (_tCached && Date.now() - _tCached.ts < 60000) {
+        console.log(`[PERF] tLoadMsgs CACHE HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_tCached.ts)/1000)}s)`);
+        return;
+      }
+    }
     if (!silent) {
       setTLoadingSlots(p => ({ ...p, [idx]: true }));
       tAutoScrolled.current[idx] = false;
@@ -32815,20 +32860,40 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] tLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
       if (_ldur > 2000) console.warn(`⚠️ [PERF] tLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
+      // ── 0.2 Write cache ──────────────────────────────────────────────────
+      _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
       setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setTHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
     } catch (e) {
       const _ldur = Math.round(performance.now() - _lt0);
       console.error(`❌ [PERF] tLoadMsgs FAILED — ${_ldur}ms — slot ${idx}`, e.message);
+      // ── 0.6 Fallback Supabase ─────────────────────────────────────────────
+      try {
+        console.warn(`[TLG] Fallback Supabase — slot ${idx} chatId: ${cid}`);
+        const { data: _tConvRow } = await sb.from("tg_conversations").select("id").eq("tg_chat_id", String(cid)).maybeSingle();
+        if (_tConvRow?.id) {
+          const { data: _tSbMsgs } = await sb.from("tg_messages").select("*")
+            .eq("conversation_id", _tConvRow.id)
+            .order("created_at", { ascending: true })
+            .limit(200);
+          const msgs = _tSbMsgs || [];
+          if (msgs.length > 0) _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+          setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
+          console.log(`✅ [TLG] Supabase fallback OK — slot ${idx} — ${msgs.length} msgs`);
+        }
+      } catch (_tSbErr) {
+        console.error(`❌ [TLG] Supabase fallback failed — slot ${idx}`, _tSbErr.message);
+      }
     }
     setTLoadingSlots(p => ({ ...p, [idx]: false }));
   }, []);
 
   useEffect(() => {
+    // ── 0.5 Stagger load : 100ms entre cellules pour éviter les rafales ──────
     tSlots.forEach((c, i) => {
       const prevId = tPrevSlotsRef.current[i] ? _dmsgChatId(tPrevSlotsRef.current[i]) : null;
       const currId = c ? _dmsgChatId(c) : null;
-      if (c && currId !== prevId) tLoadMsgs(c, i, false);
+      if (c && currId !== prevId) setTimeout(() => tLoadMsgs(c, i, false), i * 100);
     });
     tPrevSlotsRef.current = [...tSlots];
   }, [tSlots]);
@@ -37801,26 +37866,34 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     let apiList = [];
     let apiOk_ = false;
 
-    // 1. Fetch from Carlos API
-    try {
-      const data = await _dmsgFetch("/conversations");
+    // ── 0.4 Promise.allSettled : Carlos + Supabase en parallèle ─────────────
+    let _convSbQuery = sb.from("tg_conversations").select("*");
+    if (userProfile?.role === "chatter") {
+      const _assigned = userProfile.assigned_models || [];
+      if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
+    }
+    _convSbQuery = _convSbQuery.order("last_message_at", { ascending: false });
+
+    const [_convApiRes, _convSbRes] = await Promise.allSettled([
+      _dmsgFetch("/conversations"),
+      _convSbQuery,
+    ]);
+
+    // 1. Carlos result
+    if (_convApiRes.status === "fulfilled") {
+      const data = _convApiRes.value;
       apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
       apiOk_ = true;
-    } catch (e) {
-      console.warn("[CONV] Carlos API error, will use Supabase only:", e.message);
+    } else {
+      console.warn("[CONV] Carlos API error, will use Supabase only:", _convApiRes.reason?.message);
     }
 
-    // 2. Always fetch from Supabase to catch conversations the API might miss
+    // 2. Supabase result
     let sbList = [];
-    try {
-      let q = sb.from("tg_conversations").select("*");
-      if (userProfile?.role === "chatter") {
-        const assigned = userProfile.assigned_models || [];
-        if (assigned.length > 0) q = q.in("model_id", assigned);
-      }
-      const { data: sbData, error } = await q.order("last_message_at", { ascending: false });
+    if (_convSbRes.status === "fulfilled") {
+      const { data: sbData, error } = _convSbRes.value;
       if (!error && sbData) sbList = sbData;
-    } catch (_) {}
+    }
 
     // 3. Merge: API results take priority, Supabase fills gaps
     const idSet = new Set();
@@ -38408,6 +38481,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     clearTimeout(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
     const scheduleNextPoll = () => {
+      // ── 0.3 Polling adaptatif : 60s si idle >2 min, 30s sinon ────────────
+      const _pollIdleSince = Date.now() - lastActivityRef.current;
+      const _pollDelay = _pollIdleSince > 120000 ? 60000 : 30000;
       pollRef.current = setTimeout(async () => {
         if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) {
           scheduleNextPoll();
@@ -38420,7 +38496,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           isMsgPollingRef.current = false;
           scheduleNextPoll();
         }
-      }, 30000);
+      }, _pollDelay);
     };
     scheduleNextPoll();
     return () => clearTimeout(pollRef.current);
