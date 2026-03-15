@@ -31316,6 +31316,44 @@ const GRID_LAYOUTS = { "2x2": { cols: 2, slots: 4 }, "2x3": { cols: 3, slots: 6 
 const GRID_REFRESH_MS = 30000; // Realtime primary, polling fallback 30s
 
 // =====================================================================
+// GRID PREMIUM HELPERS
+// =====================================================================
+const _gpFmtTime = (ts) => {
+  if (!ts) return "";
+  try { return new Date(ts).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }); } catch(_) { return ""; }
+};
+const _gpFmtDateSep = (ts) => {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts), t = new Date(), y = new Date(t);
+    y.setDate(y.getDate() - 1);
+    if (d.toDateString() === t.toDateString()) return "Auj.";
+    if (d.toDateString() === y.toDateString()) return "Hier";
+    return d.toLocaleDateString("fr-FR", { day: "numeric", month: "short" });
+  } catch(_) { return ""; }
+};
+const _gpShouldSep = (msg, prev) => {
+  if (!prev) return true;
+  try {
+    return new Date(msg.created_at || msg.timestamp || 0).toDateString() !==
+           new Date(prev.created_at || prev.timestamp || 0).toDateString();
+  } catch(_) { return false; }
+};
+const _gpIsEmojisOnly = (text) => {
+  if (!text || typeof text !== "string") return false;
+  const clean = text.trim();
+  if (!clean || clean.length > 20) return false;
+  try {
+    return clean.replace(/[\p{Emoji}\p{Emoji_Modifier}\p{Emoji_Component}\u{FE00}-\u{FE0F}\u{200D}\s]+/gu, "").length === 0;
+  } catch(_) { return false; }
+};
+const _gpFmtCallDur = (secs) => {
+  if (!secs || Number(secs) < 1) return "";
+  const m = Math.floor(Number(secs) / 60), s = Number(secs) % 60;
+  return m > 0 ? (s > 0 ? m + "min " + s + "s" : m + "min") : s + "s";
+};
+
+// =====================================================================
 // GRID PREMIUM — Vue complète avec input, scripts, suggestions IA
 // =====================================================================
 const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [], lang, user, onSelectConv }) => {
@@ -31330,8 +31368,16 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   const [gpMsgInput, setGpMsgInput]         = useState("");
   const [gpSending, setGpSending]           = useState(false);
   const [gpShowScripts, setGpShowScripts]   = useState(false);
-  const gpRefreshRef = React.useRef(null);
-  const gpInputRef = React.useRef(null);
+  const gpRefreshRef          = React.useRef(null);
+  const gpInputRef            = React.useRef(null);
+  const [gpLightbox, setGpLightbox]       = useState(null);
+  const [gpLoadingMore, setGpLoadingMore] = useState({});
+  const [gpHasMore, setGpHasMore]         = useState({});
+  const gpSlotScrollRefs  = React.useRef({});
+  const gpTopSentinelRefs = React.useRef({});
+  const gpAutoScrolled    = React.useRef({});
+  const _gpLoadMoreFnRef  = React.useRef(null);
+  const _gpInFlight       = React.useRef(new Set());
 
   const gpLayoutCfg = GRID_LAYOUTS[gpLayout] || GRID_LAYOUTS["2x3"];
 
@@ -31362,11 +31408,15 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     if (!conv) return;
     const cid = _dmsgChatId(conv);
     if (!cid) return;
-    if (!silent) setGpLoadingSlots(p => ({ ...p, [idx]: true }));
+    if (!silent) {
+      setGpLoadingSlots(p => ({ ...p, [idx]: true }));
+      gpAutoScrolled.current[idx] = false;
+    }
     try {
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=30", { timeout: 8000 });
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200", { timeout: 10000 });
       const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
       setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
+      setGpHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
     } catch (_) {}
     setGpLoadingSlots(p => ({ ...p, [idx]: false }));
   }, []);
@@ -31383,8 +31433,88 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     return () => { if (gpRefreshRef.current) clearInterval(gpRefreshRef.current); };
   }, [gpSlots, gpLoadMsgs]);
 
+  // ── Auto-scroll vers le bas après chargement initial ──
+  useEffect(() => {
+    gpSlots.forEach((conv, idx) => {
+      if (!conv || gpAutoScrolled.current[idx]) return;
+      const scroller = gpSlotScrollRefs.current[idx];
+      const msgs = gpSlotMsgs[idx] || [];
+      if (scroller && msgs.length > 0 && !gpLoadingSlots[idx]) {
+        scroller.scrollTop = scroller.scrollHeight;
+        gpAutoScrolled.current[idx] = true;
+      }
+    });
+  }, [gpSlotMsgs, gpLoadingSlots]);
+
+  // ── Chargement historique (scroll infini) ──
+  const gpLoadMoreMsgs = async (idx) => {
+    const currentMsgs = gpSlotMsgs[idx] || [];
+    if (!gpHasMore[idx] || currentMsgs.length === 0) return;
+    if (_gpInFlight.current.has(idx)) return;
+    const conv = gpSlots[idx];
+    if (!conv) return;
+    const cid = _dmsgChatId(conv);
+    if (!cid) return;
+    _gpInFlight.current.add(idx);
+    setGpLoadingMore(p => ({ ...p, [idx]: true }));
+    try {
+      const sorted = [...currentMsgs].sort((a, b) =>
+        new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
+      );
+      const oldest = sorted[0];
+      const beforeId = oldest?.id || oldest?.message_id;
+      const path = beforeId
+        ? "/conversations/" + cid + "/messages?limit=100&before=" + beforeId
+        : "/conversations/" + cid + "/messages?limit=100";
+      const data = await _dmsgFetch(path, { timeout: 12000 });
+      const newMsgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      if (newMsgs.length === 0) {
+        setGpHasMore(p => ({ ...p, [idx]: false }));
+      } else {
+        setGpSlotMsgs(p => {
+          const existing = p[idx] || [];
+          const ids = new Set(existing.map(m => m.id || m.message_id).filter(Boolean));
+          const toAdd = newMsgs.filter(m => !ids.has(m.id || m.message_id));
+          if (toAdd.length === 0) {
+            setGpHasMore(prev => ({ ...prev, [idx]: false }));
+            return p;
+          }
+          return { ...p, [idx]: [...toAdd, ...existing] };
+        });
+        setGpHasMore(p => ({ ...p, [idx]: newMsgs.length >= 100 }));
+      }
+    } catch (_) {
+      setGpHasMore(p => ({ ...p, [idx]: false }));
+    }
+    _gpInFlight.current.delete(idx);
+    setGpLoadingMore(p => ({ ...p, [idx]: false }));
+  };
+  _gpLoadMoreFnRef.current = gpLoadMoreMsgs;
+
+  // ── IntersectionObserver : sentinel en haut de chaque slot ──
+  useEffect(() => {
+    const obs = {};
+    gpSlots.forEach((conv, idx) => {
+      if (!conv) return;
+      const sentinel = gpTopSentinelRefs.current[idx];
+      const root = gpSlotScrollRefs.current[idx];
+      if (!sentinel || !root) return;
+      const ob = new IntersectionObserver(
+        ([e]) => { if (e.isIntersecting) _gpLoadMoreFnRef.current(idx); },
+        { root, rootMargin: "80px 0px 0px 0px" }
+      );
+      ob.observe(sentinel);
+      obs[idx] = ob;
+    });
+    return () => { Object.values(obs).forEach(o => o.disconnect()); };
+  }, [gpSlots]);
+
   const gpCloseSlot = (idx) => {
     setGpSlots(p => { const n = [...p]; n[idx] = null; return n; });
+    setGpHasMore(p => ({ ...p, [idx]: false }));
+    setGpLoadingMore(p => ({ ...p, [idx]: false }));
+    _gpInFlight.current.delete(idx);
+    gpAutoScrolled.current[idx] = false;
     if (gpActiveSlot === idx) setGpActiveSlot(null);
   };
 
@@ -31424,6 +31554,42 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     setGpMsgInput(filled);
     setGpShowScripts(false);
     setTimeout(() => gpInputRef.current?.focus(), 50);
+  };
+
+  // ── Rendu contenu message (médias, appels, emojis, texte) ──
+  const renderGpMsgContent = (msg) => {
+    const rawText = msg.text || msg.content || msg.message || msg.message_text || "";
+    if (msg.type === "call" || msg.is_call || msg.message_type === "call") {
+      const dur = _gpFmtCallDur(msg.call_duration || msg.duration);
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 4, color: "#a5b4fc", fontSize: 10, fontStyle: "italic" }}>
+          <span style={{ fontSize: 13 }}>📞</span><span>{dur || "Appel"}</span>
+        </div>
+      );
+    }
+    if (msg.media_url || msg.photo_url) {
+      const url = msg.media_url || msg.photo_url;
+      return (
+        <img src={url} alt="Photo"
+          style={{ maxWidth: 120, maxHeight: 100, borderRadius: 5, cursor: "pointer", display: "block", objectFit: "cover" }}
+          onClick={e => { e.stopPropagation(); setGpLightbox(url); }}
+          loading="lazy"
+          onError={e => { e.currentTarget.style.display = "none"; }} />
+      );
+    }
+    if (msg.video_url) {
+      return (
+        <video src={msg.video_url} controls preload="metadata"
+          style={{ maxWidth: 120, borderRadius: 5, display: "block" }}
+          onClick={e => e.stopPropagation()} />
+      );
+    }
+    if (rawText && _gpIsEmojisOnly(rawText)) {
+      const count = [...rawText.trim()].filter(c => /\S/.test(c)).length;
+      const fs = count <= 2 ? "1.8rem" : count <= 5 ? "1.4rem" : "1.1rem";
+      return <div style={{ fontSize: fs, lineHeight: 1.2, padding: "2px 0" }}>{rawText}</div>;
+    }
+    return <span>{rawText || "[média]"}</span>;
   };
 
   return (
@@ -31494,23 +31660,51 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
                 </div>
               </div>
 
-              <div style={{ flex: 1, padding: "6px 8px", overflowY: "auto", fontSize: 11 }} className="grid-slot-scroller">
+              <div
+                ref={el => { gpSlotScrollRefs.current[idx] = el; }}
+                style={{ flex: 1, padding: "6px 8px", overflowY: "auto", fontSize: 11 }}
+                className="grid-slot-scroller">
+                {/* Sentinel IntersectionObserver — haut du scroller */}
+                <div ref={el => { gpTopSentinelRefs.current[idx] = el; }} style={{ height: 1 }} />
+                {gpLoadingMore[idx] && (
+                  <div style={{ textAlign: "center", color: "#6366f1", fontSize: 9, padding: "3px 0 5px", fontWeight: 600 }}>⏳ Ancien…</div>
+                )}
+                {!gpLoadingMore[idx] && !gpHasMore[idx] && (gpSlotMsgs[idx] || []).length > 0 && (
+                  <div style={{ textAlign: "center", color: "#374151", fontSize: 8, padding: "2px 0 4px" }}>— début —</div>
+                )}
                 {gpLoadingSlots[idx] ? (
                   <div style={{ color: "#6366f1", textAlign: "center", padding: 14, fontSize: 11 }}>Chargement…</div>
                 ) : (gpSlotMsgs[idx] || []).length === 0 ? (
                   <div style={{ color: "#4b5563", textAlign: "center", padding: 14, fontSize: 11 }}>Aucun message</div>
-                ) : (
-                  [...(gpSlotMsgs[idx] || [])].sort((a, b) => new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)).slice(-12).map((msg, mi) => {
+                ) : (() => {
+                  const sorted = [...(gpSlotMsgs[idx] || [])].sort((a, b) =>
+                    new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
+                  );
+                  return sorted.map((msg, mi) => {
                     const isOut = msg.is_outgoing || msg.direction === "out";
+                    const ts = msg.created_at || msg.timestamp;
+                    const showSep = _gpShouldSep(msg, mi > 0 ? sorted[mi - 1] : null);
                     return (
-                      <div key={mi} style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
-                        <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
-                          {_escapeHtml(msg.text || msg.content || msg.message || "[média]")}
+                      <React.Fragment key={msg.id || msg.message_id || mi}>
+                        {showSep && ts && (
+                          <div style={{ textAlign: "center", fontSize: 9, color: "#6b7280", margin: "5px 0 3px", fontWeight: 600 }}>
+                            {_gpFmtDateSep(ts)}
+                          </div>
+                        )}
+                        <div style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
+                          <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
+                            {renderGpMsgContent(msg)}
+                          </div>
+                          {ts && (
+                            <div style={{ fontSize: 8, color: "#4b5563", marginTop: 1, textAlign: isOut ? "right" : "left" }}>
+                              {_gpFmtTime(ts)}
+                            </div>
+                          )}
                         </div>
-                      </div>
+                      </React.Fragment>
                     );
-                  })
-                )}
+                  });
+                })()}
               </div>
 
               <button onClick={e => { e.stopPropagation(); gpCloseSlot(idx); }}
@@ -31610,6 +31804,18 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
           )}
         </div>
       </div>
+
+      {/* ── LIGHTBOX PARTAGÉ ── */}
+      {gpLightbox && (
+        <div onClick={() => setGpLightbox(null)}
+          style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.92)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 99999, cursor: "pointer" }}>
+          <img src={gpLightbox} alt="Aperçu"
+            style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 8, boxShadow: "0 20px 60px rgba(0,0,0,0.8)" }}
+            onClick={e => e.stopPropagation()} />
+          <button onClick={() => setGpLightbox(null)}
+            style={{ position: "absolute", top: 20, right: 20, background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: "50%", width: 40, height: 40, color: "#fff", fontSize: 18, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+        </div>
+      )}
 
       <style dangerouslySetInnerHTML={{ __html: `
         @keyframes gridPulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
