@@ -33837,6 +33837,12 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   const [filterModel,   setFilterModel]         = useState("all");
   const [filterDateRange, setFilterDateRange]   = useState("30");
 
+  // ── Scheduled broadcasts state ──────────────────────────
+  const [scheduledDate, setScheduledDate]         = useState("");
+  const [scheduledTime, setScheduledTime]         = useState("");
+  const [scheduledBroadcasts, setScheduledBroadcasts] = useState([]);
+  const [showScheduledPanel, setShowScheduledPanel]   = useState(false);
+
   useEffect(() => {
     if (!broadcastModel && models.length > 0) setBroadcastModel(models[0].id);
   }, [models]);
@@ -33844,6 +33850,8 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   useEffect(() => { loadAnalytics(); }, [filterModel, filterDateRange]);
 
   useEffect(() => { if (models.length > 0) loadModelsStatus(); }, [models, conversations]);
+
+  useEffect(() => { loadScheduledBroadcasts(); }, []);
 
   const computeLocalModelStatus = React.useCallback((modelId) => {
     const mConvs = conversations.filter(c => c.model_id === modelId);
@@ -33920,6 +33928,28 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
       setBroadcasts(data || []);
     } catch (_) {}
     setAnalyticsLoading(false);
+  };
+
+  const loadScheduledBroadcasts = async () => {
+    try {
+      const { data } = await sb.from("scheduled_broadcasts")
+        .select("*")
+        .in("status", ["pending", "processing"])
+        .order("scheduled_at", { ascending: true });
+      setScheduledBroadcasts(data || []);
+    } catch (_) {
+      setScheduledBroadcasts([]);
+    }
+  };
+
+  const cancelScheduledBroadcast = async (id) => {
+    try {
+      await sb.from("scheduled_broadcasts").update({ status: "cancelled" }).eq("id", id);
+      addToast("❌ Broadcast annulé", "info");
+      loadScheduledBroadcasts();
+    } catch (_) {
+      addToast("❌ Erreur annulation", "error");
+    }
   };
 
   const TIERS = [
@@ -34034,6 +34064,61 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
     if (selectedConvIds.size === 0) { addToast("Aucun destinataire", "error"); return; }
 
     const mStatus = modelsStatus[broadcastModel] || computeLocalModelStatus(broadcastModel);
+
+    // ── SI SCHEDULED : créer dans scheduled_broadcasts ──
+    if (scheduledDate && scheduledTime) {
+      const scheduledAt = new Date(`${scheduledDate}T${scheduledTime}`);
+      if (scheduledAt <= new Date()) {
+        addToast("⚠️ La date doit être dans le futur", "error");
+        return;
+      }
+
+      try {
+        setIsSending(true);
+        const modelName = models.find(m => m.id === broadcastModel)?.name || broadcastModel;
+        const tierLabel = TIERS.find(t => t.id === selectedTier)?.label || "Tous";
+        const chatIds = Array.from(selectedConvIds);
+
+        const { error } = await sb.from("scheduled_broadcasts").insert({
+          user_id:      user?.id || null,
+          model_id:     broadcastModel,
+          audience_id:  null,
+          chat_ids:     chatIds,
+          message:      broadcastMessage.trim(),
+          scheduled_at: scheduledAt.toISOString(),
+          status:       "pending",
+          metadata: {
+            spacing:          scheduleSpacing,
+            audience_name:    `${modelName} · ${tierLabel}`,
+            total_recipients: chatIds.length,
+            tier:             selectedTier,
+            has_media:        !!broadcastMedia,
+            media_type:       broadcastMedia?.type || null,
+          },
+        });
+
+        if (error) throw new Error(error.message);
+
+        addToast(`⏰ Broadcast programmé pour ${scheduledDate} ${scheduledTime}`, "success");
+        setBroadcastMessage("");
+        setBroadcastMedia(null);
+        setScheduledDate("");
+        setScheduledTime("");
+        setSelectedTier("all");
+        setMessageVariants([]);
+        setVariantsGenerated(false);
+        loadScheduledBroadcasts();
+        setShowScheduledPanel(true);
+
+      } catch (e) {
+        addToast("❌ Erreur programmation: " + e.message, "error");
+      } finally {
+        setIsSending(false);
+      }
+      return;
+    }
+
+    // ── SINON : envoi immédiat (code existant) ──
     if (mStatus && !mStatus.can_broadcast) {
       window.alert(
         "❌ BROADCAST BLOQUÉ\n\n" +
@@ -34467,14 +34552,61 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
                 </div>
               </div>
             )}
-            <button onClick={sendBroadcast} disabled={!canSend}
-              style={{ width: "100%", padding: 14, borderRadius: 12, border: "none",
-                background: canSend ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : "rgba(255,255,255,0.04)",
-                color: canSend ? "#fff" : "var(--text-tertiary)",
-                fontSize: 14, fontWeight: 800, cursor: canSend ? "pointer" : "not-allowed",
-                boxShadow: canSend ? "0 6px 20px rgba(99,102,241,0.35)" : "none", transition: "all 0.2s" }}>
-              {isSending ? "⏳ Envoi en cours…" : `📡 Envoyer à ${selectedConvIds.size} fan${selectedConvIds.size > 1 ? "s" : ""}${messageVariants.length > 0 ? ` (${messageVariants.length} variantes)` : ""}`}
-            </button>
+            {/* ── BOUTONS ENVOI + PROGRAMMATION ── */}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={sendBroadcast} disabled={!canSend || isSending || (!!scheduledDate && !!scheduledTime)}
+                style={{ flex: 2, padding: "14px 20px", borderRadius: 10, border: "none",
+                  background: canSend && !isSending && !scheduledDate ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : "rgba(255,255,255,0.05)",
+                  color: canSend && !isSending && !scheduledDate ? "#fff" : "var(--text-tertiary)",
+                  fontSize: 14, fontWeight: 700, cursor: canSend && !isSending && !scheduledDate ? "pointer" : "not-allowed",
+                  boxShadow: canSend && !isSending && !scheduledDate ? "0 4px 16px rgba(99,102,241,0.4)" : "none",
+                  transition: "all 0.2s" }}>
+                {isSending ? `⏳ Envoi ${sendProgress?.current || 0}/${sendProgress?.total || 0}…` : `🚀 Envoyer maintenant · ${selectedConvIds.size} fans · ~${estMinutes}min`}
+              </button>
+
+              <button onClick={() => setShowScheduledPanel(!showScheduledPanel)}
+                style={{ flex: 1, padding: "14px 20px", borderRadius: 10,
+                  border: `2px solid ${showScheduledPanel ? "#f59e0b" : "rgba(255,255,255,0.1)"}`,
+                  background: showScheduledPanel ? "rgba(245,158,11,0.15)" : "rgba(255,255,255,0.03)",
+                  color: showScheduledPanel ? "#f59e0b" : "var(--text-secondary)",
+                  fontSize: 14, fontWeight: 700, cursor: "pointer", transition: "all 0.2s" }}>
+                ⏰ Programmer
+              </button>
+            </div>
+
+            {/* ── PANEL PROGRAMMATION ── */}
+            {showScheduledPanel && (
+              <div style={{ marginTop: 16, padding: 16, background: "rgba(245,158,11,0.08)", border: "2px solid rgba(245,158,11,0.25)", borderRadius: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12, color: "#f59e0b" }}>
+                  ⏰ Programmer l'envoi
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <div>
+                    <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: "var(--text-tertiary)", marginBottom: 5 }}>Date</label>
+                    <input type="date" value={scheduledDate} onChange={e => setScheduledDate(e.target.value)}
+                      style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.05)", color: "var(--text-primary)", fontSize: 13 }} />
+                  </div>
+                  <div>
+                    <label style={{ display: "block", fontSize: 11, fontWeight: 700, color: "var(--text-tertiary)", marginBottom: 5 }}>Heure</label>
+                    <input type="time" value={scheduledTime} onChange={e => setScheduledTime(e.target.value)}
+                      style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.05)", color: "var(--text-primary)", fontSize: 13 }} />
+                  </div>
+                </div>
+                {scheduledDate && scheduledTime && (
+                  <div style={{ marginTop: 12, padding: "10px 12px", background: "rgba(16,185,129,0.12)", border: "1px solid rgba(16,185,129,0.3)", borderRadius: 8, fontSize: 12, color: "#10b981", fontWeight: 700 }}>
+                    ✓ Envoi prévu le {new Date(`${scheduledDate}T${scheduledTime}`).toLocaleString("fr-FR", { day: "2-digit", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" })}
+                  </div>
+                )}
+                <button onClick={sendBroadcast} disabled={!canSend || !scheduledDate || !scheduledTime || isSending}
+                  style={{ width: "100%", marginTop: 12, padding: "12px 16px", borderRadius: 8, border: "none",
+                    background: canSend && scheduledDate && scheduledTime && !isSending ? "#f59e0b" : "rgba(255,255,255,0.05)",
+                    color: canSend && scheduledDate && scheduledTime && !isSending ? "#fff" : "var(--text-tertiary)",
+                    fontSize: 13, fontWeight: 700, cursor: canSend && scheduledDate && scheduledTime && !isSending ? "pointer" : "not-allowed" }}>
+                  ⏰ Confirmer la programmation
+                </button>
+              </div>
+            )}
+
             {!canSend && !isSending && (
               <p style={{ margin: "6px 0 0", fontSize: 11, color: "var(--text-tertiary)", textAlign: "center" }}>
                 {selectedConvIds.size === 0 ? "Sélectionne modèle + segment" : "Ajoute un message ou média"}
@@ -34526,6 +34658,72 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
                   <div style={{ fontSize: 10, color: "var(--text-tertiary)", flexShrink: 0 }}>
                     {b.sent_at ? new Date(b.sent_at).toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—"}
                   </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* ── BROADCASTS PROGRAMMÉS ── */}
+      <div style={card}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+          <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700 }}>📅 Broadcasts programmés ({scheduledBroadcasts.length})</h3>
+          <button onClick={loadScheduledBroadcasts}
+            style={{ padding: "6px 10px", background: "rgba(99,102,241,0.15)", border: "1px solid rgba(99,102,241,0.3)", borderRadius: 8, color: "#a5b4fc", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+            🔄
+          </button>
+        </div>
+
+        {scheduledBroadcasts.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: "var(--text-tertiary)", fontSize: 13 }}>
+            Aucun broadcast programmé — utilise le bouton "⏰ Programmer" pour en créer un !
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+            {scheduledBroadcasts.map((bc, idx) => {
+              const dt = new Date(bc.scheduled_at);
+              const diff = dt - Date.now();
+              const hrs  = Math.floor(diff / 3600000);
+              const mins = Math.floor((diff % 3600000) / 60000);
+              const days = Math.floor(diff / 86400000);
+              const clr = getModelClr(models.find(m => m.id === bc.model_id)?.name || "");
+              const timeLabel = days > 0 ? `dans ${days}j ${hrs % 24}h` : hrs > 0 ? `dans ${hrs}h ${mins}m` : `dans ${mins}m`;
+
+              return (
+                <div key={bc.id} style={{ padding: "14px 16px", borderBottom: idx < scheduledBroadcasts.length - 1 ? "1px solid rgba(255,255,255,0.05)" : "none", display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 120 }}>
+                    <span style={{ padding: "2px 8px", borderRadius: 6, fontSize: 11, fontWeight: 700,
+                      background: clr.bg + "22", color: clr.bg, border: `1px solid ${clr.bg}44` }}>
+                      {models.find(m => m.id === bc.model_id)?.name || bc.model_id || "—"}
+                    </span>
+                    {bc.metadata?.has_media && <span style={{ fontSize: 14 }}>{bc.metadata?.media_type === "photo" ? "🖼️" : bc.metadata?.media_type === "video" ? "🎥" : "🎵"}</span>}
+                  </div>
+
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2 }}>{bc.metadata?.audience_name || "Manuel"}</div>
+                    {bc.message && <div style={{ fontSize: 11, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{bc.message.slice(0, 80)}{bc.message.length > 80 ? "…" : ""}</div>}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 12, alignItems: "center", flexShrink: 0 }}>
+                    <div>
+                      <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase" }}>Destinataires</div>
+                      <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text-primary)" }}>{bc.chat_ids?.length || 0}</div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase" }}>Prévu</div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "#f59e0b" }}>{timeLabel}</div>
+                    </div>
+                  </div>
+
+                  <div style={{ fontSize: 10, color: "var(--text-tertiary)", flexShrink: 0 }}>
+                    📅 {dt.toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                  </div>
+
+                  <button onClick={() => cancelScheduledBroadcast(bc.id)}
+                    style={{ padding: "6px 12px", borderRadius: 6, border: "1px solid #ef4444", background: "rgba(239,68,68,0.1)", color: "#ef4444", fontSize: 11, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
+                    ✕ Annuler
+                  </button>
                 </div>
               );
             })}
