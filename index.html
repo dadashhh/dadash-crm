@@ -31130,7 +31130,66 @@ const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 const _DMSG_KEY_FALLBACK = window.CRM_API_KEY || "";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
-const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s
+const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s (L1 RAM)
+
+// ── 2.3 IndexedDB persistent cache — L2, TTL 5min, survit aux refresh ────────
+const _idbOpen = (() => {
+  let _db = null;
+  return () => {
+    if (_db) return Promise.resolve(_db);
+    return new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open('DadashMsgCache', 1);
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => { _db = req.result; resolve(_db); };
+        req.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains('messages')) {
+            const store = db.createObjectStore('messages', { keyPath: 'chat_id' });
+            store.createIndex('ts', 'ts', { unique: false });
+          }
+        };
+      } catch (e) { reject(e); }
+    });
+  };
+})();
+
+const _idbGetMsgs = async (chatId) => {
+  try {
+    const db = await _idbOpen();
+    return new Promise((resolve) => {
+      const tx = db.transaction('messages', 'readonly');
+      const req = tx.objectStore('messages').get(String(chatId));
+      req.onsuccess = () => {
+        const row = req.result;
+        if (!row || Date.now() - row.ts > 300000) { resolve(null); return; } // 5min TTL
+        resolve(row);
+      };
+      req.onerror = () => resolve(null);
+    });
+  } catch { return null; }
+};
+
+const _idbSetMsgs = async (chatId, msgs) => {
+  try {
+    const db = await _idbOpen();
+    const tx = db.transaction('messages', 'readwrite');
+    tx.objectStore('messages').put({ chat_id: String(chatId), data: msgs, ts: Date.now() });
+  } catch {}
+};
+
+const _idbCleanOld = async () => {
+  try {
+    const db = await _idbOpen();
+    const tx = db.transaction('messages', 'readwrite');
+    const store = tx.objectStore('messages');
+    const range = IDBKeyRange.upperBound(Date.now() - 86400000); // >24h
+    store.index('ts').openCursor(range).onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) { store.delete(cursor.primaryKey); cursor.continue(); }
+    };
+  } catch {}
+};
 
 const _dmsgFetch = async (path, opts = {}) => {
   const key = window.CRM_API_KEY || _DMSG_KEY_FALLBACK;
@@ -31583,7 +31642,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia }) => {
 };
 
 // ── 1.2 React.memo — liste messages d'un slot Grid ──────────────────
-const GpSlotMsgList = React.memo(function GpSlotMsgList({ msgs, loading, renderMsgContent }) {
+const GpSlotMsgList = React.memo(function GpSlotMsgList({ msgs, loading, renderMsgContent, onRetry }) {
   if (loading) return React.createElement("div", { style: { color: "#6366f1", textAlign: "center", padding: 14, fontSize: 11 } }, "Chargement…");
   if (!msgs || msgs.length === 0) return React.createElement("div", { style: { color: "#4b5563", textAlign: "center", padding: 14, fontSize: 11 } }, "Aucun message");
   const sorted = [...msgs].sort((a, b) =>
@@ -31593,6 +31652,15 @@ const GpSlotMsgList = React.memo(function GpSlotMsgList({ msgs, loading, renderM
     const isOut = msg.is_outgoing || msg.direction === "out";
     const ts = msg.created_at || msg.timestamp;
     const showSep = _gpShouldSep(msg, mi > 0 ? sorted[mi - 1] : null);
+    // ── 2.2 Optimistic / failed visual feedback ──
+    const bubbleStyle = {
+      display: "inline-block", padding: "4px 8px",
+      background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)",
+      color: isOut ? "#fff" : "#d1d5db",
+      borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word",
+      opacity: msg._optimistic ? 0.6 : 1,
+      borderLeft: msg._failed ? "3px solid #ef4444" : "none",
+    };
     return (
       <React.Fragment key={msg.id || msg.message_id || mi}>
         {showSep && ts && (
@@ -31601,10 +31669,16 @@ const GpSlotMsgList = React.memo(function GpSlotMsgList({ msgs, loading, renderM
           </div>
         )}
         <div style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
-          <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
+          <div style={bubbleStyle}>
             {renderMsgContent(msg)}
+            {msg._optimistic && <span style={{ fontSize: 8, opacity: 0.7, marginLeft: 4 }}>⏳</span>}
+            {msg._failed && onRetry && (
+              <button onClick={() => onRetry(msg)} style={{ fontSize: 9, color: "#ef4444", background: "none", border: "none", cursor: "pointer", marginLeft: 4, padding: "0 2px" }}>
+                🔁 Retry
+              </button>
+            )}
           </div>
-          {ts && (
+          {ts && !msg._optimistic && (
             <div style={{ fontSize: 8, color: "#4b5563", marginTop: 1, textAlign: isOut ? "right" : "left" }}>
               {_gpFmtTime(ts)}
             </div>
@@ -31613,7 +31687,12 @@ const GpSlotMsgList = React.memo(function GpSlotMsgList({ msgs, loading, renderM
       </React.Fragment>
     );
   });
-}, (prev, next) => prev.msgs === next.msgs && prev.loading === next.loading && prev.renderMsgContent === next.renderMsgContent);
+}, (prev, next) =>
+  prev.msgs === next.msgs &&
+  prev.loading === next.loading &&
+  prev.renderMsgContent === next.renderMsgContent &&
+  prev.onRetry === next.onRetry
+);
 
 // =====================================================================
 // GRID PREMIUM — Vue complète avec input, scripts, suggestions IA
@@ -31683,11 +31762,19 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     if (!conv) return;
     const cid = _dmsgChatId(conv);
     if (!cid) return;
-    // ── 0.2 Cache hit — skip fetch si données fraîches (TTL 60s) ────────────
+    // ── 0.2 Cache hit — L1 RAM (TTL 60s) ─────────────────────────────────────
     if (silent) {
       const _gpCached = _DMSG_MSG_CACHE[String(cid)];
       if (_gpCached && Date.now() - _gpCached.ts < 60000) {
-        console.log(`[PERF] gpLoadMsgs CACHE HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_gpCached.ts)/1000)}s)`);
+        console.log(`[PERF] gpLoadMsgs L1-HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_gpCached.ts)/1000)}s)`);
+        return;
+      }
+      // ── 2.3 L2 IndexedDB cache (TTL 5min) — instant render while fetching ──
+      const _gpIdb = await _idbGetMsgs(cid);
+      if (_gpIdb) {
+        console.log(`[PERF] gpLoadMsgs L2-IDB-HIT — slot ${idx} chatId: ${cid}`);
+        _DMSG_MSG_CACHE[String(cid)] = { data: _gpIdb.data, ts: _gpIdb.ts };
+        setGpSlotMsgs(p => ({ ...p, [idx]: _gpIdb.data }));
         return;
       }
     }
@@ -31703,8 +31790,9 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] gpLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
       if (_ldur > 2000) console.warn(`⚠️ [PERF] gpLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
-      // ── 0.2 Write cache ──────────────────────────────────────────────────
+      // ── 0.2 + 2.3 Write L1 + L2 cache ────────────────────────────────────
       _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+      _idbSetMsgs(cid, msgs);
       setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setGpHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
     } catch (e) {
@@ -31847,25 +31935,68 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   const activeMsgs = gpActiveSlot !== null ? (gpSlotMsgs[gpActiveSlot] || []) : [];
   const activeName = activeConv?.first_name || activeConv?.spender?.first_name || activeConv?.username || "Unknown";
 
+  // ── 2.2 Helper: send text to a Grid slot (shared by gpSendMessage + gpRetryMsg) ──
+  const _gpDoSend = async (text, conv, slotIdx) => {
+    const cid = _dmsgChatId(conv);
+    const modelId = conv.model_id || "";
+    const _optId = "opt-" + Date.now();
+    // Add optimistic message immediately
+    setGpSlotMsgs(p => ({
+      ...p,
+      [slotIdx]: [...(p[slotIdx] || []), {
+        id: _optId, text, is_outgoing: true, direction: "out",
+        created_at: new Date().toISOString(), _optimistic: true
+      }]
+    }));
+    setTimeout(() => { const s = gpSlotScrollRefs.current[slotIdx]; if (s) s.scrollTop = s.scrollHeight; }, 50);
+    try {
+      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: modelId }), timeout: 8000 });
+      // Remove optimistic, reload real messages
+      setGpSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).filter(m => m.id !== _optId) }));
+      setTimeout(() => {
+        gpLoadMsgsRef.current?.(conv, slotIdx, true);
+        setTimeout(() => { const s = gpSlotScrollRefs.current[slotIdx]; if (s) s.scrollTop = s.scrollHeight; }, 600);
+      }, 800);
+    } catch (err) {
+      // Mark as failed for retry
+      setGpSlotMsgs(p => ({
+        ...p,
+        [slotIdx]: (p[slotIdx] || []).map(m =>
+          m.id === _optId ? { ...m, _optimistic: false, _failed: true } : m
+        )
+      }));
+      throw err;
+    }
+  };
+
   const gpSendMessage = async () => {
     if (!activeConv || !gpMsgInput.trim()) return;
     const text = gpMsgInput.trim();
-    const cid = _dmsgChatId(activeConv);
-    const modelId = activeConv.model_id || "";
+    setGpMsgInput("");
     setGpSending(true);
     try {
-      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: modelId }), timeout: 8000 });
-      setGpMsgInput("");
+      await _gpDoSend(text, activeConv, gpActiveSlot);
       addToast("Message envoyé", "success");
-      setTimeout(() => {
-        gpLoadMsgs(activeConv, gpActiveSlot, true);
-        setTimeout(() => { const s = gpSlotScrollRefs.current[gpActiveSlot]; if (s) s.scrollTop = s.scrollHeight; }, 600);
-      }, 800);
     } catch (err) {
       addToast("Erreur envoi : " + err.message, "error");
     }
     setGpSending(false);
   };
+
+  // ── 2.2 Retry failed optimistic message ────────────────────────────────────
+  const gpRetryMsg = React.useCallback(async (failedMsg) => {
+    const text = failedMsg.text || failedMsg.content || "";
+    if (!text || gpActiveSlot === null) return;
+    const conv = gpSlots[gpActiveSlot];
+    if (!conv) return;
+    // Remove failed message before retrying
+    setGpSlotMsgs(p => ({ ...p, [gpActiveSlot]: (p[gpActiveSlot] || []).filter(m => m.id !== failedMsg.id) }));
+    try {
+      await _gpDoSend(text, conv, gpActiveSlot);
+    } catch (err) {
+      addToast("Retry échoué : " + err.message, "error");
+    }
+  }, [gpActiveSlot, gpSlots, addToast]);
 
   const gpSendEmoji = async (emoji) => {
     if (!activeConv) return;
@@ -32127,11 +32258,12 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
                 {!gpLoadingMore[idx] && !gpHasMore[idx] && (gpSlotMsgs[idx] || []).length > 0 && (
                   <div style={{ textAlign: "center", color: "#374151", fontSize: 8, padding: "2px 0 4px" }}>— début —</div>
                 )}
-                {/* ── 1.2 React.memo GpSlotMsgList ── */}
+                {/* ── 1.2 React.memo GpSlotMsgList + 2.2 onRetry ── */}
                 <GpSlotMsgList
                   msgs={gpSlotMsgs[idx]}
                   loading={!!gpLoadingSlots[idx]}
                   renderMsgContent={renderGpMsgContent}
+                  onRetry={gpRetryMsg}
                 />
               </div>
 
@@ -32859,11 +32991,19 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     if (!conv) return;
     const cid = _dmsgChatId(conv);
     if (!cid) return;
-    // ── 0.2 Cache hit — skip fetch si données fraîches (TTL 60s) ────────────
+    // ── 0.2 Cache hit — L1 RAM (TTL 60s) ─────────────────────────────────────
     if (silent) {
       const _tCached = _DMSG_MSG_CACHE[String(cid)];
       if (_tCached && Date.now() - _tCached.ts < 60000) {
-        console.log(`[PERF] tLoadMsgs CACHE HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_tCached.ts)/1000)}s)`);
+        console.log(`[PERF] tLoadMsgs L1-HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_tCached.ts)/1000)}s)`);
+        return;
+      }
+      // ── 2.3 L2 IndexedDB cache (TTL 5min) ────────────────────────────────
+      const _tIdb = await _idbGetMsgs(cid);
+      if (_tIdb) {
+        console.log(`[PERF] tLoadMsgs L2-IDB-HIT — slot ${idx} chatId: ${cid}`);
+        _DMSG_MSG_CACHE[String(cid)] = { data: _tIdb.data, ts: _tIdb.ts };
+        setTSlotMsgs(p => ({ ...p, [idx]: _tIdb.data }));
         return;
       }
     }
@@ -32879,8 +33019,9 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] tLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
       if (_ldur > 2000) console.warn(`⚠️ [PERF] tLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
-      // ── 0.2 Write cache ──────────────────────────────────────────────────
+      // ── 0.2 + 2.3 Write L1 + L2 cache ────────────────────────────────────
       _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+      _idbSetMsgs(cid, msgs);
       setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setTHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
     } catch (e) {
@@ -33085,16 +33226,33 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     const text = (tInputs[idx] || "").trim();
     if (!conv || !text) return;
     const cid = _dmsgChatId(conv);
+    setTInputs(p => ({ ...p, [idx]: "" }));
     setTSending(p => ({ ...p, [idx]: true }));
+    // ── 2.2 Optimistic message ────────────────────────────────────────────────
+    const _optId = "opt-" + Date.now();
+    setTSlotMsgs(p => ({
+      ...p,
+      [idx]: [...(p[idx] || []), {
+        id: _optId, text, is_outgoing: true, direction: "out",
+        created_at: new Date().toISOString(), _optimistic: true
+      }]
+    }));
+    setTimeout(() => { const s = tSlotScrollRefs.current[idx]; if (s) s.scrollTop = s.scrollHeight; }, 50);
     try {
       await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: conv.model_id || "" }), timeout: 8000 });
-      setTInputs(p => ({ ...p, [idx]: "" }));
+      setTSlotMsgs(p => ({ ...p, [idx]: (p[idx] || []).filter(m => m.id !== _optId) }));
       addToast("Envoyé", "success");
       setTimeout(() => {
-        tLoadMsgs(conv, idx, true);
+        tLoadMsgsRef.current?.(conv, idx, true);
         setTimeout(() => { const s = tSlotScrollRefs.current[idx]; if (s) s.scrollTop = s.scrollHeight; }, 600);
       }, 800);
     } catch (err) {
+      setTSlotMsgs(p => ({
+        ...p,
+        [idx]: (p[idx] || []).map(m =>
+          m.id === _optId ? { ...m, _optimistic: false, _failed: true } : m
+        )
+      }));
       addToast("Erreur : " + err.message, "error");
     }
     setTSending(p => ({ ...p, [idx]: false }));
@@ -38453,51 +38611,42 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     return () => clearInterval(scrollInterval);
   }, [selectedChatId]);
 
-  // ── Supabase Realtime : messages instantanés (INSERT + UPDATE) ──────────────
+  // ── 2.1 Realtime via global channel CustomEvents (deduplicated) ─────────────
   useEffect(() => {
-    const channel = sb
-      .channel('dmsg-messages-rt')
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'tg_messages'
-      }, payload => {
-        const msg = payload.new;
-        if (!msg) return;
-        // Update messages if this message belongs to the active conversation
-        const activeCid = chatIdRef.current;
-        if (activeCid && msg.conversation_id) {
-          // Check by conversation_id match via cache
-          const cached = _DMSG_MSG_CACHE[activeCid];
-          const belongsToActive = cached?.data?.length > 0 &&
-            cached.data[0]?.conversation_id === msg.conversation_id;
-          if (belongsToActive) {
-            setMessages(prev => {
-              if (prev.some(m => m.id === msg.id)) return prev;
-              return [...prev, msg];
-            });
-          }
+    const handleInsert = (e) => {
+      const msg = e.detail;
+      if (!msg) return;
+      const activeCid = chatIdRef.current;
+      if (activeCid && msg.conversation_id) {
+        const cached = _DMSG_MSG_CACHE[activeCid];
+        const belongsToActive = cached?.data?.length > 0 &&
+          cached.data[0]?.conversation_id === msg.conversation_id;
+        if (belongsToActive) {
+          setMessages(prev => {
+            if (prev.some(m => m.id === msg.id)) return prev;
+            return [...prev, msg];
+          });
         }
-        // Refresh conversations list on new incoming message
-        if (msg.direction === 'in' || msg.sender_type === 'user') {
-          const now = Date.now();
-          if (now - lastConvRefreshRef.current > 5000) {
-            lastConvRefreshRef.current = now;
-            loadConversationsRef.current();
-          }
+      }
+      if (msg.direction === 'in' || msg.sender_type === 'user') {
+        const now = Date.now();
+        if (now - lastConvRefreshRef.current > 5000) {
+          lastConvRefreshRef.current = now;
+          loadConversationsRef.current();
         }
-      })
-      .on('postgres_changes', {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'tg_messages'
-      }, payload => {
-        const msg = payload.new;
-        if (!msg) return;
-        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
-      })
-      .subscribe();
-    return () => sb.removeChannel(channel);
+      }
+    };
+    const handleUpdate = (e) => {
+      const msg = e.detail;
+      if (!msg) return;
+      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+    };
+    window.addEventListener('tg-message-insert', handleInsert);
+    window.addEventListener('tg-message-update', handleUpdate);
+    return () => {
+      window.removeEventListener('tg-message-insert', handleInsert);
+      window.removeEventListener('tg-message-update', handleUpdate);
+    };
   }, []);
 
   // ── Polling messages fallback 30s (backup Realtime) ───────────────────────
@@ -41553,26 +41702,28 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
-  // ── Supabase Realtime : messages instantanés ──────────────────────────────
+  // ── 2.1 Realtime via global channel CustomEvents (deduplicated) ─────────────
   useEffect(() => {
-    const channel = sb
-      .channel('tg-page-messages-rt')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages' }, payload => {
-        const msg = payload.new;
-        if (!msg || !chatIdRef.current) return;
-        setMessages(prev => {
-          if (prev.some(m => m.id === msg.id)) return prev;
-          return [...prev, msg];
-        });
-        loadConversations(false);
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages' }, payload => {
-        const msg = payload.new;
-        if (!msg) return;
-        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
-      })
-      .subscribe();
-    return () => sb.removeChannel(channel);
+    const handleInsert = (e) => {
+      const msg = e.detail;
+      if (!msg || !chatIdRef.current) return;
+      setMessages(prev => {
+        if (prev.some(m => m.id === msg.id)) return prev;
+        return [...prev, msg];
+      });
+      loadConversations(false);
+    };
+    const handleUpdate = (e) => {
+      const msg = e.detail;
+      if (!msg) return;
+      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+    };
+    window.addEventListener('tg-message-insert', handleInsert);
+    window.addEventListener('tg-message-update', handleUpdate);
+    return () => {
+      window.removeEventListener('tg-message-insert', handleInsert);
+      window.removeEventListener('tg-message-update', handleUpdate);
+    };
   }, []);
 
   // Refresh fallback 30s — messages de la conv active + liste des convs (Realtime = primary)
@@ -56154,26 +56305,28 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     }
   }, [visible]);
 
-  // ── Supabase Realtime : messages instantanés (secondary panel) ──────────────
+  // ── 2.1 Realtime via global channel CustomEvents (deduplicated) ─────────────
   useEffect(() => {
     if (!chatId) return;
-    const channel = sb
-      .channel('secondary-chat-rt-' + chatId)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages' }, payload => {
-        const msg = payload.new;
-        if (!msg) return;
-        setMessages(prev => {
-          if (prev.some(m => m.id === msg.id)) return prev;
-          return [...prev, msg];
-        });
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages' }, payload => {
-        const msg = payload.new;
-        if (!msg) return;
-        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
-      })
-      .subscribe();
-    return () => sb.removeChannel(channel);
+    const handleInsert = (e) => {
+      const msg = e.detail;
+      if (!msg) return;
+      setMessages(prev => {
+        if (prev.some(m => m.id === msg.id)) return prev;
+        return [...prev, msg];
+      });
+    };
+    const handleUpdate = (e) => {
+      const msg = e.detail;
+      if (!msg) return;
+      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+    };
+    window.addEventListener('tg-message-insert', handleInsert);
+    window.addEventListener('tg-message-update', handleUpdate);
+    return () => {
+      window.removeEventListener('tg-message-insert', handleInsert);
+      window.removeEventListener('tg-message-update', handleUpdate);
+    };
   }, [chatId]);
 
   // Polling fallback 30s: only active when visible
@@ -58153,6 +58306,34 @@ const App = () => {
       }
     };
   }, [user?.id]);
+
+  // ── 2.1 Global Realtime — single tg_messages channel (replaces 3 duplicate subscriptions) ──
+  useEffect(() => {
+    if (!user) return;
+    if (window._tgMessagesChannelActive) return; // Already active (HMR-safe guard)
+    const channel = window.sb
+      .channel('global-tg-messages-rt')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages' }, payload => {
+        if (!payload.new) return;
+        console.log('[REALTIME] tg-message-insert id:', payload.new.id);
+        window.dispatchEvent(new CustomEvent('tg-message-insert', { detail: payload.new }));
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages' }, payload => {
+        if (!payload.new) return;
+        window.dispatchEvent(new CustomEvent('tg-message-update', { detail: payload.new }));
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') console.log('[REALTIME] Global tg_messages channel active');
+      });
+    window._tgMessagesChannelActive = true;
+    return () => {
+      window.sb.removeChannel(channel);
+      window._tgMessagesChannelActive = false;
+    };
+  }, [user?.id]);
+
+  // ── 2.3 Cleanup IndexedDB cache entries >24h at boot ─────────────────────
+  useEffect(() => { _idbCleanOld(); }, []);
 
   // Navigate to spender page from anywhere
   const navigateToSpender = (key) => {
