@@ -31266,7 +31266,7 @@ const _escapeHtml = (text) => {
 // GRID CONSTANTS (shared by Grid Premium + TLG Pro)
 // =====================================================================
 const GRID_LAYOUTS = { "2x2": { cols: 2, slots: 4 }, "2x3": { cols: 3, slots: 6 }, "3x3": { cols: 3, slots: 9 }, "3x4": { cols: 4, slots: 12 } };
-const GRID_REFRESH_MS = 10000;
+const GRID_REFRESH_MS = 30000; // Realtime primary, polling fallback 30s
 
 // =====================================================================
 // GRID PREMIUM — Vue complète avec input, scripts, suggestions IA
@@ -32621,14 +32621,14 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     }
   }, [loadMessages, showToast]);
 
-  // Auto-refresh every 10s
+  // Auto-refresh every 30s (Realtime primary, polling fallback)
   useEffect(() => {
     loadUnread(false);
 
     refreshRef.current = setInterval(() => {
       console.log("[TINDADA] Auto-refresh...");
       loadUnread(true);
-    }, 10000);
+    }, 30000);
 
     return () => {
       mountedRef.current = false;
@@ -36809,13 +36809,58 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     return () => clearInterval(scrollInterval);
   }, [selectedChatId]);
 
-  // ── Polling messages adaptatif : 2s si actif, 10s si inactif >1min ──────────
+  // ── Supabase Realtime : messages instantanés (INSERT + UPDATE) ──────────────
+  useEffect(() => {
+    const channel = sb
+      .channel('dmsg-messages-rt')
+      .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'tg_messages'
+      }, payload => {
+        const msg = payload.new;
+        if (!msg) return;
+        // Update messages if this message belongs to the active conversation
+        const activeCid = chatIdRef.current;
+        if (activeCid && msg.conversation_id) {
+          // Check by conversation_id match via cache
+          const cached = _DMSG_MSG_CACHE[activeCid];
+          const belongsToActive = cached?.data?.length > 0 &&
+            cached.data[0]?.conversation_id === msg.conversation_id;
+          if (belongsToActive) {
+            setMessages(prev => {
+              if (prev.some(m => m.id === msg.id)) return prev;
+              return [...prev, msg];
+            });
+          }
+        }
+        // Refresh conversations list on new incoming message
+        if (msg.direction === 'in' || msg.sender_type === 'user') {
+          const now = Date.now();
+          if (now - lastConvRefreshRef.current > 5000) {
+            lastConvRefreshRef.current = now;
+            loadConversationsRef.current();
+          }
+        }
+      })
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'tg_messages'
+      }, payload => {
+        const msg = payload.new;
+        if (!msg) return;
+        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+      })
+      .subscribe();
+    return () => sb.removeChannel(channel);
+  }, []);
+
+  // ── Polling messages fallback 30s (backup Realtime) ───────────────────────
   useEffect(() => {
     clearTimeout(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
     const scheduleNextPoll = () => {
-      const inactive = Date.now() - lastActivityRef.current > 60000;
-      const delay = inactive ? 30000 : 10000;
       pollRef.current = setTimeout(async () => {
         if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) {
           scheduleNextPoll();
@@ -36828,7 +36873,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           isMsgPollingRef.current = false;
           scheduleNextPoll();
         }
-      }, delay);
+      }, 30000);
     };
     scheduleNextPoll();
     return () => clearTimeout(pollRef.current);
@@ -39694,7 +39739,29 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
 
   useEffect(() => { loadConversations(); }, [loadConversations]);
 
-  // Refresh auto toutes les 10s — messages de la conv active + liste des convs
+  // ── Supabase Realtime : messages instantanés ──────────────────────────────
+  useEffect(() => {
+    const channel = sb
+      .channel('tg-page-messages-rt')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages' }, payload => {
+        const msg = payload.new;
+        if (!msg || !chatIdRef.current) return;
+        setMessages(prev => {
+          if (prev.some(m => m.id === msg.id)) return prev;
+          return [...prev, msg];
+        });
+        loadConversations(false);
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages' }, payload => {
+        const msg = payload.new;
+        if (!msg) return;
+        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+      })
+      .subscribe();
+    return () => sb.removeChannel(channel);
+  }, []);
+
+  // Refresh fallback 30s — messages de la conv active + liste des convs (Realtime = primary)
   useEffect(() => {
     clearInterval(refreshTimerRef.current);
     if (!selectedConv || !chatIdRef.current) return;
@@ -39702,7 +39769,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
       if (document.hidden) return;
       if (chatIdRef.current) loadMessages(chatIdRef.current, false);
       loadConversations(false);
-    }, 10000);
+    }, 30000);
     return () => clearInterval(refreshTimerRef.current);
   }, [selectedConv?.id, loadMessages, loadConversations]);
 
@@ -54259,13 +54326,35 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     }
   }, [visible]);
 
-  // Polling: only active when visible
+  // ── Supabase Realtime : messages instantanés (secondary panel) ──────────────
+  useEffect(() => {
+    if (!chatId) return;
+    const channel = sb
+      .channel('secondary-chat-rt-' + chatId)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages' }, payload => {
+        const msg = payload.new;
+        if (!msg) return;
+        setMessages(prev => {
+          if (prev.some(m => m.id === msg.id)) return prev;
+          return [...prev, msg];
+        });
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages' }, payload => {
+        const msg = payload.new;
+        if (!msg) return;
+        setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+      })
+      .subscribe();
+    return () => sb.removeChannel(channel);
+  }, [chatId]);
+
+  // Polling fallback 30s: only active when visible
   useEffect(() => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     if (!visible) return;
     pollRef.current = setInterval(() => {
       if (!document.hidden && mountedRef.current) loadMessages(false);
-    }, 5000);
+    }, 30000);
     return () => { clearInterval(pollRef.current); pollRef.current = null; };
   }, [chatId, visible]);
 
