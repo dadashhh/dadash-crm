@@ -126,6 +126,7 @@ export function ComptaTab() {
   const [payments, setPayments] = useState<PaiementInterne[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [gerantProfiles, setGerantProfiles] = useState<UserProfile[]>([]);
+  const [recipientProfiles, setRecipientProfiles] = useState<UserProfile[]>([]);
 
   // UI
   const [loading, setLoading] = useState(true);
@@ -146,6 +147,18 @@ export function ComptaTab() {
   });
   const [declareError, setDeclareError] = useState<string | null>(null);
   const [declareLoading, setDeclareLoading] = useState(false);
+
+  // Gerant: create payment form
+  const [showGerantForm, setShowGerantForm] = useState(false);
+  const [gerantForm, setGerantForm] = useState({
+    to_user_id: '',
+    type: 'commission' as string,
+    amount: '',
+    currency: 'CHF',
+    note: '',
+  });
+  const [gerantFormError, setGerantFormError] = useState<string | null>(null);
+  const [gerantFormLoading, setGerantFormLoading] = useState(false);
 
   const contestInputRef = useRef<HTMLInputElement>(null);
 
@@ -234,6 +247,16 @@ export function ComptaTab() {
             .select('id, name, role, timezone')
             .in('role', ['gerant','admin','ceo']);
           setGerantProfiles((gerants ?? []) as UserProfile[]);
+        }
+
+        // For gerants: fetch chatters/models for payment creation form
+        if (['gerant','admin','ceo'].includes(p.role)) {
+          const { data: recipients } = await supabase
+            .from('profiles')
+            .select('id, name, role, timezone')
+            .in('role', ['chatter','modele'])
+            .order('name');
+          setRecipientProfiles((recipients ?? []) as UserProfile[]);
         }
       }
     };
@@ -362,6 +385,42 @@ export function ComptaTab() {
     if (userId && userRole) load(userId, userRole);
   };
 
+  const submitGerantPayment = async () => {
+    setGerantFormError(null);
+    if (!userId) return;
+    const amt = parseFloat(gerantForm.amount);
+    if (!gerantForm.to_user_id) { setGerantFormError('Selectionnez un destinataire'); return; }
+    if (isNaN(amt) || amt <= 0)  { setGerantFormError('Montant invalide');             return; }
+
+    const recipient = recipientProfiles.find((r) => r.id === gerantForm.to_user_id);
+    const destType = recipient?.role === 'modele' ? 'modele' : 'chatter';
+
+    setGerantFormLoading(true);
+    const { error: e } = await supabase
+      .from('paiements_internes')
+      .insert({
+        createur_id:       userId,
+        createur_role:     'gerant',
+        createur_name:     profile?.name ?? null,
+        destinataire_id:   gerantForm.to_user_id,
+        destinataire_type: destType,
+        destinataire_name: recipient?.name ?? null,
+        type:              gerantForm.type,
+        montant:           amt,
+        devise:            gerantForm.currency,
+        note:              gerantForm.note || null,
+        statut:            'pending',
+        calcul_detail:     {},
+      });
+    setGerantFormLoading(false);
+
+    if (e) { setGerantFormError(e.message); return; }
+
+    setShowGerantForm(false);
+    setGerantForm({ to_user_id: '', type: 'commission', amount: '', currency: 'CHF', note: '' });
+    if (userId && userRole) load(userId, userRole);
+  };
+
   const markRead = async (id: string) => {
     await supabase.from('notifications').update({ is_read: true, read: true }).eq('id', id);
     setNotifications((prev) =>
@@ -482,6 +541,117 @@ export function ComptaTab() {
       {/* ================================================================ */}
       {activeTab === 'paiements' && (
         <div className="flex flex-col gap-4">
+
+          {/* Gerant: create payment form */}
+          {isGerant && (
+            <div>
+              {!showGerantForm ? (
+                <button
+                  onClick={() => setShowGerantForm(true)}
+                  className="w-full py-2.5 rounded-lg border border-dashed border-emerald-700 text-emerald-400 text-sm hover:bg-emerald-900/20 transition-colors"
+                >
+                  + Creer un paiement
+                </button>
+              ) : (
+                <div className="bg-zinc-900 rounded-xl border border-emerald-700/50 p-4 flex flex-col gap-3">
+                  <p className="text-sm font-medium text-white">Creer un paiement</p>
+
+                  {/* Recipient */}
+                  <div>
+                    <label className="text-xs text-zinc-400 mb-1 block">Destinataire</label>
+                    <select
+                      value={gerantForm.to_user_id}
+                      onChange={(e) => setGerantForm((f) => ({ ...f, to_user_id: e.target.value }))}
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
+                    >
+                      <option value="">Selectionnez...</option>
+                      {recipientProfiles.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.name ?? r.id} ({r.role})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {/* Type */}
+                  <div>
+                    <label className="text-xs text-zinc-400 mb-1 block">Type</label>
+                    <select
+                      value={gerantForm.type}
+                      onChange={(e) => setGerantForm((f) => ({ ...f, type: e.target.value }))}
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
+                    >
+                      <option value="commission">Commission</option>
+                      <option value="bonus">Bonus</option>
+                      <option value="remboursement">Remboursement</option>
+                      <option value="autre">Autre</option>
+                    </select>
+                  </div>
+
+                  {/* Amount + Currency */}
+                  <div className="flex gap-2">
+                    <div className="flex-1">
+                      <label className="text-xs text-zinc-400 mb-1 block">Montant</label>
+                      <input
+                        type="number"
+                        min="0.01"
+                        step="0.01"
+                        value={gerantForm.amount}
+                        onChange={(e) => setGerantForm((f) => ({ ...f, amount: e.target.value }))}
+                        placeholder="0.00"
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
+                      />
+                    </div>
+                    <div className="w-24">
+                      <label className="text-xs text-zinc-400 mb-1 block">Devise</label>
+                      <select
+                        value={gerantForm.currency}
+                        onChange={(e) => setGerantForm((f) => ({ ...f, currency: e.target.value }))}
+                        className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
+                      >
+                        <option>CHF</option>
+                        <option>EUR</option>
+                        <option>USD</option>
+                        <option>GBP</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Note */}
+                  <div>
+                    <label className="text-xs text-zinc-400 mb-1 block">Note (optionnel)</label>
+                    <input
+                      type="text"
+                      value={gerantForm.note}
+                      onChange={(e) => setGerantForm((f) => ({ ...f, note: e.target.value }))}
+                      placeholder="Reference, periode..."
+                      className="w-full bg-zinc-800 border border-zinc-700 rounded-lg px-3 py-2 text-sm text-white"
+                    />
+                  </div>
+
+                  {gerantFormError && (
+                    <p className="text-xs text-red-400">{gerantFormError}</p>
+                  )}
+
+                  <div className="flex gap-2">
+                    <button
+                      onClick={submitGerantPayment}
+                      disabled={gerantFormLoading}
+                      className="flex-1 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-500 disabled:opacity-50 transition-colors"
+                    >
+                      {gerantFormLoading ? 'Envoi...' : 'Creer le paiement'}
+                    </button>
+                    <button
+                      onClick={() => setShowGerantForm(false)}
+                      className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-400 text-sm hover:text-white transition-colors"
+                    >
+                      Annuler
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Provider: declare payment form toggle */}
           {isProvider && (
