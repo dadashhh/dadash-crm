@@ -32439,6 +32439,9 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
   const [stats, setStats] = useState({ treated: 0, skipped: 0, streak: 0, startTime: Date.now() });
   const [isEmpty, setIsEmpty] = useState(false);
   const [toastMsg, setToastMsg] = useState(null);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [lightboxUrl, setLightboxUrl] = useState(null);
 
   const refreshRef = useRef(null);
   const msgsEndRef = useRef(null);
@@ -32451,6 +32454,9 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
   const lastUnreadCountRef = useRef(0);
   const isEmptyRef = useRef(false);
   const refreshInFlightRef = useRef(false);
+  const topSentinelRef = useRef(null);
+  const loadingMoreRef = useRef(false);
+  const oldestMsgIdRef = useRef(null);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => { if (msgsEndRef.current) msgsEndRef.current.scrollIntoView({ behavior: "smooth" }); }, 100);
@@ -32514,7 +32520,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     const prevScrollHeight = msgsAreaRef.current?.scrollHeight || 0;
 
     try {
-      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=30", { timeout: 8000 });
+      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=9999", { timeout: 15000 });
       if (!mountedRef.current) return;
       if (String(currentChatIdRef.current) !== String(chatId)) return;
 
@@ -32524,6 +32530,9 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
       setMessages(sorted);
+      // Activer scroll infini seulement si l'API a retourné exactement 9999 messages (cap atteint)
+      oldestMsgIdRef.current = sorted[0]?.id || null;
+      setHasMoreMessages(sorted.length >= 9999);
 
       if (isSilent) {
         setTimeout(() => {
@@ -32782,6 +32791,182 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     if (inputRef.current) inputRef.current.focus();
   }, []);
 
+  // ── Helpers : rendu message (média, appels, emojis, texte) ──────────
+  const _tdIsOnlyEmojis = useCallback((text) => {
+    if (!text || typeof text !== "string") return false;
+    const t = text.trim();
+    if (!t || t.length > 24) return false;
+    return /^[\p{Emoji}\uFE0F\u20E3\u200D\s]+$/u.test(t);
+  }, []);
+
+  const _tdFormatCallDuration = useCallback((seconds) => {
+    if (!seconds || seconds < 1) return "";
+    const min = Math.floor(seconds / 60);
+    const sec = seconds % 60;
+    if (min > 0 && sec > 0) return min + "min " + sec + "s";
+    if (min > 0) return min + "min";
+    return sec + "s";
+  }, []);
+
+  const _tdFormatDateSep = useCallback((ts) => {
+    if (!ts) return "";
+    const d = new Date(ts);
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return "Aujourd'hui";
+    if (d.toDateString() === yesterday.toDateString()) return "Hier";
+    return d.toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
+  }, []);
+
+  const _tdShouldShowDate = useCallback((msg, prevMsg) => {
+    const ts = msg.created_at || msg.timestamp;
+    if (!ts) return false;
+    if (!prevMsg) return true;
+    const prevTs = prevMsg.created_at || prevMsg.timestamp;
+    if (!prevTs) return true;
+    return new Date(ts).toDateString() !== new Date(prevTs).toDateString();
+  }, []);
+
+  // ── Scroll infini : charge les messages plus anciens (pagination) ─────
+  const loadMoreMessages = useCallback(async () => {
+    const cid = currentChatIdRef.current;
+    if (!cid || !hasMoreMessages || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+
+    const el = msgsAreaRef.current;
+    const prevScrollHeight = el ? el.scrollHeight : 0;
+    const prevScrollTop = el ? el.scrollTop : 0;
+
+    try {
+      const oldest = oldestMsgIdRef.current;
+      const url = "/conversations/" + cid + "/messages?limit=50" + (oldest ? "&before=" + oldest : "");
+      const data = await _dmsgFetch(url, { timeout: 10000 });
+      if (!mountedRef.current) return;
+      if (String(currentChatIdRef.current) !== String(cid)) return;
+
+      const raw = Array.isArray(data) ? data : data.messages || data.data || [];
+      if (raw.length === 0) { setHasMoreMessages(false); return; }
+
+      const sorted = [...raw].sort((a, b) =>
+        new Date(a.created_at || a.timestamp || 0).getTime() -
+        new Date(b.created_at || b.timestamp || 0).getTime()
+      );
+      oldestMsgIdRef.current = sorted[0]?.id || null;
+      if (sorted.length < 50) setHasMoreMessages(false);
+
+      setMessages(prev => {
+        const existingIds = new Set(prev.map(m => String(m.id)));
+        const newMsgs = sorted.filter(m => !existingIds.has(String(m.id)));
+        return [...newMsgs, ...prev];
+      });
+
+      // Restaurer la position de scroll après le prepend
+      setTimeout(() => {
+        if (!el) return;
+        el.scrollTop = prevScrollTop + (el.scrollHeight - prevScrollHeight);
+      }, 30);
+    } catch (err) {
+      console.error("[TINDADA] Load more error:", err);
+    } finally {
+      loadingMoreRef.current = false;
+      if (mountedRef.current) setLoadingMore(false);
+    }
+  }, [hasMoreMessages]);
+
+  // IntersectionObserver sur le sentinel haut → déclenche le chargement de l'historique
+  useEffect(() => {
+    const sentinel = topSentinelRef.current;
+    if (!sentinel || !hasMoreMessages) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => { if (entry.isIntersecting) loadMoreMessages(); },
+      { root: msgsAreaRef.current, rootMargin: "100px" }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMoreMessages, loadMoreMessages]);
+
+  // ── Rendu du contenu d'un message (média, appel, emoji, texte) ────────
+  const renderMsgContent = useCallback((msg) => {
+    const msgType = (msg.type || msg.message_type || "").toLowerCase();
+
+    // Appel téléphonique
+    if (msgType === "call" || msgType === "phone_call" || msg.is_call) {
+      const dur = msg.call_duration ? " • " + _tdFormatCallDuration(msg.call_duration) : "";
+      const missed = msg.call_missed || msg.is_missed_call;
+      return (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontStyle: "italic",
+          color: missed ? "#f87171" : "#818cf8" }}>
+          <span style={{ fontSize: 16 }}>{missed ? "📵" : "📞"}</span>
+          <span>{(missed ? "Appel manqué" : "Appel") + dur}</span>
+        </div>
+      );
+    }
+
+    // Vidéo
+    const videoUrl = msg.video_url || (msgType === "video" ? (msg.media_url || msg.file_url) : null);
+    if (videoUrl) {
+      return (
+        <video src={videoUrl} controls preload="metadata"
+          style={{ maxWidth: 250, borderRadius: 8, display: "block" }} />
+      );
+    }
+
+    // Photo / image
+    const photoUrl = msg.photo_url
+      || (msgType === "photo" || msgType === "image" ? (msg.media_url || msg.file_url) : null);
+    if (photoUrl) {
+      return (
+        <img src={photoUrl} alt="Photo"
+          style={{ maxWidth: 250, borderRadius: 8, cursor: "pointer", display: "block" }}
+          loading="lazy"
+          onClick={() => setLightboxUrl(photoUrl)} />
+      );
+    }
+
+    // Audio / Voice
+    const audioUrl = (msgType === "audio" || msgType === "voice")
+      ? (msg.media_url || msg.audio_url || msg.file_url) : null;
+    if (audioUrl) {
+      return <audio src={audioUrl} controls style={{ maxWidth: 250, display: "block" }} />;
+    }
+
+    // Document
+    if (msgType === "document" || msgType === "file") {
+      const docUrl = msg.media_url || msg.file_url || "#";
+      const docName = msg.file_name || msg.caption || "Fichier";
+      return (
+        <a href={docUrl} target="_blank" rel="noreferrer"
+          style={{ color: "#818cf8", display: "flex", alignItems: "center", gap: 4 }}>
+          📄 {docName}
+        </a>
+      );
+    }
+
+    // media_url générique sans type reconnu → fallback photo
+    if (msg.media_url) {
+      return (
+        <img src={msg.media_url} alt="Média"
+          style={{ maxWidth: 250, borderRadius: 8, cursor: "pointer", display: "block" }}
+          loading="lazy"
+          onClick={() => setLightboxUrl(msg.media_url)} />
+      );
+    }
+
+    // Texte uniquement emojis → grand format
+    const rawText = msg.text || msg.content || msg.message || msg.caption || "";
+    if (rawText && _tdIsOnlyEmojis(rawText)) {
+      const chars = [...rawText.trim()];
+      const fs = chars.length <= 2 ? "2.5rem" : chars.length <= 4 ? "2rem" : "1.5rem";
+      return <span style={{ fontSize: fs, lineHeight: 1.2 }}>{rawText.trim()}</span>;
+    }
+
+    // Texte normal
+    const displayText = rawText || "[vide]";
+    return <span dangerouslySetInnerHTML={{ __html: _escapeHtml(displayText) }} />;
+  }, [_tdIsOnlyEmojis, _tdFormatCallDuration]);
+
   const EMOJIS = ["😘", "❤️", "🔥", "😍", "💋", "😏", "💕", "🥰", "😈", "💦", "🍑", "🫦", "😜", "💝", "👅", "🤤", "💗", "🥵", "😻", "💓", "❣️", "💞", "😽", "🫠"];
 
   const QUICK_REPLIES = [
@@ -32835,6 +33020,32 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
           fontWeight: 600, fontSize: 14
         }}>
           {toastMsg}
+        </div>
+      )}
+
+      {/* LIGHTBOX — photo plein écran au clic */}
+      {lightboxUrl && (
+        <div
+          onClick={() => setLightboxUrl(null)}
+          style={{
+            position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+            background: "rgba(0,0,0,0.92)", display: "flex",
+            alignItems: "center", justifyContent: "center",
+            zIndex: 20000, cursor: "zoom-out"
+          }}
+        >
+          <img
+            src={lightboxUrl}
+            alt="Aperçu"
+            style={{ maxWidth: "90vw", maxHeight: "90vh", borderRadius: 8,
+              boxShadow: "0 20px 60px rgba(0,0,0,0.8)" }}
+            onClick={e => e.stopPropagation()}
+          />
+          <div
+            style={{ position: "absolute", top: 20, right: 24, fontSize: 24,
+              color: "white", cursor: "pointer", opacity: 0.8, lineHeight: 1 }}
+            onClick={() => setLightboxUrl(null)}
+          >✕</div>
         </div>
       )}
 
@@ -32939,15 +33150,38 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
                 ) : messages.length === 0 ? (
                   <div style={{ textAlign: "center", padding: 40, color: "#64748b" }}>Aucun message</div>
                 ) : (
-                  messages.map((msg, i) => {
-                    const isOut = msg.is_outgoing || msg.direction === "out" || msg.is_from_me;
-                    return (
-                      <div key={msg.id || i} className={"tindada-msg " + (isOut ? "sent" : "received")}>
-                        {_escapeHtml(msg.text || msg.content || msg.message || msg.caption || "[média]")}
-                        <div className="tindada-msg-time">{formatMsgTime(msg.created_at || msg.timestamp)}</div>
+                  <React.Fragment>
+                    {/* Sentinel invisible en haut pour IntersectionObserver */}
+                    <div ref={topSentinelRef} style={{ height: 1 }} />
+                    {/* Spinner pendant le chargement des messages plus anciens */}
+                    {loadingMore && (
+                      <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
+                        <span className="spinner" style={{ width: 16, height: 16, borderWidth: 2 }} />
                       </div>
-                    );
-                  })
+                    )}
+                    {messages.map((msg, i) => {
+                      const isOut = msg.is_outgoing || msg.direction === "out" || msg.is_from_me;
+                      const showDate = _tdShouldShowDate(msg, messages[i - 1]);
+                      return (
+                        <React.Fragment key={msg.id || i}>
+                          {showDate && (
+                            <div style={{
+                              textAlign: "center", fontSize: 11, color: "#64748b",
+                              margin: "12px auto 6px", fontWeight: 500,
+                              background: "rgba(255,255,255,0.05)", borderRadius: 8,
+                              padding: "3px 12px", display: "table"
+                            }}>
+                              {_tdFormatDateSep(msg.created_at || msg.timestamp)}
+                            </div>
+                          )}
+                          <div className={"tindada-msg " + (isOut ? "sent" : "received")}>
+                            {renderMsgContent(msg)}
+                            <div className="tindada-msg-time">{formatMsgTime(msg.created_at || msg.timestamp)}</div>
+                          </div>
+                        </React.Fragment>
+                      );
+                    })}
+                  </React.Fragment>
                 )}
                 <div ref={msgsEndRef} />
               </div>
