@@ -6053,9 +6053,19 @@
         setItem: function(key, value) { try { localStorage.setItem(key, value); } catch(e) {} },
         removeItem: function(key) { try { localStorage.removeItem(key); } catch(e) {} }
       };
+      /* AUTH FIX — async mutex lock: prevents concurrent token refreshes.
+         Without this, two parallel refresh attempts can consume the same
+         refresh token, the second fails → SIGNED_OUT → user kicked out.
+         See: github.com/supabase/supabase-js/issues/2126 */
+      var _authLockQueue = Promise.resolve();
+      var _authMutexLock = function(_name, _acq, fn) {
+        var next = _authLockQueue.then(function() { return fn(); });
+        _authLockQueue = next.catch(function() {});
+        return next;
+      };
       window.sb = window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
         auth: {
-          lock: async function(_name, _acq, fn) { return await fn(); },
+          lock: _authMutexLock,
           persistSession: true,
           storageKey: 'dadash-auth',
           storage: _safariSafeStorage,
@@ -55388,6 +55398,21 @@ const App = () => {
         }
       }
       if (event === 'SIGNED_OUT') {
+        /* AUTH FIX — verify session is actually gone before logging out.
+           Concurrent token refreshes can fire spurious SIGNED_OUT events
+           (race condition: first refresh rotates token, second one fails
+           because old refresh token is already consumed).
+           See: github.com/supabase/supabase-js/issues/2126 */
+        try {
+          const { data: { session: currentSession } } = await sb.auth.getSession();
+          if (currentSession) {
+            console.warn("[AUTH] SIGNED_OUT received but session still valid — ignoring spurious event");
+            return;
+          }
+        } catch (e) {
+          console.warn("[AUTH] SIGNED_OUT session check failed:", e?.message);
+        }
+        console.log("[AUTH] SIGNED_OUT confirmed — clearing user");
         setUser(null);
       }
     });
