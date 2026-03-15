@@ -29803,8 +29803,9 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
 
   const loadMessages = async (convId) => {
     try {
-      const {data} = await sb.from("tg_messages").select("*").eq("conversation_id",convId).order("created_at",{ascending:true});
-      setMessages(data||[]);
+      // ── 1.4 LIMIT 100 most recent messages to avoid fetching entire history ──
+      const {data} = await sb.from("tg_messages").select("*").eq("conversation_id",convId).order("created_at",{ascending:false}).limit(100);
+      setMessages((data||[]).reverse());
     } catch(e) { setMessages([]); }
   };
 
@@ -30216,16 +30217,18 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
     try {
       console.log('[MESSAGES] 📥 Loading for conv:', convId);
 
+      // ── 1.4 LIMIT 100 most recent messages to avoid fetching entire history ──
       const { data, error } = await sb
         .from('tg_messages')
         .select('*')
         .eq('conversation_id', convId)
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: false })
+        .limit(100);
 
       if (error) throw error;
 
       console.log('[MESSAGES] ✅ Loaded:', data?.length || 0, 'messages');
-      setMessages(data || []);
+      setMessages((data || []).reverse());
 
       // SCROLL AUTO EN BAS (instant pour ouverture)
       setTimeout(() => {
@@ -31579,6 +31582,39 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia }) => {
   );
 };
 
+// ── 1.2 React.memo — liste messages d'un slot Grid ──────────────────
+const GpSlotMsgList = React.memo(function GpSlotMsgList({ msgs, loading, renderMsgContent }) {
+  if (loading) return React.createElement("div", { style: { color: "#6366f1", textAlign: "center", padding: 14, fontSize: 11 } }, "Chargement…");
+  if (!msgs || msgs.length === 0) return React.createElement("div", { style: { color: "#4b5563", textAlign: "center", padding: 14, fontSize: 11 } }, "Aucun message");
+  const sorted = [...msgs].sort((a, b) =>
+    new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
+  );
+  return sorted.map((msg, mi) => {
+    const isOut = msg.is_outgoing || msg.direction === "out";
+    const ts = msg.created_at || msg.timestamp;
+    const showSep = _gpShouldSep(msg, mi > 0 ? sorted[mi - 1] : null);
+    return (
+      <React.Fragment key={msg.id || msg.message_id || mi}>
+        {showSep && ts && (
+          <div style={{ textAlign: "center", fontSize: 9, color: "#6b7280", margin: "5px 0 3px", fontWeight: 600 }}>
+            {_gpFmtDateSep(ts)}
+          </div>
+        )}
+        <div style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
+          <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
+            {renderMsgContent(msg)}
+          </div>
+          {ts && (
+            <div style={{ fontSize: 8, color: "#4b5563", marginTop: 1, textAlign: isOut ? "right" : "left" }}>
+              {_gpFmtTime(ts)}
+            </div>
+          )}
+        </div>
+      </React.Fragment>
+    );
+  });
+}, (prev, next) => prev.msgs === next.msgs && prev.loading === next.loading && prev.renderMsgContent === next.renderMsgContent);
+
 // =====================================================================
 // GRID PREMIUM — Vue complète avec input, scripts, suggestions IA
 // =====================================================================
@@ -31595,6 +31631,8 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   const [gpSending, setGpSending]           = useState(false);
   const [gpShowScripts, setGpShowScripts]   = useState(false);
   const gpRefreshRef          = React.useRef(null);
+  const gpSlotsRef            = React.useRef(gpSlots);
+  const gpLoadMsgsRef         = React.useRef(null);
   const gpInputRef            = React.useRef(null);
   const [gpLightbox, setGpLightbox]       = useState(null);
   const [gpLoadingMore, setGpLoadingMore] = useState({});
@@ -31696,15 +31734,20 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   useEffect(() => {
     // ── 0.5 Stagger load : 100ms entre cellules pour éviter les rafales ──────
     gpSlots.forEach((c, i) => { if (c) setTimeout(() => gpLoadMsgs(c, i, false), i * 100); });
+    // ── 1.3 Sync ref so polling interval uses latest slots ──
+    gpSlotsRef.current = gpSlots;
   }, [gpSlots]);
+
+  // ── 1.3 Stable gpLoadMsgs ref ──
+  useEffect(() => { gpLoadMsgsRef.current = gpLoadMsgs; }, [gpLoadMsgs]);
 
   useEffect(() => {
     if (gpRefreshRef.current) clearInterval(gpRefreshRef.current);
     gpRefreshRef.current = setInterval(() => {
-      gpSlots.forEach((c, i) => { if (c) gpLoadMsgs(c, i, true); });
+      gpSlotsRef.current.forEach((c, i) => { if (c) gpLoadMsgsRef.current(c, i, true); });
     }, GRID_REFRESH_MS);
     return () => { if (gpRefreshRef.current) clearInterval(gpRefreshRef.current); };
-  }, [gpSlots, gpLoadMsgs]);
+  }, []);
 
   // ── Auto-scroll vers le bas après chargement initial ──
   useEffect(() => {
@@ -31943,7 +31986,8 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   };
 
   // ── Rendu contenu message (médias, appels, emojis, texte) ──
-  const renderGpMsgContent = (msg) => {
+  // ── 1.2 useCallback so GpSlotMsgList gets a stable renderMsgContent prop ──
+  const renderGpMsgContent = React.useCallback((msg) => {
     const rawText = msg.text || msg.content || msg.message || msg.message_text || "";
     if (msg.type === "call" || msg.is_call || msg.message_type === "call") {
       const dur = _gpFmtCallDur(msg.call_duration || msg.duration);
@@ -31976,7 +32020,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       return <div style={{ fontSize: fs, lineHeight: 1.2, padding: "2px 0" }}>{rawText}</div>;
     }
     return <span>{rawText || "[média]"}</span>;
-  };
+  }, [setGpLightbox]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 50px)", minHeight: 0, flex: 1, background: "#0a0b0f", overflow: "hidden" }}>
@@ -32022,7 +32066,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
         {/* GRID SLOTS */}
         <div style={{ flex: "0 0 68%", display: "grid", gridTemplateColumns: `repeat(${gpLayoutCfg.cols}, 1fr)`, gap: 8, overflow: "auto" }}>
           {gpSlots.map((conv, idx) => conv ? (
-            <div key={idx + "-" + _dmsgChatId(conv)}
+            <div key={_dmsgChatId(conv) || "empty-" + idx}
               onClick={() => { setGpActiveSlot(idx); setGpMsgInput(""); setGpShowScripts(false); }}
               style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: `2px solid ${gpActiveSlot === idx ? "#6366f1" : getLtv(conv) >= 500 ? "rgba(16,185,129,0.4)" : getLtv(conv) >= 50 ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.05)"}`, boxShadow: gpActiveSlot === idx ? "0 0 16px rgba(99,102,241,0.4)" : "0 2px 6px rgba(0,0,0,0.3)", cursor: "pointer", position: "relative", display: "flex", flexDirection: "column", overflow: "hidden", transition: "all 0.2s", minHeight: 140 }}>
 
@@ -32083,39 +32127,12 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
                 {!gpLoadingMore[idx] && !gpHasMore[idx] && (gpSlotMsgs[idx] || []).length > 0 && (
                   <div style={{ textAlign: "center", color: "#374151", fontSize: 8, padding: "2px 0 4px" }}>— début —</div>
                 )}
-                {gpLoadingSlots[idx] ? (
-                  <div style={{ color: "#6366f1", textAlign: "center", padding: 14, fontSize: 11 }}>Chargement…</div>
-                ) : (gpSlotMsgs[idx] || []).length === 0 ? (
-                  <div style={{ color: "#4b5563", textAlign: "center", padding: 14, fontSize: 11 }}>Aucun message</div>
-                ) : (() => {
-                  const sorted = [...(gpSlotMsgs[idx] || [])].sort((a, b) =>
-                    new Date(a.created_at || a.timestamp || 0) - new Date(b.created_at || b.timestamp || 0)
-                  );
-                  return sorted.map((msg, mi) => {
-                    const isOut = msg.is_outgoing || msg.direction === "out";
-                    const ts = msg.created_at || msg.timestamp;
-                    const showSep = _gpShouldSep(msg, mi > 0 ? sorted[mi - 1] : null);
-                    return (
-                      <React.Fragment key={msg.id || msg.message_id || mi}>
-                        {showSep && ts && (
-                          <div style={{ textAlign: "center", fontSize: 9, color: "#6b7280", margin: "5px 0 3px", fontWeight: 600 }}>
-                            {_gpFmtDateSep(ts)}
-                          </div>
-                        )}
-                        <div style={{ marginBottom: 3, textAlign: isOut ? "right" : "left" }}>
-                          <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
-                            {renderGpMsgContent(msg)}
-                          </div>
-                          {ts && (
-                            <div style={{ fontSize: 8, color: "#4b5563", marginTop: 1, textAlign: isOut ? "right" : "left" }}>
-                              {_gpFmtTime(ts)}
-                            </div>
-                          )}
-                        </div>
-                      </React.Fragment>
-                    );
-                  });
-                })()}
+                {/* ── 1.2 React.memo GpSlotMsgList ── */}
+                <GpSlotMsgList
+                  msgs={gpSlotMsgs[idx]}
+                  loading={!!gpLoadingSlots[idx]}
+                  renderMsgContent={renderGpMsgContent}
+                />
               </div>
 
               <button onClick={e => { e.stopPropagation(); gpCloseSlot(idx); }}
@@ -32565,7 +32582,9 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const [tActiveSlot, setTActiveSlot]   = useState(null);
   const [tInputs, setTInputs]           = useState({});
   const [tSending, setTSending]         = useState({});
-  const tRefreshRef = React.useRef(null);
+  const tRefreshRef    = React.useRef(null);
+  const tSlotsRef      = React.useRef([]);
+  const tLoadMsgsRef   = React.useRef(null);
   const [tPopup, setTPopup] = useState({});
   const [tSuggestData, setTSuggestData] = useState({});
   const [tShowPicker, setTShowPicker] = useState(false);
@@ -32896,15 +32915,20 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       if (c && currId !== prevId) setTimeout(() => tLoadMsgs(c, i, false), i * 100);
     });
     tPrevSlotsRef.current = [...tSlots];
+    // ── 1.3 Sync ref so polling interval uses latest slots ──
+    tSlotsRef.current = tSlots;
   }, [tSlots]);
+
+  // ── 1.3 Stable tLoadMsgs ref ──
+  useEffect(() => { tLoadMsgsRef.current = tLoadMsgs; }, [tLoadMsgs]);
 
   useEffect(() => {
     if (tRefreshRef.current) clearInterval(tRefreshRef.current);
     tRefreshRef.current = setInterval(() => {
-      tSlots.forEach((c, i) => { if (c) tLoadMsgs(c, i, true); });
+      tSlotsRef.current.forEach((c, i) => { if (c) tLoadMsgsRef.current(c, i, true); });
     }, GRID_REFRESH_MS);
     return () => { if (tRefreshRef.current) clearInterval(tRefreshRef.current); };
-  }, [tSlots, tLoadMsgs]);
+  }, []);
 
   // ── Auto-scroll vers le bas après chargement initial ──
   useEffect(() => {
@@ -33235,7 +33259,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       {/* GRID — chaque slot a son propre input */}
       <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: `repeat(${tLayoutCfg.cols}, 1fr)`, gridTemplateRows: `repeat(${Math.ceil(tLayoutCfg.slots / tLayoutCfg.cols)}, 1fr)`, gap: 8, padding: 8, overflow: "hidden" }}>
         {Array.from({ length: tLayoutCfg.slots }, (_, i) => tSlots[i] || null).map((conv, idx) => conv ? (
-          <div key={idx + "-" + _dmsgChatId(conv)}
+          <div key={_dmsgChatId(conv) || "empty-" + idx}
             onClick={() => setTActiveSlot(idx)}
             style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: `2px solid ${tActiveSlot === idx ? "#6366f1" : getLtv(conv) >= 500 ? "rgba(16,185,129,0.4)" : getLtv(conv) >= 50 ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.05)"}`, boxShadow: tActiveSlot === idx ? "0 0 16px rgba(99,102,241,0.4)" : "0 2px 6px rgba(0,0,0,0.3)", position: "relative", display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden", transition: "all 0.2s" }}>
 
