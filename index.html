@@ -31184,32 +31184,45 @@ window._getSentMediaIds = async (chatId) => {
 window._getVideoMetadata = async (videoUrl) => {
   return new Promise((resolve) => {
     const video = document.createElement('video');
-    video.src = videoUrl;
-    video.muted = true;
     video.preload = 'metadata';
+    video.crossOrigin = 'anonymous';
+    video.muted = true;
+
+    const cleanup = () => {
+      video.removeAttribute('src');
+      video.load();
+    };
+
+    const timeout = setTimeout(() => {
+      console.warn('[VIDEO_METADATA] Timeout, using defaults');
+      cleanup();
+      resolve({ width: 0, height: 0, duration: 0 });
+    }, 5000);
 
     video.onloadedmetadata = () => {
+      clearTimeout(timeout);
+      const duration = isFinite(video.duration) ? Math.round(video.duration) : 0;
       console.log('[VIDEO_METADATA] Extracted:', {
         width: video.videoWidth,
         height: video.videoHeight,
-        duration: video.duration
+        duration: duration
       });
       resolve({
-        width: video.videoWidth || 1920,
-        height: video.videoHeight || 1080,
-        duration: Math.floor(video.duration) || 0
+        width: video.videoWidth || 0,
+        height: video.videoHeight || 0,
+        duration: duration
       });
+      cleanup();
     };
 
     video.onerror = (err) => {
+      clearTimeout(timeout);
       console.error('[VIDEO_METADATA] Error loading video:', err);
-      resolve({ width: 1920, height: 1080, duration: 0 });
+      resolve({ width: 0, height: 0, duration: 0 });
+      cleanup();
     };
 
-    setTimeout(() => {
-      console.warn('[VIDEO_METADATA] Timeout, using defaults');
-      resolve({ width: 1920, height: 1080, duration: 0 });
-    }, 5000);
+    video.src = videoUrl;
   });
 };
 
@@ -31644,46 +31657,34 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
     video.muted = true;
     video.preload = 'metadata';
 
-    video.onloadedmetadata = () => {
-      console.log('[MediaCard] onloadedmetadata fired!', video.duration);
-
-      if (!video.duration || isNaN(video.duration)) {
-        console.log('[MediaCard] Duration invalid, retrying...');
-        setTimeout(() => {
-          if (video.duration && !isNaN(video.duration)) {
-            const mins = Math.floor(video.duration / 60);
-            const secs = Math.floor(video.duration % 60);
-            setDuration(`${mins}:${secs.toString().padStart(2, '0')}`);
-          }
-        }, 500);
-        return;
-      }
-
-      const mins = Math.floor(video.duration / 60);
-      const secs = Math.floor(video.duration % 60);
-      const dur = `${mins}:${secs.toString().padStart(2, '0')}`;
-      console.log('[MediaCard] Duration set:', dur);
-      setDuration(dur);
+    const formatDur = (d) => {
+      if (!d || !isFinite(d) || d <= 0) return null;
+      const m = Math.floor(d / 60);
+      const s = Math.floor(d % 60);
+      return `${m}:${s.toString().padStart(2, '0')}`;
     };
 
-    video.oncanplay = () => {
-      console.log('[MediaCard] Video can play');
+    const timeout = setTimeout(() => {
+      video.removeAttribute('src');
+      video.load();
+    }, 5000);
+
+    video.onloadedmetadata = () => {
+      clearTimeout(timeout);
+      const dur = formatDur(video.duration);
+      if (dur) { setDuration(dur); return; }
+      // duration might not be ready yet, wait for durationchange
     };
 
     video.ondurationchange = () => {
-      console.log('[MediaCard] Duration changed:', video.duration);
-      if (video.duration && !isNaN(video.duration)) {
-        const mins = Math.floor(video.duration / 60);
-        const secs = Math.floor(video.duration % 60);
-        setDuration(`${mins}:${secs.toString().padStart(2, '0')}`);
-      }
+      const dur = formatDur(video.duration);
+      if (dur) setDuration(dur);
     };
 
-    video.onerror = (err) => {
-      console.error('[MediaCard] Video error:', err);
+    video.onerror = () => {
+      clearTimeout(timeout);
     };
 
-    // FORCER LOAD
     video.load();
   }, [media.url, media.type]);
 
@@ -31767,7 +31768,7 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
           border: '1px solid rgba(255, 255, 255, 0.2)'
         }}>
           <span>▶</span>
-          <span>{duration || '...'}</span>
+          {duration && <span>{duration}</span>}
         </div>
       )}
 
@@ -37061,12 +37062,14 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
       let resolvedMediaUrl = broadcastMedia?.url || null;
       if (broadcastMedia?.file) {
         let uploadFile = broadcastMedia.file;
-        if (broadcastMedia.type === 'video') {
-          const sizeMB = uploadFile.size / 1024 / 1024;
-          addToast(`🗜️ Compression vidéo (${sizeMB.toFixed(0)} MB)…`, "info");
-          uploadFile = await compressVideoForUpload(uploadFile);
+        if (broadcastMedia.type === 'video' && uploadFile.size > 100 * 1024 * 1024) {
+          const confirmUpload = confirm(`⚠️ Cette vidéo fait ${(uploadFile.size / 1024 / 1024).toFixed(0)} MB.\nL'upload peut prendre quelques minutes.\nContinuer ?`);
+          if (!confirmUpload) { setIsSending(false); return; }
         }
-        const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "webm" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
+        if (broadcastMedia.type === 'video') {
+          console.log(`[UPLOAD] Vidéo ${(uploadFile.size / 1024 / 1024).toFixed(1)} MB — upload original`);
+        }
+        const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "mp4" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
         const path = `broadcasts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
         const { error: upErr } = await sb.storage.from("media-library").upload(path, uploadFile, { upsert: false, contentType: uploadFile.type });
         if (upErr) throw new Error((fr ? "Upload échoué : " : "Upload failed: ") + upErr.message);
@@ -38259,6 +38262,7 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [], sol
   }, [mediaType, modelName]);
 
   const formatDuration = (secs) => {
+    if (!secs || !isFinite(secs) || secs <= 0) return '';
     const m = Math.floor(secs / 60);
     const s = Math.floor(secs % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;
@@ -40381,13 +40385,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     if (broadcastMedia) {
       try {
         let uploadFile = broadcastMedia.file;
+        if (broadcastMedia.type === 'video' && uploadFile.size > 100 * 1024 * 1024) {
+          const confirmUpload = confirm(`⚠️ Cette vidéo fait ${(uploadFile.size / 1024 / 1024).toFixed(0)} MB.\nL'upload peut prendre quelques minutes.\nContinuer ?`);
+          if (!confirmUpload) { setBroadcastSending(false); return; }
+        }
         if (broadcastMedia.type === 'video') {
-          const sizeMB = uploadFile.size / 1024 / 1024;
-          setUploadStatus(`🗜️ Compression vidéo (${sizeMB.toFixed(0)} MB)…`);
-          uploadFile = await compressVideoForUpload(uploadFile);
+          console.log(`[UPLOAD] Vidéo ${(uploadFile.size / 1024 / 1024).toFixed(1)} MB — upload original`);
         }
         setUploadStatus(fr ? "Envoi vidéo en cours…" : "Uploading media…");
-        const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "webm" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
+        const ext = uploadFile.name.split(".").pop() || (broadcastMedia.type === "video" ? "mp4" : broadcastMedia.type === "audio" ? "mp3" : "jpg");
         const path = `broadcasts/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
         const { error: upErr } = await sb.storage
           .from("media-library")
@@ -44420,9 +44426,12 @@ const RessourcesPage = ({ user, lang }) => {
       let file = selectedFiles[i];
       setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
       try {
+        if (file.type.startsWith('video/') && file.size > 100 * 1024 * 1024) {
+          const confirmUpload = confirm(`⚠️ Cette vidéo fait ${(file.size / 1024 / 1024).toFixed(0)} MB.\nL'upload peut prendre quelques minutes.\nContinuer ?`);
+          if (!confirmUpload) continue;
+        }
         if (file.type.startsWith('video/')) {
-          setUploadProgress({ done: i, total: selectedFiles.length, current: `🗜️ Compression ${file.name}…` });
-          file = await compressVideoForUpload(file);
+          console.log(`[UPLOAD] Vidéo ${(file.size / 1024 / 1024).toFixed(1)} MB — upload original`);
         }
         const ext = file.name.split('.').pop();
         const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
@@ -44916,85 +44925,8 @@ const MEDIA_CATEGORIES = [
   "Autres"
 ];
 
-// Compresse une vidéo côté navigateur avant upload Supabase.
-// Utilise MediaRecorder + canvas pour re-encoder en WebM VP8 à 720p max / 1.5 Mbps.
-// Retourne le fichier original si le navigateur ne supporte pas MediaRecorder.
-const compressVideoForUpload = (file) => new Promise((resolve) => {
-  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
-    console.warn('[VIDEO_COMPRESS] MediaRecorder VP8 non supporté — upload sans compression');
-    return resolve(file);
-  }
-
-  const sizeMB = file.size / 1024 / 1024;
-  console.log(`[VIDEO_COMPRESS] Début compression ${sizeMB.toFixed(1)} MB…`);
-  const video = document.createElement('video');
-  video.muted = true;
-  video.playsInline = true;
-  video.preload = 'metadata';
-  const objectUrl = URL.createObjectURL(file);
-  video.src = objectUrl;
-
-  video.onloadedmetadata = () => {
-    const MAX_W = 1280, MAX_H = 720;
-    let w = video.videoWidth, h = video.videoHeight;
-    const ratio = Math.min(MAX_W / w, MAX_H / h, 1);
-    w = Math.floor(w * ratio);
-    h = Math.floor(h * ratio);
-
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
-
-    let recorder;
-    try {
-      recorder = new MediaRecorder(canvas.captureStream(30), {
-        mimeType: 'video/webm;codecs=vp8',
-        videoBitsPerSecond: 1_500_000,
-      });
-    } catch (e) {
-      console.warn('[VIDEO_COMPRESS] Impossible de créer MediaRecorder:', e);
-      URL.revokeObjectURL(objectUrl);
-      return resolve(file);
-    }
-
-    const chunks = [];
-    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: 'video/webm' });
-      const outName = file.name.replace(/\.[^.]+$/, '.webm');
-      const compressed = new File([blob], outName, { type: 'video/webm' });
-      console.log(`[VIDEO_COMPRESS] ✅ ${sizeMB.toFixed(1)} MB → ${(compressed.size / 1024 / 1024).toFixed(1)} MB`);
-      URL.revokeObjectURL(objectUrl);
-      resolve(compressed);
-    };
-    recorder.onerror = () => {
-      console.warn('[VIDEO_COMPRESS] Erreur recorder — upload original');
-      URL.revokeObjectURL(objectUrl);
-      resolve(file);
-    };
-
-    const drawFrame = () => {
-      if (video.paused || video.ended) { recorder.stop(); return; }
-      ctx.drawImage(video, 0, 0, w, h);
-      requestAnimationFrame(drawFrame);
-    };
-
-    recorder.start(100);
-    video.currentTime = 0;
-    video.play().then(drawFrame).catch(() => {
-      recorder.stop();
-      URL.revokeObjectURL(objectUrl);
-      resolve(file);
-    });
-  };
-
-  video.onerror = () => {
-    console.warn('[VIDEO_COMPRESS] Erreur chargement vidéo — upload original');
-    URL.revokeObjectURL(objectUrl);
-    resolve(file);
-  };
-});
+// [REMOVED] compressVideoForUpload — was converting videos to WebM VP8 via MediaRecorder/Canvas.
+// Telegram only supports MP4 H.264 for inline playback. Videos are now uploaded in their original format.
 
 const MediaLibraryPage = ({ user }) => {
   // Legacy component — kept for backward compatibility
@@ -45078,11 +45010,12 @@ const MediaLibraryPage = ({ user }) => {
       let file = selectedFiles[i];
       setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
       try {
+        if (file.type.startsWith('video/') && file.size > 100 * 1024 * 1024) {
+          const confirmUpload = confirm(`⚠️ Cette vidéo fait ${(file.size / 1024 / 1024).toFixed(0)} MB.\nL'upload peut prendre quelques minutes.\nContinuer ?`);
+          if (!confirmUpload) continue;
+        }
         if (file.type.startsWith('video/')) {
-          const sizeMB = file.size / 1024 / 1024;
-          setUploadProgress({ done: i, total: selectedFiles.length, current: `🗜️ Compression ${file.name} (${sizeMB.toFixed(0)} MB)…` });
-          file = await compressVideoForUpload(file);
-          setUploadProgress({ done: i, total: selectedFiles.length, current: file.name });
+          console.log(`[UPLOAD] Vidéo ${(file.size / 1024 / 1024).toFixed(1)} MB — upload original`);
         }
         const ext = file.name.split('.').pop();
         const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
