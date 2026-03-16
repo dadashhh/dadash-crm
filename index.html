@@ -31901,6 +31901,11 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   const [txSaving, setTxSaving]       = React.useState(false);
   const [txProducts, setTxProducts]   = React.useState([]);
   const [activeLibraryCell, setActiveLibraryCell] = React.useState(null);
+  const [gpShowAddModal, setGpShowAddModal]       = React.useState(false);
+  const [gpAddSlotIdx, setGpAddSlotIdx]           = React.useState(null);
+  const [gpModalConvs, setGpModalConvs]           = React.useState([]);
+  const [gpModalLoading, setGpModalLoading]       = React.useState(false);
+  const [gpModalSearch, setGpModalSearch]         = React.useState("");
   const gpSlotScrollRefs  = React.useRef({});
   const gpTopSentinelRefs = React.useRef({});
   const gpAutoScrolled    = React.useRef({});
@@ -31936,6 +31941,56 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     setGpSlots(s);
     if (s[0] && gpActiveSlot === null) setGpActiveSlot(0);
   }, [gpUnreadSorted, gpLayoutCfg.slots]);
+
+  const gpOpenAddModal = (slotIdx) => { setGpAddSlotIdx(slotIdx); setGpModalSearch(""); setGpShowAddModal(true); };
+  const gpLoadModalConvs = React.useCallback(async () => {
+    setGpModalLoading(true);
+    try {
+      if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < 30000) { setGpModalConvs(_DMSG_CONV_CACHE.list); setGpModalLoading(false); return; }
+      const data = await _dmsgFetch("/conversations");
+      const list = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      _DMSG_CONV_CACHE.list = list; _DMSG_CONV_CACHE.ts = Date.now(); setGpModalConvs(list);
+    } catch (e) { if (_DMSG_CONV_CACHE.list.length > 0) setGpModalConvs(_DMSG_CONV_CACHE.list); }
+    setGpModalLoading(false);
+  }, []);
+  useEffect(() => { if (gpShowAddModal) gpLoadModalConvs(); }, [gpShowAddModal]);
+  const gpAddConvToSlot = (conv) => {
+    if (gpAddSlotIdx === null) return;
+    const newSlots = [...gpSlots];
+    newSlots[gpAddSlotIdx] = conv;
+    setGpSlots(newSlots);
+    setGpShowAddModal(false); setGpAddSlotIdx(null);
+  };
+  const gpOpenChatIds = React.useMemo(() => gpSlots.filter(Boolean).map(c => String(_dmsgChatId(c))), [gpSlots]);
+  const gpFilteredModalConvs = React.useMemo(() => {
+    let list = gpModalConvs.filter(c => !gpOpenChatIds.includes(String(_dmsgChatId(c))));
+    if (gpModalSearch.trim()) { const q = gpModalSearch.toLowerCase(); list = list.filter(c => (c.first_name || c.display_name || c.username || "").toLowerCase().includes(q)); }
+    return list;
+  }, [gpModalConvs, gpOpenChatIds, gpModalSearch]);
+
+  const gpLoadSmart = React.useCallback(async () => {
+    try {
+      // Priorité : whales + oualiti avec non lus, puis tous 2+ non lus, puis sans réponse récente
+      let pool = conversations.filter(c => c && (
+        (c.unread_count >= 1 && (getLtv(c) >= 500 || getLtv(c) >= 100)) ||
+        (c.unread_count >= 2)
+      ));
+      if (pool.length < gpLayoutCfg.slots) {
+        const extra = conversations.filter(c => c && c.unread_count > 0 && !pool.includes(c));
+        extra.sort((a, b) => getLtv(b) - getLtv(a));
+        pool = [...pool, ...extra];
+      }
+      pool.sort((a, b) => {
+        const ltvDiff = getLtv(b) - getLtv(a);
+        if (ltvDiff !== 0) return ltvDiff;
+        return (b.unread_count || 0) - (a.unread_count || 0);
+      });
+      const s = [];
+      for (let i = 0; i < gpLayoutCfg.slots; i++) s.push(pool[i] || null);
+      setGpSlots(s);
+      if (s[0] && gpActiveSlot === null) setGpActiveSlot(0);
+    } catch (err) { console.error('[GridPremium] Load Smart error:', err); }
+  }, [conversations, gpLayoutCfg.slots, gpActiveSlot, convTotalsMap]);
 
   useEffect(() => { gpLoadUnread(); }, [gpLoadUnread]);
 
@@ -32376,6 +32431,12 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
             style={{ padding: "6px 12px", background: "linear-gradient(135deg,#10b981,#059669)", color: "#fff", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
             <span>🔄</span><span>Load Unread</span>
           </button>
+          <button onClick={gpLoadSmart}
+            style={{ padding: "6px 12px", background: "linear-gradient(135deg,#8b5cf6,#6366f1)", color: "#fff", border: "none", borderRadius: 8, fontWeight: 700, fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}
+            onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 4px 12px rgba(139,92,246,0.4)"; }}
+            onMouseLeave={e => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "none"; }}>
+            <span>✨</span><span>Load Smart</span>
+          </button>
         </div>
       </div>
 
@@ -32387,8 +32448,8 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
           {gpSlots.map((conv, idx) => conv ? (
             <div key={_dmsgChatId(conv) || "empty-" + idx}
               onClick={() => { setGpActiveSlot(idx); setGpMsgInput(""); setGpShowScripts(false); }}
-              className={window._shouldPulseBorder(conv) ? "cell-urgent" : ""}
-              style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: `2px solid ${gpActiveSlot === idx ? "#6366f1" : getLtv(conv) >= 500 ? "rgba(16,185,129,0.4)" : getLtv(conv) >= 50 ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.05)"}`, boxShadow: gpActiveSlot === idx ? "0 0 16px rgba(99,102,241,0.4)" : "0 2px 6px rgba(0,0,0,0.3)", cursor: "pointer", position: "relative", display: "flex", flexDirection: "column", overflow: "hidden", transition: "all 0.2s", minHeight: 140 }}>
+              className={gpActiveSlot === idx ? "cell-selected" : ""}
+              style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: `2px solid ${gpActiveSlot === idx ? "#ef4444" : getLtv(conv) >= 500 ? "rgba(16,185,129,0.4)" : getLtv(conv) >= 50 ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.05)"}`, boxShadow: gpActiveSlot === idx ? "0 0 16px rgba(239,68,68,0.4)" : "0 2px 6px rgba(0,0,0,0.3)", cursor: "pointer", position: "relative", display: "flex", flexDirection: "column", overflow: "hidden", transition: "all 0.2s", minHeight: 140 }}>
 
               {gpActiveSlot === idx && <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: "linear-gradient(90deg,#6366f1,#818cf8)", zIndex: 5 }} />}
 
@@ -32465,10 +32526,14 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
 
             </div>
           ) : (
-            <div key={"empty-" + idx} style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: "2px dashed rgba(255,255,255,0.07)", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 140 }}>
-              <div style={{ textAlign: "center", color: "#4b5563" }}>
-                <div style={{ fontSize: 28, opacity: 0.2 }}>+</div>
-                <div style={{ fontSize: 10, fontWeight: 600 }}>Vide</div>
+            <div key={"empty-" + idx}
+              onClick={() => gpOpenAddModal(idx)}
+              style={{ background: "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)", borderRadius: 10, border: "2px dashed rgba(99,102,241,0.2)", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 140, cursor: "pointer", transition: "all 0.2s" }}
+              onMouseEnter={e => { e.currentTarget.style.borderColor = "rgba(99,102,241,0.5)"; e.currentTarget.style.background = "linear-gradient(135deg,#1e1f2e 0%,rgba(99,102,241,0.05) 100%)"; }}
+              onMouseLeave={e => { e.currentTarget.style.borderColor = "rgba(99,102,241,0.2)"; e.currentTarget.style.background = "linear-gradient(135deg,#1e1f2e 0%,#1a1b26 100%)"; }}>
+              <div style={{ textAlign: "center", color: "#6b7280" }}>
+                <div style={{ fontSize: 28, opacity: 0.4 }}>+</div>
+                <div style={{ fontSize: 10, fontWeight: 600 }}>Ajouter conv</div>
               </div>
             </div>
           ))}
@@ -32777,6 +32842,49 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
           </div>
         );
       })()}
+
+      {gpShowAddModal && (
+        <div onClick={e => { if (e.target === e.currentTarget) { setGpShowAddModal(false); setGpAddSlotIdx(null); } }}
+          style={{ position: "fixed", top: 0, left: 0, width: "100vw", height: "100vh", background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ background: "#1a1b23", borderRadius: 12, width: "min(90vw,700px)", maxHeight: "80vh", display: "flex", flexDirection: "column", border: "1px solid rgba(99,102,241,0.3)", overflow: "hidden" }}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid rgba(99,102,241,0.2)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 15, fontWeight: 800, color: "#e5e7eb" }}>⊞ Ajouter une conversation{gpAddSlotIdx !== null ? ` — case ${gpAddSlotIdx + 1}` : ""}</span>
+              <button onClick={() => { setGpShowAddModal(false); setGpAddSlotIdx(null); }} style={{ background: "none", border: "none", color: "#6b7280", fontSize: 20, cursor: "pointer", lineHeight: 1 }}>✕</button>
+            </div>
+            <div style={{ padding: "12px 20px", borderBottom: "1px solid rgba(99,102,241,0.1)" }}>
+              <input autoFocus value={gpModalSearch} onChange={e => setGpModalSearch(e.target.value)} placeholder="🔍 Rechercher par nom..."
+                style={{ width: "100%", padding: "9px 14px", borderRadius: 8, border: "1px solid rgba(99,102,241,0.3)", background: "rgba(255,255,255,0.04)", color: "#e5e7eb", fontSize: 13, outline: "none", boxSizing: "border-box" }} />
+            </div>
+            <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
+              {gpModalLoading ? (
+                <div style={{ padding: 40, textAlign: "center", color: "#6b7280" }}>
+                  <div style={{ width: 24, height: 24, border: "2px solid rgba(99,102,241,0.3)", borderTopColor: "#6366f1", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }} />Chargement…
+                </div>
+              ) : gpFilteredModalConvs.length === 0 ? (
+                <div style={{ padding: 40, textAlign: "center", color: "#6b7280", fontSize: 13 }}>{gpModalSearch ? "Aucun résultat" : "Aucune conversation disponible"}</div>
+              ) : gpFilteredModalConvs.map(conv => {
+                const cid = String(_dmsgChatId(conv));
+                const name = conv.first_name || conv.display_name || conv.username || ("·" + cid.slice(-4));
+                const mEmoji = (() => { const n = (models.find(m => m.id === conv.model_id)?.name || "").toLowerCase(); return n === "carla" ? "💜" : n === "sophie" ? "🩷" : n === "bella" ? "💛" : n === "nadia" ? "✨" : "👤"; })();
+                return (
+                  <div key={cid} onClick={() => gpAddConvToSlot(conv)}
+                    style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", borderRadius: 8, cursor: "pointer", transition: "all 0.15s", marginBottom: 4 }}
+                    onMouseEnter={e => { e.currentTarget.style.background = "rgba(99,102,241,0.1)"; }}
+                    onMouseLeave={e => { e.currentTarget.style.background = "transparent"; }}>
+                    <span style={{ fontSize: 20 }}>{mEmoji}</span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: "#e5e7eb", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</div>
+                      <div style={{ fontSize: 11, color: "#6b7280" }}>{tierLabel(getLtv(conv))} · {getLtv(conv)} CHF</div>
+                    </div>
+                    {conv.unread_count > 0 && <span style={{ padding: "2px 7px", borderRadius: 10, background: "#ef4444", color: "#fff", fontSize: 10, fontWeight: 700 }}>{conv.unread_count}</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       <style dangerouslySetInnerHTML={{ __html: `
         @keyframes gridPulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
