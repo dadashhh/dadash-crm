@@ -44039,8 +44039,63 @@ const RessourcesPage = ({ user, lang }) => {
   const [mediaCategory, setMediaCategory] = useState('Autres');
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [uploadProgress, setUploadProgress] = useState(null);
+  const [customAlbums, setCustomAlbums] = useState([]);
+  const [showCreateAlbum, setShowCreateAlbum] = useState(false);
+  const [newAlbumName, setNewAlbumName] = useState('');
 
-  useEffect(() => { loadMedias(); }, []);
+  useEffect(() => { loadMedias(); loadCustomAlbums(); }, []);
+  useEffect(() => { loadCustomAlbums(); }, [activeModel]);
+
+  const IS_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  const loadCustomAlbums = async () => {
+    try {
+      const { data, error } = await sb
+        .from('media_albums')
+        .select('*')
+        .eq('is_default', false)
+        .order('created_at', { ascending: true });
+      if (!error) setCustomAlbums(data || []);
+    } catch (err) {
+      console.error('[RESSOURCES] Load albums error:', err);
+    }
+  };
+
+  const createAlbum = async () => {
+    if (!newAlbumName.trim()) { addToast('Nom d\'album requis', 'error'); return; }
+    try {
+      const { data, error } = await sb
+        .from('media_albums')
+        .insert({ name: newAlbumName.trim(), emoji: '📁', is_default: false })
+        .select().single();
+      if (error) throw error;
+      setCustomAlbums(prev => [...prev, data]);
+      setActiveAlbum(data.id);
+      setNewAlbumName('');
+      setShowCreateAlbum(false);
+      addToast(`✅ Album "${data.name}" créé !`, 'success');
+    } catch (err) {
+      console.error('[RESSOURCES] Create album error:', err);
+      addToast('Erreur création album', 'error');
+    }
+  };
+
+  const deleteAlbum = async (albumId) => {
+    const album = customAlbums.find(a => a.id === albumId);
+    if (!album) return;
+    if (!confirm(`Supprimer l'album "${album.name}" ? Les médias ne seront pas supprimés.`)) return;
+    try {
+      await sb.from('media_library').update({ album_id: null }).eq('album_id', albumId);
+      const { error } = await sb.from('media_albums').delete().eq('id', albumId);
+      if (error) throw error;
+      setCustomAlbums(prev => prev.filter(a => a.id !== albumId));
+      if (activeAlbum === albumId) setActiveAlbum('tous');
+      addToast('Album supprimé', 'success');
+    } catch (err) {
+      console.error('[RESSOURCES] Delete album error:', err);
+      addToast('Erreur suppression album', 'error');
+    }
+  };
 
   const loadMedias = async () => {
     setLoading(true);
@@ -44058,7 +44113,15 @@ const RessourcesPage = ({ user, lang }) => {
   const filteredMedias = useMemo(() => {
     let result = allMedias;
     if (activeModel) result = result.filter(m => (m.model || '').toLowerCase() === activeModel);
-    if (activeAlbum !== 'tous') result = result.filter(m => (m.category || '').toLowerCase() === activeAlbum);
+    if (activeAlbum !== 'tous') {
+      if (IS_UUID.test(activeAlbum)) {
+        // Custom album — filter by album_id
+        result = result.filter(m => m.album_id === activeAlbum);
+      } else {
+        // Default album — filter by category name
+        result = result.filter(m => (m.category || '').toLowerCase() === activeAlbum);
+      }
+    }
     if (activeType) result = result.filter(m => m.type === activeType);
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
@@ -44090,6 +44153,7 @@ const RessourcesPage = ({ user, lang }) => {
           url: urlData.publicUrl, name: file.name, filename: file.name,
           type: file.type.startsWith('video') ? 'video' : 'photo',
           model: mediaModel, category: mediaCategory || 'Autres',
+          album_id: IS_UUID.test(activeAlbum) ? activeAlbum : null,
           size: file.size, created_at: new Date().toISOString(),
         });
         if (dbError) throw dbError;
@@ -44175,6 +44239,31 @@ const RessourcesPage = ({ user, lang }) => {
               <span>{album.icon}</span><span>{album.label}</span>
             </div>
           ))}
+          {customAlbums.length > 0 && (
+            <div style={{ height: 1, background: 'rgba(99,102,241,0.2)', margin: '2px 0' }} />
+          )}
+          {customAlbums.map(album => (
+            <div key={album.id} onClick={() => setActiveAlbum(album.id)}
+              style={{ padding: '10px 14px', borderRadius: 8, background: activeAlbum === album.id ? 'rgba(99,102,241,0.2)' : 'rgba(255,255,255,0.03)', color: activeAlbum === album.id ? '#a5b4fc' : '#9ca3af', fontSize: 13, fontWeight: 500, cursor: 'pointer', transition: 'all 0.2s', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+              onMouseEnter={e => { if (activeAlbum !== album.id) { e.currentTarget.style.background = 'rgba(99,102,241,0.1)'; e.currentTarget.style.color = '#e5e7eb'; } }}
+              onMouseLeave={e => { if (activeAlbum !== album.id) { e.currentTarget.style.background = 'rgba(255,255,255,0.03)'; e.currentTarget.style.color = '#9ca3af'; } }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <span>{album.emoji || '📁'}</span>
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{album.name}</span>
+              </div>
+              <button
+                onClick={e => { e.stopPropagation(); deleteAlbum(album.id); }}
+                style={{ flexShrink: 0, width: 18, height: 18, background: 'rgba(239,68,68,0.2)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '50%', color: '#ef4444', fontSize: 10, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1 }}
+                onMouseEnter={e => { e.currentTarget.style.background = '#ef4444'; e.currentTarget.style.color = 'white'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'rgba(239,68,68,0.2)'; e.currentTarget.style.color = '#ef4444'; }}
+              >✕</button>
+            </div>
+          ))}
+          <button
+            onClick={() => setShowCreateAlbum(true)}
+            style={{ width: '100%', padding: '9px 14px', background: 'rgba(99,102,241,0.1)', border: '1px dashed rgba(99,102,241,0.35)', borderRadius: 8, color: '#a5b4fc', fontSize: 12, fontWeight: 600, cursor: 'pointer', textAlign: 'left' }}
+          >+ Nouvel album</button>
           <div style={{ height: 1, background: 'rgba(99,102,241,0.2)', margin: '4px 0' }} />
           <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', textTransform: 'uppercase', letterSpacing: 0.5 }}>Type</div>
           {[{ key: 'photo', icon: '📸', label: 'Photos' }, { key: 'video', icon: '🎬', label: 'Vidéos' }].map(type => (
@@ -44215,7 +44304,7 @@ const RessourcesPage = ({ user, lang }) => {
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 14, color: '#9ca3af' }}>
               <span style={{ textTransform: 'capitalize' }}>{activeModel}</span>
               <span>/</span>
-              <span style={{ color: '#e5e7eb', fontWeight: 600 }}>{activeAlbum === 'tous' ? 'Tous' : activeAlbum}</span>
+              <span style={{ color: '#e5e7eb', fontWeight: 600 }}>{activeAlbum === 'tous' ? 'Tous' : (IS_UUID.test(activeAlbum) ? (customAlbums.find(a => a.id === activeAlbum)?.name || activeAlbum) : activeAlbum)}</span>
               <span style={{ color: '#6b7280', fontSize: 12, marginLeft: 4 }}>({filteredMedias.length} médias)</span>
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -44301,6 +44390,32 @@ const RessourcesPage = ({ user, lang }) => {
           </div>
         </div>
       </div>
+      {showCreateAlbum && (
+        <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', background: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div style={{ background: '#1a1b23', borderRadius: 12, padding: 24, width: 360, border: '1px solid rgba(99,102,241,0.3)' }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#e5e7eb', fontSize: 16, fontWeight: 700 }}>Créer un album</h3>
+            <input
+              type="text"
+              value={newAlbumName}
+              onChange={e => setNewAlbumName(e.target.value)}
+              placeholder="Nom de l'album..."
+              autoFocus
+              style={{ width: '100%', padding: '11px 14px', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, color: 'white', fontSize: 14, marginBottom: 16, boxSizing: 'border-box', outline: 'none', fontFamily: 'inherit' }}
+              onKeyDown={e => { if (e.key === 'Enter') createAlbum(); if (e.key === 'Escape') { setShowCreateAlbum(false); setNewAlbumName(''); } }}
+            />
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => { setShowCreateAlbum(false); setNewAlbumName(''); }}
+                style={{ padding: '9px 18px', background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, color: '#9ca3af', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' }}
+              >Annuler</button>
+              <button
+                onClick={createAlbum}
+                style={{ padding: '9px 18px', background: 'linear-gradient(135deg,#6366f1,#8b5cf6)', border: 'none', borderRadius: 8, color: 'white', fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}
+              >Créer</button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 };
