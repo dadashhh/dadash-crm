@@ -30,6 +30,7 @@
 | `is_active` | BOOLEAN | Actif/inactif |
 | `name` / `full_name` | TEXT | Nom affichage |
 | `email` | TEXT | Email |
+| `messaging_permissions` | JSONB | Permissions messagerie (ex: `can_view_all_assigned`) |
 
 ### 1.3 Pas de table `model_members`
 
@@ -146,16 +147,107 @@ La fonction `_get_my_role()` (SECURITY DEFINER) existe mais les migrations réce
 |--------|-----|-----------|
 | Gérant uniquement | ALL | `role IN ('gerant', 'admin', 'ceo')` |
 
-### 2.3 Fonction SECURITY DEFINER
+#### Table `spender_events`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `spender_events_read_app` | SELECT | `role IN ('gerant', 'chatter')` |
 
-```sql
-CREATE OR REPLACE FUNCTION public._get_my_role()
-RETURNS text LANGUAGE sql STABLE SECURITY DEFINER
-SET search_path = public
-AS 'SELECT role FROM public.profiles WHERE id = auth.uid()';
-```
+#### Table `spender_enrich_queue`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `enrich_queue_read_gerant` | SELECT | `role = 'gerant'` |
 
-> Utilisée par `paiements_internes` historiquement, mais les policies récentes (20260508) utilisent le pattern inline.
+#### Table `payment_events`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `pe_all_gerant` | ALL | `_get_my_role() IN ('gerant','admin','ceo')` |
+| `pe_select_involved` | SELECT | `from_user_id = uid OR to_user_id = uid OR created_by = uid` |
+| `pe_actor_update` | UPDATE | `to_user_id = uid OR from_user_id = uid OR created_by = uid` |
+
+#### Table `ledger_entries`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `le_all_gerant` | ALL | `_get_my_role() IN ('gerant','admin','ceo')` |
+| `le_select_own` | SELECT | `owner_user_id = auth.uid()` |
+
+#### Table `bot_sessions`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `bot_sessions_gerant` | ALL | `role = 'gerant'` |
+
+#### Table `media_library`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `media_lib_gerant_all` | ALL | `role IN ('gerant', 'admin', 'ceo')` |
+
+#### Table `broadcast_history`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `broadcast_history_gerant_all` | ALL | `role IN ('gerant', 'admin', 'ceo')` |
+
+#### Table `push_campaigns` / `push_recipients`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `push_campaigns_gerant` | ALL | `role = 'gerant'` |
+| `push_campaigns_model_read` | SELECT | `model_id = uid OR created_by = uid` |
+| `push_campaigns_model_insert` | INSERT | `created_by = uid` |
+| `push_recipients_gerant` | ALL | `role = 'gerant'` |
+
+#### Table `scripts`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `scripts_all_gerant` | ALL | `role = 'gerant'` |
+| `scripts_select_chatter` | SELECT | `role = 'chatter' AND model_id IN assigned_models` |
+
+#### Table `chatter_restrictions`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `chatter_restrictions_all_gerant` | ALL | `role = 'gerant'` |
+| `chatter_restrictions_select_chatter` | SELECT | `chatter_id = auth.uid()` |
+
+#### Table `content_list`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `content_list_gerant` | ALL | `role = 'gerant'` |
+| `content_list_model_read` | SELECT | `model_id = auth.uid()` |
+
+#### Table `provider_payouts`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `pp_gerant` | ALL | `role = 'gerant'` |
+| `pp_provider_read` | SELECT | `declared_by = auth.uid()` |
+| `pp_provider_insert` | INSERT | `declared_by = auth.uid()` |
+
+#### Table `platform_accounts` / `platform_fans` / `sync_jobs`
+| Policy | CMD | Condition |
+|--------|-----|-----------|
+| `gerant_*` | ALL (CRUD) | `is_gerant()` helper function |
+
+### 2.3 Fonctions SECURITY DEFINER
+
+| Fonction | Rôle | Usage |
+|----------|------|-------|
+| `_get_my_role()` | Retourne le rôle TEXT | Utilisée par payment_events, paiements_internes |
+| `is_gerant()` | Retourne BOOLEAN | Utilisée par platform_accounts RLS |
+| `rpc_create_payment_event()` | Crée un paiement | Vérifie role IN (gerant, admin, ceo, provider) |
+| `rpc_confirm_payment_event()` | Confirme réception | Vérifie to_user_id OU gerant |
+| `rpc_reject_payment_event()` | Refuse paiement | Vérifie to_user_id OU gerant |
+| `rpc_cancel_payment_event()` | Annule paiement | Vérifie created_by OU gerant |
+| `rpc_spenders_soft_delete()` | Soft delete spender | Vérifie gerant/admin/ceo |
+| `rpc_spenders_hard_delete()` | Hard delete spender | Vérifie gerant/admin/ceo |
+| `safe_delete_spender()` | Unified delete | Vérifie gerant/admin/ceo |
+| `fn_pe_on_insert()` | Trigger INSERT payment | Crée notification |
+| `fn_pe_on_status_change()` | Trigger UPDATE payment | Ledger + notifications |
+| `fn_get_activity_feed()` | RPC feed activité | SECURITY DEFINER bypass RLS |
+| `fn_insert_spender_event()` | RPC event spender | SECURITY DEFINER bypass RLS |
+| `rpc_notifications_counts()` | Compteurs notifs | Filtré par auth.uid() |
+| `rpc_mark_notifications_read()` | Marquer lu | Filtré par auth.uid() |
+
+> **Total** : ~50+ policies RLS sur 20+ tables, ~32 fonctions SECURITY DEFINER, 2 helpers (`_get_my_role`, `is_gerant`).
+
+### 2.4 Attention : `messaging_permissions`
+
+Les policies RLS de `tg_conversations` et `tg_messages` utilisent aussi `profiles.messaging_permissions->>'can_view_all_assigned'` pour affiner l'accès chatter. Le Manager Chatter devra avoir sa propre logique distincte (pas basée sur `messaging_permissions`).
 
 ---
 
@@ -257,11 +349,13 @@ const isChatterUser = (u) => u.role === "chatter";
 
 | Fichier/Table | Ce qui change |
 |---------------|--------------|
-| `profiles` | Insérer `role = 'manager_chatter'` |
-| **12+ tables avec RLS** | Ajouter policies pour `manager_chatter` |
-| `_get_my_role()` | Aucun changement (retourne TEXT) |
+| `profiles` | ADD COLUMN `manager_id`, insérer `role = 'manager_chatter'` |
+| **20+ tables avec RLS** | Ajouter policies SELECT pour `manager_chatter` |
+| `_get_my_role()` / `is_gerant()` | Aucun changement (retournent TEXT/BOOLEAN) |
+| `rpc_create_payment_event()` | Ajouter `manager_chatter` si le manager peut créer des paiements |
+| `rpc_*_payment_event()` | Évaluer si le manager peut confirmer/rejeter |
 | `user_permissions` | Ajouter DEFAULT_ROLE_PERMISSIONS côté frontend |
-| **Nouvelle colonne ou table** | Lien manager ↔ chatters |
+| **Fonctions SECURITY DEFINER** | ~6 RPCs avec checks de rôle à évaluer |
 
 ### 5.2 Frontend (`index.html`)
 
@@ -610,10 +704,11 @@ CONTRAINTES:
 |------|--------|
 | Type colonne `role` | TEXT (pas enum) — ✅ simple à étendre |
 | Contrainte CHECK | Aucune — ✅ pas de blocage |
-| Tables avec RLS | 12+ tables — ⚠️ chaque table nécessite une nouvelle policy |
+| Tables avec RLS | **20+ tables, ~50+ policies** — chaque table à évaluer |
+| Fonctions SECURITY DEFINER | **~32 fonctions** — ~6 RPCs avec checks de rôle à modifier |
 | `model_members` | N'existe pas — `profiles.assigned_models` (JSONB) |
 | Système permissions | `user_permissions` + `DEFAULT_ROLE_PERMISSIONS` — ✅ déjà granulaire |
 | Structure équipe recommandée | **Option C** — `profiles.manager_id` |
-| Complexité estimée | **Moyenne-Haute** — ~15 policies SQL + ~20 points frontend |
-| Risque principal | Performance RLS (sous-requêtes imbriquées) |
+| Complexité estimée | **Haute** — ~15 policies SQL + ~6 RPCs + ~20 points frontend |
+| Risque principal | Performance RLS (sous-requêtes imbriquées) + récursion profiles |
 | Prérequis | Réponses de DADA aux 13 questions |
