@@ -31565,6 +31565,7 @@ const VIDEO_THUMBNAIL_CACHE = {};
 const MediaThumbnail = ({ media, isSent, onClick, style: styleProp = {} }) => {
   const [videoMetadata, setVideoMetadata] = React.useState(null);
   const [thumbnailUrl, setThumbnailUrl]   = React.useState(null);
+  const [videoReady, setVideoReady]       = React.useState(false);
 
   React.useEffect(() => {
     if (media.type !== 'video' || !media.url) return;
@@ -31574,14 +31575,19 @@ const MediaThumbnail = ({ media, isSent, onClick, style: styleProp = {} }) => {
       const cached = VIDEO_THUMBNAIL_CACHE[media.url];
       setVideoMetadata(cached.metadata);
       setThumbnailUrl(cached.thumbnail);
+      setVideoReady(true);
+      console.info('[MediaThumbnail] cache hit:', media.url.slice(-30), cached.metadata);
       return;
     }
 
+    // FIX: Load video WITHOUT crossOrigin first to guarantee metadata loads
+    // crossOrigin='anonymous' blocks loading if server doesn't send CORS headers
     const video = document.createElement('video');
-    video.src        = media.url;
-    video.crossOrigin = 'anonymous';
     video.preload    = 'metadata';
     video.muted      = true;
+    // FIX: Set crossOrigin BEFORE src (order matters), but only for canvas attempt
+    // We do TWO passes: first without CORS (metadata), then try canvas
+    video.src = media.url;
 
     const fmtDur = (secs) => {
       if (!secs || isNaN(secs)) return '0:00';
@@ -31590,11 +31596,21 @@ const MediaThumbnail = ({ media, isSent, onClick, style: styleProp = {} }) => {
       return `${m}:${s.toString().padStart(2, '0')}`;
     };
 
+    let metadataLoaded = false;
+
     video.onloadedmetadata = () => {
+      metadataLoaded = true;
+      const meta = { duration: fmtDur(video.duration), width: video.videoWidth, height: video.videoHeight };
+      console.info('[MediaThumbnail] metadata OK:', media.url.slice(-30), '| duration:', meta.duration);
+      // Save duration immediately — don't wait for canvas
+      setVideoMetadata(meta);
+      setVideoReady(true);
+      // Seek to get a frame for canvas thumbnail
       video.currentTime = Math.min(1, video.duration * 0.1 || 0);
     };
 
     video.onseeked = () => {
+      // Try canvas thumbnail (may fail due to CORS taint — that's OK)
       try {
         const canvas  = document.createElement('canvas');
         canvas.width  = video.videoWidth  || 320;
@@ -31602,21 +31618,28 @@ const MediaThumbnail = ({ media, isSent, onClick, style: styleProp = {} }) => {
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
-        const meta    = { duration: fmtDur(video.duration), width: video.videoWidth, height: video.videoHeight };
+        console.info('[MediaThumbnail] canvas thumbnail OK:', media.url.slice(-30));
+        const meta = { duration: fmtDur(video.duration), width: video.videoWidth, height: video.videoHeight };
         VIDEO_THUMBNAIL_CACHE[media.url] = { metadata: meta, thumbnail: dataUrl };
         setVideoMetadata(meta);
         setThumbnailUrl(dataUrl);
       } catch (corsErr) {
-        // CORS bloque canvas → on garde juste la durée
-        console.warn('[MediaThumbnail] canvas bloqué (CORS), durée seulement:', corsErr.message);
-        const meta = { duration: fmtDur(video.duration) };
-        VIDEO_THUMBNAIL_CACHE[media.url] = { metadata: meta, thumbnail: null };
-        setVideoMetadata(meta);
+        // CORS taint on canvas — we still have duration + will use <video> element as preview
+        console.info('[MediaThumbnail] canvas blocked (CORS) — using <video> preview fallback:', corsErr.message);
+        const meta = { duration: fmtDur(video.duration), width: video.videoWidth, height: video.videoHeight };
+        VIDEO_THUMBNAIL_CACHE[media.url] = { metadata: meta, thumbnail: '__VIDEO_ELEMENT__' };
+        setThumbnailUrl('__VIDEO_ELEMENT__');
       }
     };
 
     video.onerror = (err) => {
-      console.error('[MediaThumbnail] video load error:', err);
+      console.warn('[MediaThumbnail] video load error:', media.url.slice(-30), err);
+      // Even on error, mark as ready so we show the video URL fallback
+      if (!metadataLoaded) {
+        setVideoReady(true);
+        setThumbnailUrl('__VIDEO_ELEMENT__');
+        VIDEO_THUMBNAIL_CACHE[media.url] = { metadata: { duration: null }, thumbnail: '__VIDEO_ELEMENT__' };
+      }
     };
   }, [media.url, media.type]);
 
@@ -31643,11 +31666,29 @@ const MediaThumbnail = ({ media, isSent, onClick, style: styleProp = {} }) => {
         e.currentTarget.style.boxShadow = 'none';
       }}
     >
-      {/* Image / Thumbnail */}
+      {/* Image / Thumbnail / Video preview */}
       {isVideo ? (
-        thumbnailUrl ? (
+        thumbnailUrl && thumbnailUrl !== '__VIDEO_ELEMENT__' ? (
           <img src={thumbnailUrl} alt="video preview"
             style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        ) : videoReady || thumbnailUrl === '__VIDEO_ELEMENT__' ? (
+          /* FIX: Actual <video> element as preview when canvas fails */
+          <video src={media.url} muted preload="metadata"
+            style={{ width: '100%', height: '100%', objectFit: 'cover', background: '#0f1117' }}
+            onLoadedMetadata={e => {
+              // Seek to preview frame
+              e.target.currentTime = Math.min(1, e.target.duration * 0.1 || 0);
+              // Also capture duration if not already set
+              if (!videoMetadata?.duration || videoMetadata.duration === '0:00') {
+                const dur = e.target.duration;
+                if (dur && !isNaN(dur)) {
+                  const m = Math.floor(dur / 60);
+                  const s = Math.floor(dur % 60);
+                  setVideoMetadata(prev => ({ ...prev, duration: `${m}:${s.toString().padStart(2, '0')}` }));
+                }
+              }
+            }}
+          />
         ) : (
           <div style={{ width: '100%', height: '100%', background: '#0f1117', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, opacity: 0.35 }}>
             🎬
@@ -31667,7 +31708,7 @@ const MediaThumbnail = ({ media, isSent, onClick, style: styleProp = {} }) => {
       }}>
         <span>{isVideo ? '▶' : '📷'}</span>
         <span>{isVideo ? 'VIDEO' : 'PHOTO'}</span>
-        {isVideo && videoMetadata?.duration && (
+        {isVideo && videoMetadata?.duration && videoMetadata.duration !== '0:00' && (
           <span style={{ opacity: 0.9 }}>· {videoMetadata.duration}</span>
         )}
       </div>
