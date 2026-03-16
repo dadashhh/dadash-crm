@@ -7,6 +7,30 @@
 
 ---
 
+## ⚠️ CORRECTION CRITIQUE — Compression côté CLIENT, pas serveur
+
+**Découverte majeure de la recherche :**
+- **Telegram NE ré-encode PAS les vidéos côté serveur** (sauf pour les grandes chaînes avec streaming adaptatif)
+- **Telethon (MTProto) envoie les bytes tels quels** — AUCUNE compression appliquée par Telethon
+- La compression visible vient de **2 sources possibles** :
+  1. **La vidéo source elle-même** était déjà de mauvaise qualité / basse résolution
+  2. **Le client mobile du spender** affiche une preview basse qualité avant téléchargement complet
+- **L'app desktop Telegram ne compresse JAMAIS** (pas d'infrastructure de ré-encodage)
+
+**Impact sur le diagnostic :**
+Si Carlos API utilise Telethon `send_file()`, les vidéos arrivent INTACTES sur les serveurs Telegram. Le problème de "compression" perçu est probablement :
+- La vidéo source (depuis Supabase Storage) est déjà en basse qualité
+- Le fichier n'est pas en H.264/MP4 → Telegram ne peut pas faire de preview inline / streaming
+- Le `supports_streaming` n'est pas activé → le spender doit télécharger entièrement avant de voir
+- Le `moov atom` n'est pas au début du fichier → pas de lecture progressive
+
+**Sources :**
+- [Telethon Issues #601, #1101, #4162](https://github.com/LonamiWebs/Telethon/issues)
+- [Telegram Blog: Dynamic Video Quality](https://telegram.org/blog/dynamic-video-quality-and-more)
+- [tdesktop Issue #28075](https://github.com/telegramdesktop/tdesktop/issues/28075)
+
+---
+
 ## 0. ÉTAT DES LIEUX — Architecture actuelle
 
 ```
@@ -37,14 +61,14 @@ Frontend (index.html)
 
 ### 1.1 Tableau comparatif complet
 
-| # | Méthode | Compression Telegram | Preview chat | Streaming | Limite taille | Qualité | UX Spender |
-|---|---------|---------------------|-------------|-----------|---------------|---------|------------|
-| A | `send_file(chat, video)` basique | **OUI** — Telegram ré-encode | Oui (lecteur vidéo) | Non garanti | 2 GB (userbot) / 50 MB (bot) | **Dégradée** — Telegram compresse | Vidéo inline, play direct |
-| B | `send_file(chat, video, force_document=True)` | **NON** — fichier brut | Non (icône document) | Non | 2 GB (userbot) / 50 MB (bot) | **Originale** — aucune compression | Doit télécharger pour voir |
-| C | `send_file(chat, video, attributes=[DocumentAttributeVideo(...)])` | **Contrôlable** — voir détails | Oui (lecteur vidéo) | Oui (si configuré) | 2 GB (userbot) / 50 MB (bot) | **Haute** si bien configuré | Vidéo inline avec streaming |
-| D | `send_file(chat, video, video_note=True)` | **OUI** — fortement compressé | Oui (bulle ronde) | Non | ~12 MB | **Très dégradée** | Message vidéo rond |
-| E | `send_file(chat, video, thumb=thumb)` | Selon méthode de base | Oui + thumbnail custom | Selon config | 2 GB | Selon méthode de base | Preview améliorée |
-| F | `send_message(chat, message=InputMediaUploadedDocument(...))` | **Contrôle total** — bas niveau | Oui (si attributs vidéo) | Oui (si flag) | 2 GB (userbot) | **Maximale** | Dépend des attributs |
+| # | Méthode | Compression serveur | Preview inline | Streaming | Limite taille | Qualité reçue | UX Spender |
+|---|---------|---------------------|---------------|-----------|---------------|--------------|------------|
+| A | `send_file(chat, video)` basique | **NON** — bytes identiques | Oui (si MP4/H.264) | Non garanti | 2 GB (userbot) / 50 MB (bot) | **= source** — mais preview floue sans streaming | Vidéo inline, play direct |
+| B | `send_file(chat, video, force_document=True)` | **NON** — bytes identiques | Non (icône document) | Non | 2 GB (userbot) / 50 MB (bot) | **= source** — qualité parfaite | Doit télécharger pour voir |
+| C | `send_file(chat, video, attributes=[DocumentAttributeVideo(...)])` | **NON** — bytes identiques | Oui (lecteur vidéo) | **Oui** (si `supports_streaming=True`) | 2 GB (userbot) / 50 MB (bot) | **= source** + lecture fluide | Vidéo inline + streaming = **MEILLEURE UX** |
+| D | `send_file(chat, video, video_note=True)` | Possible ré-encodage rond | Oui (bulle ronde) | Non | ~12 MB | Dégradée (format rond) | Message vidéo rond |
+| E | `send_file(chat, video, thumb=thumb)` | Selon méthode de base | Oui + thumbnail custom | Selon config | 2 GB | = source | Preview améliorée |
+| F | `InputMediaUploadedDocument(...)` bas niveau | **NON** — contrôle total | Oui (si attributs vidéo) | Oui (si flag) | 2 GB (userbot) | **= source** — contrôle max | Dépend des attributs |
 
 ### 1.2 Détails par méthode
 
@@ -53,9 +77,10 @@ Frontend (index.html)
 await client.send_file(chat_id, video_path_or_url)
 ```
 - Telethon détecte automatiquement le type MIME
-- Telegram serveur applique sa compression standard
-- Résolution réduite, bitrate capped
-- **Pas recommandé pour qualité**
+- **Aucune compression serveur** — les bytes arrivent identiques
+- MAIS : sans `supports_streaming`, la preview peut être floue pendant le chargement
+- Sans `DocumentAttributeVideo`, Telegram peut mal détecter les dimensions
+- **Fonctionne mais pas optimal pour l'UX**
 
 #### B) `send_file()` avec `force_document=True`
 ```python
@@ -89,14 +114,14 @@ await client.send_file(
 )
 ```
 
-**C'est LA méthode qui contrôle la compression.**
+**C'est LA méthode qui contrôle l'AFFICHAGE et le STREAMING (pas la compression).**
 
 Explication des paramètres critiques :
-- `supports_streaming=True` : Indique à Telegram que le fichier est streamable (moov atom au début). Telegram traite différemment ces fichiers.
+- `supports_streaming=True` : **LE PARAMÈTRE LE PLUS IMPORTANT.** Indique à Telegram que le fichier supporte la lecture progressive. Le spender peut lire immédiatement sans attendre le téléchargement complet. Nécessite que le fichier ait le moov atom au début (`-movflags +faststart` en FFmpeg).
 - `round_message=False` : Ne pas faire de vidéo ronde
-- `nosound_video=False` : Indiquer qu'il y a du son (sinon Telegram peut traiter comme GIF)
-- `w` et `h` : Dimensions exactes de la vidéo. **Si correctement spécifiées, Telegram peut éviter le ré-encodage.**
-- `duration` : Durée exacte en secondes
+- `nosound_video=False` : Indiquer qu'il y a du son (sinon Telegram traite comme GIF/animation)
+- `w` et `h` : Dimensions exactes de la vidéo. **Permet à Telegram d'afficher le lecteur aux bonnes proportions.**
+- `duration` : Durée exacte en secondes (affichée dans le lecteur)
 
 #### D) `send_file()` avec `video_note=True`
 ```python
@@ -169,65 +194,69 @@ await client.send_message(chat_id, message='Caption ici', file=media)
 | Download vidéo | 20 MB max | 2 GB max |
 | Telegram Premium upload | 4 GB | 4 GB |
 
-### 2.2 Compression automatique Telegram
+### 2.2 Compression — QUI compresse QUOI ? (CORRECTION)
 
-Telegram compresse automatiquement une vidéo **quand elle est envoyée comme vidéo** (pas document) dans ces cas :
+**FAIT VÉRIFIÉ : Telegram serveur NE compresse PAS les vidéos.**
 
-| Critère | Seuil de compression | Comportement |
-|---------|---------------------|-------------|
-| Résolution | > 1280px côté long | Redimensionné à 1280px max |
-| Bitrate vidéo | > ~5-8 Mbps (variable) | Ré-encodé à bitrate inférieur |
-| Codec | Non H.264 Baseline/Main | Ré-encodé en H.264 |
-| Container | Non MP4 | Remuxé en MP4 |
-| Audio codec | Non AAC | Ré-encodé en AAC |
-| Moov atom | Pas au début du fichier | Peut déclencher ré-encodage |
-| Taille fichier | > ~10 MB (variable, dépend durée) | Compression plus agressive |
+La compression vient de **3 sources** :
 
-**POINTS CRITIQUES** :
-- Il n'y a **pas de seuil documenté officiel** — Telegram ajuste dynamiquement
-- La compression est **côté serveur Telegram**, pas Telethon
-- `supports_streaming=True` + fichier déjà optimisé = Telegram **peut** skip le ré-encodage
-- Les vidéos envoyées en **privé** vs **groupe** peuvent avoir des seuils différents (groupes = compression plus agressive)
+| Source | Compresse ? | Contexte |
+|--------|-----------|---------|
+| **Client mobile (iOS/Android)** | **OUI** — ré-encode avant upload | Quand l'utilisateur envoie via galerie/picker. Choix qualité 240p-1080p |
+| **Client desktop (tdesktop)** | **NON** — envoie bytes bruts | Pas d'infra de ré-encodage |
+| **Telethon / MTProto API** | **NON** — envoie bytes bruts | Upload direct, aucune transformation |
+| **Serveur Telegram** | **NON** (sauf grandes chaînes) | Pour les chaînes avec milliers d'abonnés : crée des versions streaming adaptatives, mais l'original est PRÉSERVÉ |
+| **Bot API `sendVideo`** | **NON** — mais crée preview/thumb | Le serveur peut générer un thumbnail mais ne touche PAS au fichier vidéo |
 
-### 2.3 Quand Telegram NE compresse PAS
+**CONSÉQUENCE MAJEURE pour DADASH :**
+- Si Carlos API utilise Telethon `send_file()` → **les bytes sont envoyés TELS QUELS**
+- Si la vidéo arrive en mauvaise qualité chez le spender, c'est que :
+  1. **La vidéo source est déjà en mauvaise qualité** (vérifier l'URL Supabase)
+  2. **Le format n'est pas H.264/MP4** → pas de lecteur inline, pas de streaming
+  3. **`supports_streaming` n'est pas activé** → le spender voit une preview floue pendant le téléchargement
+  4. **Le moov atom est à la fin du fichier** → pas de lecture progressive
 
-Telegram évite la compression quand :
-1. **Envoyé comme document** (`force_document=True` ou `force_file=True`)
-2. Fichier déjà dans les specs optimales :
-   - H.264 (Baseline ou Main profile)
-   - AAC audio
-   - Container MP4
-   - Moov atom au début (faststart)
-   - Résolution ≤ 1280px côté le plus long
-   - Bitrate raisonnable (< 5 Mbps pour vidéos longues)
-3. **Fichier déjà uploadé sur Telegram** (réutilisation par file_id)
+### 2.3 Ce qui affecte la PERCEPTION de qualité (pas la compression réelle)
+
+| Problème | Cause | Solution |
+|---------|-------|---------|
+| Vidéo floue pendant lecture | Pas de streaming, Telegram montre preview basse-res | `supports_streaming=True` + `movflags +faststart` |
+| Pas de lecteur inline | Format non-MP4 ou non-H.264 | Ré-encoder en H.264/AAC/MP4 |
+| Doit télécharger pour voir | `force_document=True` ou pas d'attribut vidéo | Ajouter `DocumentAttributeVideo` avec dimensions |
+| Thumbnail floue | Pas de thumb custom | Générer et envoyer un thumbnail JPEG |
+| Vidéo affichée comme fichier | MIME type incorrect ou extension non-MP4 | `mime_type='video/mp4'` |
 
 ---
 
 ## PARTIE 3 — SCÉNARIO "13 MIN HAUTE QUALITÉ"
 
-### 3.1 Analyse des hypothèses
+### 3.1 Analyse des hypothèses (CORRIGÉE)
+
+Puisque Telegram ne compresse PAS côté serveur, les hypothèses changent :
 
 | # | Hypothèse | Probabilité | Explication |
 |---|-----------|-------------|-------------|
-| 1 | **Vidéo déjà optimisée H.264** | **9/10** | Si la vidéo source était déjà en H.264 Baseline/Main, MP4, avec bitrate modéré (~2-4 Mbps), Telegram l'a laissée passer sans ré-encoder |
-| 2 | **Envoyé comme document sans le savoir** | 5/10 | Un bug ou config temporaire a pu envoyer en force_document=True |
-| 3 | **`supports_streaming=True` activé** | 7/10 | Ce flag combiné avec un fichier bien formaté peut éviter la compression |
-| 4 | **Bitrate sous le seuil** | **8/10** | Vidéo 13 min avec bitrate modéré (~2 Mbps) = ~200 MB. Telegram peut accepter sans ré-encoder si specs correctes |
-| 5 | **Chat privé vs groupe** | 3/10 | Possible mais peu probable que ce soit la seule explication |
-| 6 | **Codec match exact** | **9/10** | Si la vidéo était EXACTEMENT en H.264 Main Profile + AAC + MP4 + faststart, Telegram n'a rien à ré-encoder |
+| 1 | **La vidéo source était en H.264/MP4 de bonne qualité** | **10/10** | Telethon envoie les bytes tels quels. Si la source est bonne, le résultat est bon. |
+| 2 | **`supports_streaming=True` + faststart activés** | **9/10** | Le spender pouvait lire immédiatement en haute qualité sans attendre le téléchargement complet |
+| 3 | **`DocumentAttributeVideo` avec bonnes dimensions** | **8/10** | Telegram affiche un lecteur inline avec bonnes proportions |
+| 4 | **Les autres vidéos "compressées" étaient en fait déjà basse qualité à la source** | **9/10** | Le vrai problème : la qualité des fichiers uploadés dans Supabase Storage |
+| 5 | **Les autres vidéos n'avaient pas `supports_streaming`** | **7/10** | Sans streaming, le spender voit une preview floue → impression de "compression" |
 
-### 3.2 SCÉNARIO LE PLUS PROBABLE
+### 3.2 SCÉNARIO LE PLUS PROBABLE (CORRIGÉ)
 
-La vidéo de 13 min a passé en haute qualité car elle réunissait **toutes ces conditions** :
-1. Codec H.264 (Main ou High profile)
-2. Audio AAC
-3. Container MP4 avec moov atom au début (faststart)
-4. Résolution ≤ 1280x720 ou 1920x1080 avec bitrate modéré
-5. Bitrate total ~2-4 Mbps (taille ~200-400 MB pour 13 min)
-6. Envoyée avec `supports_streaming=True` (ou Telethon l'a ajouté automatiquement)
+La vidéo de 13 min a été perçue comme "haute qualité" car elle réunissait ces conditions :
 
-**Taille estimée** : 13 min × 3 Mbps = ~292 MB — sous la limite 2 GB userbot.
+1. **La vidéo source était déjà en bonne qualité** (H.264, bon bitrate)
+2. **Le format était MP4 avec moov atom au début** → streaming immédiat
+3. **`supports_streaming=True` était activé** (ou détecté automatiquement) → lecture progressive fluide
+4. **Les dimensions étaient correctement déclarées** → lecteur inline bien dimensionné
+
+Les autres vidéos "compressées" étaient probablement :
+- Des fichiers source de mauvaise qualité dès le départ
+- Ou des fichiers sans `supports_streaming` → preview floue pendant le chargement
+- Ou des fichiers non-MP4/non-H.264 → affichés comme document au lieu de vidéo
+
+**Taille estimée de la vidéo 13 min** : ~200-400 MB (2-4 Mbps) — largement sous la limite 2 GB userbot.
 
 ### 3.3 Code de test pour reproduire
 
