@@ -31145,6 +31145,24 @@ const getSentMediaUrls = async (spenderId, modelId) => {
 window._markMediaAsSent = markMediaAsSent;
 window._getSentMediaUrls = getSentMediaUrls;
 
+// Récupérer media_ids envoyés pour un chat_id (via media_sends)
+window._getSentMediaIds = async (chatId) => {
+  if (!chatId) return [];
+  try {
+    const { data, error } = await window.sb
+      .from('media_sends')
+      .select('media_id')
+      .eq('chat_id', String(chatId));
+    if (error) { console.error('[MEDIA_SENDS] Fetch error:', error); return []; }
+    const ids = (data || []).map(r => r.media_id);
+    console.log('[MEDIA_SENDS] Sent count for', chatId, ':', ids.length);
+    return ids;
+  } catch (err) {
+    console.error('[MEDIA_SENDS] Exception:', err);
+    return [];
+  }
+};
+
 // =============================================
 // DADASH MESSAGERIE — Live Chat 3 colonnes
 // API: https://dadash-autofill-v2-production.up.railway.app
@@ -31632,7 +31650,8 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
         borderRadius: 8,
         overflow: 'hidden',
         cursor: isSent ? 'not-allowed' : isClickable ? 'pointer' : 'default',
-        opacity: isSent ? 0.5 : 1,
+        opacity: isSent ? 0.4 : 1,
+        filter: isSent ? 'grayscale(1)' : 'none',
         background: '#0a0b14',
         border: '1px solid rgba(99, 102, 241, 0.2)',
         transition: 'all 0.2s',
@@ -31726,12 +31745,19 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
 // Alias pour backward-compat si référencé ailleurs
 const MediaThumbnail = MediaCard;
 
-const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrls = [] }) => {
+const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrls = [], chatId }) => {
   const [activeTab, setActiveTab] = React.useState('all');
   const [searchQuery, setSearchQuery] = React.useState('');
   const [medias, setMedias] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
   const [confirmMedia, setConfirmMedia] = React.useState(null);
+  const [sentMediaIds, setSentMediaIds] = React.useState([]);
+
+  // Load sent media IDs for this chatId
+  React.useEffect(() => {
+    if (!chatId) { setSentMediaIds([]); return; }
+    window._getSentMediaIds(String(chatId)).then(ids => setSentMediaIds(ids)).catch(() => {});
+  }, [chatId]);
 
   React.useEffect(() => {
     const loadMedias = async () => {
@@ -31775,13 +31801,21 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
   }, [medias, activeTab, searchQuery]);
 
   const handleSelectMedia = (media) => {
-    if (sentMediaUrls.includes(media.url)) return;
+    if (sentMediaIds.includes(media.id) || sentMediaUrls.includes(media.url)) return;
     setConfirmMedia(media);
   };
 
-  const handleConfirmSend = () => {
-    if (onSelectMedia && confirmMedia) onSelectMedia(confirmMedia);
+  const handleConfirmSend = async () => {
+    if (!onSelectMedia || !confirmMedia) return;
+    const mediaToSend = confirmMedia;
     setConfirmMedia(null);
+    await onSelectMedia(mediaToSend);
+    // Mark as sent in media_sends + refresh local state
+    if (mediaToSend.id && chatId) {
+      const modelName = modelId ? (MODEL_ID_TO_NAME[modelId] || modelId) : '';
+      await window.sb.from('media_sends').insert({ media_id: mediaToSend.id, chat_id: String(chatId), model: modelName }).catch(() => {});
+      setSentMediaIds(prev => prev.includes(mediaToSend.id) ? prev : [...prev, mediaToSend.id]);
+    }
     onClose();
   };
 
@@ -31818,7 +31852,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
               <span>Total:</span><span style={{ color: '#fbbf24', fontWeight: 700 }}>{filteredMedias.length}</span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Envoyés:</span><span style={{ color: '#10b981', fontWeight: 700 }}>{sentMediaUrls.length}</span>
+              <span>Envoyés:</span><span style={{ color: '#10b981', fontWeight: 700 }}>{sentMediaIds.length || sentMediaUrls.length}</span>
             </div>
           </div>
         </div>
@@ -31847,7 +31881,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 }}>
                 {filteredMedias.map((media, idx) => {
-                  const isSent = sentMediaUrls.includes(media.url);
+                  const isSent = sentMediaIds.includes(media.id) || sentMediaUrls.includes(media.url);
                   return (
                     <MediaCard
                       key={media.id || idx}
@@ -32839,6 +32873,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
           <LibraryModal
             modelId={libConv.model_id}
             spenderId={libConv.spender_id}
+            chatId={_dmsgChatId(libConv)}
             sentMediaUrls={sentMediaUrlsMap[activeLibraryCell] || []}
             onClose={() => setActiveLibraryCell(null)}
             onSelectMedia={async (media) => {
@@ -35270,6 +35305,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
         <LibraryModal
           modelId={currentConv.model_id}
           spenderId={currentConv.spender_id}
+          chatId={_dmsgChatId(currentConv)}
           sentMediaUrls={sentMediaUrls}
           onClose={() => setShowLibrary(false)}
           onSelectMedia={async (media) => {
@@ -35970,6 +36006,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
           <LibraryModal
             modelId={_libConvRef?.model_id || null}
             spenderId={_libConvRef?.spender_id || null}
+            chatId={_libConvRef ? _dmsgChatId(_libConvRef) : null}
             sentMediaUrls={mediaLibSentUrls}
             onClose={() => setMediaLibSlot(null)}
             onSelectMedia={selectMediaLibItem}
@@ -42165,6 +42202,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         <LibraryModal
           modelId={selectedConv.model_id}
           spenderId={selectedConv.spender_id || activeSpender?.id}
+          chatId={_dmsgChatId(selectedConv)}
           sentMediaUrls={sentMediaUrls}
           onClose={() => setShowLibrary(false)}
           onSelectMedia={async (media) => {
