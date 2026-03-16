@@ -31530,6 +31530,134 @@ const _gpFmtCallDur = (secs) => {
 // =====================================================================
 // LIBRARY MODAL — Bibliothèque médias unifiée Variant 2 (Sidebar Nav)
 // =====================================================================
+
+// ── Cache global thumbnails vidéo (évite régénération à chaque ouverture) ──
+const VIDEO_THUMBNAIL_CACHE = {};
+
+// ── MediaCard — carte média avec thumbnail vidéo auto-générée ──────────────
+const LibraryMediaCard = ({ media, isSent, onSelect }) => {
+  const [videoMetadata, setVideoMetadata] = React.useState(null);
+  const [thumbnailUrl, setThumbnailUrl]   = React.useState(null);
+
+  React.useEffect(() => {
+    if (media.type !== 'video' || !media.url) return;
+
+    // Cache hit
+    if (VIDEO_THUMBNAIL_CACHE[media.url]) {
+      const cached = VIDEO_THUMBNAIL_CACHE[media.url];
+      setVideoMetadata(cached.metadata);
+      setThumbnailUrl(cached.thumbnail);
+      return;
+    }
+
+    const video = document.createElement('video');
+    video.src        = media.url;
+    video.crossOrigin = 'anonymous';
+    video.preload    = 'metadata';
+    video.muted      = true;
+
+    const fmtDur = (secs) => {
+      if (!secs || isNaN(secs)) return '0:00';
+      const m = Math.floor(secs / 60);
+      const s = Math.floor(secs % 60);
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    };
+
+    video.onloadedmetadata = () => {
+      video.currentTime = Math.min(1, video.duration * 0.1 || 0);
+    };
+
+    video.onseeked = () => {
+      try {
+        const canvas  = document.createElement('canvas');
+        canvas.width  = video.videoWidth  || 320;
+        canvas.height = video.videoHeight || 180;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+        const meta    = { duration: fmtDur(video.duration), width: video.videoWidth, height: video.videoHeight };
+        VIDEO_THUMBNAIL_CACHE[media.url] = { metadata: meta, thumbnail: dataUrl };
+        setVideoMetadata(meta);
+        setThumbnailUrl(dataUrl);
+      } catch (corsErr) {
+        // CORS bloque canvas → on garde juste la durée
+        console.warn('[LibraryMediaCard] canvas bloqué (CORS), durée seulement:', corsErr.message);
+        const meta = { duration: fmtDur(video.duration) };
+        VIDEO_THUMBNAIL_CACHE[media.url] = { metadata: meta, thumbnail: null };
+        setVideoMetadata(meta);
+      }
+    };
+
+    video.onerror = (err) => {
+      console.error('[LibraryMediaCard] video load error:', err);
+    };
+  }, [media.url, media.type]);
+
+  const isVideo = media.type === 'video';
+
+  return (
+    <div
+      onClick={() => !isSent && onSelect(media)}
+      style={{
+        aspectRatio: '1', borderRadius: 8, overflow: 'hidden', position: 'relative',
+        cursor: isSent ? 'not-allowed' : 'pointer', transition: 'all 0.2s',
+        background: 'rgba(255,255,255,0.03)', opacity: isSent ? 0.5 : 1
+      }}
+      onMouseEnter={e => {
+        if (!isSent) {
+          e.currentTarget.style.transform = 'scale(1.05)';
+          e.currentTarget.style.boxShadow = '0 8px 24px rgba(245,158,11,0.3)';
+        }
+      }}
+      onMouseLeave={e => {
+        e.currentTarget.style.transform = 'scale(1)';
+        e.currentTarget.style.boxShadow = 'none';
+      }}
+    >
+      {/* Image / Thumbnail */}
+      {isVideo ? (
+        thumbnailUrl ? (
+          <img src={thumbnailUrl} alt="video preview"
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        ) : (
+          /* Fallback fond sombre + icône centrée tant que thumbnail pas prête */
+          <div style={{ width: '100%', height: '100%', background: '#0f1117', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, opacity: 0.35 }}>
+            🎬
+          </div>
+        )
+      ) : (
+        <img src={media.url} alt="Media"
+          style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
+      )}
+
+      {/* Badge TYPE + DURÉE (haut droite) */}
+      <div style={{
+        position: 'absolute', top: 6, right: 6, zIndex: 2,
+        background: isVideo ? 'rgba(239,68,68,0.9)' : 'rgba(99,102,241,0.9)',
+        padding: '2px 6px', borderRadius: 4, fontSize: 9, fontWeight: 700, color: 'white',
+        display: 'flex', alignItems: 'center', gap: 4
+      }}>
+        <span>{isVideo ? '▶' : '📷'}</span>
+        <span>{isVideo ? 'VIDEO' : 'PHOTO'}</span>
+        {isVideo && videoMetadata?.duration && (
+          <span style={{ opacity: 0.9 }}>· {videoMetadata.duration}</span>
+        )}
+      </div>
+
+      {/* Badge ENVOYÉ (haut gauche) */}
+      {isSent && (
+        <div style={{
+          position: 'absolute', top: 6, left: 6, zIndex: 3,
+          background: 'rgba(16,185,129,0.9)', padding: '3px 8px',
+          borderRadius: 4, fontSize: 9, fontWeight: 700, color: 'white'
+        }}>
+          ✓ Envoyé
+        </div>
+      )}
+    </div>
+  );
+};
+
 const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrls = [] }) => {
   const [activeTab, setActiveTab] = React.useState('all');
   const [searchQuery, setSearchQuery] = React.useState('');
@@ -31643,27 +31771,14 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
               </div>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 }}>
-                {filteredMedias.map((media, idx) => {
-                  const isSent = sentMediaUrls.includes(media.url);
-                  return (
-                    <div key={media.id || idx} onClick={() => !isSent && handleSelectMedia(media)}
-                      style={{ aspectRatio: '1', borderRadius: 8, overflow: 'hidden', position: 'relative', cursor: isSent ? 'not-allowed' : 'pointer', transition: 'all 0.2s', background: 'rgba(255,255,255,0.03)', opacity: isSent ? 0.5 : 1 }}
-                      onMouseEnter={e => { if (!isSent) { e.currentTarget.style.transform = 'scale(1.05)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(245,158,11,0.3)'; } }}
-                      onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.boxShadow = 'none'; }}>
-                      {isSent && (
-                        <div style={{ position: 'absolute', top: 6, left: 6, background: 'rgba(16,185,129,0.9)', padding: '3px 8px', borderRadius: 4, fontSize: 9, fontWeight: 700, color: 'white', zIndex: 3 }}>✓ Envoyé</div>
-                      )}
-                      <div style={{ background: media.type === 'video' ? 'rgba(239,68,68,0.9)' : 'rgba(99,102,241,0.9)', padding: '2px 6px', borderRadius: 4, fontSize: 9, fontWeight: 700, color: 'white', position: 'absolute', top: 6, right: 6, zIndex: 2 }}>
-                        {media.type === 'video' ? '▶ VIDEO' : '📷 PHOTO'}
-                      </div>
-                      {media.type === 'video' ? (
-                        <video src={media.url} style={{ width: '100%', height: '100%', objectFit: 'cover' }} muted />
-                      ) : (
-                        <img src={media.url} alt="Media" style={{ width: '100%', height: '100%', objectFit: 'cover' }} loading="lazy" />
-                      )}
-                    </div>
-                  );
-                })}
+                {filteredMedias.map((media, idx) => (
+                  <LibraryMediaCard
+                    key={media.id || idx}
+                    media={media}
+                    isSent={sentMediaUrls.includes(media.url)}
+                    onSelect={handleSelectMedia}
+                  />
+                ))}
               </div>
             )}
           </div>
