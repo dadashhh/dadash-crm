@@ -31907,18 +31907,20 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
     setConfirmMedia(media);
   };
 
-  const handleConfirmSend = async () => {
+  const handleConfirmSend = () => {
     if (!onSelectMedia || !confirmMedia) return;
     const mediaToSend = confirmMedia;
+    const _chatId = chatId;
+    const _modelId = modelId;
     setConfirmMedia(null);
-    await onSelectMedia(mediaToSend);
-    // Mark as sent in media_sends + refresh local state
-    if (mediaToSend.id && chatId) {
-      const modelName = modelId ? (MODEL_ID_TO_NAME[modelId] || modelId) : '';
-      await window.sb.from('media_sends').insert({ media_id: mediaToSend.id, chat_id: String(chatId), model: modelName }).catch(() => {});
-      setSentMediaIds(prev => prev.includes(mediaToSend.id) ? prev : [...prev, mediaToSend.id]);
+    onClose(); // fermer le modal IMMÉDIATEMENT
+    // Fire-and-forget : le callback parent gère l'UI optimiste
+    onSelectMedia(mediaToSend);
+    // Mark as sent in media_sends (fire-and-forget)
+    if (mediaToSend.id && _chatId) {
+      const modelName = _modelId ? (MODEL_ID_TO_NAME[_modelId] || _modelId) : '';
+      window.sb.from('media_sends').insert({ media_id: mediaToSend.id, chat_id: String(_chatId), model: modelName }).catch(() => {});
     }
-    onClose();
   };
 
   const SidebarTab = ({ active, onClick, icon, label }) => (
@@ -32994,9 +32996,14 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
             sentMediaUrls={sentMediaUrlsMap[activeLibraryCell] || []}
             onClose={() => setActiveLibraryCell(null)}
             onSelectMedia={async (media) => {
+              const slotIdx = activeLibraryCell;
               const cid = _dmsgChatId(libConv);
               const mId = libConv.model_id || "";
               const spId = libConv.spender_id;
+              // Bulle optimiste pending
+              const _optId = "pending-lib-" + Date.now();
+              const _optMsg = { id: _optId, _optimistic: true, direction: "out", is_outgoing: true, sender_type: "chatter", media_type: media.type, media_url: media.url, text: "", created_at: new Date().toISOString() };
+              setGpSlotMsgs(p => ({ ...p, [slotIdx]: [...(p[slotIdx] || []), _optMsg] }));
               try {
                 if (media.type === 'video') {
                   const _vm = await window._getVideoMetadata(media.url);
@@ -33004,16 +33011,20 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
                 } else {
                   await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: cid, media_url: media.url, caption: "", model_id: mId }), timeout: 30000 });
                 }
+                // Succès → retirer bulle optimiste (le refresh normal la remplacera)
+                setGpSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).map(m => m.id === _optId ? { ...m, _optimistic: false } : m) }));
                 addToast("Média envoyé ✅", "success");
                 if (spId && mId) {
                   window._markMediaAsSent(media.url, spId, mId, 'grid');
                   setSentMediaUrlsMap(prev => ({
                     ...prev,
-                    [activeLibraryCell]: [...(prev[activeLibraryCell] || []).filter(u => u !== media.url), media.url]
+                    [slotIdx]: [...(prev[slotIdx] || []).filter(u => u !== media.url), media.url]
                   }));
                 }
               } catch (err) {
-                addToast("Erreur envoi : " + err.message, "error");
+                // Erreur → retirer bulle optimiste + toast rouge
+                setGpSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).filter(m => m.id !== _optId) }));
+                addToast("Erreur envoi", "error");
               }
             }}
           />
@@ -34228,10 +34239,11 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
                             {_senderLabel(msg.sender)}
                           </div>
                         )}
-                        <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word" }}>
+                        <div style={{ display: "inline-block", padding: "4px 8px", background: isOut ? "#6366f1" : "rgba(255,255,255,0.06)", color: isOut ? "#fff" : "#d1d5db", borderRadius: 7, maxWidth: "85%", fontSize: 10, lineHeight: 1.4, wordBreak: "break-word", opacity: msg._optimistic ? 0.6 : 1, borderLeft: msg._failed ? "3px solid #ef4444" : "none" }}>
                           {renderTlgMsgContent(msg)}
+                          {msg._optimistic && React.createElement("span", { style: { fontSize: 8, opacity: 0.7, marginLeft: 4 } }, "⏳")}
                         </div>
-                        {ts && (
+                        {ts && !msg._optimistic && (
                           <div style={{ fontSize: 8, color: "#4b5563", marginTop: 1, textAlign: isOut ? "right" : "left" }}>
                             {_gpFmtTime(ts)}
                           </div>
@@ -35261,15 +35273,23 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
                 ) : (
                   messages.map((msg, i) => {
                     const isOut = msg.is_outgoing || msg.direction === "out" || msg.is_from_me;
+                    const isPending = msg._pending === true;
                     return (
-                      <div key={msg.id || i} className={"tindada-msg " + (isOut ? "sent" : "received")}>
+                      <div key={msg.id || i} className={"tindada-msg " + (isOut ? "sent" : "received")} style={isPending ? { opacity: 0.6, border: "1px dashed rgba(255,255,255,0.3)", background: "rgba(100,100,100,0.25)" } : undefined}>
                         {isOut && msg.sender && (
                           <div style={{ fontSize: 10, color: "#a5b4fc", fontWeight: 700, marginBottom: 2 }}>
                             {_senderLabel(msg.sender)}
                           </div>
                         )}
-                        {_escapeHtml(msg.text || msg.content || msg.message || msg.caption || "[média]")}
-                        <div className="tindada-msg-time">{formatMsgTime(msg.created_at || msg.timestamp)}</div>
+                        {isPending && msg.media_url && (
+                          <div style={{ marginBottom: 4 }}>
+                            {msg.media_type === "video"
+                              ? <video src={msg.media_url} style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 6, opacity: 0.7 }} muted />
+                              : <img src={msg.media_url} style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 6, opacity: 0.7 }} />}
+                          </div>
+                        )}
+                        {isPending ? React.createElement("span", null, "⏳ Envoi en cours…") : _escapeHtml(msg.text || msg.content || msg.message || msg.caption || "[média]")}
+                        <div className="tindada-msg-time">{isPending ? "…" : formatMsgTime(msg.created_at || msg.timestamp)}</div>
                       </div>
                     );
                   })
@@ -35441,6 +35461,11 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
             const cid = _dmsgChatId(currentConv);
             const mId = currentConv.model_id || "";
             const spId = currentConv.spender_id;
+            // Bulle optimiste pending
+            const _optId = "pending-lib-" + Date.now();
+            const _optMsg = { id: _optId, _pending: true, direction: "out", is_outgoing: true, sender_type: "chatter", media_type: media.type, media_url: media.url, text: "", created_at: new Date().toISOString() };
+            setMessages(prev => [...prev, _optMsg]);
+            if (msgsEndRef.current) msgsEndRef.current.scrollIntoView({ behavior: "smooth" });
             try {
               if (media.type === 'video') {
                 const _vm = await window._getVideoMetadata(media.url);
@@ -35448,13 +35473,17 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
               } else {
                 await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: cid, media_url: media.url, caption: "", model_id: mId }), timeout: 30000 });
               }
+              // Succès → confirmer bulle
+              setMessages(prev => prev.map(m => m.id === _optId ? { ...m, _pending: false } : m));
               addToast("Média envoyé ✅", "success");
               if (spId && mId) {
                 window._markMediaAsSent(media.url, spId, mId, 'tindada');
                 setSentMediaUrls(prev => prev.includes(media.url) ? prev : [...prev, media.url]);
               }
             } catch (err) {
-              addToast("Erreur envoi : " + err.message, "error");
+              // Erreur → retirer bulle + toast rouge
+              setMessages(prev => prev.filter(m => m.id !== _optId));
+              addToast("Erreur envoi", "error");
             }
           }}
         />
@@ -35872,6 +35901,10 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
     const cid = _dmsgChatId(convRef);
     const mId = convRef.model_id || "";
     const spId = convRef.spender_id;
+    // Bulle optimiste pending
+    const _optId = "pending-lib-" + Date.now();
+    const _optMsg = { id: _optId, _optimistic: true, direction: "out", is_outgoing: true, sender_type: "chatter", media_type: item.type, media_url: item.url, text: "", created_at: new Date().toISOString() };
+    setTSlotMsgs(p => ({ ...p, [slotIdx]: [...(p[slotIdx] || []), _optMsg] }));
     try {
       if (item.type === "video") {
         const _vm = await window._getVideoMetadata(item.url);
@@ -35879,6 +35912,8 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
       } else {
         await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: cid, media_url: item.url, caption: "", model_id: mId }), timeout: 30000 });
       }
+      // Succès → confirmer bulle
+      setTSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).map(m => m.id === _optId ? { ...m, _optimistic: false } : m) }));
       addToast("Média envoyé", "success");
       // Sync cross-pages + local graying
       if (spId && mId) {
@@ -35890,7 +35925,9 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
         setMediaLibSentIds(prev => prev.includes(item.id) ? prev : [...prev, item.id]);
       }
     } catch (err) {
-      addToast("Erreur envoi : " + err.message, "error");
+      // Erreur → retirer bulle + toast rouge
+      setTSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).filter(m => m.id !== _optId) }));
+      addToast("Erreur envoi", "error");
     }
   };
 
@@ -42360,6 +42397,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             const chatId = _dmsgChatId(selectedConv);
             const mId = selectedConv.model_id || "";
             const _spId = selectedConv.spender_id || activeSpender?.id;
+            // Bulle optimiste pending
+            const _optId = "pending-lib-" + Date.now();
+            const _optMsg = { id: _optId, _pending: true, direction: "out", is_outgoing: true, sender_type: "chatter", media_type: media.type, media_url: media.url, text: "", created_at: new Date().toISOString() };
+            setMessages(prev => [...prev, _optMsg]);
+            scrollToBottom('smooth');
             try {
               if (media.type === 'video') {
                 const _vm = await window._getVideoMetadata(media.url);
@@ -42367,13 +42409,17 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               } else {
                 await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: chatId, media_url: media.url, caption: "", model_id: mId }), timeout: 30000 });
               }
+              // Succès → confirmer bulle
+              setMessages(prev => prev.map(m => m.id === _optId ? { ...m, _pending: false } : m));
               addToast("Média envoyé ✅", "success");
               if (_spId && mId) {
                 window._markMediaAsSent(media.url, _spId, mId, 'conversation');
                 setSentMediaUrls(prev => prev.includes(media.url) ? prev : [...prev, media.url]);
               }
             } catch (err) {
-              addToast("Erreur envoi : " + err.message, "error");
+              // Erreur → retirer bulle + toast rouge
+              setMessages(prev => prev.filter(m => m.id !== _optId));
+              addToast("Erreur envoi", "error");
             }
           }}
         />
