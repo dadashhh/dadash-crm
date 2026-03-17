@@ -129,7 +129,7 @@
 
   <meta charset="UTF-8">
   <!-- CSP — Supabase Storage + API endpoints (img-src, media-src, connect-src) -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https: https://*.supabase.co; media-src 'self' blob: https: https://*.supabase.co https://lkrzjwfwhiimpnsyeuxi.supabase.co; connect-src 'self' https://lkrzjwfwhiimpnsyeuxi.supabase.co https://*.supabase.co wss://lkrzjwfwhiimpnsyeuxi.supabase.co wss://*.supabase.co https://dadash-autofill-v2-production.up.railway.app https://dadash-telegram-bot-production.up.railway.app https://api.anthropic.com https://api.exchangerate-api.com;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https: https://*.supabase.co; media-src 'self' blob: https: https://*.supabase.co https://lkrzjwfwhiimpnsyeuxi.supabase.co; connect-src 'self' https://lkrzjwfwhiimpnsyeuxi.supabase.co https://*.supabase.co wss://lkrzjwfwhiimpnsyeuxi.supabase.co wss://*.supabase.co https://dadash-autofill-v2-production.up.railway.app https://dadash-telegram-bot-production.up.railway.app https://api.anthropic.com https://api.exchangerate-api.com https://cdnjs.cloudflare.com;">
   <!-- CHRISTINE FIX — Cache-busting meta tags to prevent stale versions -->
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
@@ -59073,6 +59073,7 @@ const App = () => {
   const cardModal = useCardModal();
   const [user, setUser] = useState(null);
   const userRef = React.useRef(null);
+  const _loggedOut = React.useRef(false); // guard: prevent re-auth after explicit logout
   // Keep ref in sync for closures (onAuthStateChange etc.)
   React.useEffect(() => { userRef.current = user; }, [user]);
   const [lang, setLang] = useState(() => { try { const s=localStorage.getItem("dadash-lang"); return s&&["fr","de","en","ru","uk","es"].includes(s)?s:"fr"; } catch { return "fr"; } });
@@ -59348,6 +59349,8 @@ const App = () => {
      this listener catches the SIGNED_IN event and logs the user in automatically) */
   useEffect(() => {
     const { data: { subscription } } = sb.auth.onAuthStateChange(async (event, session) => {
+      // Guard: after explicit logout, ignore all auth events until page reload
+      if (_loggedOut.current) return;
       if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session && !userRef.current) {
         try {
           const { data: profile } = await sb.from("profiles").select("*").eq("id", session.user.id).single();
@@ -59584,7 +59587,7 @@ const App = () => {
     const assignedModelIds = isChatter ? (Array.isArray(currentUser?.assigned_models) ? currentUser.assigned_models : []).filter(Boolean) : [];
     if (isChatter) { scope._allowedModelIds = assignedModelIds; }
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR;
-    const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[]} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[]}; });
+    const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[], _error: r.error.message || r.error} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[], _error: e.message || e}; });
     try {
       /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
       const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 30 secondes")), 30000));
@@ -59733,7 +59736,11 @@ const App = () => {
     setModelPrices((mpR&&mpR.data)||[]);
     setModelTasks((mtR&&mtR.data)||[]);
     const clData = (clR&&clR.data)||[];
-    console.info("[CONTENT_LIST] fetch result — count:", clData.length, "| error:", (clR&&clR.error)||null, "| raw:", clR);
+    if (clData.length === 0 && clR && clR._error) {
+      console.warn("[CONTENT_LIST] table may not exist — run migration 20260316_content_list.sql. Error:", clR._error);
+    } else {
+      console.info("[CONTENT_LIST] fetch result — count:", clData.length);
+    }
     setContentList(clData);
     setChecklistTemplates((ctplR&&ctplR.data)||[]);
     setChecklistInstances((ciR&&ciR.data)||[]);
@@ -60263,8 +60270,12 @@ const App = () => {
   };
 
   const handleLogout = async () => {
+    // Set guard FIRST to prevent onAuthStateChange from re-authenticating
+    _loggedOut.current = true;
     try { closeDrill(); } catch (e) { console.warn("[LOGOUT] closeDrill error:", e); }
     try { await sb.auth.signOut(); } catch (e) { console.warn("[LOGOUT] signOut error:", e); }
+    // Clear auth storage to prevent auto-reconnection
+    try { localStorage.removeItem('dadash-auth'); } catch (e) {}
     // Purger les caches globaux messagerie pour éviter toute fuite entre sessions
     try {
       Object.keys(_DMSG_MSG_CACHE).forEach(k => delete _DMSG_MSG_CACHE[k]);
@@ -60274,6 +60285,7 @@ const App = () => {
     // Always clear state and redirect to login
     setUser(null);
     setTab("dashboard");
+    setLoading(false);
     setTxs([]);
     setProfiles([]);
     setModels([]);
@@ -60299,8 +60311,8 @@ const App = () => {
     setUnreadCount(0);
     setPaymentEvents([]);
     setLedgerEntries([]);
-    // Clear auth storage to prevent auto-reconnection
-    try { localStorage.removeItem('dadash-auth'); } catch (e) {}
+    // Force navigation to login
+    window.location.hash = '#login';
   };
 
   /* DB FIX — global refresh with error handling */
