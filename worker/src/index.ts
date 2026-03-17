@@ -18,7 +18,18 @@ const PORT = parseInt(process.env.PORT ?? '3000', 10);
 const START_TIME = Date.now();
 
 // ── HTTP health server ────────────────────────
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
+
 const server = http.createServer((req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, CORS_HEADERS);
+    res.end();
+    return;
+  }
   if (req.method === 'GET' && req.url === '/health') {
     const body = JSON.stringify({
       status: 'ok',
@@ -28,11 +39,11 @@ const server = http.createServer((req, res) => {
       lastPollAt: metrics.lastPollAt,
       pollerRunning: metrics.running,
     });
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { 'Content-Type': 'application/json', ...CORS_HEADERS });
     res.end(body);
     return;
   }
-  res.writeHead(404);
+  res.writeHead(404, CORS_HEADERS);
   res.end('Not found');
 });
 
