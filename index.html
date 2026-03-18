@@ -39603,6 +39603,45 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
   };
 
+  // ── Lightweight spender index for filters (tier, language, total_spent) ──
+  // Global spenders are skipped on messagerie pages, so we load a minimal subset here.
+  const [spenderFilterMap, setSpenderFilterMap] = useState({});
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data, error } = await sb
+          .from('spenders')
+          .select('telegram_id, tg_user_id, tier, langue, language, total_spent, ltv, first_name, handle');
+        if (cancelled || error || !data) {
+          if (error) console.warn('[FILTER] spender index load error:', error.message);
+          return;
+        }
+        const map = {};
+        data.forEach(s => {
+          const tgId1 = s.telegram_id ? String(s.telegram_id) : null;
+          const tgId2 = s.tg_user_id ? String(s.tg_user_id) : null;
+          const entry = {
+            tier: s.tier || null,
+            langue: (s.langue || s.language || '').toUpperCase(),
+            total_spent: Number(s.ltv || s.total_spent || 0),
+            first_name: s.first_name || null,
+            handle: s.handle || null,
+          };
+          if (tgId1) map[tgId1] = entry;
+          if (tgId2 && tgId2 !== tgId1) map[tgId2] = entry;
+        });
+        if (!cancelled) {
+          setSpenderFilterMap(map);
+          console.log(`[FILTER] spender index loaded: ${Object.keys(map).length} entries from ${data.length} spenders`);
+        }
+      } catch (e) {
+        console.warn('[FILTER] spender index exception:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   useEffect(() => {
     if (!lightboxUrl) return;
     const onKey = (e) => { if (e.key === "Escape") setLightboxUrl(null); };
@@ -40562,81 +40601,100 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const filteredConvs = React.useMemo(() => {
     let result = conversations;
 
-    // Filtre recherche
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      result = result.filter(c => {
-        const name = (c.display_name || c.username || c.tg_username || String(_dmsgChatId(c) || "")).toLowerCase();
-        const last = String(c.last_message || c.last_message_text || "").toLowerCase();
-        return name.includes(q) || last.includes(q);
-      });
-    }
+    // Helper: get spender data for a conversation via O(1) map lookup
+    const _getSpender = (c) => {
+      const cidStr = String(_dmsgChatId(c) || "");
+      return spenderFilterMap[cidStr] || null;
+    };
 
-    // Filtre spender (payant/gratuit)
-    if (filterSpender === "paying") {
-      result = result.filter(c => {
-        const cidStr = String(_dmsgChatId(c) || "");
-        const sp = (spenders || []).find(x => x.id === c.spender_id || String(x.tg_user_id || x.telegram_id || "") === cidStr);
-        const total = Number(c.total_spent || 0) || convTotalsMap[cidStr] || (sp ? Number(sp.ltv || sp.total_spent || 0) : 0);
-        return total >= 1;
-      });
-    } else if (filterSpender === "free") {
-      result = result.filter(c => {
-        const cidStr = String(_dmsgChatId(c) || "");
-        const sp = (spenders || []).find(x => x.id === c.spender_id || String(x.tg_user_id || x.telegram_id || "") === cidStr);
-        const total = Number(c.total_spent || 0) || convTotalsMap[cidStr] || (sp ? Number(sp.ltv || sp.total_spent || 0) : 0);
-        return total === 0;
-      });
-    }
+    // Helper: get total spent for a conversation
+    const _getTotal = (c) => {
+      const cidStr = String(_dmsgChatId(c) || "");
+      const sp = _getSpender(c);
+      return Number(c.total_spent || 0) || convTotalsMap[cidStr] || (sp ? sp.total_spent : 0);
+    };
 
-    // Tri déjà appliqué dans loadConversations — garder l'ordre stable ici
-    // result reste dans l'ordre du cache
-
-    // Filtre modèle — compare model_id (UUID) directement
+    // 1. Filtre modèle — compare model_id (UUID) directement
     if (filterModel && filterModel !== "all") {
-      const total = result.length;
       result = result.filter(c => String(c.model_id || "") === String(filterModel));
-      console.log("[FILTER]", filterModel, "showing", result.length, "/", total);
     }
 
-    // Filtre tier (basé sur total dépensé)
-    if (filterTier !== "all") {
-      const TIERS = {
-        sharks:     [500, Infinity],
-        baleines:   [350, 500],
-        gorilles:   [200, 350],
-        orangoutan: [100, 200],
-        ouistiti:   [50,  100],
-        poissons:   [1,   50],
-        free:       [0,   1],
-      };
-      const range = TIERS[filterTier];
-      if (range) result = result.filter(c => {
-        const cidStr = String(_dmsgChatId(c) || "");
-        const sp = (spenders||[]).find(x => x.id===c.spender_id || String(x.tg_user_id||x.telegram_id||"")===cidStr);
-        const total = Number(c.total_spent||0) || convTotalsMap[cidStr] || Number(sp?.ltv||sp?.total_spent||0);
-        return total >= range[0] && total < range[1];
-      });
-    }
-
-    // Filtre langue
-    if (filterLang && filterLang !== "all") {
-      result = result.filter(c => {
-        const cidStr = String(_dmsgChatId(c) || "");
-        const sp = (spenders || []).find(x => x.id === c.spender_id || String(x.tg_user_id || x.telegram_id || "") === cidStr);
-        const lang = (sp?.langue || sp?.language || c.spender_language || "").toUpperCase();
-        if (filterLang === "other") return !["FR", "DE", "EN", "IT", "ES"].includes(lang);
-        return lang === filterLang.toUpperCase();
-      });
-    }
-
-    // Filtre non-lus
+    // 2. Filtre non-lus
     if (showUnreadOnly) {
       result = result.filter(c => (c.unread_count || 0) > 0);
     }
 
+    // 3. Filtre tier/segment (basé sur le champ tier du spender, fallback sur total dépensé)
+    if (filterTier !== "all") {
+      if (filterTier === "free") {
+        result = result.filter(c => {
+          const sp = _getSpender(c);
+          const total = _getTotal(c);
+          return (sp && sp.tier === "free") || total === 0;
+        });
+      } else {
+        // Tier filter: prefer spender.tier field, fallback to spending ranges
+        const TIER_RANGES = {
+          sharks:     [500, Infinity],
+          baleines:   [350, 500],
+          gorilles:   [200, 350],
+          orangoutan: [100, 200],
+          ouistiti:   [50,  100],
+          poissons:   [1,   50],
+        };
+        result = result.filter(c => {
+          const sp = _getSpender(c);
+          // Direct tier match from spender record
+          if (sp && sp.tier) {
+            return sp.tier === filterTier;
+          }
+          // Fallback: spending range
+          const range = TIER_RANGES[filterTier];
+          if (range) {
+            const total = _getTotal(c);
+            return total >= range[0] && total < range[1];
+          }
+          return false;
+        });
+      }
+    }
+
+    // 4. Filtre langue
+    if (filterLang && filterLang !== "all") {
+      result = result.filter(c => {
+        const sp = _getSpender(c);
+        const spLang = (sp?.langue || c.spender_language || "").toUpperCase();
+        if (filterLang === "other") return spLang && !["FR", "DE", "EN", "IT", "ES"].includes(spLang);
+        return spLang === filterLang.toUpperCase();
+      });
+    }
+
+    // 5. Filtre spender payant/gratuit (FREE button)
+    if (filterSpender === "paying") {
+      result = result.filter(c => _getTotal(c) >= 1);
+    } else if (filterSpender === "free") {
+      result = result.filter(c => {
+        const sp = _getSpender(c);
+        const total = _getTotal(c);
+        return (sp && (sp.tier === "free" || total === 0)) || (!sp && total === 0);
+      });
+    }
+
+    // 6. Filtre recherche texte (first_name, username)
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      result = result.filter(c => {
+        const name = (c.first_name || c.display_name || c.username || c.tg_username || String(_dmsgChatId(c) || "")).toLowerCase();
+        const uname = (c.username || c.tg_username || "").toLowerCase();
+        return name.includes(q) || uname.includes(q);
+      });
+    }
+
+    console.log(`[FILTER] model=${filterModel} tier=${filterTier} lang=${filterLang} unread=${showUnreadOnly} free=${filterSpender} search="${searchQuery}"`);
+    console.log(`[FILTER] result: ${result.length}/${conversations.length} conversations`);
+
     return result;
-  }, [conversations, searchQuery, filterSpender, filterModel, filterTier, filterLang, spenders, convTotalsMap, showUnreadOnly]);
+  }, [conversations, searchQuery, filterSpender, filterModel, filterTier, filterLang, spenderFilterMap, convTotalsMap, showUnreadOnly]);
 
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
