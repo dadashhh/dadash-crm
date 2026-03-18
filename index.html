@@ -39722,34 +39722,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const convsCache = React.useRef({ data: [], lastFetch: 0 });
   const CACHE_TTL = 30000;
 
-  // ── Load conversations: Carlos API + Supabase merge (ensures ALL models visible) ──
-  // Helper: merge API + Supabase conversation lists, filter, sort
-  const _mergeAndFilterConvs = useCallback((apiList, sbList) => {
-    const idSet = new Set();
-    const chatIdSet = new Set();
-    const merged = [];
-    for (const c of apiList) {
-      const cid = c.id || c.tg_chat_id || c.chat_id;
-      if (cid && !idSet.has(String(cid))) {
-        idSet.add(String(cid));
-        if (c.tg_chat_id) chatIdSet.add(String(c.tg_chat_id));
-        if (c.chat_id) chatIdSet.add(String(c.chat_id));
-        merged.push(c);
-      }
-    }
-    let sbAdded = 0;
-    for (const c of sbList) {
-      const cid = String(c.id || "");
-      const chatId = String(c.tg_chat_id || c.chat_id || "");
-      if (!idSet.has(cid) && !chatIdSet.has(chatId)) {
-        idSet.add(cid);
-        if (chatId) chatIdSet.add(chatId);
-        merged.push(c);
-        sbAdded++;
-      }
-    }
-    let list = merged;
-    console.log(`[CONV] Merged ${list.length} conversations (API: ${apiList.length}, Supabase added: ${sbAdded})`);
+  // ── Load conversations: Carlos API only ──
+  // Helper: filter and sort API conversation list
+  const _filterAndSortConvs = useCallback((apiList) => {
+    let list = [...apiList];
+    console.log(`[CONV] ${list.length} conversations from Carlos API`);
     // Filtrage sécurité côté client pour les chatters
     if (userProfile?.role === 'chatter') {
       const assigned = userProfile.assigned_models || [];
@@ -39781,13 +39758,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     if (window._PRELOADED_CONVERSATIONS && (Date.now() - window._PRELOADED_CONVERSATIONS.ts) < 60000) {
       const pre = window._PRELOADED_CONVERSATIONS;
       window._PRELOADED_CONVERSATIONS = null; // consume once, force real fetch on next poll
-      const list = _mergeAndFilterConvs(pre.api, pre.sb);
+      const list = _filterAndSortConvs(pre.api || []);
       console.log('[CONV] Using preloaded cache —', list.length, 'conversations');
       convsCache.current = { data: list, lastFetch: now };
       _DMSG_CONV_CACHE.list = list;
       _DMSG_CONV_CACHE.ts = now;
       setConversations(list);
-      setApiOk(pre.api.length > 0 || pre.sb.length > 0);
+      setApiOk(list.length > 0);
       convLoadedRef.current = true;
       setConvLoading(false);
       return;
@@ -39800,69 +39777,36 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       if (conversations.length === 0) setConvLoading(true);
     }
 
-    let apiList = [];
-    let apiOk_ = false;
-
-    // ── Supabase-first: display immediately, then merge Carlos when ready ──
-    const _48hAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-    let _convSbQuery = sb.from("tg_conversations").select("*").gte("last_message_at", _48hAgo);
-    if (userProfile?.role === "chatter") {
-      const _assigned = userProfile.assigned_models || [];
-      if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
-    }
-    _convSbQuery = _convSbQuery.order("last_message_at", { ascending: false });
-
-    const sbPromise = _convSbQuery;
-    const apiPromise = _dmsgFetch("/conversations");
-
-    // Show Supabase results immediately (fast ~300ms)
-    let sbList = [];
+    // ── Carlos API only — no Supabase fallback ──
     try {
-      const { data: sbData, error } = await sbPromise;
-      if (!error && sbData) {
-        sbList = sbData;
-        if (sbList.length > 0) {
-          const sbOnlyList = _mergeAndFilterConvs([], sbList);
-          setConversations(sbOnlyList);
-          setConvLoading(false);
-          convLoadedRef.current = true;
-          setApiOk(true);
-        }
-      }
+      const data = await _dmsgFetch("/conversations");
+      const apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      const list = _filterAndSortConvs(apiList);
+
+      // Debug: log model distribution
+      const byModel = {};
+      list.forEach(c => { const mid = c.model_id || "unknown"; byModel[mid] = (byModel[mid] || 0) + 1; });
+      console.log(`[CONV] Carlos API: ${list.length} conversations`, byModel);
+
+      convsCache.current = { data: list, lastFetch: now };
+      _DMSG_CONV_CACHE.list = list;
+      _DMSG_CONV_CACHE.ts = now;
+      setConversations(prev => {
+        const isSame = prev.length === list.length &&
+          prev.every((c, i) => c.id === list[i]?.id && c.last_message_at === list[i]?.last_message_at && c.unread_count === list[i]?.unread_count);
+        return isSame ? prev : list;
+      });
+      setApiOk(true);
+      setApiError(null);
     } catch (e) {
-      console.warn("[CONV] Supabase fetch error:", e.message);
+      console.warn("[CONV] Carlos API error:", e.message);
+      setApiOk(false);
+      setApiError("Erreur chargement — réessaie dans quelques secondes");
+      // No Supabase fallback — show empty list + retry
     }
-
-    // Merge when Carlos arrives (slower)
-    try {
-      const data = await apiPromise;
-      apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      apiOk_ = true;
-    } catch (e) {
-      console.warn("[CONV] Carlos API error, will use Supabase only:", e.message);
-    }
-
-    // Final merge: API results take priority, Supabase fills gaps
-    const list = _mergeAndFilterConvs(apiList, sbList);
-
-    // Debug: log model distribution
-    const byModel = {};
-    list.forEach(c => { const mid = c.model_id || "unknown"; byModel[mid] = (byModel[mid] || 0) + 1; });
-    console.log(`[CONV] Final merge: ${list.length} conversations`, byModel);
-
-    convsCache.current = { data: list, lastFetch: now };
-    _DMSG_CONV_CACHE.list = list;
-    _DMSG_CONV_CACHE.ts = now;
-    setConversations(prev => {
-      const isSame = prev.length === list.length &&
-        prev.every((c, i) => c.id === list[i]?.id && c.last_message_at === list[i]?.last_message_at && c.unread_count === list[i]?.unread_count);
-      return isSame ? prev : list;
-    });
-    setApiOk(apiOk_ || sbList.length > 0);
-    if (!apiOk_ && sbList.length === 0) setApiError("Erreur chargement");
     convLoadedRef.current = true;
     setConvLoading(false);
-  }, [userProfile, _mergeAndFilterConvs]);
+  }, [userProfile, _filterAndSortConvs]);
 
   // Charger conversations quand profil est prêt
   useEffect(() => {
@@ -43697,13 +43641,9 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
         return [...list, ...stillPending];
       });
     } catch (e) {
+      console.warn("[MESSAGES] Carlos failed:", e.message);
       if (isInitial) {
-        // Fallback Supabase
-        try {
-          const { data: sbData } = await sb.from("tg_messages").select("*").eq("conversation_id", convId).order("created_at", { ascending: false }).limit(500);
-          shouldScrollRef.current = true;
-          setMessages((sbData || []).reverse());
-        } catch (_) { setMessages([]); }
+        setMessages([]);
       }
     }
     if (isInitial) setMsgLoading(false);
@@ -60960,17 +60900,13 @@ const App = () => {
     }
     if (window.PERF) { window.PERF.mark('loadData_done'); window.PERF.measure('loadData total', 'loadData_start'); }
 
-    // Pre-load conversations in background for instant Messagerie display
+    // Pre-load conversations in background for instant Messagerie display (Carlos only)
     (async () => {
       try {
-        const [apiRes, sbRes] = await Promise.allSettled([
-          _dmsgFetch("/conversations"),
-          sb.from("tg_conversations").select("*").order("last_message_at", { ascending: false })
-        ]);
-        const apiList = apiRes.status === "fulfilled" ? (Array.isArray(apiRes.value) ? apiRes.value : (apiRes.value?.conversations || apiRes.value?.data || [])) : [];
-        const sbList = sbRes.status === "fulfilled" ? (sbRes.value?.data || []) : [];
-        window._PRELOADED_CONVERSATIONS = { api: apiList, sb: sbList, ts: Date.now() };
-        console.log('[BOOT] Conversations pre-loaded — API:', apiList.length, '| SB:', sbList.length);
+        const data = await _dmsgFetch("/conversations");
+        const apiList = Array.isArray(data) ? data : (data?.conversations || data?.data || []);
+        window._PRELOADED_CONVERSATIONS = { api: apiList, ts: Date.now() };
+        console.log('[BOOT] Conversations pre-loaded — API:', apiList.length);
       } catch(e) { console.warn('[BOOT] Conversation preload failed:', e.message); }
     })();
   };
