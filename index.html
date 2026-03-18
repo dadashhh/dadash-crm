@@ -39228,11 +39228,84 @@ const getTierEmoji = (ltv) => {
 const MessagerieHubPage = ({ user, lang, models = [], setTab }) => {
   const isManager = user && ["gerant","admin","ceo","manager_chatter"].includes(user.role);
 
-  // Stats — TODO: make dynamic from API/Supabase
-  const unreadCount = 14;
-  const active24h = 8;
-  const modelsLive = 4;
-  const responseRate = 89;
+  // ── Live KPI state ──
+  const [unreadCount, setUnreadCount] = React.useState(0);
+  const [active24h, setActive24h] = React.useState(0);
+  const [modelsLive, setModelsLive] = React.useState(0);
+  const [responseRate, setResponseRate] = React.useState(0);
+
+  const refreshKpis = React.useCallback(async () => {
+    try {
+      // 1. Non lus — tg_conversations with unread_count > 0
+      const unreadPromise = sb.from("tg_conversations").select("id", { count: "exact", head: true }).gt("unread_count", 0);
+
+      // 2. Actifs 24h — spenders with last_message_at > now - 24h
+      const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const activePromise = sb.from("tg_conversations").select("id", { count: "exact", head: true }).gt("last_message_at", since24h);
+
+      // 3. Modèles live — Carlos /health endpoint
+      const healthPromise = _dmsgFetch("/health").catch(() => null);
+
+      // 4. Taux réponse — messages last 24h: outgoing / incoming
+      const msgsInPromise = sb.from("tg_messages").select("id", { count: "exact", head: true }).gt("created_at", since24h).eq("direction", "in");
+      const msgsOutPromise = sb.from("tg_messages").select("id", { count: "exact", head: true }).gt("created_at", since24h).eq("direction", "out");
+
+      const [unreadRes, activeRes, healthRes, msgsInRes, msgsOutRes] = await Promise.allSettled([
+        unreadPromise, activePromise, healthPromise, msgsInPromise, msgsOutPromise
+      ]);
+
+      // Apply results
+      if (unreadRes.status === "fulfilled") setUnreadCount(unreadRes.value?.count || 0);
+      if (activeRes.status === "fulfilled") setActive24h(activeRes.value?.count || 0);
+
+      if (healthRes.status === "fulfilled" && healthRes.value) {
+        const h = healthRes.value;
+        const liveCount = h.connected_clients || h.clients_connected || h.telethon_clients || (Array.isArray(h.clients) ? h.clients.filter(c => c.connected || c.status === "connected").length : 0) || 0;
+        setModelsLive(liveCount);
+      }
+
+      const inCount = msgsInRes.status === "fulfilled" ? (msgsInRes.value?.count || 0) : 0;
+      const outCount = msgsOutRes.status === "fulfilled" ? (msgsOutRes.value?.count || 0) : 0;
+      setResponseRate(inCount > 0 ? Math.round((outCount / inCount) * 100) : 0);
+
+      console.log('[HUB KPI] refreshed — unread:', unreadRes.value?.count, 'active24h:', activeRes.value?.count, 'live:', healthRes.value, 'in:', inCount, 'out:', outCount);
+    } catch (e) {
+      console.warn('[HUB KPI] refresh error:', e.message);
+    }
+  }, []);
+
+  // Initial load
+  React.useEffect(() => { refreshKpis(); }, [refreshKpis]);
+
+  // Auto-refresh every 30s (skip if tab hidden)
+  React.useEffect(() => {
+    const interval = setInterval(() => {
+      if (document.hidden) return;
+      refreshKpis();
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [refreshKpis]);
+
+  // Refresh on visibility change (returning to this tab)
+  React.useEffect(() => {
+    const handler = () => { if (!document.hidden) refreshKpis(); };
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
+  }, [refreshKpis]);
+
+  // Refresh on incoming message (realtime custom event from global channel)
+  React.useEffect(() => {
+    const handler = () => { refreshKpis(); };
+    window.addEventListener('tg-message-insert', handler);
+    return () => window.removeEventListener('tg-message-insert', handler);
+  }, [refreshKpis]);
+
+  // Refresh on mark-read event
+  React.useEffect(() => {
+    const handler = () => { refreshKpis(); };
+    window.addEventListener('mark-read', handler);
+    return () => window.removeEventListener('mark-read', handler);
+  }, [refreshKpis]);
 
   const navTo = (hash) => { const route = hash.replace(/^#\/?/, ''); setTab(route); };
 
