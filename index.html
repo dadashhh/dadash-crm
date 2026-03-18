@@ -32159,6 +32159,12 @@ const _msgKey = (m) => String(m.id || m.message_id || m.tg_message_id || m._loca
 // - Uses ID-based dedup (primary) + text-based (fallback for pending).
 // - Preserves sort order by created_at / timestamp.
 const mergeMessages = (prev, serverList) => {
+  // Build lookup of local messages by key for media preservation
+  const localByKey = new Map();
+  prev.forEach(m => {
+    const k = _msgKey(m);
+    if (k) localByKey.set(k, m);
+  });
   const serverIds   = new Set(serverList.map(m => _msgKey(m)).filter(Boolean));
   const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()).filter(Boolean));
   // Keep pending/error messages not yet confirmed on server
@@ -32171,7 +32177,14 @@ const mergeMessages = (prev, serverList) => {
   const merged = new Map();
   serverList.forEach((m, i) => {
     const key = _msgKey(m) || ("srv_" + i);
-    merged.set(key, m);
+    // Preserve media_url/media_type from local optimistic message if server lacks them
+    const local = key ? localByKey.get(key) : null;
+    if (local && local.media_url && !m.media_url) {
+      console.log(`[MEDIA-MERGE] Preserving media_url from local msg ${key} (type=${local.media_type})`);
+      merged.set(key, { ...m, media_url: local.media_url, media_type: local.media_type || m.media_type });
+    } else {
+      merged.set(key, m);
+    }
   });
   localOnly.forEach((m, i) => {
     const key = _msgKey(m) || ("loc_" + i);
@@ -35941,11 +35954,11 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
                             {_senderLabel(msg.sender)}
                           </div>
                         )}
-                        {isPending && msg.media_url && (
+                        {msg.media_url && (
                           <div style={{ marginBottom: 4 }}>
                             {msg.media_type === "video"
-                              ? <video src={msg.media_url} style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 6, opacity: 0.7 }} muted />
-                              : <img src={msg.media_url} style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 6, opacity: 0.7 }} />}
+                              ? <video src={msg.media_url} style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 6, opacity: isPending ? 0.7 : 1 }} muted />
+                              : <img src={msg.media_url} style={{ width: 80, height: 60, objectFit: "cover", borderRadius: 6, opacity: isPending ? 0.7 : 1 }} onError={e => { e.target.style.display = "none"; }} />}
                           </div>
                         )}
                         {isPending ? React.createElement("span", null, "⏳ Envoi en cours…") : _escapeHtml(msg.text || msg.content || msg.message || msg.caption || "[média]")}
@@ -39852,6 +39865,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
+      // Log media info for debugging
+      list.forEach(m => {
+        if (m.media_type || m.media_url || m.photo_url || m.file_url) {
+          console.log(`[MEDIA] msg ${m.id} type=${m.media_type || m.type || 'none'} url=${m.media_url || m.photo_url || m.file_url ? 'yes' : 'null'}`);
+        }
+      });
       console.log('📊 [MSG-DIAG] Query result:', {
         functionName: 'loadMessagesById',
         subpage: 'DadashMessagerieTab',
@@ -42082,6 +42101,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                         alt=""
                         loading="lazy"
                         onLoad={e => { e.target.style.opacity = "1"; }}
+                        onError={e => { e.target.style.display = "none"; }}
                         onClick={() => setLightboxUrl(mediaUrl)}
                         style={{ display: "block", width: "100%", maxWidth: 320, height: "auto", opacity: 0, transition: "opacity 0.3s", cursor: "zoom-in" }}
                       />
@@ -42092,6 +42112,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                         src={mediaUrl}
                         controls
                         preload="metadata"
+                        onError={e => { e.target.style.display = "none"; }}
                         style={{ display: "block", width: "100%", maxWidth: 320, height: "auto" }}
                       />
                     )}
@@ -42104,6 +42125,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                           {mediaUrl.split("/").pop().split("?")[0] || "Document"}
                         </span>
                       </a>
+                    )}
+                    {/* ── Media type known but URL missing ── */}
+                    {rawType && !mediaUrl && !isCall && (
+                      <div style={{ padding: "8px 14px", opacity: 0.5, fontSize: 13, fontStyle: "italic" }}>
+                        {"📎 " + rawType + (fr ? " (non chargé)" : " (not loaded)")}
+                      </div>
                     )}
                     {/* ── Call indicator ── */}
                     {isCall && (
@@ -43609,11 +43636,22 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
           || (newLast && prevLast && (newLast.id !== prevLast.id || newLast.created_at !== prevLast.created_at));
         if (!hasNew) return prev; // nothing new — keep optimistic messages visible
         shouldScrollRef.current = true;
+        // Preserve media_url from prev messages if server version lacks it
+        const prevByKey = new Map();
+        prev.forEach(m => { const k = _msgKey(m); if (k) prevByKey.set(k, m); });
+        const enrichedList = list.map(m => {
+          const k = _msgKey(m);
+          const local = k ? prevByKey.get(k) : null;
+          if (local && local.media_url && !m.media_url) {
+            return { ...m, media_url: local.media_url, media_type: local.media_type || m.media_type };
+          }
+          return m;
+        });
         // Drop pending messages already confirmed in the fresh list
-        const confirmedIds = new Set(list.map(m => String(m.id)));
-        const confirmedTexts = new Set(list.map(m => m.text || m.content || m.message || ""));
+        const confirmedIds = new Set(enrichedList.map(m => String(m.id)));
+        const confirmedTexts = new Set(enrichedList.map(m => m.text || m.content || m.message || ""));
         const stillPending = pending.filter(m => !confirmedIds.has(String(m.id)) && !confirmedTexts.has(m.text || ""));
-        return [...list, ...stillPending];
+        return [...enrichedList, ...stillPending];
       });
     } catch (e) {
       if (isInitial) {
@@ -58921,8 +58959,9 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
                   border: isPending ? "1px dashed rgba(255,255,255,0.3)" : isError ? "1px solid #ef4444" : isOut ? "1px solid rgba(129,140,248,0.2)" : "1px solid rgba(255,255,255,0.06)",
                   overflow: "hidden",
                 }}>
-                  {mediaType === "image" && <img src={mediaUrl} alt="" loading="lazy" style={{ display: "block", width: "100%", maxWidth: 200, height: "auto" }} />}
-                  {mediaType === "video" && <video src={mediaUrl} controls preload="metadata" style={{ display: "block", width: "100%", maxWidth: 200 }} />}
+                  {mediaType === "image" && <img src={mediaUrl} alt="" loading="lazy" onError={e => { e.target.style.display = "none"; }} style={{ display: "block", width: "100%", maxWidth: 200, height: "auto" }} />}
+                  {mediaType === "video" && <video src={mediaUrl} controls preload="metadata" onError={e => { e.target.style.display = "none"; }} style={{ display: "block", width: "100%", maxWidth: 200 }} />}
+                  {rawType && !mediaUrl && <div style={{ padding: "5px 9px", opacity: 0.5, fontSize: 11, fontStyle: "italic" }}>{"📎 " + rawType}</div>}
                   {(text || !mediaType) && (
                     <div style={{ padding: "5px 9px", fontSize: 12, lineHeight: 1.4, wordBreak: "break-word", color: "#fff" }}>
                       {text || <span style={{ opacity: 0.4, fontStyle: "italic" }}>—</span>}
