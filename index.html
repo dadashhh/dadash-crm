@@ -32488,7 +32488,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
     // Mark as sent in media_sends (fire-and-forget)
     if (mediaToSend.id && _chatId) {
       const modelName = _modelId ? (MODEL_ID_TO_NAME[_modelId] || _modelId) : '';
-      window.sb.from('media_sends').insert({ media_id: mediaToSend.id, chat_id: String(_chatId), model: modelName }).select().then(() => {}).catch(() => {});
+      try { window.sb.from('media_sends').insert({ media_id: mediaToSend.id, chat_id: String(_chatId), model: modelName }).select().then(() => {}).catch(() => {}); } catch (_) {}
       setSentMediaIds(prev => [...prev, mediaToSend.id]);
       // Also track in sent_medias for cross-page grisage
       if (mediaToSend.url && spenderId && _modelId) {
@@ -33047,7 +33047,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     }));
     setTimeout(() => { const s = gpSlotScrollRefs.current[slotIdx]; if (s) s.scrollTop = s.scrollHeight; }, 50);
     try {
-      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: modelId }), timeout: 8000 });
+      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: modelId }), timeout: 20000 });
       // Remove optimistic, reload real messages
       setGpSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).filter(m => m.id !== _optId) }));
       setTimeout(() => {
@@ -34511,7 +34511,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     }));
     setTimeout(() => { const s = tSlotScrollRefs.current[idx]; if (s) s.scrollTop = s.scrollHeight; }, 50);
     try {
-      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: conv.model_id || "" }), timeout: 8000 });
+      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: cid, text, model_id: conv.model_id || "" }), timeout: 20000 });
       setTSlotMsgs(p => ({ ...p, [idx]: (p[idx] || []).filter(m => m.id !== _optId) }));
       addToast("Envoyé", "success");
       setTimeout(() => {
@@ -35673,7 +35673,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
       await _dmsgFetch("/send-message", {
         method: "POST",
         body: JSON.stringify(modelId ? { chat_id: cid, text, model_id: modelId } : { chat_id: cid, text }),
-        timeout: 8000
+        timeout: 20000
       });
       setMsgInput("");
       lastUnreadCountRef.current = 0;
@@ -37528,12 +37528,14 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
 
   const loadScheduledBroadcasts = async () => {
     try {
-      const { data } = await sb.from("scheduled_broadcasts")
+      const { data, error } = await sb.from("scheduled_broadcasts")
         .select("*")
         .in("status", ["pending", "processing"])
         .order("scheduled_at", { ascending: true });
+      if (error) { setScheduledBroadcasts([]); return; }
       setScheduledBroadcasts(data || []);
     } catch (_) {
+      // Table may not exist — silent fail
       setScheduledBroadcasts([]);
     }
   };
@@ -37787,7 +37789,7 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
             const _bcVm = broadcastMedia.type === 'video' ? await window._getVideoMetadata(resolvedMediaUrl) : null;
             await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], [broadcastMedia.type + "_url"]: resolvedMediaUrl, caption: variantText, model_id: carlosModelId, ...(_bcVm ? { width: _bcVm.width, height: _bcVm.height, duration: _bcVm.duration } : {}) }), timeout: bcMediaTimeout });
           } else {
-            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: variantText, model_id: carlosModelId }), timeout: 8000 });
+            await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify({ chat_id: chatIds[i], text: variantText, model_id: carlosModelId }), timeout: 20000 });
           }
           ok++;
         } catch (_) { fail++; }
@@ -39800,9 +39802,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       setApiError(null);
     } catch (e) {
       console.warn("[CONV] Carlos API error:", e.message);
-      setApiOk(false);
-      setApiError("Erreur chargement — réessaie dans quelques secondes");
-      // No Supabase fallback — show empty list + retry
+      // Use JS cache if available instead of showing error
+      if (convsCache.current.data.length > 0) {
+        console.log(`[CONV] ⚠️ Carlos timeout, using JS cache (${convsCache.current.data.length} convs)`);
+        setConversations(convsCache.current.data);
+        setApiOk(true);
+        setApiError(null);
+      } else if (_DMSG_CONV_CACHE.list.length > 0) {
+        console.log(`[CONV] ⚠️ Carlos timeout, using global cache (${_DMSG_CONV_CACHE.list.length} convs)`);
+        setConversations(_DMSG_CONV_CACHE.list);
+        setApiOk(true);
+        setApiError(null);
+      } else {
+        setApiOk(false);
+        setApiError("Connexion en cours...");
+      }
     }
     convLoadedRef.current = true;
     setConvLoading(false);
@@ -40637,15 +40651,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
-      await _dmsgFetch("/send-message", {
-        method: "POST",
-        body: JSON.stringify(
-          modelId
-            ? { chat_id: chatId, text, model_id: modelId }
-            : { chat_id: chatId, text }
-        ),
-        timeout: 8000,
-      });
+      const _sendBody = JSON.stringify(
+        modelId
+          ? { chat_id: chatId, text, model_id: modelId }
+          : { chat_id: chatId, text }
+      );
+      // Retry once on timeout
+      for (let _attempt = 1; _attempt <= 2; _attempt++) {
+        try {
+          await _dmsgFetch("/send-message", { method: "POST", body: _sendBody, timeout: 20000 });
+          break;
+        } catch (_retryErr) {
+          console.log(`[SEND] Attempt ${_attempt} failed: ${_retryErr.message}`);
+          if (_attempt === 2) throw _retryErr;
+        }
+      }
       setMessages(prev => prev.map(m =>
         m.id === localId ? { ...m, _pending: false, id: localId + "_sent" } : m
       ));
@@ -40814,7 +40834,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           const text = msgInputRef.current.trim() || scriptStepCaption || _replaceVars(step.content) || '';
           if (text) {
             console.log(`[SCRIPT] 📤 Envoi texte étape ${currentStepIndex + 1}`);
-            await _dmsgFetch('/send-message', { method: 'POST', body: JSON.stringify({ chat_id: chatId, text, model_id: modelId }), timeout: 8000 });
+            await _dmsgFetch('/send-message', { method: 'POST', body: JSON.stringify({ chat_id: chatId, text, model_id: modelId }), timeout: 20000 });
             msgInputRef.current = '';
             setMsgInput('');
             console.log('[SCRIPT] ✅ Texte envoyé');
@@ -41356,7 +41376,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           await _dmsgFetch("/send-message", {
             method: "POST",
             body: JSON.stringify({ chat_id: chatIds[i], text: broadcastMessage.trim(), model_id: broadcastModel }),
-            timeout: 8000,
+            timeout: 20000,
           });
         }
         ok++;
@@ -58607,7 +58627,16 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     scrollToBottom('smooth');
     try {
       const body = modelId ? { chat_id: chatId, text, model_id: modelId } : { chat_id: chatId, text };
-      await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify(body), timeout: 8000 });
+      // Retry once on timeout
+      for (let _attempt = 1; _attempt <= 2; _attempt++) {
+        try {
+          await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify(body), timeout: 20000 });
+          break;
+        } catch (_retryErr) {
+          console.log(`[SEND] Attempt ${_attempt} failed: ${_retryErr.message}`);
+          if (_attempt === 2) throw _retryErr;
+        }
+      }
       setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, id: localId + "_sent" } : m));
       setTimeout(() => loadMessages(false), 2000);
     } catch (e) {
@@ -59579,7 +59608,7 @@ const MessagerieGridApp = ({ user, lang, spenders, models, profiles, txs }) => {
       if (_DMSG_CONV_CACHE.list.length > 0 && Date.now() - _DMSG_CONV_CACHE.ts < 30000) {
         convs = _DMSG_CONV_CACHE.list;
       } else {
-        const data = await _dmsgFetch("/conversations", { timeout: 8000 });
+        const data = await _dmsgFetch("/conversations", { timeout: 15000 });
         convs = Array.isArray(data) ? data : (data.conversations || data.data || []);
         _DMSG_CONV_CACHE.list = convs;
         _DMSG_CONV_CACHE.ts = Date.now();
@@ -60543,8 +60572,10 @@ const App = () => {
         secure: true,
         rejectUnauthorized: false,
         reconnection: true,
-        reconnectionDelay: 1000,
-        reconnectionAttempts: 5,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 2000,
+        reconnectionDelayMax: 10000,
+        timeout: 15000,
       });
       window.__dadashSocket = socket;
       socket.on('connect', () => {
