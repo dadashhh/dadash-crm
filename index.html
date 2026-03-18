@@ -31697,70 +31697,67 @@ const detectPaymentIA = async (spenderId, modelId, mediaUrl) => {
 };
 
 // =============================================
-// SENT MEDIAS — Helpers cross-pages (Supabase table: sent_medias)
-// Marks a media URL as sent for a spender+model, and retrieves sent URLs.
+// SENT MEDIAS — Unified cross-model greying (Supabase table: sent_medias)
+// Single source of truth: lookup by spender_id only (cross-model).
 // =============================================
 
 /**
- * Marque un média comme envoyé pour un spender donné.
- * Upsert sur (media_url, spender_id, model_id) — met à jour sent_at si déjà présent.
+ * Fetch all sent media for a spender (cross-model, cross-conversation).
+ * Returns { sentMediaIds: Set<string>, sentMediaUrls: Set<string> }
  */
-const markMediaAsSent = async (mediaUrl, spenderId, modelId, sentVia) => {
-  if (!mediaUrl || !spenderId || !modelId) return;
+const fetchSentMedias = async (spenderId) => {
+  if (!spenderId) return { sentMediaIds: new Set(), sentMediaUrls: new Set() };
   try {
-    console.log('[GRISAGE] Marking media as sent — spender:', spenderId, 'model:', modelId, '(cross-user, no user_id)');
-    const { error } = await window.sb
+    const { data, error } = await window.sb
       .from('sent_medias')
-      .upsert(
-        { media_url: mediaUrl, spender_id: spenderId, model_id: modelId, sent_via: sentVia || null, sent_at: new Date().toISOString() },
-        { onConflict: 'media_url,spender_id,model_id', ignoreDuplicates: false }
-      );
-    if (error) console.error('[sentMedias] markMediaAsSent error:', error);
+      .select('media_id, media_url, model_id, sent_at')
+      .eq('spender_id', spenderId);
+    if (error) {
+      console.error('[SENT_MEDIAS] fetch error:', error);
+      return { sentMediaIds: new Set(), sentMediaUrls: new Set() };
+    }
+    const sentMediaIds = new Set((data || []).map(d => d.media_id).filter(Boolean));
+    const sentMediaUrls = new Set((data || []).map(d => d.media_url).filter(Boolean));
+    console.log(`[SENT_MEDIAS] spender=${spenderId} — ${sentMediaIds.size} ids, ${sentMediaUrls.size} urls (cross-model)`);
+    return { sentMediaIds, sentMediaUrls };
   } catch (err) {
-    console.error('[sentMedias] markMediaAsSent exception:', err);
+    console.error('[SENT_MEDIAS] fetch exception:', err);
+    return { sentMediaIds: new Set(), sentMediaUrls: new Set() };
   }
 };
 
 /**
- * Récupère les URLs de médias déjà envoyés à un spender (pour un modèle donné).
- * @returns {Promise<string[]>}
+ * Mark a media as sent for a spender+model.
+ * Upsert on (media_url, spender_id, model_id).
  */
-const getSentMediaUrls = async (spenderId, modelId) => {
-  if (!spenderId || !modelId) return [];
+const markMediaAsSent = async (mediaUrl, spenderId, modelId, sentVia, mediaId) => {
+  if (!spenderId || (!mediaUrl && !mediaId)) return;
   try {
-    const { data, error } = await window.sb
+    const row = {
+      spender_id: spenderId,
+      model_id: modelId || null,
+      sent_via: sentVia || null,
+      sent_at: new Date().toISOString()
+    };
+    if (mediaUrl) row.media_url = mediaUrl;
+    if (mediaId) row.media_id = mediaId;
+    const { error } = await window.sb
       .from('sent_medias')
-      .select('media_url')
-      .eq('spender_id', spenderId)
-      .eq('model_id', modelId);
-    if (error) { console.error('[sentMedias] getSentMediaUrls error:', error); return []; }
-    return (data || []).map(r => r.media_url);
+      .upsert(row, { onConflict: 'media_url,spender_id,model_id', ignoreDuplicates: false });
+    if (error) console.error('[SENT_MEDIAS] markMediaAsSent error:', error);
+    else console.log(`[SENT_MEDIAS] recorded — spender=${spenderId}, model=${modelId}, via=${sentVia}`);
   } catch (err) {
-    console.error('[sentMedias] getSentMediaUrls exception:', err);
-    return [];
+    console.error('[SENT_MEDIAS] markMediaAsSent exception:', err);
   }
 };
 
-// Exposition globale pour accès depuis n'importe quel composant
+// Global exports
+window._fetchSentMedias = fetchSentMedias;
 window._markMediaAsSent = markMediaAsSent;
-window._getSentMediaUrls = getSentMediaUrls;
-
-// Récupérer media_ids envoyés pour un chat_id (via media_sends)
-window._getSentMediaIds = async (chatId) => {
-  if (!chatId) return [];
-  try {
-    const { data, error } = await window.sb
-      .from('media_sends')
-      .select('media_id')
-      .eq('chat_id', String(chatId));
-    if (error) { console.error('[MEDIA_SENDS] Fetch error:', error); return []; }
-    const ids = (data || []).map(r => r.media_id);
-    console.log('[GRISAGE] Chat:', chatId, '| Sent medias:', ids.length, '(cross-user, no user_id filter)');
-    return ids;
-  } catch (err) {
-    console.error('[MEDIA_SENDS] Exception:', err);
-    return [];
-  }
+// Legacy compat shims (return arrays for components not yet migrated)
+window._getSentMediaUrls = async (spenderId) => {
+  const { sentMediaUrls } = await fetchSentMedias(spenderId);
+  return [...sentMediaUrls];
 };
 
 // Helper pour extraire metadata vidéo (width, height, duration)
@@ -32389,17 +32386,17 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
       {isSent && (
         <div style={{
           position: 'absolute',
-          bottom: 8,
-          left: 8,
-          background: '#10b981',
-          color: 'white',
-          padding: '4px 8px',
+          top: 4,
+          right: 8,
+          background: 'rgba(0,0,0,0.6)',
+          color: '#fff',
+          padding: '2px 6px',
           borderRadius: 4,
-          fontSize: 10,
+          fontSize: 11,
           fontWeight: 700,
           zIndex: 999
         }}>
-          ✓ Envoyé
+          ✅ Déjà envoyé
         </div>
       )}
     </div>
@@ -32418,11 +32415,11 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
   const [sentMediaIds, setSentMediaIds] = React.useState([]);
   const [customAlbums, setCustomAlbums] = React.useState([]);
 
-  // Load sent media IDs for this chatId
+  // Load sent media IDs+URLs for this spender (cross-model)
   React.useEffect(() => {
-    if (!chatId) { setSentMediaIds([]); return; }
-    window._getSentMediaIds(String(chatId)).then(ids => setSentMediaIds(ids)).catch(() => {});
-  }, [chatId]);
+    if (!spenderId) { setSentMediaIds([]); return; }
+    window._fetchSentMedias(spenderId).then(({ sentMediaIds: ids }) => setSentMediaIds([...ids])).catch(() => {});
+  }, [spenderId]);
 
   React.useEffect(() => {
     const loadMedias = async () => {
@@ -32503,10 +32500,9 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
     onClose(); // fermer le modal IMMÉDIATEMENT
     // Fire-and-forget : le callback parent gère l'UI optimiste
     onSelectMedia(mediaToSend);
-    // Mark as sent in media_sends (fire-and-forget)
-    if (mediaToSend.id && _chatId) {
-      const modelName = _modelId ? (MODEL_ID_TO_NAME[_modelId] || _modelId) : '';
-      window.sb.from('media_sends').insert({ media_id: mediaToSend.id, chat_id: String(_chatId), model: modelName }).catch(() => {});
+    // Mark as sent in sent_medias (unified cross-model)
+    if (mediaToSend.url && spenderId) {
+      window._markMediaAsSent(mediaToSend.url, spenderId, _modelId, 'library', mediaToSend.id);
     }
   };
 
@@ -32552,7 +32548,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
               <span>Total:</span><span style={{ color: '#fbbf24', fontWeight: 700 }}>{filteredMedias.length}</span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Envoyés:</span><span style={{ color: '#10b981', fontWeight: 700 }}>{sentMediaIds.length || sentMediaUrls.length}</span>
+              <span>Envoyés:</span><span style={{ color: '#10b981', fontWeight: 700 }}>{sentMediaIds.length}</span>
             </div>
           </div>
         </div>
@@ -33140,11 +33136,11 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     setShowCellGallery(cellIndex);
     setGalleryFilter('all');
     setGalleryLightbox(null);
-    // Charger URLs envoyées cross-pages pour cette cellule
+    // Charger URLs envoyées cross-model pour cette cellule
     const conv = gpSlots[cellIndex];
-    if (conv?.spender_id && conv?.model_id) {
-      window._getSentMediaUrls(conv.spender_id, conv.model_id)
-        .then(urls => setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: urls })))
+    if (conv?.spender_id) {
+      window._fetchSentMedias(conv.spender_id)
+        .then(({ sentMediaUrls }) => setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: [...sentMediaUrls] })))
         .catch(() => {});
     }
   };
@@ -33631,8 +33627,8 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
                 // Succès → retirer bulle optimiste (le refresh normal la remplacera)
                 setGpSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).map(m => m.id === _optId ? { ...m, _optimistic: false } : m) }));
                 addToast("Média envoyé ✅", "success");
-                if (spId && mId) {
-                  window._markMediaAsSent(media.url, spId, mId, 'grid');
+                if (spId) {
+                  window._markMediaAsSent(media.url, spId, mId, 'grid', media.id);
                   setSentMediaUrlsMap(prev => ({
                     ...prev,
                     [slotIdx]: [...(prev[slotIdx] || []).filter(u => u !== media.url), media.url]
@@ -34578,11 +34574,11 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     setShowCellGallery(cellIndex);
     setGalleryFilter('all');
     setGalleryLightbox(null);
-    // Charger URLs envoyées cross-pages pour cette cellule
+    // Charger URLs envoyées cross-model pour cette cellule
     const conv = tSlots[cellIndex];
-    if (conv?.spender_id && conv?.model_id) {
-      window._getSentMediaUrls(conv.spender_id, conv.model_id)
-        .then(urls => setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: urls })))
+    if (conv?.spender_id) {
+      window._fetchSentMedias(conv.spender_id)
+        .then(({ sentMediaUrls }) => setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: [...sentMediaUrls] })))
         .catch(() => {});
     }
   };
@@ -35620,16 +35616,15 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     return getCurrentSpenderMedias;
   }, [getCurrentSpenderMedias, galleryFilter]);
 
-  // Charger les URLs envoyées cross-pages pour le spender courant
+  // Charger les URLs envoyées cross-model pour le spender courant
   useEffect(() => {
     const spId = currentConv?.spender_id;
-    const modId = currentConv?.model_id;
-    if (spId && modId) {
-      window._getSentMediaUrls(spId, modId).then(urls => setSentMediaUrls(urls)).catch(() => {});
+    if (spId) {
+      window._fetchSentMedias(spId).then(({ sentMediaUrls }) => setSentMediaUrls([...sentMediaUrls])).catch(() => {});
     } else {
       setSentMediaUrls([]);
     }
-  }, [currentConv?.spender_id, currentConv?.model_id]);
+  }, [currentConv?.spender_id]);
 
   // Charger les produits pour le modal TX
   useEffect(() => {
@@ -36149,8 +36144,8 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
               // Succès → confirmer bulle
               setMessages(prev => prev.map(m => m.id === _optId ? { ...m, _pending: false } : m));
               addToast("Média envoyé ✅", "success");
-              if (spId && mId) {
-                window._markMediaAsSent(media.url, spId, mId, 'tindada');
+              if (spId) {
+                window._markMediaAsSent(media.url, spId, mId, 'tindada', media.id);
                 setSentMediaUrls(prev => prev.includes(media.url) ? prev : [...prev, media.url]);
               }
             } catch (err) {
@@ -36301,7 +36296,6 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   const [mediaLibSlot, setMediaLibSlot]       = useState(null);
   const [mediaLibTab, setMediaLibTab]         = useState("photo");
   const [mediaLibSentIds, setMediaLibSentIds] = useState([]);
-  const [mediaLibSoldIds, setMediaLibSoldIds] = useState([]);
   const [mediaLibSentUrls, setMediaLibSentUrls] = useState([]);
   const mediaLibFileRef = React.useRef(null);
   const mediaInputRef = React.useRef(null);
@@ -36356,26 +36350,17 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
     sb.from("products").select("*").eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
   }, [txModalSlot]);
 
-  // Load sentMediaIds + soldMediaIds + sentUrls when media library opens for a slot
+  // Load sent medias (unified cross-model) when media library opens for a slot
   React.useEffect(() => {
-    if (mediaLibSlot === null) { setMediaLibSentIds([]); setMediaLibSoldIds([]); setMediaLibSentUrls([]); return; }
+    if (mediaLibSlot === null) { setMediaLibSentIds([]); setMediaLibSentUrls([]); return; }
     const convRef = window._tlgProSlotsRef?.[mediaLibSlot];
     if (!convRef) return;
-    const cid = _dmsgChatId(convRef);
-    if (cid) {
-      sb.from("media_sends").select("media_id").eq("chat_id", cid)
-        .then(({ data }) => setMediaLibSentIds((data || []).map(r => r.media_id)))
-        .catch(() => {});
-      const spId = convRef.spender_id;
-      const mId = convRef.model_id;
-      if (spId) {
-        sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
-          .then(({ data }) => setMediaLibSoldIds((data || []).map(r => r.media_id).filter(Boolean)))
-          .catch(() => {});
-      }
-      if (spId && mId) {
-        window._getSentMediaUrls(spId, mId).then(urls => setMediaLibSentUrls(urls)).catch(() => {});
-      }
+    const spId = convRef.spender_id;
+    if (spId) {
+      window._fetchSentMedias(spId).then(({ sentMediaIds, sentMediaUrls }) => {
+        setMediaLibSentIds([...sentMediaIds]);
+        setMediaLibSentUrls([...sentMediaUrls]);
+      }).catch(() => {});
     }
   }, [mediaLibSlot]);
 
@@ -36545,7 +36530,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
       await _dmsgFetch(ep, { method: "POST", body: JSON.stringify({ chat_id: cid, [bodyKey]: mediaUrl, caption: "", model_id: convRef.model_id || "", ...(_vmUp ? { width: _vmUp.width, height: _vmUp.height, duration: _vmUp.duration } : {}) }), timeout: isVideo ? 120000 : 30000 });
       addToast("Média envoyé", "success");
       // Sync cross-pages
-      if (convRef.spender_id && convRef.model_id) window._markMediaAsSent(mediaUrl, convRef.spender_id, convRef.model_id, 'tlg_pro');
+      if (convRef.spender_id) window._markMediaAsSent(mediaUrl, convRef.spender_id, convRef.model_id, 'tlg_pro');
       setMediaSlot(null);
       setPendingMedia(null);
     } catch (err) {
@@ -36588,14 +36573,11 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
       // Succès → confirmer bulle
       setTSlotMsgs(p => ({ ...p, [slotIdx]: (p[slotIdx] || []).map(m => m.id === _optId ? { ...m, _optimistic: false } : m) }));
       addToast("Média envoyé", "success");
-      // Sync cross-pages + local graying
-      if (spId && mId) {
-        window._markMediaAsSent(item.url, spId, mId, 'tlg_pro');
+      // Sync cross-model + local graying
+      if (spId) {
+        window._markMediaAsSent(item.url, spId, mId, 'tlg_pro', item.id);
         setMediaLibSentUrls(prev => prev.includes(item.url) ? prev : [...prev, item.url]);
-      }
-      if (item.id) {
-        await sb.from("media_sends").insert({ media_id: item.id, chat_id: cid, model: mId }).catch(() => {});
-        setMediaLibSentIds(prev => prev.includes(item.id) ? prev : [...prev, item.id]);
+        if (item.id) setMediaLibSentIds(prev => prev.includes(item.id) ? prev : [...prev, item.id]);
       }
     } catch (err) {
       // Erreur → retirer bulle + toast rouge
@@ -36629,7 +36611,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
       }
       addToast("Média envoyé", "success");
       // Sync cross-pages
-      if (convRef.spender_id && mId) window._markMediaAsSent(mediaUrl, convRef.spender_id, mId, 'tlg_pro');
+      if (convRef.spender_id) window._markMediaAsSent(mediaUrl, convRef.spender_id, mId, 'tlg_pro');
     } catch (err) {
       addToast("Erreur upload : " + err.message, "error");
     }
@@ -38972,7 +38954,7 @@ const GestionSubpage = ({ models = [], lang, user }) => {
   );
 };
 
-const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [], soldMediaIds = [] }) => {
+const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) => {
   const [mediaItems, setMediaItems] = React.useState([]);
   const [mediaLoading, setMediaLoading] = React.useState(true);
   const [videoDurations, setVideoDurations] = React.useState({});
@@ -39050,16 +39032,15 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [], sol
     )}
     <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, padding: 10 }}>
       {mediaItems.filter(m => msgActiveAlbum === "all" || m.album_id === msgActiveAlbum).map(item => {
-        const isSent = sentMediaIds.includes(item.id);
-        const isSold = soldMediaIds.includes(item.id);
-        const isUsed = isSent || isSold;
+        const isUsed = sentMediaIds.includes(item.id);
+        console.log(`[MEDIA-GREY] media=${item.id} sent=${isUsed}`);
         return (
           <div key={item.id}
             onClick={() => !isUsed && onSelect(item)}
             style={{ position: "relative", borderRadius: 8, overflow: "hidden",
-              cursor: isUsed ? "default" : "pointer",
-              opacity: isUsed ? 0.45 : 1,
-              filter: isUsed ? "grayscale(60%)" : "none",
+              cursor: isUsed ? "not-allowed" : "pointer",
+              opacity: isUsed ? 0.4 : 1,
+              filter: isUsed ? "grayscale(100%)" : "none",
               transition: "opacity 0.2s, filter 0.2s",
               background: "#0f1117",
               border: isUsed ? "1px solid rgba(255,255,255,0.06)" : "1px solid rgba(255,255,255,0.06)",
@@ -39151,15 +39132,15 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [], sol
                 background: "rgba(0,0,0,0.45)",
                 gap: 4
               }}>
-                <span style={{ fontSize: 16 }}>{isSold ? "\U0001f4b0" : "\U0001f4e4"}</span>
+                <span style={{ fontSize: 16 }}>{"\u2705"}</span>
                 <span style={{
                   fontSize: 9, fontWeight: 800,
-                  color: isSold ? "#fbbf24" : "#94a3b8",
+                  color: "#94a3b8",
                   textTransform: "uppercase",
                   letterSpacing: "0.06em",
                   background: "rgba(0,0,0,0.6)",
                   padding: "2px 6px", borderRadius: 4
-                }}>{isSold ? "Vendu" : "Envoy\xe9"}</span>
+                }}>{"D\xe9j\xe0 envoy\xe9"}</span>
               </div>
             )}
           </div>
@@ -39414,8 +39395,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const [mediaLoading, setMediaLoading] = useState(false);
   const [activeCategory, setActiveCategory] = useState("all");
   const [sentMediaIds, setSentMediaIds] = useState([]);
-  const [soldMediaIds, setSoldMediaIds] = useState([]);
-  const [sentMediaUrls, setSentMediaUrls] = useState([]); // cross-pages sync
+  const [sentMediaUrls, setSentMediaUrls] = useState([]); // unified cross-model
   const [sentScriptIds, setSentScriptIds] = useState([]);
   // Lightbox pour affichage image en grand
   const [lightboxUrl, setLightboxUrl] = useState(null);
@@ -40218,27 +40198,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         setMediaLoading(false);
       })
       .catch(() => setMediaLoading(false));
-    const chatId = selectedConv ? String(_dmsgChatId(selectedConv) || "") : "";
-    if (chatId) {
-      sb.from("media_sends").select("media_id").eq("chat_id", chatId)
-        .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)))
-        .catch(err => console.warn('[MEDIA] media_sends fetch error:', err));
-      const spId = selectedConv?.spender_id || activeSpender?.id;
-      if (spId) {
-        sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
-          .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)))
-          .catch(err => console.warn('[MEDIA] transactions fetch error:', err));
-      }
+    // Unified sent medias fetch — cross-model by spender_id
+    const spId = selectedConv?.spender_id || activeSpender?.id;
+    if (spId) {
+      window._fetchSentMedias(spId).then(({ sentMediaIds, sentMediaUrls }) => {
+        setSentMediaIds([...sentMediaIds]);
+        setSentMediaUrls([...sentMediaUrls]);
+      }).catch(() => {});
     } else {
       setSentMediaIds([]);
-      setSoldMediaIds([]);
-    }
-    // Charger les URLs envoyées cross-pages depuis sent_medias
-    const spId2 = selectedConv?.spender_id || activeSpender?.id;
-    const modId2 = selectedConv?.model_id;
-    if (spId2 && modId2) {
-      window._getSentMediaUrls(spId2, modId2).then(urls => setSentMediaUrls(urls)).catch(() => {});
-    } else {
       setSentMediaUrls([]);
     }
   }, [selectedChatId, activeSpender?.id]);
@@ -42251,7 +42219,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                         mediaType={scriptPanelTab === "photos" ? "photo" : "video"}
                         modelName={selectedConv?.model_name || chatterCtx?.modelName || ""}
                         sentMediaIds={sentMediaIds}
-                        soldMediaIds={soldMediaIds}
                         onSelect={(item) => {
                           setPendingMedia({
                             id: item.id,
@@ -42259,7 +42226,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                             name: item.name || item.filename || "média",
                             type: item.type
                           });
-                        }}
+                        }
                       />
                       {pendingMedia && (
                         <div style={{
@@ -42327,17 +42294,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                                   setMessages(prev => prev.map(m =>
                                     m.id === optimisticId ? { ...m, _pending: false } : m
                                   ));
-                                  await sb.from("media_sends").insert({
-                                    media_id: pendingMedia.id,
-                                    chat_id: chatId,
-                                    model: modelName
-                                  });
-                                  setSentMediaIds(prev => [...prev, pendingMedia.id]);
-                                  // Sync cross-pages
                                   const _spId = selectedConv?.spender_id || activeSpender?.id;
                                   const _modId = selectedConv?.model_id;
-                                  if (_spId && _modId && pendingMedia.url) {
-                                    window._markMediaAsSent(pendingMedia.url, _spId, _modId, 'conversation');
+                                  if (_spId && pendingMedia.url) {
+                                    window._markMediaAsSent(pendingMedia.url, _spId, _modId, 'conversation', pendingMedia.id);
+                                    setSentMediaIds(prev => [...prev, pendingMedia.id]);
                                     setSentMediaUrls(prev => prev.includes(pendingMedia.url) ? prev : [...prev, pendingMedia.url]);
                                   }
                                   setPendingMedia(null);
@@ -43235,12 +43196,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                     <div
                       key={media.id || idx}
                       onClick={() => !isSent && setGalleryLightbox(media.url)}
-                      style={{ aspectRatio: '1', borderRadius: 8, overflow: 'hidden', position: 'relative', cursor: isSent ? 'not-allowed' : 'pointer', transition: 'all 0.2s', background: 'rgba(255, 255, 255, 0.03)', opacity: isSent ? 0.5 : 1 }}
+                      style={{ aspectRatio: '1', borderRadius: 8, overflow: 'hidden', position: 'relative', cursor: isSent ? 'not-allowed' : 'pointer', transition: 'all 0.2s', background: 'rgba(255, 255, 255, 0.03)', opacity: isSent ? 0.4 : 1, filter: isSent ? 'grayscale(100%)' : 'none' }}
                       onMouseEnter={e => { if (!isSent) { e.currentTarget.style.transform = 'scale(1.05)'; e.currentTarget.style.boxShadow = '0 8px 24px rgba(99, 102, 241, 0.3)'; } }}
                       onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.boxShadow = 'none'; }}
                     >
                       {isSent && (
-                        <div style={{ position: 'absolute', top: 6, left: 6, background: 'rgba(16, 185, 129, 0.9)', padding: '3px 8px', borderRadius: 4, fontSize: 9, fontWeight: 700, color: 'white', zIndex: 3 }}>✓ Envoyé</div>
+                        <div style={{ position: 'absolute', top: 4, right: 4, background: 'rgba(0,0,0,0.6)', color: '#fff', borderRadius: '4px', padding: '2px 6px', fontSize: '11px', zIndex: 3, fontWeight: 700 }}>✅ Déjà envoyé</div>
                       )}
                       <div style={{ background: media.type === 'video' ? 'rgba(239, 68, 68, 0.9)' : 'rgba(99, 102, 241, 0.9)', padding: '2px 6px', borderRadius: 4, fontSize: 9, fontWeight: 700, color: 'white', position: 'absolute', top: 6, right: 6, zIndex: 2 }}>
                         {media.type === 'video' ? '▶ VIDEO' : '📷 PHOTO'}
@@ -43307,8 +43268,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               // Succès → confirmer bulle
               setMessages(prev => prev.map(m => m.id === _optId ? { ...m, _pending: false } : m));
               addToast("Média envoyé ✅", "success");
-              if (_spId && mId) {
-                window._markMediaAsSent(media.url, _spId, mId, 'conversation');
+              if (_spId) {
+                window._markMediaAsSent(media.url, _spId, mId, 'conversation', media.id);
                 setSentMediaUrls(prev => prev.includes(media.url) ? prev : [...prev, media.url]);
               }
             } catch (err) {
@@ -58364,7 +58325,6 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
   const [pendingMedia, setPendingMedia] = useState(null);
   const [sendingMedia, setSendingMedia] = useState(false);
   const [sentMediaIds, setSentMediaIds] = useState([]);
-  const [soldMediaIds, setSoldMediaIds] = useState([]);
   const mediaFileRef = React.useRef(null);
 
   // TX modal state
@@ -58715,9 +58675,10 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
         : { chat_id: chatId, media_url: mediaUrl, caption: "", model_id: mName };
       const res = await _dmsgFetch(endpoint, { method: "POST", body: JSON.stringify(body), timeout: pendingMedia.type === 'video' ? 120000 : 30000 });
       setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, media_url: mediaUrl } : m));
-      if (pendingMedia.id) {
-        await sb.from("media_sends").insert({ media_id: pendingMedia.id, chat_id: chatId, model: mName }).catch(() => {});
-        setSentMediaIds(prev => prev.includes(pendingMedia.id) ? prev : [...prev, pendingMedia.id]);
+      const _spId = resolvedSpender?.id || convData?.spender_id;
+      if (_spId && pendingMedia.url) {
+        window._markMediaAsSent(pendingMedia.url || mediaUrl, _spId, modelId, 'conversation', pendingMedia.id);
+        if (pendingMedia.id) setSentMediaIds(prev => prev.includes(pendingMedia.id) ? prev : [...prev, pendingMedia.id]);
       }
       setPendingMedia(null);
       setTimeout(() => loadMessages(false), 2000);
@@ -58754,19 +58715,14 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     return tier;
   }, [spLtv]);
 
-  // Load sentMediaIds + soldMediaIds for this cell's chat
+  // Load sent medias (unified cross-model) for this cell
   useEffect(() => {
-    if (!chatId) return;
-    sb.from("media_sends").select("media_id").eq("chat_id", chatId)
-      .then(({ data }) => setSentMediaIds((data || []).map(r => r.media_id)))
-      .catch(() => {});
     const spId = resolvedSpender?.id || convData?.spender_id;
-    if (spId) {
-      sb.from("transactions").select("media_id").eq("spender_id", spId).not("media_id", "is", null)
-        .then(({ data }) => setSoldMediaIds((data || []).map(r => r.media_id).filter(Boolean)))
-        .catch(() => {});
-    }
-  }, [chatId]);
+    if (!spId) return;
+    window._fetchSentMedias(spId).then(({ sentMediaIds }) => {
+      setSentMediaIds([...sentMediaIds]);
+    }).catch(() => {});
+  }, [chatId, resolvedSpender?.id, convData?.spender_id]);
 
   const modelName = React.useMemo(() => {
     if (!modelId) return null;
@@ -59083,7 +59039,6 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
               mediaType={mediaPanelTab}
               modelName={modelName?.toLowerCase() || ""}
               sentMediaIds={sentMediaIds}
-              soldMediaIds={soldMediaIds}
               onSelect={selectMediaItem}
             />
           </div>
