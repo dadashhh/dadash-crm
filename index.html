@@ -11410,20 +11410,27 @@ const CHATTER_DASHBOARD_METRICS = [
 ];
 
 // ── useCarlosPing — latence Carlos en temps réel ──
+// FIX 2: Throttled to 30s, in-flight guard, fire-and-forget (no blocking)
 function useCarlosPing() {
   const [ping, setPing] = React.useState(null);
   React.useEffect(() => {
+    let _healthInFlight = false;
     const check = async () => {
+      if (_healthInFlight) return; // Guard: skip if a health check is already pending
+      _healthInFlight = true;
       const start = Date.now();
       try {
         await fetch('https://dadash-autofill-v2-production.up.railway.app/health');
         setPing(Date.now() - start);
       } catch {
         setPing(null);
+        // FIX 2: On failure/timeout, don't retry — wait for next 30s cycle
+      } finally {
+        _healthInFlight = false;
       }
     };
     check();
-    const interval = setInterval(check, 10000);
+    const interval = setInterval(check, 30000); // FIX 2: 10s → 30s
     return () => clearInterval(interval);
   }, []);
   return ping;
@@ -60585,6 +60592,7 @@ const App = () => {
     const transports = (isSafari || wsBlocked) ? ['polling'] : ['polling', 'websocket'];
 
     try {
+      // FIX 3: Exponential backoff for reconnection: 1s → 2s → 4s → 8s (cap)
       const socket = io(CARLOS_WS_URL, {
         transports: transports,
         upgrade: !(isSafari || wsBlocked), // don't try upgrading to WS if blocked
@@ -60592,13 +60600,16 @@ const App = () => {
         rejectUnauthorized: false,
         reconnection: true,
         reconnectionAttempts: Infinity,
-        reconnectionDelay: 2000,
-        reconnectionDelayMax: 10000,
+        reconnectionDelay: 1000,      // FIX 3: start at 1s (was 2s)
+        reconnectionDelayMax: 8000,    // FIX 3: cap at 8s (was 10s)
+        randomizationFactor: 0.2,      // FIX 3: slight jitter to avoid thundering herd
         timeout: 15000,
       });
       window.__dadashSocket = socket;
       socket.on('connect', () => {
         console.log('[SOCKET] Connected successfully via', socket.io.engine.transport.name);
+        // FIX 3: Reset backoff on successful connection (socket.io handles this internally)
+        // Do NOT trigger full data re-fetch on reconnect — lightweight health check only
       });
       socket.on('connect_error', (error) => {
         const msg = String(error?.message || "").toLowerCase();
@@ -60613,9 +60624,11 @@ const App = () => {
       });
       socket.on('disconnect', (reason) => {
         console.log('[SOCKET] Disconnected:', reason);
+        // FIX 3: Do NOT immediately reconnect or re-fetch — let socket.io backoff handle it
       });
       socket.on('reconnect', (attempt) => {
         console.log('[SOCKET] Reconnected after', attempt, 'attempts');
+        // FIX 3: On reconnect, only do a lightweight health check — do NOT re-fetch spenders/conversations/etc.
       });
       // Catch upgrade errors (when polling→websocket upgrade fails in Safari)
       socket.io.on('error', (error) => {
@@ -61517,6 +61530,8 @@ const App = () => {
   useEffect(() => { window.__softRefresh = fn_afterMutationOrImportRefresh; return () => { delete window.__softRefresh; }; }, [user?.id]);
 
   /* Pipeline spenders — boot hydration + 60s fallback polling (realtime handles live updates) */
+  /* FIX 1: Skip spenders polling on standalone messagerie pages (conversations, grid, etc.) */
+  const SPENDERS_SKIP_TABS = new Set(["messagerie-conversations", "messagerie-grid", "messagerie-multi", "messagerie-tlg-pro", "messagerie-tindada", "messagerie-grid-premium", "messagerie"]);
   useEffect(() => {
     if (!user) return;
     let cancelled = false;
@@ -61532,6 +61547,12 @@ const App = () => {
     };
 
     const fetchAndSet = async (scope) => {
+      // FIX 1: Skip global spenders fetch on messagerie/conversations pages
+      const currentTab = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+      if (SPENDERS_SKIP_TABS.has(currentTab)) {
+        console.log("[SPENDERS] skipped — on messagerie page (" + currentTab + ")");
+        return;
+      }
       try {
         const data = scope ? await apiFetchSpenders({ scope }) : await apiFetchSpenders();
         if (cancelled) return;
