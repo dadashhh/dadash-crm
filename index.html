@@ -38970,6 +38970,38 @@ const GestionSubpage = ({ models = [], lang, user }) => {
   );
 };
 
+// ── Global media library cache (shared across all MediaPanelGrid instances) ──
+const _MEDIA_LIB_CACHE = { photo: {}, video: {} };
+// Structure: _MEDIA_LIB_CACHE[type][model] = { data: [], ts: number, albums: [] }
+const _MEDIA_LIB_TTL = 60000; // 1 minute cache TTL
+
+// Prefetch media library in background (call on page mount)
+const _prefetchMediaLibrary = (modelName) => {
+  const key = modelName || "__all__";
+  ["photo", "video"].forEach(type => {
+    if (_MEDIA_LIB_CACHE[type]?.[key]?.ts && Date.now() - _MEDIA_LIB_CACHE[type][key].ts < _MEDIA_LIB_TTL) return;
+    let query = sb.from("media_library").select("*").eq("type", type);
+    if (modelName) query = query.eq("model", modelName);
+    query.order("created_at", { ascending: false }).limit(50)
+      .then(({ data }) => {
+        if (!_MEDIA_LIB_CACHE[type]) _MEDIA_LIB_CACHE[type] = {};
+        _MEDIA_LIB_CACHE[type][key] = {
+          ..._MEDIA_LIB_CACHE[type][key],
+          data: data || [],
+          ts: Date.now()
+        };
+      }).catch(() => {});
+    if (modelName) {
+      sb.from("media_albums").select("*").eq("model", modelName).order("created_at")
+        .then(({ data }) => {
+          if (_MEDIA_LIB_CACHE[type]?.[key]) {
+            _MEDIA_LIB_CACHE[type][key].albums = data || [];
+          }
+        }).catch(() => {});
+    }
+  });
+};
+
 const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) => {
   const [mediaItems, setMediaItems] = React.useState([]);
   const [mediaLoading, setMediaLoading] = React.useState(true);
@@ -38977,23 +39009,92 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
   const [previewVideo, setPreviewVideo] = React.useState(null);
   const [msgAlbums, setMsgAlbums] = React.useState([]);
   const [msgActiveAlbum, setMsgActiveAlbum] = React.useState("all");
+  const [hasMore, setHasMore] = React.useState(false);
+  const [loadingMore, setLoadingMore] = React.useState(false);
+  const MEDIA_PAGE_SIZE = 50;
+
+  const cacheKey = modelName || "__all__";
 
   React.useEffect(() => {
-    setMediaLoading(true);
     setMsgActiveAlbum("all");
-    let query = sb.from("media_library").select("*").eq("type", mediaType);
-    if (modelName) {
-      query = query.eq("model", modelName);
+
+    // Check cache first — show immediately if fresh
+    const cached = _MEDIA_LIB_CACHE[mediaType]?.[cacheKey];
+    if (cached && Date.now() - cached.ts < _MEDIA_LIB_TTL) {
+      setMediaItems(cached.data);
+      setHasMore(cached.data.length >= MEDIA_PAGE_SIZE);
+      if (cached.albums) setMsgAlbums(cached.albums);
+      setMediaLoading(false);
+      return;
     }
+
+    // If stale cache exists, show it while refreshing
+    if (cached?.data?.length > 0) {
+      setMediaItems(cached.data);
+      setHasMore(cached.data.length >= MEDIA_PAGE_SIZE);
+      if (cached.albums) setMsgAlbums(cached.albums);
+      setMediaLoading(false);
+    } else {
+      setMediaLoading(true);
+    }
+
+    // Fetch from Supabase
+    let query = sb.from("media_library").select("*").eq("type", mediaType);
+    if (modelName) query = query.eq("model", modelName);
     query
       .order("created_at", { ascending: false })
-      .limit(50)
-      .then(({ data }) => { setMediaItems(data || []); setMediaLoading(false); });
+      .limit(MEDIA_PAGE_SIZE)
+      .then(({ data }) => {
+        const items = data || [];
+        setMediaItems(items);
+        setHasMore(items.length >= MEDIA_PAGE_SIZE);
+        if (!_MEDIA_LIB_CACHE[mediaType]) _MEDIA_LIB_CACHE[mediaType] = {};
+        _MEDIA_LIB_CACHE[mediaType][cacheKey] = {
+          data: items,
+          ts: Date.now(),
+          albums: _MEDIA_LIB_CACHE[mediaType][cacheKey]?.albums || []
+        };
+        setMediaLoading(false);
+      });
     if (modelName) {
       sb.from("media_albums").select("*").eq("model", modelName).order("created_at")
-        .then(({ data }) => setMsgAlbums(data || []));
+        .then(({ data }) => {
+          const albums = data || [];
+          setMsgAlbums(albums);
+          if (_MEDIA_LIB_CACHE[mediaType]?.[cacheKey]) {
+            _MEDIA_LIB_CACHE[mediaType][cacheKey].albums = albums;
+          }
+        });
     }
   }, [mediaType, modelName]);
+
+  const loadMore = React.useCallback(() => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    let query = sb.from("media_library").select("*").eq("type", mediaType);
+    if (modelName) query = query.eq("model", modelName);
+    query
+      .order("created_at", { ascending: false })
+      .range(mediaItems.length, mediaItems.length + MEDIA_PAGE_SIZE - 1)
+      .then(({ data }) => {
+        const newItems = data || [];
+        setMediaItems(prev => {
+          const existingIds = new Set(prev.map(m => m.id));
+          const deduped = newItems.filter(m => !existingIds.has(m.id));
+          const merged = [...prev, ...deduped];
+          // Update cache with full list
+          if (!_MEDIA_LIB_CACHE[mediaType]) _MEDIA_LIB_CACHE[mediaType] = {};
+          _MEDIA_LIB_CACHE[mediaType][cacheKey] = {
+            ..._MEDIA_LIB_CACHE[mediaType][cacheKey],
+            data: merged,
+            ts: Date.now()
+          };
+          return merged;
+        });
+        setHasMore(newItems.length >= MEDIA_PAGE_SIZE);
+        setLoadingMore(false);
+      });
+  }, [loadingMore, hasMore, mediaType, modelName, mediaItems.length]);
 
   const formatDuration = (secs) => {
     if (!secs || !isFinite(secs) || secs <= 0) return '';
@@ -39049,7 +39150,6 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
     <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, padding: 10 }}>
       {mediaItems.filter(m => msgActiveAlbum === "all" || m.album_id === msgActiveAlbum).map(item => {
         const isUsed = sentMediaIds.includes(item.id);
-        console.log(`[MEDIA-GREY] media=${item.id} sent=${isUsed}`);
         return (
           <div key={item.id}
             onClick={() => !isUsed && onSelect(item)}
@@ -39064,7 +39164,8 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
             onMouseEnter={e => { if (!isUsed) e.currentTarget.style.borderColor = "rgba(99,102,241,0.5)"; }}
             onMouseLeave={e => { if (!isUsed) e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; }}>
             {mediaType === "photo" ? (
-              <img src={item.url} alt={item.name}
+              <img src={item.thumbnail_url || item.url} alt={item.name}
+                loading="lazy"
                 style={{ width: "100%", height: "100%", objectFit: "cover" }} />
             ) : (
               <div style={{ position: "relative", width: "100%", paddingBottom: "75%", borderRadius: 8, overflow: "hidden", background: "#0e1220" }}>
@@ -39163,6 +39264,15 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
         );
       })}
     </div>
+    {hasMore && (
+      <div style={{ padding: "8px 10px", textAlign: "center" }}>
+        <button onClick={loadMore} disabled={loadingMore}
+          style={{ padding: "6px 16px", borderRadius: 6, border: "none", fontSize: 11, fontWeight: 700,
+            background: "rgba(99,102,241,0.15)", color: "#818cf8", cursor: loadingMore ? "not-allowed" : "pointer" }}>
+          {loadingMore ? "\u23f3 Chargement\u2026" : "\u25bc Charger plus"}
+        </button>
+      </div>
+    )}
 
     {previewVideo && (
       <div
@@ -40239,6 +40349,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       setSentMediaIds([]);
       setSentMediaUrls([]);
     }
+    // Prefetch media library in background for instant modal opening
+    const mName = selectedConv?.model_name || chatterCtx?.modelName || "";
+    if (mName) _prefetchMediaLibrary(mName);
   }, [selectedChatId, activeSpender?.id]);
 
   // ── Scroll to bottom helper ──────────────────────────────────────────
@@ -58901,6 +59014,11 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
       setSentMediaIds([...sentMediaIds]);
     }).catch(() => {});
   }, [chatId, resolvedSpender?.id, convData?.spender_id]);
+
+  // Prefetch media library in background for instant modal opening
+  useEffect(() => {
+    _prefetchMediaLibrary(modelName?.toLowerCase() || "");
+  }, [modelName]);
 
   const modelName = React.useMemo(() => {
     if (!modelId) return null;
