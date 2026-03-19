@@ -32180,9 +32180,9 @@ const mergeMessages = (prev, serverList) => {
   });
   const serverIds   = new Set(serverList.map(m => _msgKey(m)).filter(Boolean));
   const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()).filter(Boolean));
-  // Keep pending/error messages not yet confirmed on server
+  // Keep pending/error/sent-but-unconfirmed messages not yet on server
   const localOnly = prev.filter(m =>
-    (m._pending || m._error) &&
+    (m._pending || m._error || m._sent) &&
     !serverIds.has(_msgKey(m)) &&
     !serverTexts.has((m.text || "").trim())
   );
@@ -39612,6 +39612,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         setMessages(prev => {
           const exists = prev.some(m => m.id === data.message.id);
           if (exists) return prev;
+          // Check if this socket message matches a pending optimistic message
+          const pendingIdx = prev.findIndex(m =>
+            m._pending && (m.text || "").trim() === (data.message?.text || data.message?.content || "").trim() &&
+            (m.direction === "out" || m.is_outgoing)
+          );
+          if (pendingIdx >= 0) {
+            return prev.map((m, i) => i === pendingIdx ? data.message : m);
+          }
           return [...prev, data.message];
         });
       }
@@ -40325,6 +40333,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         if (belongsToActive) {
           setMessages(prev => {
             if (prev.some(m => m.id === msg.id)) return prev;
+            // Check if this realtime message matches a pending optimistic message
+            const pendingIdx = prev.findIndex(m =>
+              m._pending && (m.text || "").trim() === (msg.text || msg.content || "").trim() &&
+              (m.direction === "out" || m.is_outgoing)
+            );
+            if (pendingIdx >= 0) {
+              // Replace the optimistic with the real server message
+              return prev.map((m, i) => i === pendingIdx ? msg : m);
+            }
             return [...prev, msg];
           });
         }
@@ -40639,7 +40656,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         timeout: 15000,
       });
       setMessages(prev => prev.map(m =>
-        m.id === localId ? { ...m, _pending: false, id: localId + "_sent" } : m
+        m.id === localId ? { ...m, _sent: true } : m
       ));
       // Remonter la conv en haut de liste
       loadConversations(true);
@@ -40672,7 +40689,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           const list = Array.isArray(data) ? data : (data.messages || data.data || []);
           setMessages(prev => mergeMessages(prev, list));
         } catch (_) { /* keep confirmed state */ }
-      }, 2000);
+      }, 3000);
 
     } catch (e) {
       // Don't remove — mark the message as failed so user sees it and can retry
@@ -42077,7 +42094,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               const isOut = msg.direction === "out" || msg.from_bot === true || msg.sender_type === "bot" || msg.sender_type === "chatter" || msg.is_outgoing === true;
               const text = msg.text || msg.content || msg.message || "";
               const ts = msg.created_at || msg.timestamp || msg.date;
-              const isPending = msg._pending === true;
+              const isPending = msg._pending === true && !msg._sent;
               const isError   = msg._error === true;
               const isNew = i >= prevMsgCountRef.current - 1 && !isPending && !isError;
               const prevMsg = i > 0 ? messages[i - 1] : null;
@@ -42438,7 +42455,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                                 });
                                 if (res?.success) {
                                   setMessages(prev => prev.map(m =>
-                                    m.id === optimisticId ? { ...m, _pending: false } : m
+                                    m.id === optimisticId ? { ...m, _sent: true } : m
                                   ));
                                   const _spId = selectedConv?.spender_id || activeSpender?.id;
                                   const _modId = selectedConv?.model_id;
@@ -43600,6 +43617,14 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
       if (!msg || !chatIdRef.current) return;
       setMessages(prev => {
         if (prev.some(m => m.id === msg.id)) return prev;
+        // Check if this realtime message matches a pending optimistic message
+        const pendingIdx = prev.findIndex(m =>
+          m._pending && (m.text || "").trim() === (msg.text || msg.content || "").trim() &&
+          (m.direction === "out" || m.is_outgoing)
+        );
+        if (pendingIdx >= 0) {
+          return prev.map((m, i) => i === pendingIdx ? msg : m);
+        }
         return [...prev, msg];
       });
       loadConversations(false);
@@ -43824,7 +43849,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
             );
           });
         } catch (_) { /* garder l'optimiste jusqu'au prochain poll */ }
-      }, 2000);
+      }, 3000);
     } catch (e) {
       // Annuler l'optimiste et restaurer le texte
       setMessages(prev => prev.filter(m => m.id !== localId));
@@ -43873,7 +43898,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
                 );
               });
             } catch (_) {}
-          }, 2000);
+          }, 3000);
         })
         .catch(e => {
           setMessages(prev => prev.filter(m => m.id !== localId));
@@ -44098,7 +44123,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
                   )}
                   <div style={{ padding: "9px 13px", borderRadius: isOut ? "14px 14px 2px 14px" : "14px 14px 14px 2px", fontSize: 13, lineHeight: 1.4,
                     background: isOut ? "#3B82F6" : "rgba(255,255,255,0.07)", color: "#fff", wordBreak: "break-word",
-                    opacity: msg._pending ? 0.65 : 1 }}>
+                    opacity: (msg._pending && !msg._sent) ? 0.65 : 1 }}>
                     {(() => {
                       const raw = msg.text || msg.content || msg.message || "";
                       if (!raw) return "—";
@@ -44110,7 +44135,7 @@ const TgCarlosMessagerieTab = ({ user, lang, spenders, profiles, models, txs }) 
                     })()}
                   </div>
                   <div style={{ fontSize: 9, color: "var(--text-quaternary)", marginTop: 2, textAlign: isOut ? "right" : "left" }}>
-                    {msg._pending ? (fr ? "Envoi…" : "Sending…") : (msg.created_at ? new Date(msg.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : "")}
+                    {(msg._pending && !msg._sent) ? (fr ? "Envoi…" : "Sending…") : (msg.created_at ? new Date(msg.created_at).toLocaleTimeString("fr-CH", { hour: "2-digit", minute: "2-digit" }) : "")}
                   </div>
                 </div>
                 </React.Fragment>
@@ -58668,6 +58693,14 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
       if (!msg) return;
       setMessages(prev => {
         if (prev.some(m => m.id === msg.id)) return prev;
+        // Check if this realtime message matches a pending optimistic message
+        const pendingIdx = prev.findIndex(m =>
+          m._pending && (m.text || "").trim() === (msg.text || msg.content || "").trim() &&
+          (m.direction === "out" || m.is_outgoing)
+        );
+        if (pendingIdx >= 0) {
+          return prev.map((m, i) => i === pendingIdx ? msg : m);
+        }
         return [...prev, msg];
       });
     };
@@ -58701,6 +58734,14 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
       if (String(data.chat_id) !== String(chatId)) return;
       setMessages(prev => {
         if (prev.some(m => m.id === data.message?.id)) return prev;
+        // Check if this socket message matches a pending optimistic message
+        const pendingIdx = prev.findIndex(m =>
+          m._pending && (m.text || "").trim() === (data.message?.text || data.message?.content || "").trim() &&
+          (m.direction === "out" || m.is_outgoing)
+        );
+        if (pendingIdx >= 0) {
+          return prev.map((m, i) => i === pendingIdx ? data.message : m);
+        }
         const updated = [...prev, data.message];
         if (!isUserScrollRef.current) setTimeout(() => scrollToBottom('smooth'), 50);
         else { setHasNewBadge(p => p + 1); if (onNewMessage) onNewMessage(chatId, 1); }
@@ -58723,8 +58764,8 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     try {
       const body = modelId ? { chat_id: chatId, text, model_id: modelId } : { chat_id: chatId, text };
       await _dmsgFetch("/send-message", { method: "POST", body: JSON.stringify(body), timeout: 15000 });
-      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, id: localId + "_sent" } : m));
-      setTimeout(() => loadMessages(false), 2000);
+      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _sent: true } : m));
+      setTimeout(() => loadMessages(false), 3000);
     } catch (e) {
       setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, _error: true } : m));
       addToast("Erreur envoi: " + e.message, "error");
@@ -58811,14 +58852,14 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
         ? { chat_id: chatId, video_url: mediaUrl, caption: "", model_id: mName, width: _gmVm.width, height: _gmVm.height, duration: _gmVm.duration }
         : { chat_id: chatId, media_url: mediaUrl, caption: "", model_id: mName };
       const res = await _dmsgFetch(endpoint, { method: "POST", body: JSON.stringify(body), timeout: pendingMedia.type === 'video' ? 120000 : 30000 });
-      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, media_url: mediaUrl } : m));
+      setMessages(prev => prev.map(m => m.id === localId ? { ...m, _sent: true, media_url: mediaUrl } : m));
       const _spId = resolvedSpender?.id || convData?.spender_id;
       if (_spId && pendingMedia.url) {
         window._markMediaAsSent(pendingMedia.url || mediaUrl, _spId, modelId, 'conversation', pendingMedia.id);
         if (pendingMedia.id) setSentMediaIds(prev => prev.includes(pendingMedia.id) ? prev : [...prev, pendingMedia.id]);
       }
       setPendingMedia(null);
-      setTimeout(() => loadMessages(false), 2000);
+      setTimeout(() => loadMessages(false), 3000);
     } catch (e) {
       setMessages(prev => prev.map(m => m.id === localId ? { ...m, _pending: false, _error: true } : m));
       addToast("Erreur média: " + e.message, "error");
@@ -59022,7 +59063,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
             const isOut = msg.direction === "out" || msg.from_bot === true || msg.sender_type === "bot" || msg.sender_type === "chatter" || msg.is_outgoing === true;
             const text = msg.text || msg.content || msg.message || "";
             const ts = msg.created_at || msg.timestamp || msg.date;
-            const isPending = msg._pending === true;
+            const isPending = msg._pending === true && !msg._sent;
             const isError = msg._error === true;
             const prevMsg = i > 0 ? messages[i - 1] : null;
             const showDateSep = _shouldShowDateSep(msg, prevMsg);
