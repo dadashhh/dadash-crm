@@ -39828,6 +39828,63 @@ const MessagerieHubPage = ({ user, lang, models = [], setTab }) => {
 // Passer à true uniquement après avoir chargé react-window via CDN et testé le scroll infini.
 const ENABLE_VIRTUALIZATION = false;
 
+// ── normalizeMessage : standardise TOUT message (Carlos API / Supabase / optimistic) ──
+// Un seul format canonical + champs compat pour mergeMessages, _msgKey, _shouldShowDateSep.
+function normalizeMessage(raw) {
+  if (!raw) return null;
+  if (raw._normalized) return raw;
+
+  const id = raw.id || raw.message_id || raw.tg_message_id || raw._localId || ('gen-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const text = raw.text || raw.content || raw.message || raw.message_text || '';
+  const isOutgoing = !!(raw.direction === 'out' || raw.from_bot === true || raw.sender_type === 'bot' || raw.sender_type === 'chatter' || raw.is_outgoing === true);
+  const date = raw.created_at || raw.message_date || raw.date || raw.timestamp || new Date().toISOString();
+  const mediaUrl = raw.media_url || raw.photo_url || raw.video_url || raw.file_url || null;
+  const rawType = raw.media_type || raw.type || (raw.video_url ? 'video' : null) || (raw.photo_url ? 'photo' : null);
+  const mediaType = !mediaUrl ? null
+    : (rawType === 'photo' || rawType === 'image') ? 'image'
+    : rawType === 'video' ? 'video'
+    : (rawType === 'document' || rawType === 'audio' || rawType === 'voice') ? 'document'
+    : /\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(mediaUrl) ? 'image'
+    : /\.(mp4|mov|webm)(\?|$)/i.test(mediaUrl) ? 'video'
+    : null;
+  const isCall = !!(rawType === 'call' || rawType === 'phone_call' || rawType === 'video_call');
+  const pending = raw._pending || false;
+  const sent = raw._sent || false;
+  const error = raw._error || false;
+
+  return {
+    _normalized: true,
+    // ── Canonical fields ──
+    id,
+    text,
+    isOutgoing,
+    date,
+    mediaUrl,
+    mediaType,
+    isCall,
+    callStatus: raw.call_status || null,
+    callMissed: !!(raw.call_status === 'missed' || raw.missed_call === true),
+    callDuration: raw.call_duration || null,
+    pending,
+    sent,
+    error,
+    sender: raw.sender || null,
+    // ── Backward-compat fields (mergeMessages, _msgKey, _shouldShowDateSep) ──
+    created_at: date,
+    direction: isOutgoing ? 'out' : 'in',
+    is_outgoing: isOutgoing,
+    _pending: pending,
+    _sent: sent,
+    _error: error,
+    media_url: mediaUrl,
+    media_type: rawType || null,
+    // ── Preserved for specific features ──
+    conversation_id: raw.conversation_id || null,
+    _chatId: raw._chatId || null,
+    _modelId: raw._modelId || null,
+  };
+}
+
 const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, initialChatId }) => {
   const fr = lang === "fr";
   const addToast = useToast();
@@ -40091,18 +40148,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     const onNewMessage = (data) => {
       if (data.chat_id === chatIdRef.current) {
+        const nMsg = normalizeMessage(data.message);
+        if (!nMsg) return;
         setMessages(prev => {
-          const exists = prev.some(m => m.id === data.message.id);
+          const exists = prev.some(m => m.id === nMsg.id);
           if (exists) return prev;
-          // Check if this socket message matches a pending optimistic message
           const pendingIdx = prev.findIndex(m =>
-            m._pending && (m.text || "").trim() === (data.message?.text || data.message?.content || "").trim() &&
-            (m.direction === "out" || m.is_outgoing)
+            m.pending && m.text.trim() === nMsg.text.trim() && m.isOutgoing
           );
           if (pendingIdx >= 0) {
-            return prev.map((m, i) => i === pendingIdx ? data.message : m);
+            return prev.map((m, i) => i === pendingIdx ? nMsg : m);
           }
-          return [...prev, data.message];
+          return [...prev, nMsg];
         });
       }
       setConversations(prev => prev.map(c =>
@@ -40341,7 +40398,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     const _cachedMsgs = _DMSG_MSG_CACHE[cid];
     const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
     if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
-      setMessages(_cachedMsgs.data);
+      setMessages(_cachedMsgs.data.map(normalizeMessage).filter(Boolean));
       setMsgLoading(false);
       setTimeout(() => scrollToBottom('instant'), 50);
       // Continuer pour refresh silencieux
@@ -40381,20 +40438,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           hint: 'Vérifier si chat_id match dans la DB'
         });
       }
-      if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
+      const nList = list.map(normalizeMessage).filter(Boolean);
+      if (nList.length > 0) _DMSG_MSG_CACHE[cid] = { data: nList, ts: Date.now() };
       if (isInitial) {
-        setMessages(list);
+        setMessages(nList);
         setMsgOffset(0);
         setHasMoreMsgs(raw.length >= 50);
         setTimeout(() => scrollToBottom('instant'), 100);
       } else {
-        if (list.length === 0) return; // Ne pas vider les messages si le serveur renvoie vide
+        if (nList.length === 0) return;
         setMessages(prev => {
-          const prevConfirmed = prev.filter(m => !m._pending && !m._error);
+          const prevConfirmed = prev.filter(m => !m.pending && !m.error);
           const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
-          const hasNew = list.some(m => !prevKeys.has(_msgKey(m)));
+          const hasNew = nList.some(m => !prevKeys.has(_msgKey(m)));
           if (!hasNew) return prev;
-          return mergeMessages(prev, list);
+          return mergeMessages(prev, nList);
         });
       }
       // Si nouveau message entrant → rafraîchir la liste conv
@@ -40420,7 +40478,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             const { data } = await sb.from("tg_messages").select("*")
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: true });
-            const list = _normalizeMsgMedia(data || []);
+            const list = _normalizeMsgMedia(data || []).map(normalizeMessage).filter(Boolean);
             if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
             setMessages(list);
             setMsgOffset(0);
@@ -40447,7 +40505,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       const older = [...raw].sort((a, b) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
-      );
+      ).map(normalizeMessage).filter(Boolean);
       if (older.length > 0) {
         setMessages(prev => {
           const prevKeys = new Set(prev.map(m => _msgKey(m)));
@@ -40555,7 +40613,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     const cid = String(chatId || "");
     const cached = _DMSG_MSG_CACHE[cid];
     if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
-      setMessages(cached.data);
+      setMessages(cached.data.map(normalizeMessage).filter(Boolean));
     } else {
       setMessages([]);
     }
@@ -40809,30 +40867,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // ── 2.1 Realtime via global channel CustomEvents (deduplicated) ─────────────
   useEffect(() => {
     const handleInsert = (e) => {
-      const msg = e.detail;
-      if (!msg) return;
+      const rawMsg = e.detail;
+      if (!rawMsg) return;
+      const nMsg = normalizeMessage(rawMsg);
+      if (!nMsg) return;
       const activeCid = chatIdRef.current;
-      if (activeCid && msg.conversation_id) {
+      if (activeCid && rawMsg.conversation_id) {
         const cached = _DMSG_MSG_CACHE[activeCid];
         const belongsToActive = cached?.data?.length > 0 &&
-          cached.data[0]?.conversation_id === msg.conversation_id;
+          cached.data[0]?.conversation_id === rawMsg.conversation_id;
         if (belongsToActive) {
           setMessages(prev => {
-            if (prev.some(m => m.id === msg.id)) return prev;
-            // Check if this realtime message matches a pending optimistic message
+            if (prev.some(m => m.id === nMsg.id)) return prev;
             const pendingIdx = prev.findIndex(m =>
-              m._pending && (m.text || "").trim() === (msg.text || msg.content || "").trim() &&
-              (m.direction === "out" || m.is_outgoing)
+              m.pending && m.text.trim() === nMsg.text.trim() && m.isOutgoing
             );
             if (pendingIdx >= 0) {
-              // Replace the optimistic with the real server message
-              return prev.map((m, i) => i === pendingIdx ? msg : m);
+              return prev.map((m, i) => i === pendingIdx ? nMsg : m);
             }
-            return [...prev, msg];
+            return [...prev, nMsg];
           });
         }
       }
-      if (msg.direction === 'in' || msg.sender_type === 'user') {
+      if (nMsg.direction === 'in' || rawMsg.sender_type === 'user') {
         const now = Date.now();
         if (now - lastConvRefreshRef.current > 5000) {
           lastConvRefreshRef.current = now;
@@ -40841,9 +40898,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       }
     };
     const handleUpdate = (e) => {
-      const msg = e.detail;
-      if (!msg) return;
-      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, ...msg } : m));
+      const rawUpd = e.detail;
+      if (!rawUpd) return;
+      setMessages(prev => prev.map(m => m.id === rawUpd.id ? normalizeMessage({ ...(m._normalized ? {} : m), ...rawUpd, _pending: m._pending, _sent: m._sent, _error: m._error }) : m));
     };
     window.addEventListener('tg-message-insert', handleInsert);
     window.addEventListener('tg-message-update', handleUpdate);
@@ -41094,7 +41151,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     // Optimistic message — visible instantly, pending state
     const localId = "pending-" + Date.now();
-    const optimistic = {
+    const optimistic = normalizeMessage({
       id: localId,
       text,
       direction: "out",
@@ -41102,7 +41159,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       sender_type: "chatter",
       created_at: new Date().toISOString(),
       _pending: true,
-    };
+    });
     setMessages(prev => [...prev, optimistic]);
     // Forcer scroll vers le bas à l'envoi (même si l'user avait scrollé)
     isUserScrollRef.current = false;
@@ -41132,7 +41189,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         timeout: 15000,
       });
       setMessages(prev => prev.map(m =>
-        m.id === localId ? { ...m, _sent: true } : m
+        m.id === localId ? { ...m, _sent: true, sent: true } : m
       ));
       // Remonter la conv en haut de liste
       loadConversations(true);
@@ -41162,7 +41219,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         if (String(chatIdRef.current) !== String(chatId)) return;
         try {
           const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50");
-          const list = Array.isArray(data) ? data : (data.messages || data.data || []);
+          const list = (Array.isArray(data) ? data : (data.messages || data.data || [])).map(normalizeMessage).filter(Boolean);
           setMessages(prev => mergeMessages(prev, list));
         } catch (_) { /* keep confirmed state */ }
       }, 3000);
@@ -41170,7 +41227,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     } catch (e) {
       // Don't remove — mark the message as failed so user sees it and can retry
       setMessages(prev => prev.map(m =>
-        m.id === localId ? { ...m, _pending: false, _error: true, _chatId: chatId, _modelId: selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined } : m
+        m.id === localId ? { ...m, _pending: false, pending: false, _error: true, error: true, _chatId: chatId, _modelId: selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined } : m
       ));
       addToast((fr ? "Erreur envoi: " : "Send error: ") + (e.message || e), "error");
     } finally {
@@ -41528,12 +41585,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const getConversationMedias = React.useMemo(() => {
     if (!messages || messages.length === 0) return [];
     return messages
-      .filter(msg => msg.media_url || msg.photo_url || msg.video_url)
+      .filter(msg => msg.mediaUrl)
       .map(msg => ({
-        type: msg.video_url ? 'video' : 'photo',
-        url: msg.media_url || msg.photo_url || msg.video_url,
-        date: msg.created_at || msg.timestamp,
-        id: msg.id || msg.message_id
+        type: msg.mediaType === 'video' ? 'video' : 'photo',
+        url: msg.mediaUrl,
+        date: msg.date,
+        id: msg.id
       }))
       .sort((a, b) => new Date(b.date) - new Date(a.date));
   }, [messages]);
@@ -42555,29 +42612,22 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               </div>
             )}
             {!msgLoading && (Array.isArray(messages) ? messages : []).map((msg, i) => {
-              const isOut = msg.direction === "out" || msg.from_bot === true || msg.sender_type === "bot" || msg.sender_type === "chatter" || msg.is_outgoing === true;
-              const text = msg.text || msg.content || msg.message || "";
-              const ts = msg.created_at || msg.timestamp || msg.date;
-              const isPending = msg._pending === true && !msg._sent;
-              const isError   = msg._error === true;
+              const isOut = msg.isOutgoing;
+              const text = msg.text;
+              const ts = msg.date;
+              const isPending = msg.pending && !msg.sent;
+              const isError   = msg.error;
               const isNew = i >= prevMsgCountRef.current - 1 && !isPending && !isError;
               const prevMsg = i > 0 ? messages[i - 1] : null;
               const showDateSep = _shouldShowDateSep(msg, prevMsg);
               // ── Media detection ──
-              const mediaUrl  = msg.media_url || msg.photo_url || msg.video_url || msg.file_url || null;
-              const rawType   = msg.media_type || msg.type || (msg.video_url ? "video" : null) || (msg.photo_url ? "photo" : null);
-              const mediaType = !mediaUrl ? null
-                : (rawType === "photo" || rawType === "image") ? "image"
-                : rawType === "video" ? "video"
-                : (rawType === "document" || rawType === "audio" || rawType === "voice") ? "document"
-                : mediaUrl.match(/\.(jpg|jpeg|png|gif|webp)(\?|$)/i) ? "image"
-                : mediaUrl.match(/\.(mp4|mov|webm)(\?|$)/i) ? "video"
-                : null;
+              const mediaUrl  = msg.mediaUrl;
+              const mediaType = msg.mediaType;
               const hasMedia = !!mediaType;
               // ── Call detection ──
-              const isCall = rawType === 'call' || rawType === 'phone_call' || rawType === 'video_call';
-              const callMissed = msg.call_status === 'missed' || msg.missed_call === true;
-              const callDuration = msg.call_duration ? _formatCallDuration(msg.call_duration) : '';
+              const isCall = msg.isCall;
+              const callMissed = msg.callMissed;
+              const callDuration = msg.callDuration ? _formatCallDuration(msg.callDuration) : '';
               // ── Emoji-only detection ──
               const onlyEmoji = !hasMedia && !isCall && _isOnlyEmojis(text);
               const emojiCnt = onlyEmoji ? _emojiCount(text) : 0;
@@ -42645,9 +42695,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                       </a>
                     )}
                     {/* ── Media type known but URL missing ── */}
-                    {rawType && !mediaUrl && !isCall && (
+                    {msg.media_type && !mediaUrl && !isCall && (
                       <div style={{ padding: "8px 14px", opacity: 0.5, fontSize: 13, fontStyle: "italic" }}>
-                        {"📎 " + rawType + (fr ? " (non chargé)" : " (not loaded)")}
+                        {"📎 " + msg.media_type + (fr ? " (non chargé)" : " (not loaded)")}
                       </div>
                     )}
                     {/* ── Call indicator ── */}
@@ -42696,7 +42746,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                 <button onClick={async () => {
                   const spId = activeSpender?.id || selectedConv?.spender_id;
                   const modId = selectedConv?.model_id || selectedModelId;
-                  const lastMsg = (() => { const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing); return last?.text || last?.content || ""; })();
+                  const lastMsg = (() => { const last = [...messages].reverse().find(m => !m.isOutgoing); return last?.text || ""; })();
                   setInlineIALoading(true); setInlineIAError(null);
                   try { const data = await generateIASuggestions(spId, modId, lastMsg); setInlineIASuggestions(data.suggestions || []); } catch (e) { setInlineIAError(e.message); }
                   setInlineIALoading(false);
@@ -42725,7 +42775,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                   <button onClick={async () => {
                     const spId = activeSpender?.id || selectedConv?.spender_id;
                     const modId = selectedConv?.model_id || selectedModelId;
-                    const lastMsg = (() => { const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing); return last?.text || last?.content || ""; })();
+                    const lastMsg = (() => { const last = [...messages].reverse().find(m => !m.isOutgoing); return last?.text || ""; })();
                     setInlineIALoading(true); setInlineIAError(null); setInlineIASuggestions([]);
                     try { const data = await generateIASuggestions(spId, modId, lastMsg); setInlineIASuggestions(data.suggestions || []); } catch (e) { setInlineIAError(e.message); }
                     setInlineIALoading(false);
@@ -42760,7 +42810,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                     if (inlineIASuggestions.length > 0) { setInlineIASuggestions([]); return; }
                     const spId = activeSpender?.id || selectedConv?.spender_id;
                     const modId = selectedConv?.model_id || selectedModelId;
-                    const lastMsg = (() => { const last = [...messages].reverse().find(m => m.direction !== "out" && !m.is_outgoing); return last?.text || last?.content || ""; })();
+                    const lastMsg = (() => { const last = [...messages].reverse().find(m => !m.isOutgoing); return last?.text || ""; })();
                     setInlineIALoading(true); setInlineIAError(null);
                     try {
                       const data = await generateIASuggestions(spId, modId, lastMsg);
@@ -43722,7 +43772,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             const _spId = selectedConv.spender_id || activeSpender?.id;
             // Bulle optimiste pending
             const _optId = "pending-lib-" + Date.now();
-            const _optMsg = { id: _optId, _pending: true, direction: "out", is_outgoing: true, sender_type: "chatter", media_type: media.type, media_url: media.url, text: "", created_at: new Date().toISOString() };
+            const _optMsg = normalizeMessage({ id: _optId, _pending: true, direction: "out", is_outgoing: true, sender_type: "chatter", media_type: media.type, media_url: media.url, text: "", created_at: new Date().toISOString() });
             setMessages(prev => [...prev, _optMsg]);
             scrollToBottom('smooth');
             try {
@@ -43733,7 +43783,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                 await _dmsgFetch("/send-media", { method: "POST", body: JSON.stringify({ chat_id: chatId, media_url: media.url, caption: "", model_id: mId }), timeout: 30000 });
               }
               // Succès → confirmer bulle
-              setMessages(prev => prev.map(m => m.id === _optId ? { ...m, _pending: false } : m));
+              setMessages(prev => prev.map(m => m.id === _optId ? { ...m, _pending: false, pending: false } : m));
               addToast("Média envoyé ✅", "success");
               if (_spId) {
                 window._markMediaAsSent(media.url, _spId, mId, 'conversation', media.id);
