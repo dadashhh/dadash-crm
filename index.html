@@ -32016,6 +32016,24 @@ const _DMSG_KEY_FALLBACK = window.CRM_API_KEY || "";
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
 const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s (L1 RAM)
 
+/** Normalize media fields: extract from meta JSONB if flat fields are missing */
+const _normalizeMsgMedia = (msgs) => {
+  if (!Array.isArray(msgs)) return msgs;
+  msgs.forEach(m => {
+    if (m._mediaNormalized) return;
+    const meta = m.meta;
+    if (meta && typeof meta === 'object') {
+      if (!m.media_url && meta.media_url) m.media_url = meta.media_url;
+      if (!m.media_type && meta.media_type) m.media_type = meta.media_type;
+      if (!m.photo_url && meta.photo_url) m.photo_url = meta.photo_url;
+      if (!m.video_url && meta.video_url) m.video_url = meta.video_url;
+      if (!m.file_url && meta.file_url) m.file_url = meta.file_url;
+    }
+    m._mediaNormalized = true;
+  });
+  return msgs;
+};
+
 // ── 2.3 IndexedDB persistent cache — L2, TTL 5min, survit aux refresh ────────
 const _idbOpen = (() => {
   let _db = null;
@@ -33145,6 +33163,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       const _gpIdb = await _idbGetMsgs(cid);
       if (_gpIdb) {
         console.log(`[PERF] gpLoadMsgs L2-IDB-HIT — slot ${idx} chatId: ${cid}`);
+        _normalizeMsgMedia(_gpIdb.data);
         _DMSG_MSG_CACHE[String(cid)] = { data: _gpIdb.data, ts: _gpIdb.ts };
         setGpSlotMsgs(p => ({ ...p, [idx]: _gpIdb.data }));
         return;
@@ -33158,7 +33177,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     console.log(`⏱️ [PERF] gpLoadMsgs START — slot ${idx} — chatId: ${cid}`);
     try {
       const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200", { timeout: 20000 });
-      const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      const msgs = _normalizeMsgMedia(Array.isArray(data) ? data : data.messages || data.data || []);
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] gpLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
       if (_ldur > 2000) console.warn(`⚠️ [PERF] gpLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
@@ -33196,7 +33215,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
             .eq("conversation_id", _gpConvRow.id)
             .order("created_at", { ascending: true })
             .limit(200);
-          const msgs = _gpSbMsgs || [];
+          const msgs = _normalizeMsgMedia(_gpSbMsgs || []);
           if (msgs.length > 0) _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
           setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
           console.log(`✅ [GP] Supabase fallback OK — slot ${idx} — ${msgs.length} msgs`);
@@ -34558,6 +34577,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       const _tIdb = await _idbGetMsgs(cid);
       if (_tIdb) {
         console.log(`[PERF] tLoadMsgs L2-IDB-HIT — slot ${idx} chatId: ${cid}`);
+        _normalizeMsgMedia(_tIdb.data);
         _DMSG_MSG_CACHE[String(cid)] = { data: _tIdb.data, ts: _tIdb.ts };
         setTSlotMsgs(p => ({ ...p, [idx]: _tIdb.data }));
         return;
@@ -34571,7 +34591,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     console.log(`⏱️ [PERF] tLoadMsgs START — slot ${idx} — chatId: ${cid}`);
     try {
       const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200", { timeout: 20000 });
-      const msgs = Array.isArray(data) ? data : data.messages || data.data || [];
+      const msgs = _normalizeMsgMedia(Array.isArray(data) ? data : data.messages || data.data || []);
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] tLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
       if (_ldur > 2000) console.warn(`⚠️ [PERF] tLoadMsgs SLOW — ${_ldur}ms — slot ${idx}`);
@@ -34609,7 +34629,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
             .eq("conversation_id", _tConvRow.id)
             .order("created_at", { ascending: true })
             .limit(200);
-          const msgs = _tSbMsgs || [];
+          const msgs = _normalizeMsgMedia(_tSbMsgs || []);
           if (msgs.length > 0) _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
           setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
           console.log(`✅ [TLG] Supabase fallback OK — slot ${idx} — ${msgs.length} msgs`);
@@ -35708,10 +35728,10 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
       if (String(currentChatIdRef.current) !== String(chatId)) return;
 
       const raw = Array.isArray(data) ? data : data.messages || data.data || [];
-      const sorted = [...raw].sort((a, b) =>
+      const sorted = _normalizeMsgMedia([...raw].sort((a, b) =>
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
-      );
+      ));
       console.log('📊 [MSG-DIAG] Query result:', {
         functionName: 'loadMessages',
         subpage: 'Tindada',
@@ -40319,6 +40339,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         new Date(a.created_at || a.timestamp || 0).getTime() -
         new Date(b.created_at || b.timestamp || 0).getTime()
       );
+      _normalizeMsgMedia(list);
       // Log media info for debugging
       list.forEach(m => {
         if (m.media_type || m.media_url || m.photo_url || m.file_url) {
@@ -40381,7 +40402,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             const { data } = await sb.from("tg_messages").select("*")
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: true });
-            const list = data || [];
+            const list = _normalizeMsgMedia(data || []);
             if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
             setMessages(list);
             setMsgOffset(0);

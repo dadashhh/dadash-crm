@@ -49,15 +49,52 @@ const server = http.createServer((req, res) => {
 // ── Grammy bot ──
 const bot = new Bot(BOT_TOKEN);
 
+/** Resolve a Telegram file_id to a full download URL. */
+async function resolveFileUrl(fileId: string): Promise<string | null> {
+  try {
+    const file = await bot.api.getFile(fileId);
+    if (file.file_path) {
+      return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
+    }
+  } catch (err) {
+    log.error('BOT', 'get_file_failed', {
+      file_id: fileId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return null;
+}
+
+/** Extract media type and file_id from a Telegram message. */
+function extractMedia(msg: any): { type: 'photo' | 'video' | 'document' | 'audio' | 'voice'; fileId: string } | null {
+  if (msg.photo && msg.photo.length > 0) {
+    // photo is an array of PhotoSize, last one is the biggest
+    return { type: 'photo', fileId: msg.photo[msg.photo.length - 1].file_id };
+  }
+  if (msg.video) return { type: 'video', fileId: msg.video.file_id };
+  if (msg.document) return { type: 'document', fileId: msg.document.file_id };
+  if (msg.audio) return { type: 'audio', fileId: msg.audio.file_id };
+  if (msg.voice) return { type: 'voice', fileId: msg.voice.file_id };
+  return null;
+}
+
 bot.on('message', async (ctx) => {
   const msg = ctx.message;
   const from = msg.from;
   if (!from) return;
 
   const text = msg.text ?? msg.caption ?? '';
-  if (!text) return;
+  const media = extractMedia(msg);
+
+  // Skip messages with no text AND no media
+  if (!text && !media) return;
 
   try {
+    let mediaUrl: string | null = null;
+    if (media) {
+      mediaUrl = await resolveFileUrl(media.fileId);
+    }
+
     await handleIncomingMessage({
       chatId: msg.chat.id,
       tgUserId: from.id,
@@ -67,6 +104,8 @@ bot.on('message', async (ctx) => {
       firstName: from.first_name,
       lastName: from.last_name,
       direction: 'in',
+      mediaType: media?.type ?? null,
+      mediaUrl,
     });
     msgCount++;
   } catch (err) {

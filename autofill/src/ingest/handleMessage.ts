@@ -13,6 +13,8 @@ export interface IncomingMessage {
   firstName?: string;
   lastName?: string;
   direction: 'in' | 'out';
+  mediaType?: 'photo' | 'video' | 'document' | 'audio' | 'voice' | null;
+  mediaUrl?: string | null;
 }
 
 /**
@@ -80,6 +82,8 @@ export async function handleIncomingMessage(msg: IncomingMessage): Promise<void>
       username: msg.username || null,
       display_name: displayName || null,
       first_name: msg.firstName || null,
+      ...(msg.mediaType ? { media_type: msg.mediaType } : {}),
+      ...(msg.mediaUrl ? { media_url: msg.mediaUrl } : {}),
     },
   };
 
