@@ -40229,7 +40229,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const chatterCtx = React.useMemo(() => getChatterContext(user, models), [user?.id, models]);
 
   const convsCache = React.useRef({ data: [], lastFetch: 0 });
-  const CACHE_TTL = 30000;
+  const CACHE_TTL = 120000; // 2min — Realtime + Socket.IO trigger immediate refresh
 
   // ── Load conversations: Carlos API + Supabase merge (ensures ALL models visible) ──
   const loadConversations = useCallback(async (force = false) => {
@@ -40878,6 +40878,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         const belongsToActive = cached?.data?.length > 0 &&
           cached.data[0]?.conversation_id === rawMsg.conversation_id;
         if (belongsToActive) {
+          lastActivityRef.current = Date.now(); // snap polling back to 3s
           setMessages(prev => {
             if (prev.some(m => m.id === nMsg.id)) return prev;
             const pendingIdx = prev.findIndex(m =>
@@ -40911,20 +40912,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     };
   }, []);
 
-  // ── Polling messages live toutes les 3s ───────────────────────────────────
+  // ── Polling messages adaptatif : 3s actif, 10s idle (>30s sans activité) ──
   useEffect(() => {
-    if (pollRef.current) clearInterval(pollRef.current);
+    if (pollRef.current) clearTimeout(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
-    pollRef.current = setInterval(async () => {
-      if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) return;
-      isMsgPollingRef.current = true;
-      try {
-        await loadMessagesById(chatIdRef.current, false);
-      } finally {
-        isMsgPollingRef.current = false;
-      }
-    }, 3000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    let cancelled = false;
+    const schedule = () => {
+      if (cancelled) return;
+      const idleMs = Date.now() - lastActivityRef.current;
+      const delay = idleMs > 30000 ? 10000 : 3000;
+      pollRef.current = setTimeout(async () => {
+        if (cancelled) return;
+        if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) { schedule(); return; }
+        isMsgPollingRef.current = true;
+        try {
+          await loadMessagesById(chatIdRef.current, false);
+        } finally {
+          isMsgPollingRef.current = false;
+        }
+        schedule();
+      }, delay);
+    };
+    schedule();
+    return () => { cancelled = true; if (pollRef.current) clearTimeout(pollRef.current); };
   }, [selectedChatId, loadMessagesById]);
 
   // ── Ref stable vers loadConversations ───────────────────────────────────────
@@ -40936,7 +40946,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const lastConvRefreshRef = React.useRef(0);
   useEffect(() => { loadConversationsRef.current = loadConversations; }, [loadConversations]);
 
-  // ── Polling conversations toutes les 3s — intervalle STABLE ([] deps) ────────
+  // ── Polling conversations toutes les 60s — intervalle STABLE ([] deps) ────────
+  // Safety net only — Realtime + Socket.IO handle live updates
   useEffect(() => {
     convPollRef.current = setInterval(async () => {
       if (document.hidden) return;
@@ -40947,7 +40958,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       } finally {
         isConvPollingRef.current = false;
       }
-    }, 30000);
+    }, 60000);
     return () => clearInterval(convPollRef.current);
   }, []); // Vide intentionnel — l'interval ne redémarre JAMAIS
 
