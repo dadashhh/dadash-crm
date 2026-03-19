@@ -32427,7 +32427,7 @@ const _escapeHtml = (text) => {
 // GRID CONSTANTS (shared by Grid Premium + TLG Pro)
 // =====================================================================
 const GRID_LAYOUTS = { "2x2": { cols: 2, slots: 4 }, "2x3": { cols: 3, slots: 6 }, "3x3": { cols: 3, slots: 9 }, "3x4": { cols: 4, slots: 12 } };
-const GRID_REFRESH_MS = 30000; // Realtime primary, polling fallback 30s
+const GRID_REFRESH_MS = 3000; // Live polling messages toutes les 3s
 
 // =====================================================================
 // GRID PREMIUM HELPERS
@@ -33152,11 +33152,10 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       modelId: conv.model_id || 'undefined',
       timestamp: new Date().toISOString()
     });
-    // ── 0.2 Cache hit — L1 RAM (TTL 60s) ─────────────────────────────────────
+    // ── 0.2 Cache hit — L1 RAM (TTL 2s pour polling live) ──────────────────
     if (silent) {
       const _gpCached = _DMSG_MSG_CACHE[String(cid)];
-      if (_gpCached && Date.now() - _gpCached.ts < 60000) {
-        console.log(`[PERF] gpLoadMsgs L1-HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_gpCached.ts)/1000)}s)`);
+      if (_gpCached && Date.now() - _gpCached.ts < 2000) {
         return;
       }
       // ── 2.3 L2 IndexedDB cache (TTL 5min) — instant render while fetching ──
@@ -34566,11 +34565,10 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       modelId: conv.model_id || 'undefined',
       timestamp: new Date().toISOString()
     });
-    // ── 0.2 Cache hit — L1 RAM (TTL 60s) ─────────────────────────────────────
+    // ── 0.2 Cache hit — L1 RAM (TTL 2s pour polling live) ──────────────────
     if (silent) {
       const _tCached = _DMSG_MSG_CACHE[String(cid)];
-      if (_tCached && Date.now() - _tCached.ts < 60000) {
-        console.log(`[PERF] tLoadMsgs L1-HIT — slot ${idx} chatId: ${cid} (${Math.round((Date.now()-_tCached.ts)/1000)}s)`);
+      if (_tCached && Date.now() - _tCached.ts < 2000) {
         return;
       }
       // ── 2.3 L2 IndexedDB cache (TTL 5min) ────────────────────────────────
@@ -35653,6 +35651,8 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
   const lastUnreadCountRef = useRef(0);
   const isEmptyRef = useRef(false);
   const refreshInFlightRef = useRef(false);
+  const msgPollRef = useRef(null);
+  const isMsgPollingRef = useRef(false);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => { if (msgsEndRef.current) msgsEndRef.current.scrollIntoView({ behavior: "smooth" }); }, 100);
@@ -35909,6 +35909,24 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
       if (refreshRef.current) clearInterval(refreshRef.current);
     };
   }, []);
+
+  // ── Polling messages live toutes les 3s pour la conv ouverte ──────────────
+  useEffect(() => {
+    if (msgPollRef.current) clearInterval(msgPollRef.current);
+    const chatId = currentChatIdRef.current;
+    if (!chatId) return;
+    msgPollRef.current = setInterval(async () => {
+      const curCid = currentChatIdRef.current;
+      if (!curCid || document.hidden || isMsgPollingRef.current) return;
+      isMsgPollingRef.current = true;
+      try {
+        await loadMessages(curCid, true);
+      } finally {
+        isMsgPollingRef.current = false;
+      }
+    }, 3000);
+    return () => { if (msgPollRef.current) clearInterval(msgPollRef.current); };
+  }, [currentIdx, loadMessages]);
 
   const currentConv = useMemo(() => {
     if (currentIdx >= 0 && currentIdx < unreadConvs.length) return unreadConvs[currentIdx];
@@ -40835,30 +40853,20 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     };
   }, []);
 
-  // ── Polling messages fallback 30s (backup Realtime) ───────────────────────
+  // ── Polling messages live toutes les 3s ───────────────────────────────────
   useEffect(() => {
-    clearTimeout(pollRef.current);
+    if (pollRef.current) clearInterval(pollRef.current);
     if (!selectedChatId || !chatIdRef.current) return;
-    const scheduleNextPoll = () => {
-      // ── 0.3 Polling adaptatif : 60s si idle >2 min, 30s sinon ────────────
-      const _pollIdleSince = Date.now() - lastActivityRef.current;
-      const _pollDelay = _pollIdleSince > 120000 ? 60000 : 30000;
-      pollRef.current = setTimeout(async () => {
-        if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) {
-          scheduleNextPoll();
-          return;
-        }
-        isMsgPollingRef.current = true;
-        try {
-          await loadMessagesById(chatIdRef.current, false);
-        } finally {
-          isMsgPollingRef.current = false;
-          scheduleNextPoll();
-        }
-      }, _pollDelay);
-    };
-    scheduleNextPoll();
-    return () => clearTimeout(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) return;
+      isMsgPollingRef.current = true;
+      try {
+        await loadMessagesById(chatIdRef.current, false);
+      } finally {
+        isMsgPollingRef.current = false;
+      }
+    }, 3000);
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [selectedChatId, loadMessagesById]);
 
   // ── Ref stable vers loadConversations ───────────────────────────────────────
