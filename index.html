@@ -39827,6 +39827,8 @@ const MessagerieHubPage = ({ user, lang, models = [], setTab }) => {
 // Active la virtualisation DOM (react-window) pour les conversations > 200 messages.
 // Passer à true uniquement après avoir chargé react-window via CDN et testé le scroll infini.
 const ENABLE_VIRTUALIZATION = false;
+// Debug logs: activate with ?debug=true in URL
+const _DADASH_DEBUG = window.location.search.includes('debug=true');
 
 // ── normalizeMessage : standardise TOUT message (Carlos API / Supabase / optimistic) ──
 // Un seul format canonical + champs compat pour mergeMessages, _msgKey, _shouldShowDateSep.
@@ -40140,6 +40142,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const msgContainerRef = React.useRef(null);
   // WebSocket connection ref
   const socketRef = React.useRef(null);
+  // FIX 1 — Realtime debounce: buffer incoming messages, flush in batch
+  const rtBufferRef = React.useRef([]);
+  const rtTimerRef  = React.useRef(null);
+  // FIX 2 — Guard polling while initial load is in progress
+  const isInitialLoadingRef = React.useRef(false);
 
   // DISABLED: Socket.IO — using Supabase Realtime instead. Uncomment when socket is properly initialized.
   /*
@@ -40389,8 +40396,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
+    if (isInitial) isInitialLoadingRef.current = true;
     const cid = String(chatId);
-    console.log('🔍 [MSG-DIAG] Function called:', {
+    if (_DADASH_DEBUG) console.log('🔍 [MSG-DIAG] Function called:', {
       functionName: 'loadMessagesById',
       subpage: 'DadashMessagerieTab',
       chatId: cid,
@@ -40409,12 +40417,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       setMsgLoading(true);
     }
     try {
-      console.log('[DEBUG-LOAD] Fetching messages:', {
+      if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] Fetching messages:', {
         chatId: cid,
         isInitial: isInitial,
         url: _DMSG_API + "/conversations/" + cid + "/messages?limit=50&offset=0"
       });
-      console.log('[DEBUG-LOAD] chat_id sent to Carlos:', {
+      if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] chat_id sent to Carlos:', {
         rawCid: cid,
         type: typeof cid,
         length: String(cid).length,
@@ -40425,7 +40433,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       if (signal?.aborted) return;
       const _rawData = Array.isArray(data) ? data : (data?.messages || data?.data || []);
       const raw = Array.isArray(_rawData) ? _rawData : [];
-      console.log('[DEBUG-LOAD] Carlos API response:', {
+      if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] Carlos API response:', {
         chatId: cid,
         status: 'ok',
         rawCount: raw.length,
@@ -40445,7 +40453,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           console.log(`[MEDIA] msg ${m.id} type=${m.media_type || m.type || 'none'} url=${m.media_url || m.photo_url || m.file_url ? 'yes' : 'null'}`);
         }
       });
-      console.log('📊 [MSG-DIAG] Query result:', {
+      if (_DADASH_DEBUG) console.log('📊 [MSG-DIAG] Query result:', {
         functionName: 'loadMessagesById',
         subpage: 'DadashMessagerieTab',
         resultCount: raw.length,
@@ -40454,7 +40462,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         queryParams: { table: 'carlos_api', filterColumn: 'chat_id', filterValue: cid }
       });
       if (raw.length === 0) {
-        console.warn('⚠️ [MSG-DIAG] EMPTY RESULT — Possible bug:', {
+        if (_DADASH_DEBUG) console.warn('⚠️ [MSG-DIAG] EMPTY RESULT — Possible bug:', {
           functionName: 'loadMessagesById',
           subpage: 'DadashMessagerieTab',
           chatId: cid,
@@ -40463,7 +40471,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         });
       }
       const nList = list.map(normalizeMessage).filter(Boolean);
-      console.log('[DEBUG-LOAD] Setting messages:', {
+      if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] Setting messages:', {
         chatId: cid,
         isInitial: isInitial,
         normalizedCount: nList.length,
@@ -40504,7 +40512,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       if (e.name === "AbortError") return;
       if (isInitial && !_DMSG_MSG_CACHE[cid]?.data?.length) {
         try {
-          console.log('[DEBUG-LOAD] FALLBACK Supabase used:', {
+          if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] FALLBACK Supabase used:', {
             chatId: cid,
             reason: 'Carlos API failed or returned empty'
           });
@@ -40517,7 +40525,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               .order("created_at", { ascending: false })
               .limit(50);
             const list = _normalizeMsgMedia((data || []).reverse()).map(normalizeMessage).filter(Boolean);
-            console.log('[DEBUG-LOAD] FALLBACK Supabase result:', {
+            if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] FALLBACK Supabase result:', {
               chatId: cid,
               supabaseCount: list.length,
               lastText: list[list.length-1]?.text?.substring(0, 50) || 'N/A',
@@ -40532,7 +40540,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         } catch (_) { setMessages([]); }
       }
     } finally {
-      if (isInitial) setMsgLoading(false);
+      if (isInitial) {
+        setMsgLoading(false);
+        isInitialLoadingRef.current = false;
+      }
     }
   }, []);
 
@@ -40617,7 +40628,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
   // ── Select conversation ───────────────────────────
   const selectConv = useCallback((conv) => {
-    console.log('📂 [CONV-OPEN] Opening conversation:', {
+    if (_DADASH_DEBUG) console.log('📂 [CONV-OPEN] Opening conversation:', {
       subpage: 'DadashMessagerieTab',
       spender: {
         id: conv.spender_id || conv.id,
@@ -40627,7 +40638,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       }
     });
     const _dbgChatId = _dmsgChatId(conv);
-    console.log('[DEBUG-SELECT] Clicked conv:', {
+    if (_DADASH_DEBUG) console.log('[DEBUG-SELECT] Clicked conv:', {
       chatId: _dbgChatId,
       convLastMessage: conv.last_message,
       convLastMessageAt: conv.last_message_at
@@ -40662,7 +40673,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     openTab(conv);
     const cid = String(chatId || "");
     const cached = _DMSG_MSG_CACHE[cid];
-    console.log('[DEBUG-SELECT] Cache status:', {
+    if (_DADASH_DEBUG) console.log('[DEBUG-SELECT] Cache status:', {
       cacheExists: !!_DMSG_MSG_CACHE[cid],
       cacheFresh: _DMSG_MSG_CACHE[cid] ? (Date.now() - _DMSG_MSG_CACHE[cid].ts < 60000) : false,
       cacheLength: _DMSG_MSG_CACHE[cid]?.data?.length || 0,
@@ -40921,7 +40932,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     return () => clearInterval(scrollInterval);
   }, [selectedChatId]);
 
-  // ── 2.1 Realtime via global channel CustomEvents (deduplicated) ─────────────
+  // ── 2.1 Realtime via global channel CustomEvents (deduplicated + debounced) ──
   useEffect(() => {
     const handleInsert = (e) => {
       const rawMsg = e.detail;
@@ -40931,16 +40942,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       const activeCid = chatIdRef.current;
       if (activeCid) {
         const belongsToActive = (() => {
-          // Match 1 : comparer tg_chat_id du message Realtime avec le chat_id actif
           const msgChatId = String(rawMsg.tg_chat_id || rawMsg.chat_id || '');
           if (msgChatId && msgChatId === String(activeCid)) return true;
-          // Match 2 : fallback sur conversation_id UUID si disponible dans le cache
           const cached = _DMSG_MSG_CACHE[activeCid];
           if (cached?.data?.length > 0 && cached.data[0]?.conversation_id &&
               cached.data[0].conversation_id === rawMsg.conversation_id) return true;
           return false;
         })();
-        console.log('[DEBUG-RT] Realtime message received:', {
+        if (_DADASH_DEBUG) console.log('[DEBUG-RT] Realtime message received:', {
           msgText: rawMsg.text?.substring(0, 50) || 'N/A',
           msgChatId: rawMsg.tg_chat_id || rawMsg.chat_id || 'N/A',
           msgConvId: rawMsg.conversation_id || 'N/A',
@@ -40948,18 +40957,35 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           belongsToActive: belongsToActive
         });
         if (belongsToActive) {
-          console.log('[REALTIME] ✅ Message injecté dans conv active:', { id: nMsg.id, chatId: activeCid, text: (nMsg.text || '').slice(0, 50) });
-          lastActivityRef.current = Date.now(); // snap polling back to 3s
-          setMessages(prev => {
-            if (prev.some(m => m.id === nMsg.id)) return prev;
-            const pendingIdx = prev.findIndex(m =>
-              m.pending && m.text.trim() === nMsg.text.trim() && m.isOutgoing
-            );
-            if (pendingIdx >= 0) {
-              return prev.map((m, i) => i === pendingIdx ? nMsg : m);
+          lastActivityRef.current = Date.now();
+          // Buffer the message and debounce the flush (handles bulk inserts)
+          rtBufferRef.current.push(nMsg);
+          if (rtTimerRef.current) clearTimeout(rtTimerRef.current);
+          rtTimerRef.current = setTimeout(() => {
+            const batch = [...rtBufferRef.current];
+            rtBufferRef.current = [];
+            rtTimerRef.current = null;
+            if (batch.length === 0) return;
+            console.log('[RT-BATCH] Flushing', batch.length, 'messages');
+            setMessages(prev => {
+              let updated = [...prev];
+              for (const msg of batch) {
+                if (updated.some(m => String(m.id) === String(msg.id))) continue;
+                const pendingIdx = updated.findIndex(m =>
+                  m.pending && m.text.trim() === msg.text.trim() && m.isOutgoing
+                );
+                if (pendingIdx >= 0) {
+                  updated = updated.map((m, i) => i === pendingIdx ? msg : m);
+                } else {
+                  updated.push(msg);
+                }
+              }
+              return updated;
+            });
+            if (!isUserScrollRef.current) {
+              setTimeout(() => scrollToBottom('smooth'), 100);
             }
-            return [...prev, nMsg];
-          });
+          }, 500);
         }
       }
       if (nMsg.direction === 'in' || rawMsg.sender_type === 'user') {
@@ -40980,6 +41006,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     return () => {
       window.removeEventListener('tg-message-insert', handleInsert);
       window.removeEventListener('tg-message-update', handleUpdate);
+      if (rtTimerRef.current) clearTimeout(rtTimerRef.current);
     };
   }, []);
 
@@ -40995,7 +41022,12 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       pollRef.current = setTimeout(async () => {
         if (cancelled) return;
         if (document.hidden || isMsgPollingRef.current || !chatIdRef.current) { schedule(); return; }
-        console.log('[DEBUG-POLL] Polling messages:', {
+        if (isInitialLoadingRef.current) {
+          if (_DADASH_DEBUG) console.log('[POLL] Skipping — initial load in progress');
+          schedule();
+          return;
+        }
+        if (_DADASH_DEBUG) console.log('[DEBUG-POLL] Polling messages:', {
           chatId: chatIdRef.current,
           currentMsgCount: 'check-state',
           timestamp: new Date().toISOString()
