@@ -41277,8 +41277,26 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     return map;
   }, [spenders, txs]);
 
+  // ── Build a model-id → model-name map (stable, rebuilt when models change) ──
+  const _modelIdToName = React.useMemo(() => {
+    const map = {};
+    (models || []).forEach(m => { if (m.id && m.name) map[String(m.id)] = m.name.toLowerCase(); });
+    return map;
+  }, [models]);
+
+  // ── Build a model-name → Set<model-id> reverse map (handles API vs Supabase UUID mismatch) ──
+  const _modelNameToIds = React.useMemo(() => {
+    const map = {};
+    (models || []).forEach(m => {
+      const n = (m.name || "").toLowerCase();
+      if (n) { if (!map[n]) map[n] = new Set(); map[n].add(String(m.id)); }
+    });
+    return map;
+  }, [models]);
+
   const filteredConvs = React.useMemo(() => {
     let result = Array.isArray(conversations) ? conversations : [];
+    const _beforeCount = result.length;
 
     // Filtre recherche
     if (searchQuery.trim()) {
@@ -41310,15 +41328,24 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Tri déjà appliqué dans loadConversations — garder l'ordre stable ici
     // result reste dans l'ordre du cache
 
-    // Filtre modèle
+    // Filtre modèle — match by model_id OR model_name (handles API vs Supabase UUID mismatch)
     if (filterModel && filterModel !== "all") {
-      const fmId = filterModel;
-      const fmModel = (models || []).find(m => m.id === fmId);
-      const fmName = (fmModel?.name || filterModel).toLowerCase();
-      result = result.filter(c =>
-        (c.model_id && (c.model_id === fmId || String(c.model_id).toLowerCase() === fmName)) ||
-        (c.model_name && c.model_name.toLowerCase() === fmName)
-      );
+      const fmId = String(filterModel);
+      // Resolve the model name from the models prop
+      const fmName = _modelIdToName[fmId] || "";
+      // Collect ALL known UUIDs for this model name (API may use different UUIDs than Supabase)
+      const fmIds = fmName ? _modelNameToIds[fmName] : null;
+      result = result.filter(c => {
+        // Match by model_id (direct or via name-resolved set)
+        if (c.model_id) {
+          if (c.model_id === fmId) return true;
+          if (fmIds && fmIds.has(String(c.model_id))) return true;
+        }
+        // Match by model_name (case-insensitive)
+        if (fmName && c.model_name && c.model_name.toLowerCase() === fmName) return true;
+        return false;
+      });
+      console.log(`[FILTER] model=${fmName || fmId}: ${_beforeCount} → ${result.length}`);
     }
 
     // Filtre tier (basé sur total dépensé)
@@ -41339,6 +41366,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         const total = Number(c.total_spent||0) || convTotalsMap[cidStr] || Number(sp?.ltv||sp?.total_spent||0);
         return total >= range[0] && total < range[1];
       });
+      console.log(`[FILTER] tier=${filterTier}: → ${result.length}`);
     }
 
     // Filtre langue
@@ -41355,10 +41383,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Filtre non-lus
     if (showUnreadOnly) {
       result = result.filter(c => (c.unread_count || 0) > 0);
+      console.log(`[FILTER] unreadOnly: → ${result.length}`);
+    }
+
+    if (result.length !== _beforeCount) {
+      console.log(`[FILTER] total: ${_beforeCount} → ${result.length} (model=${filterModel}, tier=${filterTier}, unread=${showUnreadOnly})`);
     }
 
     return result;
-  }, [conversations, searchQuery, filterSpender, filterModel, filterTier, filterLang, spenders, convTotalsMap, showUnreadOnly]);
+  }, [conversations, searchQuery, filterSpender, filterModel, filterTier, filterLang, spenders, convTotalsMap, showUnreadOnly, _modelIdToName, _modelNameToIds]);
 
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
