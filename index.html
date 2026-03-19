@@ -32270,13 +32270,35 @@ const VIDEO_THUMBNAIL_CACHE = {};
 // Remplace MediaThumbnail — render <video> et <img> directement
 // Utilisé : LibraryModal, Galerie (GridPremium + Tindada), MediaLibraryPage
 // ════════════════════════════════════════════════════════
+// Thumbnail URL helper — use Supabase transforms for smaller images in grid
+const _libGetThumbUrl = (url, size = 300) => {
+  if (!url) return '';
+  if (url.includes('supabase.co/storage')) {
+    const sep = url.includes('?') ? '&' : '?';
+    return url + sep + 'width=' + size + '&height=' + size + '&resize=cover&quality=60';
+  }
+  return url;
+};
+
 const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
+  const [loaded, setLoaded] = React.useState(false);
   const [duration, setDuration] = React.useState(null);
 
-  React.useEffect(() => {
-    if (media.type !== 'video' || !media.url) return;
+  // Lazy duration fetch: only when card is visible (via IntersectionObserver)
+  const cardRef = React.useRef(null);
+  const [isVisible, setIsVisible] = React.useState(false);
 
-    console.log('[MediaCard] Loading video:', media.url);
+  React.useEffect(() => {
+    if (!cardRef.current) return;
+    const obs = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) { setIsVisible(true); obs.disconnect(); }
+    }, { rootMargin: '200px' });
+    obs.observe(cardRef.current);
+    return () => obs.disconnect();
+  }, []);
+
+  React.useEffect(() => {
+    if (media.type !== 'video' || !media.url || !isVisible) return;
 
     const video = document.createElement('video');
     video.src = media.url;
@@ -32299,7 +32321,6 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
       clearTimeout(timeout);
       const dur = formatDur(video.duration);
       if (dur) { setDuration(dur); return; }
-      // duration might not be ready yet, wait for durationchange
     };
 
     video.ondurationchange = () => {
@@ -32307,18 +32328,19 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
       if (dur) setDuration(dur);
     };
 
-    video.onerror = () => {
-      clearTimeout(timeout);
-    };
+    video.onerror = () => { clearTimeout(timeout); };
 
     video.load();
-  }, [media.url, media.type]);
+
+    return () => { clearTimeout(timeout); video.removeAttribute('src'); video.load(); };
+  }, [media.url, media.type, isVisible]);
 
   const isVideo = media.type === 'video';
   const isClickable = !!onClick && !isSent;
 
   return (
     <div
+      ref={cardRef}
       onClick={() => isClickable && onClick(media)}
       style={{
         position: 'relative',
@@ -32332,6 +32354,8 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
         background: '#0a0b14',
         border: '1px solid rgba(99, 102, 241, 0.2)',
         transition: 'all 0.2s',
+        willChange: 'transform',
+        contain: 'layout style paint',
         ...styleProp
       }}
       onMouseEnter={e => {
@@ -32345,35 +32369,40 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
         e.currentTarget.style.boxShadow = 'none';
       }}
     >
-      {/* PREVIEW — vidéo ou image directement */}
-      {isVideo ? (
-        <video
-          src={media.url}
-          style={{
-            width: '100%',
-            height: '100%',
-            objectFit: 'cover',
-            background: '#0f1117'
-          }}
-          muted
-          preload="metadata"
-          onLoadedMetadata={(e) => {
-            // Seek to 1 second for preview frame
-            e.currentTarget.currentTime = 1;
-          }}
-        />
-      ) : (
-        <img
-          src={media.url}
-          style={{
-            width: '100%',
-            height: '100%',
-            objectFit: 'cover'
-          }}
-          alt=""
-          loading="lazy"
-        />
-      )}
+      {/* PREVIEW — vidéo ou image avec lazy loading + placeholder */}
+      <div style={{ width: '100%', height: '100%', background: loaded ? 'transparent' : '#2a2a3e' }}>
+        {isVideo ? (
+          <video
+            poster={_libGetThumbUrl(media.thumbnail_url || media.url, 300)}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              background: '#0f1117',
+              opacity: loaded ? 1 : 0,
+              transition: 'opacity 0.2s'
+            }}
+            muted
+            preload="none"
+            onLoadedData={() => setLoaded(true)}
+          />
+        ) : (
+          <img
+            src={_libGetThumbUrl(media.url, 300)}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              opacity: loaded ? 1 : 0,
+              transition: 'opacity 0.2s'
+            }}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            onLoad={() => setLoaded(true)}
+          />
+        )}
+      </div>
 
       {/* BADGE DURÉE — toujours visible pour vidéos */}
       {isVideo && (
@@ -32422,6 +32451,8 @@ const MediaCard = ({ media, isSent, onClick, style: styleProp = {} }) => {
 // Alias pour backward-compat si référencé ailleurs
 const MediaThumbnail = MediaCard;
 
+const LIBRARY_BATCH_SIZE = 30;
+
 const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrls = [], chatId }) => {
   const [activeTab, setActiveTab] = React.useState('all');
   const [searchQuery, setSearchQuery] = React.useState('');
@@ -32430,6 +32461,8 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
   const [confirmMedia, setConfirmMedia] = React.useState(null);
   const [sentMediaIds, setSentMediaIds] = React.useState([]);
   const [customAlbums, setCustomAlbums] = React.useState([]);
+  const [visibleCount, setVisibleCount] = React.useState(LIBRARY_BATCH_SIZE);
+  const loadMoreRef = React.useRef(null);
 
   // Load sent media IDs+URLs for this spender (cross-model)
   React.useEffect(() => {
@@ -32501,6 +32534,26 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
     }
     return result;
   }, [medias, activeTab, searchQuery]);
+
+  // Reset pagination when filter/search changes
+  React.useEffect(() => {
+    setVisibleCount(LIBRARY_BATCH_SIZE);
+  }, [activeTab, searchQuery]);
+
+  const visibleMedias = React.useMemo(() => filteredMedias.slice(0, visibleCount), [filteredMedias, visibleCount]);
+
+  // IntersectionObserver for infinite scroll "load more"
+  React.useEffect(() => {
+    const node = loadMoreRef.current;
+    if (!node) return;
+    const obs = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        setVisibleCount(prev => prev + LIBRARY_BATCH_SIZE);
+      }
+    }, { threshold: 0.1 });
+    obs.observe(node);
+    return () => obs.disconnect();
+  }, [visibleCount, filteredMedias.length]);
 
   const handleSelectMedia = (media) => {
     if (sentMediaIds.includes(media.id) || sentMediaUrls.includes(media.url)) return;
@@ -32581,8 +32634,8 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
               style={{ background: 'rgba(255,255,255,0.1)', border: 'none', borderRadius: '50%', width: 32, height: 32, color: 'white', fontSize: 18, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>
           </div>
 
-          {/* Grid */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+          {/* Grid — GPU-accelerated scroll container */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: 16, WebkitOverflowScrolling: 'touch', willChange: 'scroll-position', contain: 'layout style paint' }}>
             {loading ? (
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#6b7280' }}>Chargement…</div>
             ) : filteredMedias.length === 0 ? (
@@ -32592,7 +32645,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
               </div>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 }}>
-                {filteredMedias.map((media, idx) => {
+                {visibleMedias.map((media, idx) => {
                   const isSent = sentMediaIds.includes(media.id) || sentMediaUrls.includes(media.url);
                   return (
                     <MediaCard
@@ -32603,6 +32656,19 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
                     />
                   );
                 })}
+                {visibleCount < filteredMedias.length && (
+                  <div ref={loadMoreRef} style={{
+                    height: 40,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#9CA3AF',
+                    fontSize: 13,
+                    gridColumn: '1 / -1'
+                  }}>
+                    Chargement…
+                  </div>
+                )}
               </div>
             )}
           </div>
