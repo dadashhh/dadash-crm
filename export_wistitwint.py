@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Export TWINT Wistitwint transactions from Supabase via REST API."""
+"""Export ALL Twint transactions from Supabase (Wistiti Twint period)."""
 
 import json
+import os
+import ssl
 import urllib.request
 import urllib.parse
-
-import os
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://lkrzjwfwhiimpnsyeuxi.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY", "")
 
 if not SUPABASE_KEY:
     print("ERROR: Set SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY env var")
-    print("  export SUPABASE_SERVICE_ROLE_KEY='eyJ...'")
     exit(1)
 
 DATE_FROM = "2026-03-14T16:07:00+00:00"
@@ -21,121 +20,115 @@ DATE_TO = "2026-03-20T23:59:59+00:00"
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=representation",
 }
 
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
 
-def supabase_get(endpoint, params=None):
-    """Make a GET request to Supabase REST API."""
-    url = f"{SUPABASE_URL}/rest/v1/{endpoint}"
-    if params:
-        url += "?" + "&".join(f"{k}={urllib.parse.quote(str(v), safe='(),.*')}" for k, v in params.items())
+
+def api_get(qs):
+    url = f"{SUPABASE_URL}/rest/v1/transactions?{qs}"
     req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, context=CTX) as resp:
         return json.loads(resp.read().decode())
 
 
 def main():
-    print("=== Export Wistitwint Transactions ===\n")
+    print("=== Export Twint (Wistiti) Transactions ===")
+    print(f"Period: {DATE_FROM} -> {DATE_TO}\n")
 
-    # Query transactions with joins via PostgREST select syntax
+    date_from = urllib.parse.quote(DATE_FROM)
+    date_to = urllib.parse.quote(DATE_TO)
+
+    # With spenders + models joins
     select = (
-        "id,created_at,amount,description,status,"
-        "spender_id,model_id,chatter_id,"
-        "spenders(id,name,tg_user_id,notes),"
-        "models(id,name,tg_session_account),"
-        "chatters(id,name)"
+        "id,date,created_at,amount,currency,payment_method,product,tag,"
+        "status,notes,spender_handle,spender_id,model_id,chatter_id,"
+        "provider_id,net_amount,provider_fee,dada_fee,chatter_commission,margin,"
+        "amount_original,currency_original,channel,validated_at,"
+        "spenders(id,name,tg_user_id,handle,notes),"
+        "models(id,name)"
     )
 
-    params = {
-        "select": select,
-        "created_at": f"gte.{DATE_FROM}",
-        "and": f"(created_at.lte.{DATE_TO},description.ilike.*wistitwint*,or(status.eq.completed,status.eq.pending))",
-        "order": "created_at.desc",
-        "limit": "1000",
-    }
+    qs = (
+        f"select={urllib.parse.quote(select)}"
+        f"&created_at=gte.{date_from}"
+        f"&created_at=lte.{date_to}"
+        f"&payment_method=eq.Twint"
+        f"&status=neq.cancelled"
+        f"&order=created_at.desc"
+        f"&limit=1000"
+    )
 
     try:
-        rows = supabase_get("transactions", params)
+        rows = api_get(qs)
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        print(f"HTTP {e.code}: {body}")
-        # Fallback: try without the joins to see if relationship names differ
-        print("\nRetrying without joins...")
-        params["select"] = "*"
-        try:
-            rows = supabase_get("transactions", params)
-        except urllib.error.HTTPError as e2:
-            body2 = e2.read().decode()
-            print(f"HTTP {e2.code}: {body2}")
-            # Try even simpler - just get any transactions in range
-            print("\nTrying simplest query (all transactions in date range)...")
-            params2 = {
-                "select": "*",
-                "created_at": f"gte.{DATE_FROM}",
-                "order": "created_at.desc",
-                "limit": "5",
-            }
-            try:
-                sample = supabase_get("transactions", params2)
-                if sample:
-                    print(f"Found {len(sample)} sample rows. Columns: {list(sample[0].keys())}")
-                    for r in sample:
-                        print(f"  desc={r.get('description','?')!r}  status={r.get('status','?')}  date={r.get('created_at','?')}")
-                else:
-                    print("No transactions in date range at all.")
-            except urllib.error.HTTPError as e3:
-                print(f"HTTP {e3.code}: {e3.read().decode()}")
-            return
+        print(f"Join query failed: {body}")
+        # Fallback: no joins
+        qs2 = (
+            f"select=*"
+            f"&created_at=gte.{date_from}"
+            f"&created_at=lte.{date_to}"
+            f"&payment_method=eq.Twint"
+            f"&status=neq.cancelled"
+            f"&order=created_at.desc"
+            f"&limit=1000"
+        )
+        rows = api_get(qs2)
 
     if not rows:
-        print("No transactions found with status filter. Trying without status filter...")
-        params2 = {
-            "select": select,
-            "created_at": f"gte.{DATE_FROM}",
-            "and": f"(created_at.lte.{DATE_TO},description.ilike.*wistitwint*)",
-            "order": "created_at.desc",
-            "limit": "1000",
-        }
-        try:
-            rows = supabase_get("transactions", params2)
-        except urllib.error.HTTPError:
-            # Try without joins
-            params2["select"] = "*"
-            rows = supabase_get("transactions", params2)
-
-    if not rows:
-        print("No wistitwint transactions found in this period.")
+        print("No Twint transactions found.")
         return
 
-    # Format output
+    # Format
     export = []
     for row in rows:
-        spender = row.get("spenders") or {}
-        model = row.get("models") or {}
-        chatter = row.get("chatters") or {}
+        spender = row.get("spenders") if isinstance(row.get("spenders"), dict) else {}
+        model = row.get("models") if isinstance(row.get("models"), dict) else {}
 
         export.append({
             "transaction_id": row.get("id"),
             "date": row.get("created_at"),
-            "spender_name": spender.get("name") if isinstance(spender, dict) else None,
-            "spender_tg_id": spender.get("tg_user_id") if isinstance(spender, dict) else None,
-            "spender_notes": spender.get("notes") if isinstance(spender, dict) else None,
-            "model_name": model.get("name") if isinstance(model, dict) else None,
+            "spender_name": spender.get("name") or row.get("spender_handle"),
+            "spender_tg_id": spender.get("tg_user_id"),
+            "spender_notes": spender.get("notes"),
+            "spender_handle": row.get("spender_handle"),
+            "model_name": model.get("name"),
             "amount_eur": row.get("amount"),
-            "description": row.get("description"),
+            "currency": row.get("currency"),
+            "amount_original": row.get("amount_original"),
+            "currency_original": row.get("currency_original"),
+            "product": row.get("product"),
+            "payment_method": row.get("payment_method"),
             "status": row.get("status"),
-            "chatter_assigned": chatter.get("name") if isinstance(chatter, dict) else None,
+            "notes": row.get("notes"),
+            "net_amount": row.get("net_amount"),
+            "provider_fee": row.get("provider_fee"),
+            "dada_fee": row.get("dada_fee"),
+            "chatter_commission": row.get("chatter_commission"),
+            "margin": row.get("margin"),
+            "channel": row.get("channel"),
+            "validated_at": row.get("validated_at"),
+            "chatter_id": row.get("chatter_id"),
         })
 
-    # Save to file
+    # Save
     output_path = "/tmp/wistitwint_export.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(export, f, indent=2, ensure_ascii=False, default=str)
 
-    # Print results
+    # Summary
     print(f"TOTAL TRANSACTIONS: {len(export)}")
+    total = sum(r.get("amount_eur") or 0 for r in export)
+    currencies = set(r.get("currency") for r in export)
+    print(f"TOTAL AMOUNT: {total} ({'/'.join(c for c in currencies if c)})")
+    statuses = {}
+    for r in export:
+        s = r.get("status", "unknown")
+        statuses[s] = statuses.get(s, 0) + 1
+    print(f"BY STATUS: {statuses}")
     print(f"Exported to: {output_path}\n")
     print(json.dumps(export, indent=2, ensure_ascii=False, default=str))
 
