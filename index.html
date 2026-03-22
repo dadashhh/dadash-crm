@@ -61263,6 +61263,25 @@ const App = () => {
     return () => { clearTimeout(timer); clearTimeout(forceTimer); };
   }, [loading]);
 
+  // Cache profil pour éviter les fetch dupliqués au boot
+  let _cachedProfile = null;
+  let _cachedProfileAt = 0;
+
+  async function fetchProfileCached(userId) {
+    const now = Date.now();
+    // Cache valide 5 secondes (couvre le boot)
+    if (_cachedProfile && (now - _cachedProfileAt) < 5000) {
+      console.log("[AUTH] profile from cache");
+      return _cachedProfile;
+    }
+    const { data } = await sb.from("profiles").select("*").eq("id", userId).single();
+    if (data) {
+      _cachedProfile = data;
+      _cachedProfileAt = now;
+    }
+    return data;
+  }
+
   /* SAFARI FIX — onAuthStateChange: auto-recover user if session resolves late
      (e.g. after the 3s force-bypass showed the login page, if getSession eventually completes,
      this listener catches the SIGNED_IN event and logs the user in automatically) */
@@ -61272,7 +61291,7 @@ const App = () => {
       if (_loggedOut.current) return;
       if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session && !userRef.current) {
         try {
-          const { data: profile } = await sb.from("profiles").select("*").eq("id", session.user.id).single();
+          const profile = await fetchProfileCached(session.user.id);
           if (profile) {
             const fullUser = { ...profile, email: session.user.email };
             console.log("[SAFARI FIX] onAuthStateChange recovered user:", event);
@@ -61498,6 +61517,13 @@ const App = () => {
 
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
+    // Guard anti-double-appel concurrent
+    if (window.__loadDataRunning) {
+      console.log("[APP] loadData skipped (already running)");
+      return;
+    }
+    window.__loadDataRunning = true;
+    try {
     if (window.PERF) window.PERF.mark('loadData_start');
     const thisVersion = ++_loadVersion.current;
     const scope = getScope(currentUser);
@@ -61754,6 +61780,9 @@ const App = () => {
       } catch(e) { /* notifications fetch failed */ }
     }
     if (window.PERF) { window.PERF.mark('loadData_done'); window.PERF.measure('loadData total', 'loadData_start'); }
+    } finally {
+      window.__loadDataRunning = false;
+    }
   };
 
   // ── NOTIFICATION HELPERS ──
@@ -61874,10 +61903,10 @@ const App = () => {
         if (signal && signal.aborted) throw new Error("Auth init annulé");
         if(session) {
           if (window.PERF) window.PERF.mark('profile_fetch_start');
-          const {data:profile, error:profileErr} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
-          if (profileErr) {
-            console.error("[DADASH] Profile fetch error:", profileErr.message);
-            addToast("Erreur chargement profil: " + profileErr.message, "error");
+          const profile = await fetchProfileCached(session.user.id);
+          if (!profile) {
+            console.error("[DADASH] Profile fetch returned null");
+            addToast("Erreur chargement profil", "error");
           }
           if(profile) {
             if (window.PERF) window.PERF.mark('profile_fetch_done');
@@ -61909,7 +61938,7 @@ const App = () => {
           try {
             const {data:{session}} = await sb.auth.getSession();
             if (session) {
-              const {data:profile} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
+              const profile = await fetchProfileCached(session.user.id);
               if (profile) {
                 const fullUser = {...profile, email:session.user.email};
                 setUser(fullUser);
