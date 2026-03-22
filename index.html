@@ -32429,11 +32429,23 @@ const mergeMessages = (prev, serverList) => {
   const serverIds   = new Set(serverList.map(m => _msgKey(m)).filter(Boolean));
   const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()).filter(Boolean));
   // Keep pending/error/sent-but-unconfirmed messages not yet on server
-  const localOnly = prev.filter(m =>
-    (m._pending || m._error || m._sent) &&
-    !serverIds.has(_msgKey(m)) &&
-    !serverTexts.has((m.text || "").trim())
-  );
+  const localOnly = prev.filter(m => {
+    if (!(m._pending || m._error || m._sent)) return false;
+    if (serverIds.has(_msgKey(m))) return false;
+    // Text-based dedup : seulement si un message serveur RÉCENT (<2min) a le même texte
+    // Évite les faux positifs avec des vieux messages qui ont le même texte
+    const mText = (m.text || "").trim();
+    if (mText) {
+      const mTime = new Date(m.created_at || 0).getTime();
+      const recentTextMatch = serverList.some(s => {
+        if ((s.text || s.content || s.message || "").trim() !== mText) return false;
+        const sTime = new Date(s.created_at || s.timestamp || 0).getTime();
+        return Math.abs(sTime - mTime) < 120000; // 2 minutes
+      });
+      if (recentTextMatch) return false; // Le serveur a le message → safe to drop
+    }
+    return true; // Garder le pending/sent
+  });
   // Merge: server list + unconfirmed locals, dedup by stable key
   const merged = new Map();
   serverList.forEach((m, i) => {
@@ -40238,6 +40250,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // Verrou anti-doublon pour sendMessage (ref synchrone, pas de race condition)
   const isSendingMsgRef = React.useRef(false);
   const lastSendTimestampRef = React.useRef(0);
+  // Guard : bloque le polling pendant l'envoi + réconciliation (évite merge stale)
+  const isSendingRef = React.useRef(false);
   // Ref miroir de scriptStates pour accès depuis useCallback sans dépendances
   const scriptStatesRef = React.useRef({});
   // Ref for messages scroll container
@@ -40501,6 +40515,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
+    // Ne pas poll pendant un envoi en cours (évite d'écraser le pending)
+    if (!isInitial && isSendingRef.current) return;
     if (isInitial) isInitialLoadingRef.current = true;
     const cid = String(chatId);
     if (_DADASH_DEBUG) console.log('🔍 [MSG-DIAG] Function called:', {
@@ -41407,6 +41423,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
     isSendingMsgRef.current = true;
     lastSendTimestampRef.current = now;
+    isSendingRef.current = true;
+    // Safety timeout : débloquer le polling après 20s max
+    const sendGuardTimeout = setTimeout(() => { isSendingRef.current = false; }, 20000);
 
     const text = msgInputRef.current.trim();
     // Clear input immediately — snappy UX, don't wait for API
@@ -41487,9 +41506,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           const list = (Array.isArray(data) ? data : (data.messages || data.data || [])).map(normalizeMessage).filter(Boolean);
           setMessages(prev => mergeMessages(prev, list));
         } catch (_) { /* keep confirmed state */ }
+        clearTimeout(sendGuardTimeout);
+        isSendingRef.current = false;
       }, 3000);
 
     } catch (e) {
+      clearTimeout(sendGuardTimeout);
+      isSendingRef.current = false;
       // Don't remove — mark the message as failed so user sees it and can retry
       setMessages(prev => prev.map(m =>
         m.id === localId ? { ...m, _pending: false, pending: false, _error: true, error: true, _chatId: chatId, _modelId: selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined } : m
