@@ -17,20 +17,29 @@ self.addEventListener('fetch', e => {
   const isNav = e.request.mode === 'navigate';
   const isNeverCache = isNav || NEVER_CACHE.some(p => url.pathname === p || url.pathname.endsWith(p));
 
+  // Navigation / index.html : network-first avec fallback sûr
   if (isNeverCache) {
     e.respondWith(
-      fetch(e.request).catch(() => caches.match(e.request))
+      fetch(e.request)
+        .catch(() => caches.match(e.request))
+        .then(resp => {
+          if (resp) return resp;
+          // Fallback ultime : si RIEN ne fonctionne, retourner une page d'erreur
+          return new Response(
+            '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DADASH</title></head><body style="background:#0F0F0F;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center"><div><h2>Connexion perdue</h2><p>Vérifie ta connexion internet puis rafraîchis.</p><button onclick="location.reload()" style="margin-top:16px;padding:12px 24px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer">Rafraîchir</button></div></body></html>',
+            { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+          );
+        })
     );
     return;
   }
 
-  // Ne jamais intercepter les requêtes cross-origin (Supabase, Carlos, CDNs, APIs)
-  // — les laisser passer directement au navigateur sans cache ni gestion SW
+  // Cross-origin : laisser le navigateur gérer
   if (url.origin !== self.location.origin) {
     return;
   }
 
-  // Same-origin uniquement : cache-first avec fallback réseau
+  // Same-origin GET : cache-first avec stale-while-revalidate
   if (e.request.method === 'GET') {
     e.respondWith(
       caches.match(e.request).then(cached => {
@@ -40,7 +49,7 @@ self.addEventListener('fetch', e => {
             caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
           }
           return response;
-        }).catch(() => cached);
+        }).catch(() => cached || new Response('', { status: 408 }));
         return cached || fetchPromise;
       })
     );
