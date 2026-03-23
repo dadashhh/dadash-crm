@@ -30953,6 +30953,8 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
   // selectedConv ne doit être modifié QUE par un clic utilisateur (selectConv).
   // Les rechargements de la liste ne doivent jamais réinitialiser selectedConv.
   const convLoadedRef = React.useRef(false);
+  const msgCacheRef = React.useRef({}); // { [convId]: { data: [...], ts: number } }
+  const abortMsgRef = React.useRef(null);
 
   const loadConversations = useCallback(async () => {
     setLoadError(null);
@@ -30980,14 +30982,15 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
     else setLoading(false);
   }, [loadConversations, myModelIds?.length]);
 
-  const loadMessages = async (convId) => {
+  const loadMessages = async (convId, silent = false) => {
     console.log('🔍 [MSG-DIAG] Function called:', {
       functionName: 'loadMessages',
       subpage: 'ChatterMessagerieTab',
       convId: convId || 'undefined',
+      silent,
       timestamp: new Date().toISOString()
     });
-    setIsLoadingMessages(true);
+    if (!silent) setIsLoadingMessages(true);
 
     try {
       console.log('[MESSAGES] 📥 Loading for conv:', convId);
@@ -30998,7 +31001,11 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
         .select('*')
         .eq('conversation_id', convId)
         .order('created_at', { ascending: false })
-        .limit(100);
+        .limit(100)
+        .abortSignal(abortMsgRef.current?.signal);
+
+      // Si aborté, ne rien faire
+      if (abortMsgRef.current?.signal?.aborted) return;
 
       if (error) throw error;
 
@@ -31019,18 +31026,26 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
           hint: 'Vérifier si conversation_id match dans la DB'
         });
       }
-      setMessages((data || []).reverse());
+      const sorted = (data || []).reverse();
+      setMessages(sorted);
 
-      // SCROLL AUTO EN BAS (instant pour ouverture)
-      setTimeout(() => {
-        scrollToBottom('instant');
-      }, 100);
+      // ── FIX: Écrire dans le cache ──
+      if (sorted.length > 0) {
+        msgCacheRef.current[convId] = { data: sorted, ts: Date.now() };
+      }
+
+      if (!silent) {
+        // SCROLL AUTO EN BAS (instant pour ouverture)
+        setTimeout(() => {
+          scrollToBottom('instant');
+        }, 100);
+      }
 
     } catch (err) {
       console.error('[MESSAGES] ❌ Error:', err);
-      setMessages([]);
+      if (!silent) setMessages([]);
     } finally {
-      setIsLoadingMessages(false);
+      if (!silent) setIsLoadingMessages(false);
     }
   };
 
@@ -31056,8 +31071,30 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
       (c.chat_id || c.tg_chat_id) === (conv.chat_id || conv.tg_chat_id)
         ? { ...c, unread_count: 0 } : c
     ));
+
+    // ── FIX: Sauvegarder les messages actuels dans le cache avant de quitter ──
+    if (selectedConv?.id && messages.length > 0) {
+      msgCacheRef.current[selectedConv.id] = { data: [...messages], ts: Date.now() };
+    }
+
     setSelectedConv(conv);
-    loadMessages(conv.id);
+
+    // ── FIX: Annuler le fetch précédent ──
+    if (abortMsgRef.current) abortMsgRef.current.abort();
+    const controller = new AbortController();
+    abortMsgRef.current = controller;
+
+    // ── FIX: Afficher le cache immédiatement si disponible (TTL 120s) ──
+    const cached = msgCacheRef.current[conv.id];
+    if (cached && Date.now() - cached.ts < 120000 && cached.data.length > 0) {
+      setMessages(cached.data);
+      setIsLoadingMessages(false);
+      // Refresh silencieux en arrière-plan
+      loadMessages(conv.id, true);
+    } else {
+      loadMessages(conv.id);
+    }
+    setAssignDropdown(null);
   };
 
   const isBlocked = (text) => {
@@ -31075,7 +31112,7 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
     }
     setSending(true);
     try {
-      const {error} = await sb.from("tg_messages").insert({conversation_id: selectedConv.id, direction: "out", sender_profile_id: user.id, text: msgInput.trim()});
+      const {error} = await sb.from("tg_messages").insert({conversation_id: selectedConv.id, direction: "out", sender_type: "human", sender_id: user.id, sender_profile_id: user.id, text: msgInput.trim(), content: msgInput.trim()});
       if (error) { addToast("Erreur: " + error.message, "error"); setSending(false); return; }
       // Log
       try { await sb.from("chatter_logs").insert({chatter_id: user.id, conversation_id: selectedConv.id, action: "message_sent", content: msgInput.trim().slice(0, 200)}); } catch(e) { /* Chatter log write failed */ }
@@ -40816,7 +40853,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       cacheLastMsg: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
       cacheLastDate: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.timestamp || 'N/A'
     });
-    if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
+    if (cached && cached.data.length > 0) {
+      // Afficher le cache même si expiré — le fetch en cours le remplacera
       setMessages(cached.data.map(normalizeMessage).filter(Boolean));
     } else {
       setMessages([]);
