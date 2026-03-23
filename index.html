@@ -32050,6 +32050,7 @@ const _DMSG_KEY_FALLBACK = window.CRM_API_KEY || "";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
 const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s (L1 RAM)
+const _CONV_UUID_TO_CHATID = {}; // { conversationUUID: tg_chat_id } — bridges Supabase realtime → active chat
 
 /** Normalize media fields: extract from meta JSONB if flat fields are missing */
 const _normalizeMsgMedia = (msgs) => {
@@ -40477,6 +40478,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     for (const c of sbList) {
       const cid = String(c.id || "");
       const chatId = String(c.tg_chat_id || c.chat_id || "");
+      // Build UUID → tg_chat_id mapping for realtime message matching
+      if (cid && chatId) _CONV_UUID_TO_CHATID[cid] = chatId;
       if (!idSet.has(cid) && !chatIdSet.has(chatId)) {
         idSet.add(cid);
         if (chatId) chatIdSet.add(chatId);
@@ -40683,6 +40686,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             .from("tg_conversations").select("id")
             .eq("tg_chat_id", cid).maybeSingle();
           if (convRow?.id) {
+            // Cache UUID→chatId mapping for realtime message matching
+            _CONV_UUID_TO_CHATID[convRow.id] = cid;
             const { data } = await sb.from("tg_messages").select("*")
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: false })
@@ -40842,6 +40847,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
+    // Ensure UUID→chatId mapping exists for realtime message matching
+    const _selCid = String(chatId || "");
+    if (_selCid && !Object.values(_CONV_UUID_TO_CHATID).includes(_selCid)) {
+      // Check if conv itself has a UUID id different from chatId (Supabase conv)
+      if (conv.id && String(conv.id) !== _selCid && /^[0-9a-f-]{36}$/i.test(String(conv.id))) {
+        _CONV_UUID_TO_CHATID[conv.id] = _selCid;
+      } else {
+        // Async lookup — fire and forget, result cached for future realtime events
+        sb.from("tg_conversations").select("id").eq("tg_chat_id", _selCid).maybeSingle()
+          .then(({ data }) => { if (data?.id) _CONV_UUID_TO_CHATID[data.id] = _selCid; });
+      }
+    }
     // Ouvrir dans les onglets
     openTab(conv);
     const cid = String(chatId || "");
@@ -41118,6 +41135,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         const belongsToActive = (() => {
           const msgChatId = String(rawMsg.tg_chat_id || rawMsg.chat_id || '');
           if (msgChatId && msgChatId === String(activeCid)) return true;
+          // Bridge: use UUID→chatId map to match Supabase realtime conversation_id to active chat
+          if (rawMsg.conversation_id) {
+            const mappedChatId = _CONV_UUID_TO_CHATID[rawMsg.conversation_id];
+            if (mappedChatId && String(mappedChatId) === String(activeCid)) return true;
+          }
           const cached = _DMSG_MSG_CACHE[activeCid];
           if (cached?.data?.length > 0 && cached.data[0]?.conversation_id &&
               cached.data[0].conversation_id === rawMsg.conversation_id) return true;
