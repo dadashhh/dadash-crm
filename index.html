@@ -40392,22 +40392,71 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     let apiOk_ = false;
 
     // ── 0.4 Promise.allSettled : Carlos + Supabase en parallèle ─────────────
-    let _convSbQuery = sb.from("tg_conversations").select("*");
-    if (userProfile?.role === "chatter") {
-      const _assigned = userProfile.assigned_models || [];
-      if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
-    }
-    _convSbQuery = _convSbQuery.order("last_message_at", { ascending: false });
+    // Supabase: fetch ALL conversations in pages of 1000 to bypass default 1000-row limit
+    const _fetchAllSupabase = async () => {
+      const PAGE_SIZE = 1000;
+      let allRows = [];
+      let offset = 0;
+      let hasMore = true;
+      while (hasMore) {
+        let q = sb.from("tg_conversations").select("*");
+        if (userProfile?.role === "chatter") {
+          const _assigned = userProfile.assigned_models || [];
+          if (_assigned.length > 0) q = q.in("model_id", _assigned);
+        }
+        q = q.order("last_message_at", { ascending: false }).range(offset, offset + PAGE_SIZE - 1);
+        const { data, error } = await q;
+        if (error) { console.warn("[CONV] Supabase page error:", error.message); break; }
+        if (!data || data.length === 0) break;
+        allRows = allRows.concat(data);
+        hasMore = data.length === PAGE_SIZE;
+        offset += PAGE_SIZE;
+      }
+      if (allRows.length > 1000) console.log(`[CONV] Supabase pagination: fetched ${allRows.length} rows across ${Math.ceil(allRows.length / PAGE_SIZE)} pages`);
+      return allRows;
+    };
+
+    // Carlos: fetch with pagination if API supports it (offset/limit params)
+    const _fetchAllCarlos = async () => {
+      const PAGE_SIZE = 500;
+      // First call: try without pagination to check response format
+      const data = await _dmsgFetch("/conversations");
+      const firstPage = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      const total = data.total || data.count || null;
+
+      // If API reports a total higher than returned items, paginate
+      if (total && total > firstPage.length) {
+        console.warn(`[CONV] Carlos returned ${firstPage.length}/${total} — fetching remaining pages`);
+        let allItems = [...firstPage];
+        let offset = firstPage.length;
+        while (offset < total) {
+          try {
+            const pageData = await _dmsgFetch(`/conversations?limit=${PAGE_SIZE}&offset=${offset}`);
+            const page = Array.isArray(pageData) ? pageData : (pageData.conversations || pageData.data || []);
+            if (!page.length) break;
+            allItems = allItems.concat(page);
+            offset += page.length;
+          } catch (e) { console.warn("[CONV] Carlos pagination error at offset", offset, e.message); break; }
+        }
+        console.log(`[CONV] Carlos pagination complete: ${allItems.length}/${total} conversations`);
+        return allItems;
+      }
+
+      // Heuristic: if returned count is a round number (multiple of 100), API might be truncating silently
+      if (firstPage.length > 0 && firstPage.length % 100 === 0) {
+        console.warn(`[CONV] ⚠️ Carlos returned exactly ${firstPage.length} conversations — possible server-side LIMIT truncation!`);
+      }
+      return firstPage;
+    };
 
     const [_convApiRes, _convSbRes] = await Promise.allSettled([
-      _dmsgFetch("/conversations"),
-      _convSbQuery,
+      _fetchAllCarlos(),
+      _fetchAllSupabase(),
     ]);
 
     // 1. Carlos result
     if (_convApiRes.status === "fulfilled") {
-      const data = _convApiRes.value;
-      apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
+      apiList = _convApiRes.value;
       apiOk_ = true;
     } else {
       console.warn("[CONV] Carlos API error, will use Supabase only:", _convApiRes.reason?.message);
@@ -40416,8 +40465,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // 2. Supabase result
     let sbList = [];
     if (_convSbRes.status === "fulfilled") {
-      const { data: sbData, error } = _convSbRes.value;
-      if (!error && sbData) sbList = sbData;
+      sbList = _convSbRes.value;
     }
 
     // 3. Merge: API results take priority, Supabase fills gaps ONLY for missing chat_ids
@@ -40450,10 +40498,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     let list = merged;
 
-    // Debug: log model distribution
+    // Debug: log model distribution + gap detection
     const byModel = {};
     list.forEach(c => { const mid = c.model_id || "unknown"; byModel[mid] = (byModel[mid] || 0) + 1; });
-    console.log(`[CONV] Loaded ${list.length} conversations (API: ${apiList.length}, Supabase added: ${sbAdded})`, byModel);
+    console.log(`[CONV] Loaded ${list.length} conversations (API: ${apiList.length}, Supabase: ${sbList.length}, Supabase added after dedup: ${sbAdded})`, byModel);
+    if (sbList.length > apiList.length + 50) {
+      console.warn(`[CONV] ⚠️ GAP DETECTED: Supabase has ${sbList.length} rows but Carlos API returned only ${apiList.length}. ${sbAdded} conversations rescued from Supabase.`);
+    }
 
     // Filtrage sécurité côté client pour les chatters
     if (userProfile?.role === 'chatter') {
