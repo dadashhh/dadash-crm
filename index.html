@@ -30953,8 +30953,6 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
   // selectedConv ne doit être modifié QUE par un clic utilisateur (selectConv).
   // Les rechargements de la liste ne doivent jamais réinitialiser selectedConv.
   const convLoadedRef = React.useRef(false);
-  const msgCacheRef = React.useRef({}); // { [convId]: { data: [...], ts: number } }
-  const abortMsgRef = React.useRef(null);
 
   const loadConversations = useCallback(async () => {
     setLoadError(null);
@@ -30982,15 +30980,14 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
     else setLoading(false);
   }, [loadConversations, myModelIds?.length]);
 
-  const loadMessages = async (convId, silent = false) => {
+  const loadMessages = async (convId) => {
     console.log('🔍 [MSG-DIAG] Function called:', {
       functionName: 'loadMessages',
       subpage: 'ChatterMessagerieTab',
       convId: convId || 'undefined',
-      silent,
       timestamp: new Date().toISOString()
     });
-    if (!silent) setIsLoadingMessages(true);
+    setIsLoadingMessages(true);
 
     try {
       console.log('[MESSAGES] 📥 Loading for conv:', convId);
@@ -31001,11 +30998,7 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
         .select('*')
         .eq('conversation_id', convId)
         .order('created_at', { ascending: false })
-        .limit(100)
-        .abortSignal(abortMsgRef.current?.signal);
-
-      // Si aborté, ne rien faire
-      if (abortMsgRef.current?.signal?.aborted) return;
+        .limit(100);
 
       if (error) throw error;
 
@@ -31026,26 +31019,18 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
           hint: 'Vérifier si conversation_id match dans la DB'
         });
       }
-      const sorted = (data || []).reverse();
-      setMessages(sorted);
+      setMessages((data || []).reverse());
 
-      // ── FIX: Écrire dans le cache ──
-      if (sorted.length > 0) {
-        msgCacheRef.current[convId] = { data: sorted, ts: Date.now() };
-      }
-
-      if (!silent) {
-        // SCROLL AUTO EN BAS (instant pour ouverture)
-        setTimeout(() => {
-          scrollToBottom('instant');
-        }, 100);
-      }
+      // SCROLL AUTO EN BAS (instant pour ouverture)
+      setTimeout(() => {
+        scrollToBottom('instant');
+      }, 100);
 
     } catch (err) {
       console.error('[MESSAGES] ❌ Error:', err);
-      if (!silent) setMessages([]);
+      setMessages([]);
     } finally {
-      if (!silent) setIsLoadingMessages(false);
+      setIsLoadingMessages(false);
     }
   };
 
@@ -31071,30 +31056,8 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
       (c.chat_id || c.tg_chat_id) === (conv.chat_id || conv.tg_chat_id)
         ? { ...c, unread_count: 0 } : c
     ));
-
-    // ── FIX: Sauvegarder les messages actuels dans le cache avant de quitter ──
-    if (selectedConv?.id && messages.length > 0) {
-      msgCacheRef.current[selectedConv.id] = { data: [...messages], ts: Date.now() };
-    }
-
     setSelectedConv(conv);
-
-    // ── FIX: Annuler le fetch précédent ──
-    if (abortMsgRef.current) abortMsgRef.current.abort();
-    const controller = new AbortController();
-    abortMsgRef.current = controller;
-
-    // ── FIX: Afficher le cache immédiatement si disponible (TTL 120s) ──
-    const cached = msgCacheRef.current[conv.id];
-    if (cached && Date.now() - cached.ts < 120000 && cached.data.length > 0) {
-      setMessages(cached.data);
-      setIsLoadingMessages(false);
-      // Refresh silencieux en arrière-plan
-      loadMessages(conv.id, true);
-    } else {
-      loadMessages(conv.id);
-    }
-    setAssignDropdown(null);
+    loadMessages(conv.id);
   };
 
   const isBlocked = (text) => {
@@ -31112,7 +31075,7 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
     }
     setSending(true);
     try {
-      const {error} = await sb.from("tg_messages").insert({conversation_id: selectedConv.id, direction: "out", sender_type: "human", sender_id: user.id, sender_profile_id: user.id, text: msgInput.trim(), content: msgInput.trim()});
+      const {error} = await sb.from("tg_messages").insert({conversation_id: selectedConv.id, direction: "out", sender_profile_id: user.id, text: msgInput.trim()});
       if (error) { addToast("Erreur: " + error.message, "error"); setSending(false); return; }
       // Log
       try { await sb.from("chatter_logs").insert({chatter_id: user.id, conversation_id: selectedConv.id, action: "message_sent", content: msgInput.trim().slice(0, 200)}); } catch(e) { /* Chatter log write failed */ }
@@ -32050,7 +32013,6 @@ const _DMSG_KEY_FALLBACK = window.CRM_API_KEY || "";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
 const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s (L1 RAM)
-const _CONV_UUID_TO_CHATID = {}; // { conversationUUID: tg_chat_id } — bridges Supabase realtime → active chat
 
 /** Normalize media fields: extract from meta JSONB if flat fields are missing */
 const _normalizeMsgMedia = (msgs) => {
@@ -40478,8 +40440,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     for (const c of sbList) {
       const cid = String(c.id || "");
       const chatId = String(c.tg_chat_id || c.chat_id || "");
-      // Build UUID → tg_chat_id mapping for realtime message matching
-      if (cid && chatId) _CONV_UUID_TO_CHATID[cid] = chatId;
       if (!idSet.has(cid) && !chatIdSet.has(chatId)) {
         idSet.add(cid);
         if (chatId) chatIdSet.add(chatId);
@@ -40686,8 +40646,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             .from("tg_conversations").select("id")
             .eq("tg_chat_id", cid).maybeSingle();
           if (convRow?.id) {
-            // Cache UUID→chatId mapping for realtime message matching
-            _CONV_UUID_TO_CHATID[convRow.id] = cid;
             const { data } = await sb.from("tg_messages").select("*")
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: false })
@@ -40847,18 +40805,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
-    // Ensure UUID→chatId mapping exists for realtime message matching
-    const _selCid = String(chatId || "");
-    if (_selCid && !Object.values(_CONV_UUID_TO_CHATID).includes(_selCid)) {
-      // Check if conv itself has a UUID id different from chatId (Supabase conv)
-      if (conv.id && String(conv.id) !== _selCid && /^[0-9a-f-]{36}$/i.test(String(conv.id))) {
-        _CONV_UUID_TO_CHATID[conv.id] = _selCid;
-      } else {
-        // Async lookup — fire and forget, result cached for future realtime events
-        sb.from("tg_conversations").select("id").eq("tg_chat_id", _selCid).maybeSingle()
-          .then(({ data }) => { if (data?.id) _CONV_UUID_TO_CHATID[data.id] = _selCid; });
-      }
-    }
     // Ouvrir dans les onglets
     openTab(conv);
     const cid = String(chatId || "");
@@ -40870,8 +40816,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       cacheLastMsg: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
       cacheLastDate: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.timestamp || 'N/A'
     });
-    if (cached && cached.data.length > 0) {
-      // Afficher le cache même si expiré — le fetch en cours le remplacera
+    if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
       setMessages(cached.data.map(normalizeMessage).filter(Boolean));
     } else {
       setMessages([]);
@@ -41135,11 +41080,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         const belongsToActive = (() => {
           const msgChatId = String(rawMsg.tg_chat_id || rawMsg.chat_id || '');
           if (msgChatId && msgChatId === String(activeCid)) return true;
-          // Bridge: use UUID→chatId map to match Supabase realtime conversation_id to active chat
-          if (rawMsg.conversation_id) {
-            const mappedChatId = _CONV_UUID_TO_CHATID[rawMsg.conversation_id];
-            if (mappedChatId && String(mappedChatId) === String(activeCid)) return true;
-          }
           const cached = _DMSG_MSG_CACHE[activeCid];
           if (cached?.data?.length > 0 && cached.data[0]?.conversation_id &&
               cached.data[0].conversation_id === rawMsg.conversation_id) return true;
