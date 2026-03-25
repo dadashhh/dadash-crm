@@ -15195,6 +15195,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [invoiceValidateTx, setInvoiceValidateTx] = useState(null);
   const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
+  const [bulkInvoiceOpen, setBulkInvoiceOpen] = useState(false);
+  const [bulkEligibleTxs, setBulkEligibleTxs] = useState([]);
   const [txCardFilter, setTxCardFilter] = useState(null);
   const [txChartMetric, setTxChartMetric] = useState("ca");
   const [spSearch, setSpSearch] = useState("");
@@ -15489,6 +15491,27 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
         provider={txProvider} setProvider={setTxProvider} showProviderFilter={user.role==="gerant"}
         chatter={chatter} setChatter={setChatter} showChatterFilter={user.role==="gerant"}
         status={status} setStatus={setStatus} showStatusFilter />
+      {user.role==="gerant" && (()=>{
+        const _elCount = (displayTxs||[]).filter(tx=>(tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee")&&!tx.invoice_url).length;
+        if (_elCount === 0) return null;
+        return (
+          <div style={{marginBottom:10,display:"flex",alignItems:"center",gap:10}}>
+            <button onClick={async()=>{
+              let query = sb.from('transactions').select('*').in('status',['validated','confirmee','payee']).or('invoice_url.is.null,invoice_url.eq.');
+              if(txProvider) query = query.eq('provider_id',txProvider);
+              const {data}=await query.order('created_at',{ascending:false});
+              setBulkEligibleTxs(data||[]);
+              setBulkInvoiceOpen(true);
+            }} style={{
+              background:'linear-gradient(135deg, #6366f1, #818cf8)',color:'white',border:'none',borderRadius:8,
+              padding:'6px 14px',fontSize:13,fontWeight:700,cursor:'pointer',display:'inline-flex',alignItems:'center',gap:6,
+            }}>
+              📄 {fr?`Générer les factures manquantes`:`Generate missing invoices`}
+            </button>
+            <span style={{fontSize:11,color:'var(--text-tertiary)'}}>{_elCount} {fr?'sur cette page':'on this page'}</span>
+          </div>
+        );
+      })()}
       {/* ── KPI ROW Transactions (6 cartes) ── */}
       {(()=>{
         const vTx = _kpiAllTxs.filter(tx=>tx.status==="validated"||tx.status==="validé"||tx.status==="confirmee"||tx.status==="payee");
@@ -15788,13 +15811,14 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
                     </td>
                     <td style={{textAlign:"center"}}>
                       {tx.invoice_url ? (
-                        <span
-                          title={fr?"Télécharger facture":"Download invoice"}
-                          onClick={()=>window.open(tx.invoice_url,'_blank')}
-                          style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}}
-                          onMouseEnter={e=>e.currentTarget.style.opacity="0.6"}
-                          onMouseLeave={e=>e.currentTarget.style.opacity="1"}
-                        >📄</span>
+                        tx.invoice_has_fallback ? (
+                          <span style={{display:"inline-flex",alignItems:"center",gap:2}}>
+                            <span title={fr?"Voir facture (données incomplètes)":"View invoice (incomplete data)"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                            <button onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}} title={fr?"Regénérer avec les vraies données":"Regenerate with real data"} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,padding:0,lineHeight:1}}>⚠️</button>
+                          </span>
+                        ) : (
+                          <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                        )
                       ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
                         <button
                           onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
@@ -15912,10 +15936,23 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
           lang={lang}
           models={models}
           onSuccess={(txId, invoiceUrl) => {
-            const updater = (prev) => (prev || []).map(t => t.id === txId ? { ...t, invoice_url: invoiceUrl } : t);
+            const updater = (prev) => (prev || []).map(t => t.id === txId ? { ...t, invoice_url: invoiceUrl, invoice_has_fallback: false } : t);
             if (setSrvData && srvData) setSrvData(updater);
             if (setTxs) setTxs(updater);
             if (setTxSummary) setTxSummary(updater);
+          }}
+        />
+      )}
+      {bulkInvoiceOpen && (
+        <BulkInvoiceModal
+          eligibleTxs={bulkEligibleTxs}
+          open={bulkInvoiceOpen}
+          onClose={() => setBulkInvoiceOpen(false)}
+          lang={lang}
+          models={models}
+          onComplete={() => {
+            if (onRefresh) onRefresh();
+            fetchTxPage(srvPage);
           }}
         />
       )}
@@ -24438,6 +24475,9 @@ const SingleInvoiceModal = ({ tx, open, onClose, onSuccess, lang, models }) => {
         lang: lang,
       });
       if (result.success) {
+        if (tx.invoice_has_fallback) {
+          await sb.from('transactions').update({ invoice_has_fallback: false }).eq('id', tx.id);
+        }
         addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
         if (onSuccess) onSuccess(tx.id, result.invoice_url);
         onClose();
@@ -24547,6 +24587,272 @@ const SingleInvoiceModal = ({ tx, open, onClose, onSuccess, lang, models }) => {
                 }}>{isGenerating ? (fr ? 'Génération…' : 'Generating…') : (fr ? 'Générer la facture' : 'Generate invoice')}</button>
               </div>
             </>
+          )}
+        </div>
+      </div>
+    </ModalShell>
+  );
+};
+
+// =============================================
+// BULK INVOICE MODAL — Generate all missing invoices
+// =============================================
+const BulkInvoiceModal = ({ eligibleTxs, open, onClose, onComplete, lang, models }) => {
+  const addToast = useToast();
+  const fr = (lang || 'fr') === 'fr';
+  const [step, setStep] = useState('recap');
+  const [scope, setScope] = useState('all');
+  const [readyList, setReadyList] = useState([]);
+  const [fallbackList, setFallbackList] = useState([]);
+  const [progress, setProgress] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [currentTx, setCurrentTx] = useState(null);
+  const [generated, setGenerated] = useState(0);
+  const [fallbackCount, setFallbackCount] = useState(0);
+  const [errors, setErrors] = useState([]);
+  const [cancelled, setCancelled] = useState(false);
+  const cancelledRef = useRef(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!open || !eligibleTxs?.length) { setLoading(false); return; }
+    setStep('recap'); setScope('all'); setLoading(true);
+    setGenerated(0); setFallbackCount(0); setErrors([]); setCancelled(false);
+    cancelledRef.current = false;
+    (async () => {
+      const ready = [];
+      const fallback = [];
+      for (const tx of eligibleTxs) {
+        if (!tx.spender_id) { fallback.push(tx); continue; }
+        const { data: spender } = await sb
+          .from('spenders')
+          .select('billing_full_name, billing_phone')
+          .eq('id', tx.spender_id)
+          .maybeSingle();
+        if (spender?.billing_full_name && spender?.billing_phone) {
+          ready.push(tx);
+        } else {
+          fallback.push(tx);
+        }
+      }
+      setReadyList(ready);
+      setFallbackList(fallback);
+      setLoading(false);
+    })();
+  }, [open, eligibleTxs]);
+
+  const startGeneration = async () => {
+    setStep('progress');
+    cancelledRef.current = false;
+    const txsToProcess = scope === 'ready' ? readyList : [...readyList, ...fallbackList];
+    const tot = txsToProcess.length;
+    setTotal(tot);
+    let genCount = 0;
+    let fbCount = 0;
+    const errs = [];
+
+    for (let i = 0; i < tot; i++) {
+      if (cancelledRef.current) break;
+      const tx = txsToProcess[i];
+      setProgress(i + 1);
+      setCurrentTx(tx);
+
+      try {
+        const { providerInfo, clientInfo, invoiceData, hasFallback } =
+          await resolveInvoiceData(tx, sb, models || []);
+        const result = await generateAndUploadInvoice({
+          invoiceData, providerInfo, clientInfo, supabaseClient: sb, lang: lang,
+        });
+        if (result.success) {
+          genCount++;
+          if (hasFallback) {
+            fbCount++;
+            await sb.from('transactions').update({ invoice_has_fallback: true }).eq('id', tx.id);
+          }
+        } else {
+          errs.push({ tx, error: result.error });
+        }
+      } catch (err) {
+        errs.push({ tx, error: err.message });
+      }
+      if (i < tot - 1 && !cancelledRef.current) {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    setGenerated(genCount);
+    setFallbackCount(fbCount);
+    setErrors(errs);
+    setStep('done');
+  };
+
+  const handleCancel = () => {
+    if (step === 'progress') {
+      cancelledRef.current = true;
+      setCancelled(true);
+    } else {
+      onClose();
+    }
+  };
+
+  const handleDone = () => {
+    if (onComplete) onComplete();
+    onClose();
+  };
+
+  const progressPct = total > 0 ? Math.round((progress / total) * 100) : 0;
+
+  return (
+    <ModalShell open={!!open} onClose={step === 'progress' ? undefined : onClose} closeOnBackdrop={step !== 'progress'} closeOnEsc={step !== 'progress'}>
+      <div style={{
+        background: 'var(--bg-modal, #0a0c12)',
+        border: '1px solid var(--border-default)',
+        borderRadius: _isMobile ? '16px 16px 0 0' : 16,
+        width: _isMobile ? '100%' : 500,
+        maxWidth: '96vw',
+        maxHeight: _isMobile ? '94vh' : '85vh',
+        overflowY: 'auto',
+        boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+      }}>
+        <div style={{
+          padding: '16px 20px',
+          borderBottom: '1px solid var(--border-default)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--text-primary)' }}>
+            📄 {fr ? 'Génération bulk de factures' : 'Bulk invoice generation'}
+          </div>
+          {step !== 'progress' && <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 8 }}>✕</button>}
+        </div>
+
+        <div style={{ padding: '16px 20px' }}>
+          {step === 'recap' && (
+            loading ? (
+              <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--text-tertiary)', fontSize: 13 }}>
+                {fr ? 'Analyse des transactions…' : 'Analyzing transactions…'}
+              </div>
+            ) : (
+              <>
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <span style={{ fontSize: 18 }}>✅</span>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+                      {readyList.length} {fr ? 'transaction(s) prête(s)' : 'transaction(s) ready'}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>({fr ? 'infos client complètes' : 'complete client info'})</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 18 }}>⚠️</span>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--warning, #f59e0b)' }}>
+                      {fallbackList.length} {fr ? 'transaction(s) avec fallbacks' : 'transaction(s) with fallbacks'}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>({fr ? 'nom/tél déduits ou N/A' : 'name/phone inferred or N/A'})</span>
+                  </div>
+                </div>
+                {fallbackList.length > 0 && (
+                  <div style={{
+                    background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)',
+                    borderRadius: 10, padding: '10px 14px', marginBottom: 16, fontSize: 12,
+                    color: 'var(--text-secondary)', lineHeight: 1.5,
+                  }}>
+                    {fr
+                      ? 'Les factures avec fallbacks seront marquées ⚠️ et pourront être regénérées individuellement via ➕📄.'
+                      : 'Invoices with fallbacks will be marked ⚠️ and can be individually regenerated via ➕📄.'}
+                  </div>
+                )}
+                <div style={{ marginBottom: 20 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '8px 0', fontSize: 13, color: 'var(--text-primary)' }}>
+                    <input type="radio" name="bulk-scope" checked={scope === 'ready'} onChange={() => setScope('ready')} style={{ accentColor: '#6366f1' }} />
+                    {fr ? `Générer uniquement les ${readyList.length} prêtes` : `Generate only ${readyList.length} ready`}
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', padding: '8px 0', fontSize: 13, color: 'var(--text-primary)' }}>
+                    <input type="radio" name="bulk-scope" checked={scope === 'all'} onChange={() => setScope('all')} style={{ accentColor: '#6366f1' }} />
+                    {fr ? `Générer toutes (${readyList.length + fallbackList.length} — avec fallbacks)` : `Generate all (${readyList.length + fallbackList.length} — with fallbacks)`}
+                  </label>
+                </div>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <button onClick={onClose} style={{
+                    flex: 1, padding: '10px', borderRadius: 10, border: '1px solid var(--border-default)',
+                    background: 'transparent', color: 'var(--text-secondary)', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                  }}>{fr ? 'Annuler' : 'Cancel'}</button>
+                  <button onClick={startGeneration} disabled={(scope === 'ready' ? readyList.length : readyList.length + fallbackList.length) === 0} style={{
+                    flex: 1, padding: '10px', borderRadius: 10, border: 'none',
+                    background: 'linear-gradient(135deg, #6366f1, #818cf8)', color: '#fff',
+                    fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                    opacity: (scope === 'ready' ? readyList.length : readyList.length + fallbackList.length) === 0 ? 0.5 : 1,
+                  }}>{fr ? 'Lancer la génération' : 'Start generation'}</button>
+                </div>
+              </>
+            )
+          )}
+
+          {step === 'progress' && (
+            <div>
+              <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)' }}>
+                {fr ? 'Génération en cours…' : 'Generating…'} {progress} / {total}
+              </div>
+              <div style={{
+                width: '100%', height: 8, borderRadius: 4,
+                background: 'var(--bg-raised, rgba(255,255,255,0.06))',
+                marginBottom: 12, overflow: 'hidden',
+              }}>
+                <div style={{
+                  width: `${progressPct}%`, height: '100%', borderRadius: 4,
+                  background: 'linear-gradient(90deg, #6366f1, #818cf8)',
+                  transition: 'width 0.3s ease',
+                }} />
+              </div>
+              {currentTx && (
+                <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 16 }}>
+                  TX: {currentTx.spender_handle || '—'} — {Number(currentTx.amount).toLocaleString('fr-FR')} {currentTx.currency || 'CHF'}
+                </div>
+              )}
+              <button onClick={handleCancel} style={{
+                width: '100%', padding: '10px', borderRadius: 10,
+                border: '1px solid rgba(239,68,68,0.3)', background: 'transparent',
+                color: '#EF4444', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+              }}>{fr ? 'Annuler' : 'Cancel'}</button>
+            </div>
+          )}
+
+          {step === 'done' && (
+            <div>
+              {cancelled && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, fontSize: 14, color: 'var(--warning, #f59e0b)' }}>
+                  ⚠️ {fr ? 'Génération interrompue' : 'Generation cancelled'}
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, fontSize: 14, color: 'var(--success, #10b981)' }}>
+                ✅ {generated} {fr ? 'facture(s) générée(s)' : 'invoice(s) generated'}
+              </div>
+              {fallbackCount > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, fontSize: 13, color: 'var(--warning, #f59e0b)' }}>
+                  ⚠️ {fallbackCount} {fr ? 'avec fallbacks (regénérables via ➕📄)' : 'with fallbacks (regenerable via ➕📄)'}
+                </div>
+              )}
+              {errors.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ fontSize: 13, color: '#EF4444', marginBottom: 6 }}>
+                    ❌ {errors.length} {fr ? 'erreur(s) :' : 'error(s):'}
+                  </div>
+                  <div style={{
+                    maxHeight: 120, overflowY: 'auto', fontSize: 11, color: 'var(--text-tertiary)',
+                    background: 'rgba(239,68,68,0.06)', borderRadius: 8, padding: '8px 10px',
+                  }}>
+                    {errors.map((e, i) => (
+                      <div key={i} style={{ marginBottom: 4 }}>
+                        {e.tx?.spender_handle || e.tx?.id} — {e.error}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <button onClick={handleDone} style={{
+                width: '100%', padding: '10px', borderRadius: 10, border: 'none',
+                background: 'linear-gradient(135deg, #6366f1, #818cf8)', color: '#fff',
+                fontSize: 13, fontWeight: 700, cursor: 'pointer', marginTop: 8,
+              }}>{fr ? 'Fermer' : 'Close'}</button>
+            </div>
           )}
         </div>
       </div>
@@ -25486,6 +25792,8 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
   const [provSubTab, setProvSubTab] = useState("paiements");
   const [showBillingModal, setShowBillingModal] = useState(false);
   const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
+  const [bulkInvoiceOpen, setBulkInvoiceOpen] = useState(false);
+  const [bulkEligibleTxs, setBulkEligibleTxs] = useState([]);
   const [form, setForm] = useState({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
 
   // TX stats
@@ -25739,7 +26047,19 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
 
       {/* TX list */}
       <div className="card">
-        <div className="section-title"><div className="section-bar"></div>{fr?"Mes transactions":"My transactions"}</div>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+          <div className="section-title" style={{margin:0}}><div className="section-bar"></div>{fr?"Mes transactions":"My transactions"}</div>
+          {(()=>{
+            const eligible = providerTxs.filter(tx=>(tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee")&&(!tx.invoice_url||tx.invoice_url===""));
+            return eligible.length > 0 ? (
+              <button
+                className="btn btn-sm"
+                onClick={()=>{setBulkEligibleTxs(eligible);setBulkInvoiceOpen(true);}}
+                style={{fontSize:12,padding:"4px 10px",display:"inline-flex",alignItems:"center",gap:4}}
+              >📄 {fr?`Générer ${eligible.length} facture${eligible.length>1?"s":""}`:`Generate ${eligible.length} invoice${eligible.length>1?"s":""}`}</button>
+            ) : null;
+          })()}
+        </div>
         <div className="table-wrap">
           <table className="table" style={{fontSize:12}}>
             <thead><tr><th>{t(lang,"date")}</th><th>Spender</th><th>Model</th><th>{t(lang,"amount")}</th><th style={{fontSize:11,whiteSpace:"nowrap",textAlign:"center"}}>{fr?"Facture":"Invoice"}</th><th>{t(lang,"status")}</th></tr></thead>
@@ -25751,7 +26071,14 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
                   <td><Tag type="model" label={models.find(m=>m.id===tx.model_id)?.name||"?"} id={tx.model_id}/></td>
                   <td style={{fontWeight:700}}>{fmtAmount(tx.amount,tx.currency)}</td>
                   <td style={{textAlign:"center"}}>{tx.invoice_url ? (
-                    <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                    tx.invoice_has_fallback ? (
+                      <span style={{display:"inline-flex",alignItems:"center",gap:2}}>
+                        <span title={fr?"Voir facture (données incomplètes)":"View invoice (incomplete data)"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                        <button onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}} title={fr?"Regénérer avec les vraies données":"Regenerate with real data"} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,padding:0,lineHeight:1}}>⚠️</button>
+                      </span>
+                    ) : (
+                      <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                    )
                   ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
                     <button
                       onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
@@ -25776,6 +26103,16 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
           lang={lang}
           models={models}
           onSuccess={() => { setSingleInvoiceTx(null); if (onRefresh) onRefresh(); }}
+        />
+      )}
+      {bulkInvoiceOpen && (
+        <BulkInvoiceModal
+          eligibleTxs={bulkEligibleTxs}
+          open={bulkInvoiceOpen}
+          onClose={() => setBulkInvoiceOpen(false)}
+          lang={lang}
+          models={models}
+          onComplete={() => { setBulkInvoiceOpen(false); if (onRefresh) onRefresh(); }}
         />
       )}
       </>
@@ -29054,13 +29391,14 @@ const SpenderDetailView = ({spenderId, txs, models, profiles, lang}) => {
                   <td style={{fontWeight:700}}>{fmtAmount(tx.amount,tx.currency)}</td>
                   <td style={{textAlign:"center"}}>
                     {tx.invoice_url ? (
-                      <span
-                        title={lang==="fr"?"Télécharger facture":"Download invoice"}
-                        onClick={()=>window.open(tx.invoice_url,'_blank')}
-                        style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}}
-                        onMouseEnter={e=>e.currentTarget.style.opacity="0.6"}
-                        onMouseLeave={e=>e.currentTarget.style.opacity="1"}
-                      >📄</span>
+                      tx.invoice_has_fallback ? (
+                        <span style={{display:"inline-flex",alignItems:"center",gap:2}}>
+                          <span title={lang==="fr"?"Voir facture (données incomplètes)":"View invoice (incomplete data)"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                          <button onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}} title={lang==="fr"?"Regénérer avec les vraies données":"Regenerate with real data"} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,padding:0,lineHeight:1}}>⚠️</button>
+                        </span>
+                      ) : (
+                        <span title={lang==="fr"?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                      )
                     ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
                       <button
                         onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
@@ -30778,13 +31116,14 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
                       </td>
                       <td style={{textAlign:"center"}}>
                         {tx.invoice_url ? (
-                          <span
-                            title={fr?"Télécharger facture":"Download invoice"}
-                            onClick={()=>window.open(tx.invoice_url,'_blank')}
-                            style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}}
-                            onMouseEnter={e=>e.currentTarget.style.opacity="0.6"}
-                            onMouseLeave={e=>e.currentTarget.style.opacity="1"}
-                          >📄</span>
+                          tx.invoice_has_fallback ? (
+                            <span style={{display:"inline-flex",alignItems:"center",gap:2}}>
+                              <span title={fr?"Voir facture (données incomplètes)":"View invoice (incomplete data)"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                              <button onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}} title={fr?"Regénérer avec les vraies données":"Regenerate with real data"} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,padding:0,lineHeight:1}}>⚠️</button>
+                            </span>
+                          ) : (
+                            <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                          )
                         ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
                           <button
                             onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
