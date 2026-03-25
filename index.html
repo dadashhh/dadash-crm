@@ -24047,6 +24047,317 @@ const BillingInfoModal = ({ open, onClose, user, lang }) => {
 };
 
 // =============================================
+// INVOICE UTILITIES — Standalone PDF generation + upload
+// =============================================
+
+/**
+ * Génère une facture PDF via jsPDF (identique au template existant).
+ * Retourne le blob PDF + métadonnées, sans side-effects (pas d'upload, pas d'update BDD).
+ *
+ * @param {Object} params
+ * @param {Object} params.provider - { billing_company_name, billing_address, billing_siret, billing_vat_number, full_name, name }
+ * @param {Object} params.client - { full_name, phone }
+ * @param {number} params.amount
+ * @param {string} params.currency - 'CHF' | 'EUR' | ...
+ * @param {string} params.date - ISO date string
+ * @param {string} params.notes - description de la prestation
+ * @param {string} [params.lang] - 'fr' | 'en' (default 'fr')
+ * @returns {{ ok: boolean, blob?: Blob, invNumber?: string, fileName?: string, error?: string }}
+ */
+function generateInvoicePDFUtil({ provider, client, amount, currency, date, notes, lang: pdfLang }) {
+  const fr = (pdfLang || 'fr') === 'fr';
+  const JsPDF = (window.jspdf && window.jspdf.jsPDF) || (window.jsPDF);
+  if (!JsPDF) { return { ok: false, error: 'jsPDF non disponible' }; }
+
+  const doc = new JsPDF({ unit: 'mm', format: 'a4' });
+  const W = 210, marginL = 20, marginR = 20, contentW = W - marginL - marginR;
+  const accentColor = [99, 102, 241]; // indigo
+  const darkColor   = [15, 18, 40];
+  const grayColor   = [100, 110, 130];
+  let y = 20;
+
+  const fmtCurrency = (amt, cur) => {
+    const sym = cur === 'EUR' ? '€' : cur === 'CHF' ? ' CHF' : ` ${cur}`;
+    return `${Number(amt).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${sym}`;
+  };
+  const fmtDate = (d) => d ? new Date(d).toLocaleDateString('fr-FR', { day:'2-digit', month:'long', year:'numeric' }) : '';
+  const invNumber = `FACT-${new Date().getFullYear()}-${String(Date.now()).slice(-5)}`;
+
+  // ── Bandeau haut indigo ──
+  doc.setFillColor(...accentColor);
+  doc.rect(0, 0, W, 12, 'F');
+  doc.setTextColor(255, 255, 255);
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'bold');
+  doc.text('FACTURE', W - marginR, 8, { align: 'right' });
+
+  y = 22;
+  // ── Logo / Titre ──
+  doc.setTextColor(...darkColor);
+  doc.setFontSize(22);
+  doc.setFont('helvetica', 'bold');
+  const companyDisplay = provider.billing_company_name ||
+    provider.full_name || provider.name || 'Prestataire';
+  doc.text(companyDisplay, marginL, y);
+
+  // N° facture + date — aligné droite
+  doc.setFontSize(10);
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(...grayColor);
+  doc.text(`N° ${invNumber}`, W - marginR, y - 6, { align: 'right' });
+  doc.text(`Date : ${fmtDate(date)}`, W - marginR, y, { align: 'right' });
+  doc.text(`Échéance : ${fmtDate(date)}`, W - marginR, y + 6, { align: 'right' });
+
+  y += 12;
+  // ── Ligne séparatrice ──
+  doc.setDrawColor(...accentColor);
+  doc.setLineWidth(0.5);
+  doc.line(marginL, y, W - marginR, y);
+
+  y += 10;
+  // ── Bloc ÉMETTEUR (gauche) ──
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(...accentColor);
+  doc.text('ÉMETTEUR (PRESTATAIRE)', marginL, y);
+  y += 5;
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(...darkColor);
+  const provLines = [
+    companyDisplay,
+    provider.billing_address || '',
+    provider.billing_siret ? `SIRET : ${provider.billing_siret}` : '',
+    provider.billing_vat_number ? `TVA : ${provider.billing_vat_number}` : '',
+  ].filter(Boolean);
+  provLines.forEach(l => { doc.text(l, marginL, y); y += 5; });
+
+  // ── Bloc CLIENT (droite) ──
+  let yClient = y - provLines.length * 5 - 5;
+  doc.setFontSize(8);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(...accentColor);
+  doc.text('CLIENT', W - marginR - 60, yClient);
+  yClient += 5;
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(...darkColor);
+  [
+    client.full_name,
+    client.phone,
+  ].filter(Boolean).forEach(l => { doc.text(l, W - marginR - 60, yClient); yClient += 5; });
+
+  y = Math.max(y, yClient) + 8;
+
+  // ── Ligne séparatrice ──
+  doc.setDrawColor(220, 222, 240);
+  doc.setLineWidth(0.3);
+  doc.line(marginL, y, W - marginR, y);
+  y += 8;
+
+  // ── En-tête tableau ──
+  doc.setFillColor(240, 241, 255);
+  doc.rect(marginL, y - 4, contentW, 8, 'F');
+  doc.setFontSize(9);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(...accentColor);
+  doc.text('DESCRIPTION', marginL + 2, y + 1);
+  doc.text('DATE', marginL + 85, y + 1);
+  doc.text('QTÉ', marginL + 115, y + 1, { align: 'center' });
+  doc.text('P.U.', marginL + 135, y + 1, { align: 'center' });
+  doc.text('TOTAL', W - marginR - 2, y + 1, { align: 'right' });
+  y += 10;
+
+  // ── Ligne transaction ──
+  doc.setFontSize(9);
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(...darkColor);
+  const descText = notes || (fr ? 'Prestation de service' : 'Service delivery');
+  const descLines = doc.splitTextToSize(descText, 80);
+  doc.text(descLines, marginL + 2, y);
+  doc.text(fmtDate(date), marginL + 85, y);
+  doc.text('1', marginL + 115, y, { align: 'center' });
+  doc.text(fmtCurrency(amount, currency), marginL + 135, y, { align: 'center' });
+  doc.text(fmtCurrency(amount, currency), W - marginR - 2, y, { align: 'right' });
+  y += Math.max(descLines.length * 5, 8) + 4;
+
+  // ── Ligne séparatrice ──
+  doc.setDrawColor(220, 222, 240);
+  doc.line(marginL, y, W - marginR, y);
+  y += 8;
+
+  // ── Total HT / TVA / TTC ──
+  const tvaApplicable = !!provider.billing_vat_number;
+  const tvaRate = 0.20;
+  const ht  = tvaApplicable ? amount / (1 + tvaRate) : amount;
+  const tva = tvaApplicable ? amount - ht : 0;
+
+  const totals = [
+    { label: fr ? 'Sous-total HT' : 'Subtotal excl. VAT', val: fmtCurrency(ht, currency) },
+    tvaApplicable && { label: `TVA (20%)`, val: fmtCurrency(tva, currency) },
+    { label: fr ? 'TOTAL TTC' : 'TOTAL', val: fmtCurrency(amount, currency), bold: true },
+  ].filter(Boolean);
+
+  totals.forEach(row => {
+    doc.setFont('helvetica', row.bold ? 'bold' : 'normal');
+    doc.setFontSize(row.bold ? 11 : 9);
+    doc.setTextColor(...(row.bold ? accentColor : grayColor));
+    doc.text(row.label, W - marginR - 50, y);
+    doc.text(row.val, W - marginR, y, { align: 'right' });
+    y += row.bold ? 8 : 6;
+  });
+
+  if (!tvaApplicable) {
+    y += 2;
+    doc.setFont('helvetica', 'italic');
+    doc.setFontSize(8);
+    doc.setTextColor(...grayColor);
+    doc.text('TVA non applicable — Art. 293 B du CGI', marginL, y);
+    y += 6;
+  }
+
+  // ── Pied de page ──
+  doc.setFillColor(...accentColor);
+  doc.rect(0, 285, W, 12, 'F');
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(7);
+  doc.setTextColor(255, 255, 255);
+  doc.text(`${companyDisplay}  •  ${fr ? 'Document généré le' : 'Generated on'} ${fmtDate(new Date())}`, W / 2, 291, { align: 'center' });
+
+  // ── Téléchargement local + retour blob pour upload Storage ──
+  const fileName = `Facture_${invNumber}_${(client.full_name || 'client').replace(/\s+/g,'_')}.pdf`;
+  doc.save(fileName);
+  const pdfBlob = doc.output('blob');
+  return { ok: true, blob: pdfBlob, invNumber, fileName };
+}
+
+/**
+ * Génère une facture PDF, l'upload sur Supabase Storage, et met à jour transactions.invoice_url.
+ *
+ * @param {Object} params
+ * @param {Object} params.invoiceData - { amount, currency, date, notes, txId }
+ * @param {Object} params.providerInfo - { billing_company_name, billing_address, billing_siret, billing_vat_number, full_name, name }
+ * @param {Object} params.clientInfo - { full_name, phone }
+ * @param {Object} params.supabaseClient - instance Supabase (sb)
+ * @param {string} [params.lang] - 'fr' | 'en'
+ * @returns {Promise<{ success: boolean, invoice_url?: string, error?: string }>}
+ */
+async function generateAndUploadInvoice({ invoiceData, providerInfo, clientInfo, supabaseClient, lang }) {
+  try {
+    // 1. Génère le PDF
+    const pdfResult = generateInvoicePDFUtil({
+      provider: providerInfo,
+      client: clientInfo,
+      amount: invoiceData.amount,
+      currency: invoiceData.currency,
+      date: invoiceData.date,
+      notes: invoiceData.notes,
+      lang: lang,
+    });
+
+    if (!pdfResult?.ok || !pdfResult.blob) {
+      return { success: false, error: pdfResult?.error || 'PDF generation failed' };
+    }
+
+    // 2. Upload vers Supabase Storage
+    const storagePath = `invoice_${invoiceData.txId}.pdf`;
+    const { error: uploadErr } = await supabaseClient.storage
+      .from('invoices')
+      .upload(storagePath, pdfResult.blob, { contentType: 'application/pdf', upsert: true });
+
+    if (uploadErr) {
+      return { success: false, error: uploadErr.message };
+    }
+
+    // 3. Récupérer l'URL publique
+    const { data: urlData } = supabaseClient.storage.from('invoices').getPublicUrl(storagePath);
+    const invoiceUrl = urlData?.publicUrl || null;
+
+    // 4. Mettre à jour la transaction
+    if (invoiceUrl && invoiceData.txId) {
+      const { error: updateErr } = await supabaseClient
+        .from('transactions')
+        .update({ invoice_url: invoiceUrl })
+        .eq('id', invoiceData.txId);
+      if (updateErr) {
+        console.warn('[Invoice] TX update error:', updateErr.message);
+      }
+    }
+
+    return { success: true, invoice_url: invoiceUrl };
+  } catch (error) {
+    console.error('[generateAndUploadInvoice] error:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Résout toutes les données nécessaires à la génération d'une facture pour une TX donnée.
+ * Utilise des fallbacks si les billing fields sont NULL.
+ *
+ * @param {Object} tx - la transaction (id, amount, currency, created_at/date, notes/description, provider_id, spender_id, model_id)
+ * @param {Object} supabaseClient - instance Supabase
+ * @param {Array} [models] - tableau des modèles en mémoire
+ * @returns {Promise<{ providerInfo: Object, clientInfo: Object, invoiceData: Object, hasFallback: boolean }>}
+ */
+async function resolveInvoiceData(tx, supabaseClient, models) {
+  models = models || [];
+  let hasFallback = false;
+
+  // 1. PROVIDER INFO
+  const { data: provider } = await supabaseClient
+    .from('profiles')
+    .select('billing_company_name, billing_address, billing_siret, billing_vat_number, full_name, name')
+    .eq('id', tx.provider_id)
+    .single();
+
+  const providerInfo = {
+    billing_company_name: provider?.billing_company_name || provider?.full_name || provider?.name || 'N/A',
+    billing_address: provider?.billing_address || '',
+    billing_siret: provider?.billing_siret || '',
+    billing_vat_number: provider?.billing_vat_number || '',
+    full_name: provider?.full_name || provider?.name || 'N/A',
+    name: provider?.name || '',
+  };
+
+  // 2. SPENDER / CLIENT INFO
+  let clientFullName = null;
+  let clientPhone = null;
+
+  if (tx.spender_id) {
+    const { data: spender } = await supabaseClient
+      .from('spenders')
+      .select('billing_full_name, billing_phone, name, whatsapp_phone')
+      .eq('id', tx.spender_id)
+      .maybeSingle();
+
+    if (spender) {
+      clientFullName = spender.billing_full_name;
+      clientPhone = spender.billing_phone;
+      if (!clientFullName) { clientFullName = spender.name || null; hasFallback = true; }
+      if (!clientPhone) { clientPhone = spender.whatsapp_phone || null; hasFallback = true; }
+    }
+  }
+
+  const clientInfo = {
+    full_name: clientFullName || tx.spender_handle || 'Non renseigné',
+    phone: clientPhone || 'N/A',
+  };
+  if (!clientFullName || !clientPhone) hasFallback = true;
+
+  // 3. INVOICE DATA
+  const model = models.find(m => m.id === tx.model_id);
+  const modelName = model?.name || '';
+  const invoiceData = {
+    amount: Number(tx.amount),
+    currency: tx.currency || 'CHF',
+    date: tx.date || tx.created_at,
+    notes: tx.notes || tx.description || (modelName ? `Prestation — ${modelName}` : 'Prestation'),
+    txId: tx.id,
+  };
+
+  return { providerInfo, clientInfo, invoiceData, hasFallback };
+}
+
+// =============================================
 // INVOICE GENERATOR MODAL — PDF facture provider
 // =============================================
 const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, spenders, onConfirm }) => {
@@ -24108,171 +24419,6 @@ const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, 
     return e;
   };
 
-  const generateInvoicePDF = (invoiceData) => {
-    const { jspdf } = window.jspdf || {};
-    const JsPDF = (window.jspdf && window.jspdf.jsPDF) || (window.jsPDF);
-    if (!JsPDF) { addToast('jsPDF non disponible', 'error'); return false; }
-
-    const doc = new JsPDF({ unit: 'mm', format: 'a4' });
-    const W = 210, marginL = 20, marginR = 20, contentW = W - marginL - marginR;
-    const accentColor = [99, 102, 241]; // indigo
-    const darkColor   = [15, 18, 40];
-    const grayColor   = [100, 110, 130];
-    let y = 20;
-
-    const fmtCurrency = (amount, currency) => {
-      const sym = currency === 'EUR' ? '€' : currency === 'CHF' ? ' CHF' : ` ${currency}`;
-      return `${Number(amount).toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${sym}`;
-    };
-    const fmtDate = (d) => d ? new Date(d).toLocaleDateString('fr-FR', { day:'2-digit', month:'long', year:'numeric' }) : '';
-    const invNumber = `FACT-${new Date().getFullYear()}-${String(Date.now()).slice(-5)}`;
-
-    // ── Bandeau haut indigo ──
-    doc.setFillColor(...accentColor);
-    doc.rect(0, 0, W, 12, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(8);
-    doc.setFont('helvetica', 'bold');
-    doc.text('FACTURE', W - marginR, 8, { align: 'right' });
-
-    y = 22;
-    // ── Logo / Titre ──
-    doc.setTextColor(...darkColor);
-    doc.setFontSize(22);
-    doc.setFont('helvetica', 'bold');
-    const companyDisplay = invoiceData.provider.billing_company_name ||
-      invoiceData.provider.full_name || invoiceData.provider.name || 'Prestataire';
-    doc.text(companyDisplay, marginL, y);
-
-    // N° facture + date — aligné droite
-    doc.setFontSize(10);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...grayColor);
-    doc.text(`N° ${invNumber}`, W - marginR, y - 6, { align: 'right' });
-    doc.text(`Date : ${fmtDate(invoiceData.date)}`, W - marginR, y, { align: 'right' });
-    doc.text(`Échéance : ${fmtDate(invoiceData.date)}`, W - marginR, y + 6, { align: 'right' });
-
-    y += 12;
-    // ── Ligne séparatrice ──
-    doc.setDrawColor(...accentColor);
-    doc.setLineWidth(0.5);
-    doc.line(marginL, y, W - marginR, y);
-
-    y += 10;
-    // ── Bloc ÉMETTEUR (gauche) ──
-    doc.setFontSize(8);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(...accentColor);
-    doc.text('ÉMETTEUR (PRESTATAIRE)', marginL, y);
-    y += 5;
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...darkColor);
-    const provLines = [
-      companyDisplay,
-      invoiceData.provider.billing_address || '',
-      invoiceData.provider.billing_siret ? `SIRET : ${invoiceData.provider.billing_siret}` : '',
-      invoiceData.provider.billing_vat_number ? `TVA : ${invoiceData.provider.billing_vat_number}` : '',
-    ].filter(Boolean);
-    provLines.forEach(l => { doc.text(l, marginL, y); y += 5; });
-
-    // ── Bloc CLIENT (droite) ──
-    let yClient = y - provLines.length * 5 - 5;
-    doc.setFontSize(8);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(...accentColor);
-    doc.text('CLIENT', W - marginR - 60, yClient);
-    yClient += 5;
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...darkColor);
-    [
-      invoiceData.client.full_name,
-      invoiceData.client.phone,
-    ].filter(Boolean).forEach(l => { doc.text(l, W - marginR - 60, yClient); yClient += 5; });
-
-    y = Math.max(y, yClient) + 8;
-
-    // ── Ligne séparatrice ──
-    doc.setDrawColor(220, 222, 240);
-    doc.setLineWidth(0.3);
-    doc.line(marginL, y, W - marginR, y);
-    y += 8;
-
-    // ── En-tête tableau ──
-    doc.setFillColor(240, 241, 255);
-    doc.rect(marginL, y - 4, contentW, 8, 'F');
-    doc.setFontSize(9);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(...accentColor);
-    doc.text('DESCRIPTION', marginL + 2, y + 1);
-    doc.text('DATE', marginL + 85, y + 1);
-    doc.text('QTÉ', marginL + 115, y + 1, { align: 'center' });
-    doc.text('P.U.', marginL + 135, y + 1, { align: 'center' });
-    doc.text('TOTAL', W - marginR - 2, y + 1, { align: 'right' });
-    y += 10;
-
-    // ── Ligne transaction ──
-    doc.setFontSize(9);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(...darkColor);
-    const descText = invoiceData.notes || (fr ? 'Prestation de service' : 'Service delivery');
-    const descLines = doc.splitTextToSize(descText, 80);
-    doc.text(descLines, marginL + 2, y);
-    doc.text(fmtDate(invoiceData.date), marginL + 85, y);
-    doc.text('1', marginL + 115, y, { align: 'center' });
-    doc.text(fmtCurrency(invoiceData.amount, invoiceData.currency), marginL + 135, y, { align: 'center' });
-    doc.text(fmtCurrency(invoiceData.amount, invoiceData.currency), W - marginR - 2, y, { align: 'right' });
-    y += Math.max(descLines.length * 5, 8) + 4;
-
-    // ── Ligne séparatrice ──
-    doc.setDrawColor(220, 222, 240);
-    doc.line(marginL, y, W - marginR, y);
-    y += 8;
-
-    // ── Total HT / TVA / TTC ──
-    const tvaApplicable = !!invoiceData.provider.billing_vat_number;
-    const tvaRate = 0.20;
-    const ht  = tvaApplicable ? invoiceData.amount / (1 + tvaRate) : invoiceData.amount;
-    const tva = tvaApplicable ? invoiceData.amount - ht : 0;
-
-    const totals = [
-      { label: fr ? 'Sous-total HT' : 'Subtotal excl. VAT', val: fmtCurrency(ht, invoiceData.currency) },
-      tvaApplicable && { label: `TVA (20%)`, val: fmtCurrency(tva, invoiceData.currency) },
-      { label: fr ? 'TOTAL TTC' : 'TOTAL', val: fmtCurrency(invoiceData.amount, invoiceData.currency), bold: true },
-    ].filter(Boolean);
-
-    totals.forEach(row => {
-      doc.setFont('helvetica', row.bold ? 'bold' : 'normal');
-      doc.setFontSize(row.bold ? 11 : 9);
-      doc.setTextColor(...(row.bold ? accentColor : grayColor));
-      doc.text(row.label, W - marginR - 50, y);
-      doc.text(row.val, W - marginR, y, { align: 'right' });
-      y += row.bold ? 8 : 6;
-    });
-
-    if (!tvaApplicable) {
-      y += 2;
-      doc.setFont('helvetica', 'italic');
-      doc.setFontSize(8);
-      doc.setTextColor(...grayColor);
-      doc.text('TVA non applicable — Art. 293 B du CGI', marginL, y);
-      y += 6;
-    }
-
-    // ── Pied de page ──
-    doc.setFillColor(...accentColor);
-    doc.rect(0, 285, W, 12, 'F');
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(7);
-    doc.setTextColor(255, 255, 255);
-    doc.text(`${companyDisplay}  •  ${fr ? 'Document généré le' : 'Generated on'} ${fmtDate(new Date())}`, W / 2, 291, { align: 'center' });
-
-    // ── Téléchargement local + retour blob pour upload Storage ──
-    const fileName = `Facture_${invNumber}_${(invoiceData.client.full_name || 'client').replace(/\s+/g,'_')}.pdf`;
-    doc.save(fileName);
-    const pdfBlob = doc.output('blob');
-    return { ok: true, blob: pdfBlob, invNumber, fileName };
-  };
-
   const handleGenerate = async () => {
     const e = validateClient();
     if (Object.keys(e).length > 0) { setClientErrors(e); return; }
@@ -24299,37 +24445,30 @@ const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, 
         }).eq('id', spenderId);
       }
 
-      // 3. Génère le PDF (téléchargement local + blob)
+      // 3. Génère le PDF + upload via la fonction utilitaire extraite
       const modelName = (models || []).find(m => m.id === txFormData?.model_id)?.name || '';
-      const pdfResult = generateInvoicePDF({
-        provider: providerInfo || {},
-        client:   { phone: clientPhone.trim(), full_name: clientName.trim() },
-        amount:   txFormData?.amount,
-        currency: txFormData?.currency || 'CHF',
-        date:     txFormData?.date || new Date().toISOString(),
-        notes:    txFormData?.notes || (modelName ? `Prestation — ${modelName}` : ''),
+      const result = await generateAndUploadInvoice({
+        invoiceData: {
+          amount:   txFormData?.amount,
+          currency: txFormData?.currency || 'CHF',
+          date:     txFormData?.date || new Date().toISOString(),
+          notes:    txFormData?.notes || (modelName ? `Prestation — ${modelName}` : ''),
+          txId:     insertedTxId,
+        },
+        providerInfo: providerInfo || {},
+        clientInfo: {
+          full_name: clientName.trim(),
+          phone:     clientPhone.trim(),
+        },
+        supabaseClient: sb,
+        lang: lang,
       });
 
-      // 4. Upload PDF → Supabase Storage bucket "invoices" + update invoice_url
-      if (pdfResult?.ok && pdfResult.blob && insertedTxId) {
-        const storagePath = `invoice_${insertedTxId}.pdf`;
-        const { error: uploadErr } = await sb.storage
-          .from('invoices')
-          .upload(storagePath, pdfResult.blob, { contentType: 'application/pdf', upsert: true });
-
-        if (uploadErr) {
-          console.warn('[Invoice] Storage upload error:', uploadErr.message);
-          addToast(fr ? 'PDF téléchargé mais upload cloud échoué' : 'PDF downloaded but cloud upload failed', 'warning');
-        } else {
-          const { data: urlData } = sb.storage.from('invoices').getPublicUrl(storagePath);
-          if (urlData?.publicUrl) {
-            await sb.from('transactions').update({ invoice_url: urlData.publicUrl }).eq('id', insertedTxId);
-          }
-        }
+      if (result.success) {
+        addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
+      } else {
+        addToast(fr ? 'Erreur génération facture : ' + result.error : 'Invoice error: ' + result.error, 'error');
       }
-
-      if (pdfResult?.ok) addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
-      else addToast(fr ? 'Erreur génération PDF' : 'PDF generation error', 'error');
 
       onClose();
     } catch (err) {
