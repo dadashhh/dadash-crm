@@ -15194,6 +15194,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
   const [editingTx, setEditingTx] = useState(null);
   const [confirmRefuse, setConfirmRefuse] = useState(null);
   const [invoiceValidateTx, setInvoiceValidateTx] = useState(null);
+  const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
   const [txCardFilter, setTxCardFilter] = useState(null);
   const [txChartMetric, setTxChartMetric] = useState("ca");
   const [spSearch, setSpSearch] = useState("");
@@ -15794,6 +15795,14 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
                           onMouseEnter={e=>e.currentTarget.style.opacity="0.6"}
                           onMouseLeave={e=>e.currentTarget.style.opacity="1"}
                         >📄</span>
+                      ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
+                        <button
+                          onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
+                          title={fr?"Générer facture":"Generate invoice"}
+                          style={{background:"none",border:"none",cursor:"pointer",fontSize:14,opacity:0.55,padding:"2px 4px",borderRadius:4,transition:"opacity 0.2s"}}
+                          onMouseEnter={e=>e.currentTarget.style.opacity="1"}
+                          onMouseLeave={e=>e.currentTarget.style.opacity="0.55"}
+                        >➕📄</button>
                       ) : <span style={{color:"var(--text-quaternary)"}}>—</span>}
                     </td>
                     <td style={{fontSize:11,whiteSpace:"nowrap"}}>{tx.payment_method?(()=>{const ptc=PAYMENT_TYPE_COLORS[tx.payment_method]||PAYMENT_TYPE_COLORS["Autre"];return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 8px",borderRadius:9,fontSize:10,fontWeight:600,background:ptc.bg,color:ptc.text}}>{ptc.icon} {tx.payment_method}</span>;})():"—"}</td>
@@ -15892,6 +15901,21 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
             } catch (err) {
               return { ok: false, error: err.message };
             }
+          }}
+        />
+      )}
+      {singleInvoiceTx && (
+        <SingleInvoiceModal
+          tx={singleInvoiceTx}
+          open={!!singleInvoiceTx}
+          onClose={() => setSingleInvoiceTx(null)}
+          lang={lang}
+          models={models}
+          onSuccess={(txId, invoiceUrl) => {
+            const updater = (prev) => (prev || []).map(t => t.id === txId ? { ...t, invoice_url: invoiceUrl } : t);
+            if (setSrvData && srvData) setSrvData(updater);
+            if (setTxs) setTxs(updater);
+            if (setTxSummary) setTxSummary(updater);
           }}
         />
       )}
@@ -24358,6 +24382,179 @@ async function resolveInvoiceData(tx, supabaseClient, models) {
 }
 
 // =============================================
+// SINGLE INVOICE MODAL — Generate invoice for existing validated TX
+// =============================================
+const SingleInvoiceModal = ({ tx, open, onClose, onSuccess, lang, models }) => {
+  const addToast = useToast();
+  const fr = (lang || 'fr') === 'fr';
+  const [clientName, setClientName] = useState('');
+  const [clientPhone, setClientPhone] = useState('');
+  const [isComplete, setIsComplete] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [errors, setErrors] = useState({});
+
+  useEffect(() => {
+    if (!open || !tx?.spender_id) { setLoading(false); return; }
+    setErrors({});
+    setIsGenerating(false);
+    setLoading(true);
+    (async () => {
+      const { data: spender } = await sb
+        .from('spenders')
+        .select('billing_full_name, billing_phone, name, whatsapp_phone')
+        .eq('id', tx.spender_id)
+        .maybeSingle();
+      if (spender) {
+        const name = spender.billing_full_name || spender.name || '';
+        const phone = spender.billing_phone || spender.whatsapp_phone || '';
+        setClientName(name);
+        setClientPhone(phone);
+        setIsComplete(!!spender.billing_full_name && !!spender.billing_phone);
+      }
+      setLoading(false);
+    })();
+  }, [open, tx?.spender_id]);
+
+  const handleGenerate = async () => {
+    const e = {};
+    if (!clientName.trim()) e.name = fr ? 'Le nom est obligatoire.' : 'Name is required.';
+    if (!clientPhone.trim()) e.phone = fr ? 'Le téléphone est obligatoire.' : 'Phone is required.';
+    if (Object.keys(e).length > 0) { setErrors(e); return; }
+    setIsGenerating(true);
+    try {
+      if (tx.spender_id) {
+        await sb.from('spenders').update({
+          billing_full_name: clientName.trim(),
+          billing_phone: clientPhone.trim(),
+        }).eq('id', tx.spender_id);
+      }
+      const { providerInfo, invoiceData } = await resolveInvoiceData(tx, sb, models || []);
+      const result = await generateAndUploadInvoice({
+        invoiceData,
+        providerInfo,
+        clientInfo: { full_name: clientName.trim(), phone: clientPhone.trim() },
+        supabaseClient: sb,
+        lang: lang,
+      });
+      if (result.success) {
+        addToast(fr ? 'Facture générée ✓' : 'Invoice generated ✓', 'success');
+        if (onSuccess) onSuccess(tx.id, result.invoice_url);
+        onClose();
+      } else {
+        addToast((fr ? 'Erreur : ' : 'Error: ') + result.error, 'error');
+      }
+    } catch (err) {
+      addToast((fr ? 'Erreur : ' : 'Error: ') + err.message, 'error');
+    }
+    setIsGenerating(false);
+  };
+
+  const inputStyle = {
+    width: '100%', boxSizing: 'border-box',
+    background: 'var(--input-bg, rgba(255,255,255,0.05))',
+    border: '1px solid var(--border-default)',
+    borderRadius: 10, padding: '10px 14px',
+    color: 'var(--text-primary)', fontSize: 14, outline: 'none', fontFamily: 'inherit',
+  };
+
+  return (
+    <ModalShell open={!!open} onClose={onClose} closeOnBackdrop={true} closeOnEsc={true}>
+      <div style={{
+        background: 'var(--bg-modal, #0a0c12)',
+        border: '1px solid var(--border-default)',
+        borderRadius: _isMobile ? '16px 16px 0 0' : 16,
+        width: _isMobile ? '100%' : 440,
+        maxWidth: '96vw',
+        maxHeight: _isMobile ? '94vh' : '80vh',
+        overflowY: 'auto',
+        boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+      }}>
+        <div style={{
+          padding: '16px 20px',
+          borderBottom: '1px solid var(--border-default)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div style={{ fontSize: 15, fontWeight: 800, color: 'var(--text-primary)' }}>
+            📄 {fr ? 'Générer facture' : 'Generate invoice'}
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: 20, cursor: 'pointer', padding: '4px 8px', borderRadius: 8 }}>✕</button>
+        </div>
+        <div style={{ padding: '16px 20px' }}>
+          {loading ? (
+            <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--text-tertiary)', fontSize: 13 }}>
+              {fr ? 'Chargement…' : 'Loading…'}
+            </div>
+          ) : (
+            <>
+              <div style={{
+                background: 'var(--bg-raised, rgba(255,255,255,0.03))',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 10, padding: '12px 14px', marginBottom: 16,
+                fontSize: 13, color: 'var(--text-secondary)',
+              }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                  <div><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>{fr ? 'Montant' : 'Amount'}</span><div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{Number(tx.amount).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} {tx.currency || 'CHF'}</div></div>
+                  <div><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>Date</span><div style={{ fontWeight: 600 }}>{tx.date ? new Date(tx.date).toLocaleDateString('fr-FR') : '—'}</div></div>
+                  <div style={{ gridColumn: '1/-1' }}><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>Spender</span><div style={{ fontWeight: 600 }}>{tx.spender_handle || '—'}</div></div>
+                </div>
+              </div>
+
+              {isComplete ? (
+                <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16 }}>
+                  <div style={{ marginBottom: 6 }}><span style={{ color: 'var(--text-quaternary)', fontSize: 10, textTransform: 'uppercase', display: 'block' }}>{fr ? 'Client' : 'Client'}</span>{clientName}</div>
+                  <div><span style={{ color: 'var(--text-quaternary)', fontSize: 10, textTransform: 'uppercase', display: 'block' }}>{fr ? 'Téléphone' : 'Phone'}</span>{clientPhone}</div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ marginBottom: 12 }}>
+                    <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.3 }}>
+                      {fr ? 'Nom complet' : 'Full name'} <span style={{ color: '#f43f5e' }}>*</span>
+                    </label>
+                    <input
+                      type="text" value={clientName}
+                      onChange={e => { setClientName(e.target.value); if (errors.name) setErrors(er => ({ ...er, name: null })); }}
+                      placeholder={fr ? 'Prénom Nom' : 'First Last'}
+                      style={{ ...inputStyle, borderColor: errors.name ? '#f43f5e' : 'var(--border-default)' }}
+                    />
+                    {errors.name && <span style={{ color: '#f43f5e', fontSize: 11, marginTop: 3, display: 'block' }}>{errors.name}</span>}
+                  </div>
+                  <div style={{ marginBottom: 16 }}>
+                    <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.3 }}>
+                      {fr ? 'Téléphone' : 'Phone'} <span style={{ color: '#f43f5e' }}>*</span>
+                    </label>
+                    <input
+                      type="tel" value={clientPhone}
+                      onChange={e => { setClientPhone(e.target.value); if (errors.phone) setErrors(er => ({ ...er, phone: null })); }}
+                      placeholder="+41 XX XXX XX XX"
+                      style={{ ...inputStyle, borderColor: errors.phone ? '#f43f5e' : 'var(--border-default)' }}
+                    />
+                    {errors.phone && <span style={{ color: '#f43f5e', fontSize: 11, marginTop: 3, display: 'block' }}>{errors.phone}</span>}
+                  </div>
+                </>
+              )}
+
+              <div style={{ display: 'flex', gap: 10, marginTop: 4 }}>
+                <button onClick={onClose} style={{
+                  flex: 1, padding: '10px', borderRadius: 10, border: '1px solid var(--border-default)',
+                  background: 'transparent', color: 'var(--text-secondary)', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                }}>{fr ? 'Annuler' : 'Cancel'}</button>
+                <button onClick={handleGenerate} disabled={isGenerating} style={{
+                  flex: 1, padding: '10px', borderRadius: 10, border: 'none',
+                  background: 'linear-gradient(135deg, #6366f1, #818cf8)', color: '#fff',
+                  fontSize: 13, fontWeight: 700, cursor: isGenerating ? 'wait' : 'pointer',
+                  opacity: isGenerating ? 0.7 : 1,
+                }}>{isGenerating ? (fr ? 'Génération…' : 'Generating…') : (fr ? 'Générer la facture' : 'Generate invoice')}</button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </ModalShell>
+  );
+};
+
+// =============================================
 // INVOICE GENERATOR MODAL — PDF facture provider
 // =============================================
 const InvoiceGeneratorModal = ({ open, onClose, txFormData, user, lang, models, spenders, onConfirm }) => {
@@ -25288,6 +25485,7 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
   const [saving, setSaving] = useState(false);
   const [provSubTab, setProvSubTab] = useState("paiements");
   const [showBillingModal, setShowBillingModal] = useState(false);
+  const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
   const [form, setForm] = useState({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
 
   // TX stats
@@ -25554,6 +25752,14 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
                   <td style={{fontWeight:700}}>{fmtAmount(tx.amount,tx.currency)}</td>
                   <td style={{textAlign:"center"}}>{tx.invoice_url ? (
                     <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
+                  ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
+                    <button
+                      onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
+                      title={fr?"Générer facture":"Generate invoice"}
+                      style={{background:"none",border:"none",cursor:"pointer",fontSize:14,opacity:0.55,padding:"2px 4px",borderRadius:4,transition:"opacity 0.2s"}}
+                      onMouseEnter={e=>e.currentTarget.style.opacity="1"}
+                      onMouseLeave={e=>e.currentTarget.style.opacity="0.55"}
+                    >➕📄</button>
                   ) : <span style={{color:"var(--text-quaternary)"}}>—</span>}</td>
                   <td><StatusPill status={tx.status} lang={lang}/></td>
                 </tr>
@@ -25562,6 +25768,16 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
           </table>
         </div>
       </div>
+      {singleInvoiceTx && (
+        <SingleInvoiceModal
+          tx={singleInvoiceTx}
+          open={!!singleInvoiceTx}
+          onClose={() => setSingleInvoiceTx(null)}
+          lang={lang}
+          models={models}
+          onSuccess={() => { setSingleInvoiceTx(null); if (onRefresh) onRefresh(); }}
+        />
+      )}
       </>
       )}
     </div>
@@ -28795,6 +29011,7 @@ const AdminShell = ({user, lang, profiles, models, subTab, setSubTab, onRefresh,
 const SpenderDetailView = ({spenderId, txs, models, profiles, lang}) => {
   const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
   const {closeDrill, openEntity} = useNav();
+  const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
   const spTx = txs.filter(tx=>tx.spender_handle===spenderId);
   const ltv = spTx.reduce((s,tx)=>s+Number(tx.amount),0);
   const validCA = spTx.filter(tx=>tx.status==="validated").reduce((s,tx)=>s+Number(tx.amount),0);
@@ -28844,6 +29061,14 @@ const SpenderDetailView = ({spenderId, txs, models, profiles, lang}) => {
                         onMouseEnter={e=>e.currentTarget.style.opacity="0.6"}
                         onMouseLeave={e=>e.currentTarget.style.opacity="1"}
                       >📄</span>
+                    ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
+                      <button
+                        onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
+                        title={lang==="fr"?"Générer facture":"Generate invoice"}
+                        style={{background:"none",border:"none",cursor:"pointer",fontSize:14,opacity:0.55,padding:"2px 4px",borderRadius:4,transition:"opacity 0.2s"}}
+                        onMouseEnter={e=>e.currentTarget.style.opacity="1"}
+                        onMouseLeave={e=>e.currentTarget.style.opacity="0.55"}
+                      >➕📄</button>
                     ) : <span style={{color:"var(--text-quaternary)"}}>—</span>}
                   </td>
                   <td>{tx.product||"—"}</td>
@@ -28873,6 +29098,16 @@ const SpenderDetailView = ({spenderId, txs, models, profiles, lang}) => {
           <div className="profile-row"><span>{t(lang,"frequency")}</span><span>{cnt} tx</span></div>
         </div>
       </div>
+      {singleInvoiceTx && (
+        <SingleInvoiceModal
+          tx={singleInvoiceTx}
+          open={!!singleInvoiceTx}
+          onClose={() => setSingleInvoiceTx(null)}
+          lang={lang}
+          models={models}
+          onSuccess={() => { setSingleInvoiceTx(null); }}
+        />
+      )}
     </div>
   );
 };
@@ -30104,6 +30339,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const myModelIds = assignedModelIds;
   const myModels = assignedModels;
   const [unifiedSpenderId, setUnifiedSpenderId] = useState(null);
+  const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
   const activeProducts = (products||[]).filter(p => p.active !== false);
   const activeTags = (productTags||[]).filter(t => t.active !== false);
 
@@ -30549,6 +30785,14 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
                             onMouseEnter={e=>e.currentTarget.style.opacity="0.6"}
                             onMouseLeave={e=>e.currentTarget.style.opacity="1"}
                           >📄</span>
+                        ) : (tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee") ? (
+                          <button
+                            onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
+                            title={fr?"Générer facture":"Generate invoice"}
+                            style={{background:"none",border:"none",cursor:"pointer",fontSize:14,opacity:0.55,padding:"2px 4px",borderRadius:4,transition:"opacity 0.2s"}}
+                            onMouseEnter={e=>e.currentTarget.style.opacity="1"}
+                            onMouseLeave={e=>e.currentTarget.style.opacity="0.55"}
+                          >➕📄</button>
                         ) : <span style={{color:"var(--text-quaternary)"}}>—</span>}
                       </td>
                       <td>{statusBadge(tx.status)}</td>
@@ -30577,6 +30821,16 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
         chatterMode={true}
         setTxSummary={setTxSummary}
       />
+      {singleInvoiceTx && (
+        <SingleInvoiceModal
+          tx={singleInvoiceTx}
+          open={!!singleInvoiceTx}
+          onClose={() => setSingleInvoiceTx(null)}
+          lang={lang}
+          models={models}
+          onSuccess={() => { setSingleInvoiceTx(null); if (onRefresh) onRefresh(); }}
+        />
+      )}
     </div>
   );
 };
