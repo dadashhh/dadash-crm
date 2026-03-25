@@ -171,6 +171,7 @@
   <script src="https://cdn.jsdelivr.net/npm/recharts@2.1.16/umd/Recharts.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js" defer></script>
   <!-- Safari WebSocket crash guard — swallow WS errors globally so they NEVER crash the app -->
   <script>
@@ -15197,6 +15198,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
   const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
   const [bulkInvoiceOpen, setBulkInvoiceOpen] = useState(false);
   const [bulkEligibleTxs, setBulkEligibleTxs] = useState([]);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [zipProgress, setZipProgress] = useState(null);
   const [txCardFilter, setTxCardFilter] = useState(null);
   const [txChartMetric, setTxChartMetric] = useState("ca");
   const [spSearch, setSpSearch] = useState("");
@@ -15493,10 +15496,11 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
         status={status} setStatus={setStatus} showStatusFilter />
       {user.role==="gerant" && (()=>{
         const _elCount = (displayTxs||[]).filter(tx=>(tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee")&&!tx.invoice_url).length;
-        if (_elCount === 0) return null;
+        const _withInvoice = (displayTxs||[]).filter(tx=>tx.invoice_url&&tx.invoice_url!=="");
+        if (_elCount === 0 && _withInvoice.length === 0) return null;
         return (
-          <div style={{marginBottom:10,display:"flex",alignItems:"center",gap:10}}>
-            <button onClick={async()=>{
+          <div style={{marginBottom:10,display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+            {_elCount > 0 && <button onClick={async()=>{
               let query = sb.from('transactions').select('*').in('status',['validated','confirmee','payee']).or('invoice_url.is.null,invoice_url.eq.');
               if(txProvider) query = query.eq('provider_id',txProvider);
               const {data}=await query.order('created_at',{ascending:false});
@@ -15507,8 +15511,28 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
               padding:'6px 14px',fontSize:13,fontWeight:700,cursor:'pointer',display:'inline-flex',alignItems:'center',gap:6,
             }}>
               📄 {fr?`Générer les factures manquantes`:`Generate missing invoices`}
-            </button>
-            <span style={{fontSize:11,color:'var(--text-tertiary)'}}>{_elCount} {fr?'sur cette page':'on this page'}</span>
+            </button>}
+            {_elCount > 0 && <span style={{fontSize:11,color:'var(--text-tertiary)'}}>{_elCount} {fr?'sur cette page':'on this page'}</span>}
+            {_withInvoice.length > 0 && <button disabled={downloadingZip} onClick={async()=>{
+              setDownloadingZip(true); setZipProgress({fetched:0,total:_withInvoice.length});
+              await downloadAllInvoicesZip(_withInvoice, {
+                fr,
+                onProgress: (p) => setZipProgress(p),
+                onDone: ({ total, errors }) => {
+                  setDownloadingZip(false); setZipProgress(null);
+                  addToast(fr?`${total} facture${total>1?'s':''} téléchargée${total>1?'s':''}`:`${total} invoice${total>1?'s':''} downloaded`, errors?'warning':'success');
+                },
+                onError: (msg) => { setDownloadingZip(false); setZipProgress(null); addToast(msg,'error'); }
+              });
+            }} style={{
+              background:'linear-gradient(135deg, #059669, #34d399)',color:'white',border:'none',borderRadius:8,
+              padding:'6px 14px',fontSize:13,fontWeight:700,cursor:'pointer',display:'inline-flex',alignItems:'center',gap:6,
+              opacity: downloadingZip ? 0.7 : 1,
+            }}>
+              {downloadingZip
+                ? `⏳ ${zipProgress?`${zipProgress.fetched}/${zipProgress.total}`:'...'}`
+                : `⬇️ ${fr?`Télécharger ${_withInvoice.length} facture${_withInvoice.length>1?'s':''}`:`Download ${_withInvoice.length} invoice${_withInvoice.length>1?'s':''}`}`}
+            </button>}
           </div>
         );
       })()}
@@ -24419,6 +24443,41 @@ async function resolveInvoiceData(tx, supabaseClient, models) {
 }
 
 // =============================================
+// DOWNLOAD ALL INVOICES AS ZIP
+// =============================================
+async function downloadAllInvoicesZip(txsWithInvoice, { fr = true, onProgress, onDone, onError } = {}) {
+  if (!window.JSZip) { if (onError) onError(fr ? 'JSZip non chargé' : 'JSZip not loaded'); return; }
+  const zip = new JSZip();
+  const total = txsWithInvoice.length;
+  let fetched = 0;
+  let errors = 0;
+  for (const tx of txsWithInvoice) {
+    try {
+      if (onProgress) onProgress({ fetched, total, current: tx });
+      const resp = await fetch(tx.invoice_url);
+      if (!resp.ok) { errors++; continue; }
+      const blob = await resp.blob();
+      const fileName = `invoice_${tx.id}.pdf`;
+      zip.file(fileName, blob);
+    } catch (e) { errors++; }
+    fetched++;
+  }
+  if (onProgress) onProgress({ fetched: total, total, current: null });
+  try {
+    const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `factures_${new Date().toISOString().slice(0,10)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    if (onDone) onDone({ total: fetched, errors });
+  } catch (e) { if (onError) onError(e.message); }
+}
+
+// =============================================
 // SINGLE INVOICE MODAL — Generate invoice for existing validated TX
 // =============================================
 const SingleInvoiceModal = ({ tx, open, onClose, onSuccess, lang, models }) => {
@@ -25794,6 +25853,8 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
   const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
   const [bulkInvoiceOpen, setBulkInvoiceOpen] = useState(false);
   const [bulkEligibleTxs, setBulkEligibleTxs] = useState([]);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [zipProgress, setZipProgress] = useState(null);
   const [form, setForm] = useState({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
 
   // TX stats
@@ -26049,16 +26110,47 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
       <div className="card">
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
           <div className="section-title" style={{margin:0}}><div className="section-bar"></div>{fr?"Mes transactions":"My transactions"}</div>
-          {(()=>{
-            const eligible = providerTxs.filter(tx=>(tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee")&&(!tx.invoice_url||tx.invoice_url===""));
-            return eligible.length > 0 ? (
-              <button
-                className="btn btn-sm"
-                onClick={()=>{setBulkEligibleTxs(eligible);setBulkInvoiceOpen(true);}}
-                style={{fontSize:12,padding:"4px 10px",display:"inline-flex",alignItems:"center",gap:4}}
-              >📄 {fr?`Générer ${eligible.length} facture${eligible.length>1?"s":""}`:`Generate ${eligible.length} invoice${eligible.length>1?"s":""}`}</button>
-            ) : null;
-          })()}
+          <div style={{display:"flex",gap:6,alignItems:"center"}}>
+            {(()=>{
+              const withInvoice = providerTxs.filter(tx=>tx.invoice_url&&tx.invoice_url!=="");
+              return withInvoice.length > 0 ? (
+                <button
+                  className="btn btn-sm"
+                  disabled={downloadingZip}
+                  onClick={async()=>{
+                    setDownloadingZip(true);
+                    setZipProgress({fetched:0,total:withInvoice.length});
+                    await downloadAllInvoicesZip(withInvoice, {
+                      fr,
+                      onProgress: (p) => setZipProgress(p),
+                      onDone: ({ total, errors }) => {
+                        addToast(fr
+                          ? `${total} facture${total>1?"s":""} téléchargée${total>1?"s":""}${errors?` (${errors} erreur${errors>1?"s":""})`:""}`
+                          : `${total} invoice${total>1?"s":""} downloaded${errors?` (${errors} error${errors>1?"s":""})`:""}`, errors?"warning":"success");
+                        setDownloadingZip(false); setZipProgress(null);
+                      },
+                      onError: (msg) => { addToast(msg,"error"); setDownloadingZip(false); setZipProgress(null); }
+                    });
+                  }}
+                  style={{fontSize:12,padding:"4px 10px",display:"inline-flex",alignItems:"center",gap:4}}
+                >{downloadingZip ? (
+                  <>{zipProgress ? `${zipProgress.fetched}/${zipProgress.total}` : "..."} ⏳</>
+                ) : (
+                  <>⬇️ {fr?`Télécharger ${withInvoice.length} facture${withInvoice.length>1?"s":""}`:`Download ${withInvoice.length} invoice${withInvoice.length>1?"s":""}`}</>
+                )}</button>
+              ) : null;
+            })()}
+            {(()=>{
+              const eligible = providerTxs.filter(tx=>(tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee")&&(!tx.invoice_url||tx.invoice_url===""));
+              return eligible.length > 0 ? (
+                <button
+                  className="btn btn-sm"
+                  onClick={()=>{setBulkEligibleTxs(eligible);setBulkInvoiceOpen(true);}}
+                  style={{fontSize:12,padding:"4px 10px",display:"inline-flex",alignItems:"center",gap:4}}
+                >📄 {fr?`Générer ${eligible.length} facture${eligible.length>1?"s":""}`:`Generate ${eligible.length} invoice${eligible.length>1?"s":""}`}</button>
+              ) : null;
+            })()}
+          </div>
         </div>
         <div className="table-wrap">
           <table className="table" style={{fontSize:12}}>
