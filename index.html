@@ -33267,23 +33267,11 @@ const mergeMessages = (prev, serverList) => {
   const serverIds   = new Set(serverList.map(m => _msgKey(m)).filter(Boolean));
   const serverTexts = new Set(serverList.map(m => (m.text || m.content || m.message || "").trim()).filter(Boolean));
   // Keep pending/error/sent-but-unconfirmed messages not yet on server
-  const localOnly = prev.filter(m => {
-    if (!(m._pending || m._error || m._sent)) return false;
-    if (serverIds.has(_msgKey(m))) return false;
-    // Text-based dedup : seulement si un message serveur RÉCENT (<2min) a le même texte
-    // Évite les faux positifs avec des vieux messages qui ont le même texte
-    const mText = (m.text || "").trim();
-    if (mText) {
-      const mTime = new Date(m.created_at || 0).getTime();
-      const recentTextMatch = serverList.some(s => {
-        if ((s.text || s.content || s.message || "").trim() !== mText) return false;
-        const sTime = new Date(s.created_at || s.timestamp || 0).getTime();
-        return Math.abs(sTime - mTime) < 120000; // 2 minutes
-      });
-      if (recentTextMatch) return false; // Le serveur a le message → safe to drop
-    }
-    return true; // Garder le pending/sent
-  });
+  const localOnly = prev.filter(m =>
+    (m._pending || m._error || m._sent) &&
+    !serverIds.has(_msgKey(m)) &&
+    !serverTexts.has((m.text || "").trim())
+  );
   // Merge: server list + unconfirmed locals, dedup by stable key
   const merged = new Map();
   serverList.forEach((m, i) => {
@@ -41066,9 +41054,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const isUserScrollRef = React.useRef(false);
   // Guard against parallel polling calls
   const isMsgPollingRef  = React.useRef(false);
-  // Ref synchronisée avec le state messages pour sauvegarder dans le cache au changement de conv
-  const messagesRef = React.useRef([]);
-  React.useEffect(() => { messagesRef.current = messages; }, [messages]);
   const isConvPollingRef = React.useRef(false);
   // AbortController for in-flight message fetches (rapid conv switching)
   const abortMsgRef = React.useRef(null);
@@ -41084,8 +41069,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // Verrou anti-doublon pour sendMessage (ref synchrone, pas de race condition)
   const isSendingMsgRef = React.useRef(false);
   const lastSendTimestampRef = React.useRef(0);
-  // Guard : bloque le polling pendant l'envoi + réconciliation (évite merge stale)
-  const isSendingRef = React.useRef(false);
   // Ref miroir de scriptStates pour accès depuis useCallback sans dépendances
   const scriptStatesRef = React.useRef({});
   // Ref for messages scroll container
@@ -41223,71 +41206,22 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     let apiOk_ = false;
 
     // ── 0.4 Promise.allSettled : Carlos + Supabase en parallèle ─────────────
-    // Supabase: fetch ALL conversations in pages of 1000 to bypass default 1000-row limit
-    const _fetchAllSupabase = async () => {
-      const PAGE_SIZE = 1000;
-      let allRows = [];
-      let offset = 0;
-      let hasMore = true;
-      while (hasMore) {
-        let q = sb.from("tg_conversations").select("*");
-        if (userProfile?.role === "chatter") {
-          const _assigned = userProfile.assigned_models || [];
-          if (_assigned.length > 0) q = q.in("model_id", _assigned);
-        }
-        q = q.order("last_message_at", { ascending: false }).range(offset, offset + PAGE_SIZE - 1);
-        const { data, error } = await q;
-        if (error) { console.warn("[CONV] Supabase page error:", error.message); break; }
-        if (!data || data.length === 0) break;
-        allRows = allRows.concat(data);
-        hasMore = data.length === PAGE_SIZE;
-        offset += PAGE_SIZE;
-      }
-      if (allRows.length > 1000) console.log(`[CONV] Supabase pagination: fetched ${allRows.length} rows across ${Math.ceil(allRows.length / PAGE_SIZE)} pages`);
-      return allRows;
-    };
-
-    // Carlos: fetch with pagination if API supports it (offset/limit params)
-    const _fetchAllCarlos = async () => {
-      const PAGE_SIZE = 500;
-      // First call: try without pagination to check response format
-      const data = await _dmsgFetch("/conversations");
-      const firstPage = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      const total = data.total || data.count || null;
-
-      // If API reports a total higher than returned items, paginate
-      if (total && total > firstPage.length) {
-        console.warn(`[CONV] Carlos returned ${firstPage.length}/${total} — fetching remaining pages`);
-        let allItems = [...firstPage];
-        let offset = firstPage.length;
-        while (offset < total) {
-          try {
-            const pageData = await _dmsgFetch(`/conversations?limit=${PAGE_SIZE}&offset=${offset}`);
-            const page = Array.isArray(pageData) ? pageData : (pageData.conversations || pageData.data || []);
-            if (!page.length) break;
-            allItems = allItems.concat(page);
-            offset += page.length;
-          } catch (e) { console.warn("[CONV] Carlos pagination error at offset", offset, e.message); break; }
-        }
-        console.log(`[CONV] Carlos pagination complete: ${allItems.length}/${total} conversations`);
-        return allItems;
-      }
-
-      // Heuristic: if returned count is a round number (multiple of 100), API might be truncating silently
-      if (firstPage.length > 0 && firstPage.length % 100 === 0) {
-        console.warn(`[CONV] ⚠️ Carlos returned exactly ${firstPage.length} conversations — possible server-side LIMIT truncation!`);
-      }
-      return firstPage;
-    };
+    let _convSbQuery = sb.from("tg_conversations").select("*");
+    if (userProfile?.role === "chatter") {
+      const _assigned = userProfile.assigned_models || [];
+      if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
+    }
+    _convSbQuery = _convSbQuery.order("last_message_at", { ascending: false });
 
     const [_convApiRes, _convSbRes] = await Promise.allSettled([
-      _fetchAllCarlos(),
-      _fetchAllSupabase(),
+      _dmsgFetch("/conversations"),
+      _convSbQuery,
     ]);
 
     // 1. Carlos result
     if (_convApiRes.status === "fulfilled") {
-      apiList = _convApiRes.value;
+      const data = _convApiRes.value;
+      apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
       apiOk_ = true;
     } else {
       console.warn("[CONV] Carlos API error, will use Supabase only:", _convApiRes.reason?.message);
@@ -41296,7 +41230,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // 2. Supabase result
     let sbList = [];
     if (_convSbRes.status === "fulfilled") {
-      sbList = _convSbRes.value;
+      const { data: sbData, error } = _convSbRes.value;
+      if (!error && sbData) sbList = sbData;
     }
 
     // 3. Merge: API results take priority, Supabase fills gaps ONLY for missing chat_ids
@@ -41329,13 +41264,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     let list = merged;
 
-    // Debug: log model distribution + gap detection
+    // Debug: log model distribution
     const byModel = {};
     list.forEach(c => { const mid = c.model_id || "unknown"; byModel[mid] = (byModel[mid] || 0) + 1; });
-    console.log(`[CONV] Loaded ${list.length} conversations (API: ${apiList.length}, Supabase: ${sbList.length}, Supabase added after dedup: ${sbAdded})`, byModel);
-    if (sbList.length > apiList.length + 50) {
-      console.warn(`[CONV] ⚠️ GAP DETECTED: Supabase has ${sbList.length} rows but Carlos API returned only ${apiList.length}. ${sbAdded} conversations rescued from Supabase.`);
-    }
+    console.log(`[CONV] Loaded ${list.length} conversations (API: ${apiList.length}, Supabase added: ${sbAdded})`, byModel);
 
     // Filtrage sécurité côté client pour les chatters
     if (userProfile?.role === 'chatter') {
@@ -41400,8 +41332,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // ── Load messages — isInitial=true on first open, false on poll ──
   const loadMessagesById = useCallback(async (chatId, isInitial, signal) => {
     if (!chatId) return;
-    // Ne pas poll pendant un envoi en cours (évite d'écraser le pending)
-    if (!isInitial && isSendingRef.current) return;
     if (isInitial) isInitialLoadingRef.current = true;
     const cid = String(chatId);
     if (_DADASH_DEBUG) console.log('🔍 [MSG-DIAG] Function called:', {
@@ -41411,8 +41341,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       isInitial,
       timestamp: new Date().toISOString()
     });
-    // FIX: Toujours fetcher depuis Carlos — pas de cache frontend
-    if (isInitial) {
+    // Afficher cache immédiatement si dispo et dans le TTL (60s)
+    const _cachedMsgs = _DMSG_MSG_CACHE[cid];
+    const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
+    if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
+      setMessages(_cachedMsgs.data.map(normalizeMessage).filter(Boolean));
+      setMsgLoading(false);
+      setTimeout(() => scrollToBottom('instant'), 50);
+      // Continuer pour refresh silencieux
+    } else if (isInitial) {
       setMsgLoading(true);
     }
     try {
@@ -41667,19 +41604,26 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     const controller = new AbortController();
     abortMsgRef.current = controller;
 
-    // FIX: Ne plus sauvegarder les messages en cache au changement de conv
-    // (causait l'affichage de messages stale au retour sur une conv)
-
     chatIdRef.current = chatId;
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
     // Ouvrir dans les onglets
     openTab(conv);
-    // FIX: Toujours vider les messages et afficher le loading au changement de conv
-    // (plus de cache frontend — chaque changement re-fetch depuis Carlos)
-    setMessages([]);
-    setMsgLoading(true);
+    const cid = String(chatId || "");
+    const cached = _DMSG_MSG_CACHE[cid];
+    if (_DADASH_DEBUG) console.log('[DEBUG-SELECT] Cache status:', {
+      cacheExists: !!_DMSG_MSG_CACHE[cid],
+      cacheFresh: _DMSG_MSG_CACHE[cid] ? (Date.now() - _DMSG_MSG_CACHE[cid].ts < 60000) : false,
+      cacheLength: _DMSG_MSG_CACHE[cid]?.data?.length || 0,
+      cacheLastMsg: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
+      cacheLastDate: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.timestamp || 'N/A'
+    });
+    if (cached && Date.now() - cached.ts < 60000 && cached.data.length > 0) {
+      setMessages(cached.data.map(normalizeMessage).filter(Boolean));
+    } else {
+      setMessages([]);
+    }
     msgInputRef.current = "";
     setMsgInput("");
     setShowScripts(false);
@@ -41979,16 +41923,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             });
             if (!isUserScrollRef.current) {
               setTimeout(() => scrollToBottom('smooth'), 100);
-            }
-            // Mettre à jour le cache avec les messages live
-            const cid = String(chatIdRef.current || "");
-            if (cid) {
-              setTimeout(function() {
-                if (messagesRef.current && messagesRef.current.length > 0) {
-                  var toCache = messagesRef.current.filter(function(m) { return !m._pending && !m._error; });
-                  if (toCache.length > 0) _DMSG_MSG_CACHE[cid] = { data: toCache, ts: Date.now() };
-                }
-              }, 100);
             }
           }, 500);
         }
@@ -42304,9 +42238,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
     isSendingMsgRef.current = true;
     lastSendTimestampRef.current = now;
-    isSendingRef.current = true;
-    // Safety timeout : débloquer le polling après 20s max
-    const sendGuardTimeout = setTimeout(() => { isSendingRef.current = false; }, 20000);
 
     const text = msgInputRef.current.trim();
     // Clear input immediately — snappy UX, don't wait for API
@@ -42387,13 +42318,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           const list = (Array.isArray(data) ? data : (data.messages || data.data || [])).map(normalizeMessage).filter(Boolean);
           setMessages(prev => mergeMessages(prev, list));
         } catch (_) { /* keep confirmed state */ }
-        clearTimeout(sendGuardTimeout);
-        isSendingRef.current = false;
       }, 3000);
 
     } catch (e) {
-      clearTimeout(sendGuardTimeout);
-      isSendingRef.current = false;
       // Don't remove — mark the message as failed so user sees it and can retry
       setMessages(prev => prev.map(m =>
         m.id === localId ? { ...m, _pending: false, pending: false, _error: true, error: true, _chatId: chatId, _modelId: selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined } : m
@@ -62150,25 +62077,6 @@ const App = () => {
     return () => { clearTimeout(timer); clearTimeout(forceTimer); };
   }, [loading]);
 
-  // Cache profil pour éviter les fetch dupliqués au boot
-  let _cachedProfile = null;
-  let _cachedProfileAt = 0;
-
-  async function fetchProfileCached(userId) {
-    const now = Date.now();
-    // Cache valide 5 secondes (couvre le boot)
-    if (_cachedProfile && (now - _cachedProfileAt) < 5000) {
-      console.log("[AUTH] profile from cache");
-      return _cachedProfile;
-    }
-    const { data } = await sb.from("profiles").select("*").eq("id", userId).single();
-    if (data) {
-      _cachedProfile = data;
-      _cachedProfileAt = now;
-    }
-    return data;
-  }
-
   /* SAFARI FIX — onAuthStateChange: auto-recover user if session resolves late
      (e.g. after the 3s force-bypass showed the login page, if getSession eventually completes,
      this listener catches the SIGNED_IN event and logs the user in automatically) */
@@ -62178,7 +62086,7 @@ const App = () => {
       if (_loggedOut.current) return;
       if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'INITIAL_SESSION') && session && !userRef.current) {
         try {
-          const profile = await fetchProfileCached(session.user.id);
+          const { data: profile } = await sb.from("profiles").select("*").eq("id", session.user.id).single();
           if (profile) {
             const fullUser = { ...profile, email: session.user.email };
             console.log("[SAFARI FIX] onAuthStateChange recovered user:", event);
@@ -62404,13 +62312,6 @@ const App = () => {
 
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
-    // Guard anti-double-appel concurrent
-    if (window.__loadDataRunning) {
-      console.log("[APP] loadData skipped (already running)");
-      return;
-    }
-    window.__loadDataRunning = true;
-    try {
     if (window.PERF) window.PERF.mark('loadData_start');
     const thisVersion = ++_loadVersion.current;
     const scope = getScope(currentUser);
@@ -62667,9 +62568,6 @@ const App = () => {
       } catch(e) { /* notifications fetch failed */ }
     }
     if (window.PERF) { window.PERF.mark('loadData_done'); window.PERF.measure('loadData total', 'loadData_start'); }
-    } finally {
-      window.__loadDataRunning = false;
-    }
   };
 
   // ── NOTIFICATION HELPERS ──
@@ -62790,10 +62688,10 @@ const App = () => {
         if (signal && signal.aborted) throw new Error("Auth init annulé");
         if(session) {
           if (window.PERF) window.PERF.mark('profile_fetch_start');
-          const profile = await fetchProfileCached(session.user.id);
-          if (!profile) {
-            console.error("[DADASH] Profile fetch returned null");
-            addToast("Erreur chargement profil", "error");
+          const {data:profile, error:profileErr} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
+          if (profileErr) {
+            console.error("[DADASH] Profile fetch error:", profileErr.message);
+            addToast("Erreur chargement profil: " + profileErr.message, "error");
           }
           if(profile) {
             if (window.PERF) window.PERF.mark('profile_fetch_done');
@@ -62825,7 +62723,7 @@ const App = () => {
           try {
             const {data:{session}} = await sb.auth.getSession();
             if (session) {
-              const profile = await fetchProfileCached(session.user.id);
+              const {data:profile} = await sb.from("profiles").select("*").eq("id",session.user.id).single();
               if (profile) {
                 const fullUser = {...profile, email:session.user.email};
                 setUser(fullUser);
