@@ -31399,7 +31399,7 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
         ? { ...c, unread_count: 0 } : c
     ));
     setSelectedConv(conv);
-    window.__rtActiveConversationId = conv?.id || null;
+    window.dispatchEvent(new CustomEvent('conversationChanged', { detail: { id: conv?.id || null } }));
     loadMessages(conv.id);
     setAssignDropdown(null);
   };
@@ -31894,7 +31894,7 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
         ? { ...c, unread_count: 0 } : c
     ));
     setSelectedConv(conv);
-    window.__rtActiveConversationId = conv?.id || null;
+    window.dispatchEvent(new CustomEvent('conversationChanged', { detail: { id: conv?.id || null } }));
     loadMessages(conv.id);
   };
 
@@ -41607,8 +41607,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     abortMsgRef.current = controller;
 
     chatIdRef.current = chatId;
-    // Expose active conversation_id for global realtime filter
-    window.__rtActiveConversationId = conv?.id || null;
+    // Notify global realtime channel of conversation change
+    window.dispatchEvent(new CustomEvent('conversationChanged', { detail: { id: conv?.id || null } }));
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
@@ -62264,35 +62264,68 @@ const App = () => {
   }, [user?.id]);
 
   // ── 2.1 Global Realtime — tg_messages channel filtered by active conversation_id ──
-  const [activeConversationId, setActiveConversationId] = useState(window.__rtActiveConversationId || null);
+  const [activeConversationId, setActiveConversationId] = useState(null);
   useEffect(() => {
-    const poll = setInterval(() => {
-      const current = window.__rtActiveConversationId || null;
-      setActiveConversationId(prev => prev === current ? prev : current);
-    }, 300);
-    return () => clearInterval(poll);
+    const handler = (e) => {
+      const id = e.detail?.id || null;
+      setActiveConversationId(prev => prev === id ? prev : id);
+    };
+    window.addEventListener('conversationChanged', handler);
+    return () => window.removeEventListener('conversationChanged', handler);
   }, []);
   useEffect(() => {
     if (!user) return;
     if (!activeConversationId) return;
-    const channelName = 'global-tg-messages-rt-' + activeConversationId;
+    let channel = null;
+    let heartbeatTimer = null;
+    let reconnectTimer = null;
+    let cancelled = false;
     const filter = 'conversation_id=eq.' + activeConversationId;
-    const channel = window.sb
-      .channel(channelName)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages', filter: filter }, payload => {
-        if (!payload.new) return;
-        console.log('[REALTIME] tg-message-insert id:', payload.new.id, 'conv:', activeConversationId);
-        window.dispatchEvent(new CustomEvent('tg-message-insert', { detail: payload.new }));
-      })
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages', filter: filter }, payload => {
-        if (!payload.new) return;
-        window.dispatchEvent(new CustomEvent('tg-message-update', { detail: payload.new }));
-      })
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') console.log('[REALTIME] tg_messages channel active for conv:', activeConversationId);
-      });
+    const subscribe = () => {
+      if (cancelled) return;
+      if (channel) { try { window.sb.removeChannel(channel); } catch (_) {} }
+      const channelName = 'global-tg-messages-rt-' + activeConversationId + '-' + Date.now();
+      channel = window.sb
+        .channel(channelName)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'tg_messages', filter: filter }, payload => {
+          if (!payload.new) return;
+          console.log('[REALTIME] tg-message-insert id:', payload.new.id, 'conv:', activeConversationId);
+          window.dispatchEvent(new CustomEvent('tg-message-insert', { detail: payload.new }));
+        })
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'tg_messages', filter: filter }, payload => {
+          if (!payload.new) return;
+          window.dispatchEvent(new CustomEvent('tg-message-update', { detail: payload.new }));
+        })
+        .on('system', {}, (payload) => {
+          const status = payload?.extension === 'system' ? payload?.status : payload;
+          if (status === 'CHANNEL_ERROR' || status === 'CLOSED') {
+            console.warn('[REALTIME] Channel error/closed for conv:', activeConversationId, '— reconnecting in 2s');
+            if (!cancelled) reconnectTimer = setTimeout(subscribe, 2000);
+          }
+        })
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') console.log('[REALTIME] tg_messages channel active for conv:', activeConversationId);
+          if (status === 'CHANNEL_ERROR' || status === 'CLOSED') {
+            console.warn('[REALTIME] Subscribe status:', status, '— reconnecting in 2s');
+            if (!cancelled) reconnectTimer = setTimeout(subscribe, 2000);
+          }
+        });
+    };
+    subscribe();
+    // Heartbeat: check channel health every 30s
+    heartbeatTimer = setInterval(() => {
+      if (cancelled) return;
+      const state = channel?.state;
+      if (state && state !== 'joined' && state !== 'joining') {
+        console.warn('[REALTIME] Heartbeat: channel state is', state, '— forcing resubscribe');
+        subscribe();
+      }
+    }, 30000);
     return () => {
-      window.sb.removeChannel(channel);
+      cancelled = true;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (channel) { try { window.sb.removeChannel(channel); } catch (_) {} }
     };
   }, [user?.id, activeConversationId]);
 
