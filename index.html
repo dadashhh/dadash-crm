@@ -8265,7 +8265,7 @@ const ROLE_ACCESS = {
   ceo: ["admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments","model_compta","model_notif"],
   chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","messagerie","chatter_compta","chatter_competition","chatter_scan","chatter_notif"],
-  provider: ["provider_dashboard","transactions","provider_compta","provider_notif"],
+  provider: ["provider_dashboard","provider_compta","provider_factures","provider_notif"],
   manager_chatter: ["mc_dashboard","mc_chatters","mc_conversations","mc_transactions","mc_planning","mc_solde","mc_parametres"]
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
@@ -23888,6 +23888,169 @@ const TelegramTab = ({user, lang, txs, models, profiles, spenders, onRefresh, na
 };
 
 // =============================================
+// LOGIN BRIEF MODAL — Universal login briefing (all roles)
+// =============================================
+const LoginBriefModal = ({ open, onClose, user, lang, txs, providerPayouts, notifications, profiles }) => {
+  const { convertAmount, fmtAmount } = useCurrency();
+  const role = user?.role || '';
+  const fr = lang === 'fr';
+  const BRIEF_KEY = user ? `dadash_last_visit_${user.id}` : '';
+  const lastVisit = BRIEF_KEY ? localStorage.getItem(BRIEF_KEY) : null;
+  const since = lastVisit ? new Date(lastVisit) : new Date(Date.now() - 7 * 86400000);
+
+  // TX scoped par rôle
+  const scopedTxs = useMemo(() => {
+    if (!user) return [];
+    const all = (txs || []).filter(tx => new Date(tx.created_at || tx.date) > since);
+    switch (role) {
+      case 'gerant': return all;
+      case 'provider': return all.filter(tx => tx.provider_id === user.id);
+      case 'chatter': return all.filter(tx => tx.chatter_id === user.id);
+      case 'manager_chatter': {
+        const myIds = (profiles || []).filter(p => p.manager_id === user.id || p.id === user.id).map(p => p.id);
+        return all.filter(tx => myIds.includes(tx.chatter_id));
+      }
+      case 'modele': return all.filter(tx => tx.model_id === user.id);
+      default: return all;
+    }
+  }, [txs, since, role, user?.id, profiles]);
+
+  const newValidTxs = scopedTxs.filter(tx => isValidTx(tx.status));
+  const newPendingTxs = scopedTxs.filter(tx => isPendingTx(tx.status));
+  const newRefusedTxs = scopedTxs.filter(tx => isRefusedTx(tx.status));
+  const txCA = newValidTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+
+  // Payouts (provider + gérant)
+  const recentPayouts = (providerPayouts || []).filter(p => new Date(p.created_at) > since);
+  const payoutsPending = recentPayouts.filter(p => p.status === 'pending');
+  const payoutsValidated = recentPayouts.filter(p => p.status === 'validated');
+
+  // Notifs non lues
+  const unreadNotifs = (notifications || []).filter(n => !n.read_at);
+
+  // CA 7j snapshot (gérant)
+  const ca7j = useMemo(() => {
+    if (role !== 'gerant') return null;
+    const d7 = new Date(Date.now() - 7 * 86400000);
+    const d14 = new Date(Date.now() - 14 * 86400000);
+    const all = txs || [];
+    const week1 = all.filter(tx => isValidTx(tx.status) && new Date(tx.created_at || tx.date) > d7);
+    const week2 = all.filter(tx => isValidTx(tx.status) && new Date(tx.created_at || tx.date) > d14 && new Date(tx.created_at || tx.date) <= d7);
+    const ca1 = week1.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const ca2 = week2.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const delta = ca2 > 0 ? Math.round((ca1 - ca2) / ca2 * 100) : (ca1 > 0 ? 100 : 0);
+    return { ca: ca1, delta, txCount: week1.length };
+  }, [txs, role, convertAmount]);
+
+  if (!open || !user) return null;
+
+  const hasAnything = scopedTxs.length > 0 || recentPayouts.length > 0 || unreadNotifs.length > 0;
+
+  const ctaLabel = {
+    gerant: fr ? 'Voir le tableau de bord' : 'Go to dashboard',
+    provider: fr ? 'Voir mon activité' : 'See my activity',
+    chatter: fr ? 'Voir mes transactions' : 'See my transactions',
+    manager_chatter: fr ? 'Voir mon dashboard' : 'See my dashboard',
+    modele: fr ? 'Voir mon espace' : 'See my space',
+  }[role] || (fr ? 'Continuer' : 'Continue');
+
+  const handleClose = () => {
+    localStorage.setItem(BRIEF_KEY, new Date().toISOString());
+    onClose();
+  };
+
+  const sinceLabel = lastVisit
+    ? (fr ? `Depuis votre dernière visite (${new Date(lastVisit).toLocaleDateString('fr-CH')})` : `Since your last visit (${new Date(lastVisit).toLocaleDateString('en-GB')})`)
+    : (fr ? 'Cette semaine' : 'This week');
+
+  return ReactDOM.createPortal(
+    <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)' }}
+      onClick={handleClose}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: 'var(--bg-raised, #1a1a2e)', border: '1px solid var(--border, #333)', borderRadius: 20,
+        width: _isMobile ? '92vw' : 460, maxHeight: '80vh', overflow: 'auto',
+        padding: '28px 24px', boxShadow: '0 20px 60px rgba(0,0,0,0.4)'
+      }}>
+        {/* Header */}
+        <div style={{ textAlign: 'center', marginBottom: 20 }}>
+          <div style={{ fontSize: 28, marginBottom: 6 }}>👋</div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text)' }}>
+            {fr ? `Bonjour ${user.name || user.email || ''}` : `Hello ${user.name || user.email || ''}`}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>{sinceLabel}</div>
+        </div>
+
+        {!hasAnything ? (
+          <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--muted)', fontSize: 14 }}>
+            ✨ {fr ? 'Rien de nouveau, tout est calme !' : 'Nothing new, all quiet!'}
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {/* 💳 TX bloc */}
+            {scopedTxs.length > 0 && (
+              <div style={{ background: 'var(--card-bg, #222)', borderRadius: 14, padding: '14px 16px', border: '1px solid var(--border-subtle, #333)' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>💳 Transactions</div>
+                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                  {newValidTxs.length > 0 && <div style={{ fontSize: 12, color: '#10b981', fontWeight: 600 }}>✅ {newValidTxs.length} {fr ? 'validées' : 'validated'} · {fmtAmount(txCA)}</div>}
+                  {newPendingTxs.length > 0 && <div style={{ fontSize: 12, color: '#f59e0b', fontWeight: 600 }}>⏳ {newPendingTxs.length} {fr ? 'en attente' : 'pending'}</div>}
+                  {newRefusedTxs.length > 0 && <div style={{ fontSize: 12, color: '#ef4444', fontWeight: 600 }}>❌ {newRefusedTxs.length} {fr ? 'refusées' : 'refused'}</div>}
+                </div>
+              </div>
+            )}
+
+            {/* 💰 Reversements (provider + gérant) */}
+            {(role === 'provider' || role === 'gerant') && recentPayouts.length > 0 && (
+              <div style={{ background: 'var(--card-bg, #222)', borderRadius: 14, padding: '14px 16px', border: '1px solid var(--border-subtle, #333)' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>💰 {fr ? 'Reversements' : 'Payments'}</div>
+                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                  {payoutsValidated.length > 0 && <div style={{ fontSize: 12, color: '#10b981', fontWeight: 600 }}>✅ {payoutsValidated.length} {fr ? 'validés' : 'validated'}</div>}
+                  {payoutsPending.length > 0 && <div style={{ fontSize: 12, color: '#f59e0b', fontWeight: 600 }}>⏳ {payoutsPending.length} {fr ? 'à valider' : 'to validate'}</div>}
+                </div>
+              </div>
+            )}
+
+            {/* 📊 CA Snapshot (gérant only) */}
+            {role === 'gerant' && ca7j && (
+              <div style={{ background: 'var(--card-bg, #222)', borderRadius: 14, padding: '14px 16px', border: '1px solid var(--border-subtle, #333)' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>📊 CA 7 {fr ? 'jours' : 'days'}</div>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                  <span style={{ fontSize: 20, fontWeight: 800, color: 'var(--text)' }}>{fmtAmount(ca7j.ca)}</span>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: ca7j.delta >= 0 ? '#10b981' : '#ef4444' }}>{ca7j.delta >= 0 ? '↑' : '↓'} {Math.abs(ca7j.delta)}%</span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)' }}>{ca7j.txCount} TX</span>
+                </div>
+              </div>
+            )}
+
+            {/* 🔔 Notifs */}
+            {unreadNotifs.length > 0 && (
+              <div style={{ background: 'var(--card-bg, #222)', borderRadius: 14, padding: '14px 16px', border: '1px solid var(--border-subtle, #333)' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>🔔 Notifications</div>
+                <div style={{ fontSize: 12, color: '#ef4444', fontWeight: 600 }}>{unreadNotifs.length} {fr ? 'non lue(s)' : 'unread'}</div>
+                {unreadNotifs.slice(0, 3).map((n, i) => (
+                  <div key={n.id || i} style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {n.title || n.message || '—'}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* CTA */}
+        <button onClick={handleClose} style={{
+          width: '100%', marginTop: 20, padding: '12px 0', borderRadius: 12,
+          background: 'var(--accent, #6366f1)', color: 'white', border: 'none',
+          fontSize: 14, fontWeight: 700, cursor: 'pointer'
+        }}>
+          {ctaLabel}
+        </button>
+      </div>
+    </div>,
+    document.body
+  );
+};
+
+// =============================================
 // BILLING INFO MODAL — Provider billing details
 // =============================================
 const BillingInfoModal = ({ open, onClose, user, lang }) => {
@@ -25588,14 +25751,16 @@ const ProviderNewTxModal = ({ open, onClose, user, lang, models, spenders: spend
 // PROVIDER DASHBOARD — Dashboard temps réel provider
 // Données déjà isolées (txSummary filtré par provider_id au chargement)
 // =============================================
-const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh, navigateTo }) => {
+const ProviderDashboardTab = ({ user, lang, txs, txsPaginated, providerPayouts: ppData, models, profiles, screenshotChecks, providerPaymentMethods, onRefresh, onNotify, products, productTags, modelPrices, navigateToSpender, setTxs, setTxSummary, navigateTo }) => {
   const { convertAmount, fmtAmount } = useCurrency();
   const fr = lang === 'fr';
   const [period, setPeriod] = useState('30j');
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
   const [showBillingModal, setShowBillingModal] = useState(false);
+  const [viewMode, setViewMode] = useState('dashboard');
 
+  // ── Date range ──
   const { dateDebut, dateFin } = useMemo(() => {
     if (period === 'custom' && customStart && customEnd) {
       return { dateDebut: new Date(customStart + 'T00:00:00'), dateFin: new Date(customEnd + 'T23:59:59') };
@@ -25613,24 +25778,40 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
     });
   }, [txs, dateDebut, dateFin]);
 
-  const isVal = s => s === 'validated' || s === 'confirmee' || s === 'payee';
-  const validTxs   = filteredTxs.filter(tx => isVal(tx.status));
+  // ── BUGFIX: Utiliser les constantes globales, pas de isVal local ──
+  const validTxs   = filteredTxs.filter(tx => isValidTx(tx.status));
   const pendingTxs = filteredTxs.filter(tx => isPendingTx(tx.status));
-  const totalCA      = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-  const totalPending = pendingTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-  const panierMoyen  = validTxs.length > 0 ? totalCA / validTxs.length : 0;
-  const tauxValid    = (validTxs.length + pendingTxs.length) > 0 ? Math.round(validTxs.length / (validTxs.length + pendingTxs.length) * 100) : 0;
+  const refusedTxs = filteredTxs.filter(tx => isRefusedTx(tx.status));
 
-  // Solde provider (all-time pour refléter la vraie dette)
-  // Le provider garde 10% et reverse 90% au gérant
-  const allValidTxs = (txs || []).filter(tx => isVal(tx.status));
+  // ── KPIs FINANCIERS ──
+  const totalBrut      = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+  const totalNet       = validTxs.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+  const totalPending   = pendingTxs.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+  const totalRefused   = refusedTxs.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+  const panierMoyen    = validTxs.length > 0 ? totalBrut / validTxs.length : 0;
+
+  // ── MA COMMISSION (variable, lue depuis profil ou TX) ──
+  const providerRate = Number(user.commission_rate || user.commission_pct || 10) / 100;
+  const myCommission = validTxs.reduce((s, tx) => {
+    const amt = convertAmount(Number(tx.amount || 0), tx.currency);
+    const txRate = Number(tx.provider_pct || 0) / 100 || providerRate;
+    return s + (amt * txRate);
+  }, 0);
+
+  // ── SOLDE (all-time) ──
+  const allValidTxs = (txs || []).filter(tx => isValidTx(tx.status));
   const caAllTime   = allValidTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+  const myCommissionAllTime = allValidTxs.reduce((s, tx) => {
+    const amt = convertAmount(Number(tx.amount || 0), tx.currency);
+    const txRate = Number(tx.provider_pct || 0) / 100 || providerRate;
+    return s + (amt * txRate);
+  }, 0);
   const myPayouts   = (ppData || []).filter(p => p.provider_id === user.id || p.declared_by === user.id);
-  const totalPaid   = myPayouts.filter(p => p.status === 'validated').reduce((s, p) => s + Number(p.amount || 0), 0);
-  const aReverserAllTime = caAllTime * 0.90;
+  const totalPaid   = myPayouts.filter(p => p.status === 'validated').reduce((s, p) => s + convertAmount(Number(p.amount || 0), p.currency), 0);
+  const aReverserAllTime = caAllTime - myCommissionAllTime;
   const soldeData   = { solde: -(aReverserAllTime - totalPaid), caEncaisse: caAllTime, dejaReversi: totalPaid };
 
-  // Chart CA par jour
+  // ── Chart CA par jour ──
   const chartData = useMemo(() => {
     if (period === "24h") return getChartData(filteredTxs, "date", ["ca", "tx", "pending"], period);
     const byDay = {};
@@ -25639,7 +25820,7 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
       if (!key || key.length < 10) return;
       if (!byDay[key]) byDay[key] = { ca: 0, tx: 0, pending: 0 };
       const amt = convertAmount(Number(tx.amount || 0), tx.currency);
-      if (isVal(tx.status)) { byDay[key].ca += amt; byDay[key].tx++; }
+      if (isValidTx(tx.status)) { byDay[key].ca += amt; byDay[key].tx++; }
       if (isPendingTx(tx.status)) byDay[key].pending += amt;
     });
     return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
@@ -25648,7 +25829,7 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
     }));
   }, [filteredTxs, convertAmount, period]);
 
-  // Top modèles sur la période
+  // ── Top modèles sur la période ──
   const modelStats = useMemo(() => {
     const byModel = {};
     validTxs.forEach(tx => {
@@ -25662,7 +25843,7 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
       .sort((a, b) => b.ca - a.ca).slice(0, 6);
   }, [validTxs, models, convertAmount]);
 
-  // TX récentes (toutes périodes confondues, triées par date)
+  // TX récentes
   const recentTxs = useMemo(() => {
     return [...(txs || [])].sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at)).slice(0, 12);
   }, [txs]);
@@ -25672,7 +25853,7 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
 
   return (
     <div style={{ padding: _isMobile ? '0 12px' : 0 }}>
-      {/* Filtre période */}
+      {/* ── Filtre période ── */}
       <div className="toolbar" style={{ marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
         <div className="period-filters">
           {PERIODS.map(p => (
@@ -25681,223 +25862,212 @@ const ProviderDashboardTab = ({ user, lang, txs, providerPayouts: ppData, models
           ))}
         </div>
         <div className="filter-sep"/>
-        <DateRangePicker
-          startDate={customStart} endDate={customEnd}
+        <DateRangePicker startDate={customStart} endDate={customEnd}
           onChange={({ start, end }) => { setCustomStart(start || ''); setCustomEnd(end || ''); if (start && end) setPeriod('custom'); }}
-          placeholder={fr ? 'Période perso' : 'Custom range'}
-        />
+          placeholder={fr ? 'Période perso' : 'Custom range'} />
         <div className="filter-sep"/>
-        <button
-          onClick={() => setShowBillingModal(true)}
-          style={{
-            display:'flex',alignItems:'center',gap:6,
-            padding:'7px 14px',borderRadius:10,border:'1px solid var(--accent)',
-            background:'var(--accent-muted,rgba(99,102,241,0.12))',
-            color:'var(--accent)',fontSize:12,fontWeight:700,cursor:'pointer',
-            whiteSpace:'nowrap',flexShrink:0,
-          }}
-        >
+        <button onClick={() => setShowBillingModal(true)} style={{
+          display:'flex',alignItems:'center',gap:6,
+          padding:'7px 14px',borderRadius:10,border:'1px solid var(--accent)',
+          background:'var(--accent-muted,rgba(99,102,241,0.12))',
+          color:'var(--accent)',fontSize:12,fontWeight:700,cursor:'pointer',
+          whiteSpace:'nowrap',flexShrink:0,
+        }}>
           🧾 {fr ? 'Infos facturation' : 'Billing info'}
         </button>
       </div>
 
       <BillingInfoModal open={showBillingModal} onClose={() => setShowBillingModal(false)} user={user} lang={lang} />
 
-      {/* KPI strip */}
-      <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-6'} style={{ marginBottom: 18 }}>
+      {/* ── 7 KPIs — Row 1 : Financier (4 cartes) ── */}
+      <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-4'} style={{ marginBottom: 12 }}>
         <div className="kpi-card green">
-          <div className="kpi-card-label">CA BRUT</div>
-          <div className="kpi-card-value green">{fmtAmount(totalCA)}</div>
-          <div className="kpi-card-delta up">↑ {validTxs.length} TX validées</div>
+          <div className="kpi-card-label">{fr ? 'REÇU VALIDÉ NET' : 'VALIDATED NET'}</div>
+          <div className="kpi-card-value green">{fmtAmount(totalNet)}</div>
+          <div className="kpi-card-delta up">↑ {validTxs.length} TX</div>
+        </div>
+        <div className="kpi-card red">
+          <div className="kpi-card-label">{fr ? 'REFUSÉ NET' : 'REFUSED NET'}</div>
+          <div className="kpi-card-value red">{fmtAmount(totalRefused)}</div>
+          <div className="kpi-card-delta dim">{refusedTxs.length} TX</div>
         </div>
         <div className="kpi-card amber">
-          <div className="kpi-card-label">CA EN ATTENTE</div>
+          <div className="kpi-card-label">{fr ? 'EN ATTENTE NET' : 'PENDING NET'}</div>
           <div className="kpi-card-value amber">{fmtAmount(totalPending)}</div>
-          <div className={`kpi-card-delta ${pendingTxs.length > 0 ? 'warn' : 'up'}`}>{pendingTxs.length} TX pending</div>
+          <div className="kpi-card-delta warn">{pendingTxs.length} TX</div>
         </div>
         <div className="kpi-card indigo">
-          <div className="kpi-card-label">TOTAL TX</div>
-          <div className="kpi-card-value indigo">{filteredTxs.length}</div>
-          <div className="kpi-card-hint">sur la période</div>
+          <div className="kpi-card-label">{fr ? 'MA COMMISSION' : 'MY COMMISSION'}</div>
+          <div className="kpi-card-value indigo">{fmtAmount(myCommission)}</div>
+          <div className="kpi-card-hint">{Math.round(providerRate * 100)}% {fr ? 'du brut' : 'of gross'}</div>
         </div>
+      </div>
+
+      {/* ── 7 KPIs — Row 2 : Stats + Solde (3 cartes) ── */}
+      <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-3'} style={{ marginBottom: 18 }}>
         <div className="kpi-card white">
           <div className="kpi-card-label">PANIER MOYEN</div>
           <div className="kpi-card-value white">{fmtAmount(panierMoyen)}</div>
-          <div className="kpi-card-hint">par TX validée</div>
+          <div className="kpi-card-hint">{fr ? 'par TX validée' : 'per validated TX'}</div>
         </div>
-        <div className={`kpi-card ${tauxValid >= 80 ? 'green' : tauxValid >= 50 ? 'amber' : 'red'}`}>
-          <div className="kpi-card-label">TAUX VALID.</div>
-          <div className={`kpi-card-value ${tauxValid >= 80 ? 'green' : tauxValid >= 50 ? 'amber' : 'red'}`}>{tauxValid}%</div>
-          <div className="kpi-card-hint">des transactions</div>
+        <div className="kpi-card white">
+          <div className="kpi-card-label">TOTAL TX</div>
+          <div className="kpi-card-value white">{filteredTxs.length}</div>
+          <div className="kpi-card-hint">{fr ? 'sur la période' : 'in period'}</div>
         </div>
         <SoldeWidget role="provider" soldeData={soldeData} onClickDetails={() => navigateTo && navigateTo('provider_compta')} />
       </div>
 
-      {/* Chart */}
-      {chartData.length > 0 && (
-        <div className="ui-panel" style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 14 }}>
-            📈 {fr ? 'Évolution du CA' : 'Revenue trend'}
-            <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--muted)', marginLeft: 8 }}>{chartData.length} {fr ? 'jours' : 'days'}</span>
-          </div>
-          <ResponsiveContainer width="100%" height={160}>
-            <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
-              <defs>
-                <linearGradient id="prov-grad-ca" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#6366f1" stopOpacity={0.25}/>
-                  <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false}/>
-              <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd"} tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false}/>
-              <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false} width={48}/>
-              <Tooltip contentStyle={{ background: '#0b1020', border: '1px solid rgba(99,102,241,0.2)', borderRadius: 10, fontSize: 12 }}
-                formatter={(v, n) => [`${Math.round(v).toLocaleString()} CHF`, n === 'ca' ? 'CA validé' : 'En attente']}/>
-              <Area type="monotone" dataKey="ca" stroke="#6366f1" strokeWidth={2} fill="url(#prov-grad-ca)" name="ca"/>
-            </AreaChart>
-          </ResponsiveContainer>
+      {/* ── View toggle : Dashboard / Transactions ── */}
+      <div className="page-tabs-bar" style={{marginBottom:16,display:'flex',gap:4}}>
+        <div className={`filter-pill${viewMode==='dashboard'?' active':''}`} onClick={()=>setViewMode('dashboard')}>
+          {fr?'📈 Vue générale':'📈 Overview'}
         </div>
-      )}
-
-      {/* Bottom grid: Top modèles + TX récentes */}
-      <div style={{ display: 'grid', gridTemplateColumns: _isMobile ? '1fr' : '1fr 1fr', gap: 16, marginBottom: 16 }}>
-        {/* Top modèles */}
-        <div className="ui-panel">
-          <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 14 }}>🔥 {fr ? 'Mes modèles' : 'My models'}</div>
-          {modelStats.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>{fr ? 'Aucune donnée sur cette période' : 'No data for this period'}</div>
-          ) : (
-            <div>
-              {modelStats.map((ms, i) => {
-                const pct = totalCA > 0 ? (ms.ca / totalCA) * 100 : 0;
-                const initials = (ms.model?.name || ms.id || '?')[0].toUpperCase();
-                return (
-                  <div key={ms.id} style={{ marginBottom: i < modelStats.length - 1 ? 10 : 0 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <div style={{ width: 26, height: 26, borderRadius: 7, background: 'var(--accent-muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 800, color: 'var(--accent)', flexShrink: 0 }}>{initials}</div>
-                        <div>
-                          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{ms.model?.name || ms.id.slice(0, 8)}</div>
-                          <div style={{ fontSize: 10, color: 'var(--muted)' }}>{ms.count} TX · {Math.round(pct)}%</div>
-                        </div>
-                      </div>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: '#10b981' }}>{fmtAmount(ms.ca)}</div>
-                    </div>
-                    <div style={{ height: 3, background: 'var(--border)', borderRadius: 2 }}>
-                      <div style={{ height: '100%', width: `${Math.round(pct)}%`, background: 'var(--accent)', borderRadius: 2, transition: 'width .4s' }}/>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* TX récentes */}
-        <div className="ui-panel">
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>💳 {fr ? 'TX récentes' : 'Recent TX'}</div>
-            <button onClick={() => navigateTo && navigateTo('transactions')} style={{ fontSize: 11, fontWeight: 600, color: 'var(--accent)', background: 'var(--accent-muted)', border: 'none', borderRadius: 8, padding: '4px 10px', cursor: 'pointer' }}>
-              {fr ? 'Voir tout →' : 'See all →'}
-            </button>
-          </div>
-          <div>
-            {recentTxs.map((tx, i) => {
-              const v = isVal(tx.status), pend = isPendingTx(tx.status);
-              const clr = v ? '#10b981' : pend ? '#f59e0b' : '#ef4444';
-              const ico = v ? '✅' : pend ? '⏳' : '❌';
-              const m = (models || []).find(mo => mo.id === tx.model_id);
-              return (
-                <div key={tx.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: i < recentTxs.length - 1 ? '1px solid var(--border)' : 'none' }}>
-                  <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      @{tx.spender_handle || '?'}{m ? ` · ${m.name}` : ''}
-                    </div>
-                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.date || tx.created_at || '').slice(0, 10)}</div>
-                  </div>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: clr, flexShrink: 0, marginLeft: 8 }}>{ico} {fmtAmount(convertAmount(Number(tx.amount || 0), tx.currency))}</div>
-                </div>
-              );
-            })}
-            {recentTxs.length === 0 && (
-              <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>{fr ? 'Aucune transaction' : 'No transactions yet'}</div>
-            )}
-          </div>
+        <div className={`filter-pill${viewMode==='transactions'?' active':''}`} onClick={()=>setViewMode('transactions')}>
+          {fr?'💳 Toutes les TX':'💳 All transactions'}
         </div>
       </div>
 
-      {/* Mes déclarations de paiement — trace complète */}
-      {(()=>{
-        const myPayouts = (ppData||[]).filter(p=>p.provider_id===user.id||p.declared_by===user.id)
-          .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).slice(0,10);
-        const STATUS_C = {pending:{bg:'rgba(245,158,11,0.12)',c:'#f59e0b',lbl:'⏳ En attente'},validated:{bg:'rgba(16,185,129,0.1)',c:'#10b981',lbl:'✅ Validé'},rejected:{bg:'rgba(239,68,68,0.1)',c:'#ef4444',lbl:'❌ Refusé'}};
-        return (
-          <div className="ui-panel" style={{marginTop:16}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-              <div style={{fontSize:13,fontWeight:700,color:'var(--text)'}}>💳 {fr?'Mes déclarations de paiement':'My payment declarations'}</div>
-              <button onClick={()=>navigateTo&&navigateTo('provider_compta')} style={{fontSize:11,fontWeight:600,color:'var(--accent)',background:'var(--accent-muted)',border:'none',borderRadius:8,padding:'4px 10px',cursor:'pointer'}}>
-                {myPayouts.length>0?(fr?'Tout voir →':'See all →'):(fr?'+ Déclarer':'+ Declare')}
-              </button>
+      {/* ── Vue Dashboard : Chart + Top modèles ── */}
+      {viewMode === 'dashboard' && <>
+        {/* Chart CA */}
+        {chartData.length > 0 && (
+          <div className="ui-panel" style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 14 }}>
+              📈 {fr ? 'Évolution du CA' : 'Revenue trend'}
+              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--muted)', marginLeft: 8 }}>{chartData.length} {fr ? 'jours' : 'days'}</span>
             </div>
-            {myPayouts.length===0&&<div style={{textAlign:'center',padding:'18px 0',color:'var(--muted)',fontSize:12}}>{fr?'Aucune déclaration. Allez dans "Mes Paiements" pour déclarer un versement.':'No declarations yet. Go to "My Payments" to declare a transfer.'}</div>}
-            {myPayouts.map((p,i)=>{
-              const st=STATUS_C[p.status]||STATUS_C.pending;
-              return (
-                <div key={p.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:i<myPayouts.length-1?'1px solid var(--border)':'none'}}>
-                  <div>
-                    <div style={{fontSize:12,fontWeight:600,color:'var(--text)'}}>
-                      {Number(p.amount||0).toLocaleString()} {p.currency||'CHF'} — {p.payment_method||'virement'}
-                    </div>
-                    <div style={{fontSize:10,color:'var(--muted)'}}>{(p.period_from||'').slice(0,10)} → {(p.period_to||'').slice(0,10)} · {(p.created_at||'').slice(0,10)}</div>
-                    {p.reference&&<div style={{fontSize:10,color:'var(--muted)'}}>Réf: {p.reference}</div>}
-                    {p.notes&&p.status==='rejected'&&<div style={{fontSize:10,color:'#ef4444',marginTop:2}}>⚠️ {p.notes}</div>}
-                  </div>
-                  <span style={{background:st.bg,color:st.c,padding:'3px 10px',borderRadius:8,fontSize:11,fontWeight:700,flexShrink:0,marginLeft:8}}>{st.lbl}</span>
-                </div>
-              );
-            })}
+            <ResponsiveContainer width="100%" height={160}>
+              <AreaChart data={chartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="prov-grad-ca" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.25}/>
+                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false}/>
+                <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd"} tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false}/>
+                <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false} width={48}/>
+                <Tooltip contentStyle={{ background: '#0b1020', border: '1px solid rgba(99,102,241,0.2)', borderRadius: 10, fontSize: 12 }}
+                  formatter={(v, n) => [`${Math.round(v).toLocaleString()} CHF`, n === 'ca' ? (fr?'CA validé':'Validated') : (fr?'En attente':'Pending')]}/>
+                <Area type="monotone" dataKey="ca" stroke="#6366f1" strokeWidth={2} fill="url(#prov-grad-ca)" name="ca"/>
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
-        );
-      })()}
+        )}
+
+        {/* Bottom grid: Top modèles + TX récentes */}
+        <div style={{ display: 'grid', gridTemplateColumns: _isMobile ? '1fr' : '1fr 1fr', gap: 16, marginBottom: 16 }}>
+          {/* Top modèles */}
+          <div className="ui-panel">
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 14 }}>🔥 {fr ? 'Mes modèles' : 'My models'}</div>
+            {modelStats.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>{fr ? 'Aucune donnée sur cette période' : 'No data for this period'}</div>
+            ) : (
+              <div>
+                {modelStats.map((ms, i) => {
+                  const pct = totalBrut > 0 ? (ms.ca / totalBrut) * 100 : 0;
+                  const initials = (ms.model?.name || ms.id || '?')[0].toUpperCase();
+                  return (
+                    <div key={ms.id} style={{ marginBottom: i < modelStats.length - 1 ? 10 : 0 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <div style={{ width: 26, height: 26, borderRadius: 7, background: 'var(--accent-muted)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, fontWeight: 800, color: 'var(--accent)', flexShrink: 0 }}>{initials}</div>
+                          <div>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{ms.model?.name || ms.id.slice(0, 8)}</div>
+                            <div style={{ fontSize: 10, color: 'var(--muted)' }}>{ms.count} TX · {Math.round(pct)}%</div>
+                          </div>
+                        </div>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: '#10b981' }}>{fmtAmount(ms.ca)}</div>
+                      </div>
+                      <div style={{ height: 3, background: 'var(--border)', borderRadius: 2 }}>
+                        <div style={{ height: '100%', width: `${Math.round(pct)}%`, background: 'var(--accent)', borderRadius: 2, transition: 'width .4s' }}/>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* TX récentes */}
+          <div className="ui-panel">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>💳 {fr ? 'TX récentes' : 'Recent TX'}</div>
+            </div>
+            <div>
+              {recentTxs.map((tx, i) => {
+                const v = isValidTx(tx.status), pend = isPendingTx(tx.status);
+                const clr = v ? '#10b981' : pend ? '#f59e0b' : '#ef4444';
+                const ico = v ? '✅' : pend ? '⏳' : '❌';
+                const m = (models || []).find(mo => mo.id === tx.model_id);
+                return (
+                  <div key={tx.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: i < recentTxs.length - 1 ? '1px solid var(--border)' : 'none' }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                        @{tx.spender_handle || '?'}{m ? ` · ${m.name}` : ''}
+                      </div>
+                      <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.date || tx.created_at || '').slice(0, 10)}</div>
+                    </div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: clr, flexShrink: 0, marginLeft: 8 }}>{ico} {fmtAmount(convertAmount(Number(tx.amount || 0), tx.currency))}</div>
+                  </div>
+                );
+              })}
+              {recentTxs.length === 0 && (
+                <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>{fr ? 'Aucune transaction' : 'No transactions yet'}</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </>}
+
+      {/* ── Vue Transactions : Liste TX complète avec pagination ── */}
+      {viewMode === 'transactions' && (
+        <TransactionsTab
+          user={user} lang={lang}
+          txs={txsPaginated} txSummary={txs}
+          models={models} profiles={profiles} dbSpenders={[]}
+          onRefresh={onRefresh} onNotify={onNotify}
+          products={products} productTags={productTags}
+          modelPrices={modelPrices}
+          providerPaymentMethods={providerPaymentMethods}
+          navigateToSpender={navigateToSpender}
+          setTxs={setTxs} setTxSummary={setTxSummary}
+        />
+      )}
     </div>
   );
 };
 
-const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, spenders, onRefresh, onNotify, invoices, providerPaymentMethods}) => {
+const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, models, onRefresh, onNotify, providerPaymentMethods}) => {
   const addToast = useToast();
-  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const { convertAmount, fmtAmount } = useCurrency();
   const fr = lang === "fr";
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [provSubTab, setProvSubTab] = useState("paiements");
-  const [showBillingModal, setShowBillingModal] = useState(false);
-  const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
-  const [bulkInvoiceOpen, setBulkInvoiceOpen] = useState(false);
-  const [bulkEligibleTxs, setBulkEligibleTxs] = useState([]);
-  const [downloadingZip, setDownloadingZip] = useState(false);
-  const [zipProgress, setZipProgress] = useState(null);
-  const [form, setForm] = useState({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
+  const [form, setForm] = useState({amount:"",currency:"CHF",period_from:"",period_to:"",payment_method:"twint",reference:"",notes:""});
 
-  // TX stats
-  const providerTxs = txs.filter(tx=>tx.provider_id===user.id);
-  const validTxs = providerTxs.filter(tx=>isValidTx(tx.status));
-  const pendingTxs = providerTxs.filter(tx=>isPendingTx(tx.status));
-  const totalCA = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
-  const totalPending = pendingTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(),now.getMonth(),1);
-  const thisMonthTxs = validTxs.filter(tx=>new Date(tx.date)>=monthStart);
-  const thisMonthCA = thisMonthTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount),tx.currency),0);
+  // ── Calculs all-time ──
+  const providerTxs = (txs||[]).filter(tx => tx.provider_id === user.id);
+  const validTxs = providerTxs.filter(tx => isValidTx(tx.status));
+  const totalCA = validTxs.reduce((s,tx) => s + convertAmount(Number(tx.amount||0), tx.currency), 0);
 
-  // Provider payouts from provider_payouts table
-  const myPayouts = (ppData||[]).filter(p=>p.provider_id===user.id||p.declared_by===user.id);
-  const validatedPayouts = myPayouts.filter(p=>p.status==="validated");
-  const pendingPayouts = myPayouts.filter(p=>p.status==="pending");
-  const totalPaid = validatedPayouts.reduce((s,p)=>s+Number(p.amount),0);
-  const totalPendingPayout = pendingPayouts.reduce((s,p)=>s+Number(p.amount),0);
-  // Le provider garde 10% et reverse 90% au gérant
-  const aReverser = totalCA * 0.90;
-  const balance = aReverser - totalPaid - totalPendingPayout;
+  // Commission provider (variable)
+  const providerRate = Number(user.commission_rate || user.commission_pct || 10) / 100;
+  const myCommission = validTxs.reduce((s, tx) => {
+    const amt = convertAmount(Number(tx.amount||0), tx.currency);
+    const txRate = Number(tx.provider_pct||0) / 100 || providerRate;
+    return s + (amt * txRate);
+  }, 0);
+  const totalAReverser = totalCA - myCommission;
+
+  // Payouts
+  const myPayouts = (ppData||[]).filter(p => p.provider_id === user.id || p.declared_by === user.id);
+  const validatedPayouts = myPayouts.filter(p => p.status === "validated");
+  const pendingPayouts = myPayouts.filter(p => p.status === "pending");
+  const totalPaid = validatedPayouts.reduce((s,p) => s + convertAmount(Number(p.amount||0), p.currency), 0);
+  const totalPendingPayout = pendingPayouts.reduce((s,p) => s + convertAmount(Number(p.amount||0), p.currency), 0);
+  const resteAPayer = Math.max(0, totalAReverser - totalPaid - totalPendingPayout);
 
   const handleDeclare = async () => {
     if(!form.amount||isNaN(parseFloat(form.amount))||parseFloat(form.amount)<=0){addToast(fr?"Montant invalide (> 0)":"Invalid amount (> 0)","error");return;}
@@ -25917,7 +26087,7 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
       for(const g of gerants){
         if(onNotify) await onNotify(g.id,"payment","\u{1F4B3} Paiement provider déclaré",`${user.name||user.email} a déclaré un reversement de ${form.amount}${form.currency==="EUR"?"€":"CHF"} (${form.payment_method||"virement"}). Période: ${form.period_from} → ${form.period_to}. À valider dans Providers.`);
       }
-      setForm({amount:"",currency:"EUR",period_from:"",period_to:"",payment_method:"virement",reference:"",notes:""});
+      setForm({amount:"",currency:"CHF",period_from:"",period_to:"",payment_method:"twint",reference:"",notes:""});
       setShowForm(false);
       addToast(fr?"Paiement déclaré ✓ — En attente de validation":"Payment declared ✓ — Awaiting validation","success");
       if(onRefresh) await onRefresh();
@@ -25938,119 +26108,44 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
 
   return (
     <div style={{padding:_isMobile?"0 12px":0}}>
-      {/* ── KPI ROW Provider Finances ── */}
-      {(()=>{
-        const soldeProviderData = { solde: -(totalCA * 0.90 - totalPaid), caEncaisse: totalCA, dejaReversi: totalPaid };
-        return (
-          <div className={_isMobile?"kpi-row cols-2":"kpi-row cols-5"} style={{marginBottom:16}}>
-            <div className="kpi-card green">
-              <div className="kpi-card-label">CA TOTAL</div>
-              <div className="kpi-card-value green">{fmtAmount(totalCA)}</div>
-              <div className="kpi-card-delta up">↑ {validTxs.length} TX validées</div>
-              <div className="kpi-card-hint">CA collecté total</div>
-            </div>
-            <div className="kpi-card indigo">
-              <div className="kpi-card-label">DÉJÀ REVERSÉ</div>
-              <div className="kpi-card-value indigo">{fmtAmount(totalPaid)}</div>
-              <div className="kpi-card-delta up">↑ {validatedPayouts.length} paiements</div>
-              <div className="kpi-card-hint">versements validés</div>
-            </div>
-            <div className="kpi-card amber">
-              <div className="kpi-card-label">SOLDE À REVERSER</div>
-              <div className="kpi-card-value amber">{fmtAmount(Math.max(0,balance))}</div>
-              <div className={`kpi-card-delta ${balance>0?"warn":"up"}`}>{balance>0?"⚠ à régler":"✓ à jour"}</div>
-              <div className="kpi-card-hint">Cliquer → créer paiement</div>
-            </div>
-            <div className="kpi-card amber">
-              <div className="kpi-card-label">CA CE MOIS</div>
-              <div className="kpi-card-value amber">{fmtAmount(thisMonthCA)}</div>
-              <div className="kpi-card-delta dim">{thisMonthTxs.length} TX ce mois</div>
-            </div>
-            <SoldeWidget role="provider" soldeData={soldeProviderData} />
-          </div>
-        );
-      })()}
-
-      {/* ── Sub-tabs Paiements / Factures / Comptes — style pills ── */}
-      <div className="page-tabs-bar" style={{marginBottom:16,display:'flex',alignItems:'center',justifyContent:'space-between',flexWrap:'wrap',gap:8}}>
-        <div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
-          {[{id:"paiements",label:fr?"Mes Paiements":"My Payments"},{id:"comptes",label:fr?"Mes Comptes":"My Accounts"}].map(tb=>(
-            <div key={tb.id} className={`filter-pill${provSubTab===tb.id?" active":""}`} onClick={()=>setProvSubTab(tb.id)}>{tb.label}</div>
-          ))}
+      {/* ── 3 KPIs Reversements ── */}
+      <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-3'} style={{marginBottom:16}}>
+        <div className="kpi-card indigo">
+          <div className="kpi-card-label">{fr ? 'TOTAL À REVERSER' : 'TOTAL TO PAY'}</div>
+          <div className="kpi-card-value indigo">{fmtAmount(totalAReverser)}</div>
+          <div className="kpi-card-hint">{fr ? 'brut - ma commission' : 'gross - my commission'}</div>
         </div>
-        <button
-          onClick={()=>setShowBillingModal(true)}
-          style={{
-            display:'flex',alignItems:'center',gap:6,
-            padding:'7px 14px',borderRadius:10,border:'1px solid var(--accent)',
-            background:'var(--accent-muted,rgba(99,102,241,0.12))',
-            color:'var(--accent)',fontSize:12,fontWeight:700,cursor:'pointer',
-            whiteSpace:'nowrap',flexShrink:0,
-          }}
-        >
-          🧾 {fr?'Infos facturation':'Billing info'}
+        <div className="kpi-card green">
+          <div className="kpi-card-label">{fr ? 'DÉJÀ REVERSÉ' : 'ALREADY PAID'}</div>
+          <div className="kpi-card-value green">{fmtAmount(totalPaid)}</div>
+          <div className="kpi-card-delta up">✅ {validatedPayouts.length} {fr ? 'paiements' : 'payments'}</div>
+        </div>
+        <div className={`kpi-card ${resteAPayer > 0 ? 'amber' : 'green'}`}>
+          <div className="kpi-card-label">{fr ? 'RESTE À PAYER' : 'REMAINING'}</div>
+          <div className={`kpi-card-value ${resteAPayer > 0 ? 'amber' : 'green'}`}>{fmtAmount(resteAPayer)}</div>
+          <div className={`kpi-card-delta ${resteAPayer > 0 ? 'warn' : 'up'}`}>
+            {resteAPayer > 0 ? (fr ? '⚠ à régler' : '⚠ to pay') : (fr ? '✓ à jour' : '✓ up to date')}
+          </div>
+          {pendingPayouts.length > 0 && (
+            <div className="kpi-card-hint">{pendingPayouts.length} {fr ? 'en attente de validation' : 'awaiting validation'}</div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Bouton déclarer ── */}
+      <div style={{display:'flex',justifyContent:'flex-end',marginBottom:16}}>
+        <button onClick={() => setShowForm(!showForm)} style={{
+          background: 'var(--accent)', color: 'white', border: 'none', borderRadius: 10,
+          padding: '10px 20px', fontSize: 13, fontWeight: 700, cursor: 'pointer'
+        }}>
+          {showForm ? (fr ? '✕ Fermer' : '✕ Close') : (fr ? '+ Déclarer un reversement' : '+ Declare a payment')}
         </button>
       </div>
 
-      <BillingInfoModal open={showBillingModal} onClose={()=>setShowBillingModal(false)} user={user} lang={lang} />
-
-      {provSubTab === "comptes" ? (()=>{
-        const myMethods = (providerPaymentMethods || []).filter(pm => pm.provider_id === user.id && pm.active !== false).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
-        return (
-          <div>
-            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 16 }}>{fr ? "Mes moyens de paiement" : "My payment methods"} ({myMethods.length})</div>
-            {myMethods.length === 0 ? (
-              <div style={{ textAlign: "center", color: "var(--text-quaternary)", padding: 40, fontSize: 12 }}>
-                {fr ? "Aucun moyen de paiement configuré. Contactez le gérant." : "No payment methods configured. Contact the manager."}
-              </div>
-            ) : myMethods.map(pm => {
-              const ptc = PAYMENT_TYPE_COLORS[pm.type] || PAYMENT_TYPE_COLORS["Autre"];
-              return (
-                <div key={pm.id} style={{ padding: "14px 16px", marginBottom: 10, borderRadius: 14, background: "var(--card-bg)", border: "1px solid var(--border-subtle)", display: "flex", alignItems: "center", gap: 12 }}>
-                  <div style={{ width: 40, height: 40, borderRadius: 12, background: ptc.bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>{ptc.icon}</div>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span style={{ fontWeight: 700, fontSize: 14 }}>{pm.label || pm.type}</span>
-                      {pm.is_primary && <span style={{ padding: "2px 10px", borderRadius: 10, background: "var(--warning-muted)", color: "var(--warning)", fontSize: 10, fontWeight: 700 }}>{"⭐"} PRINCIPAL</span>}
-                    </div>
-                    <div style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: 3 }}>{pm.detail}</div>
-                    <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>{fr ? "Devise" : "Currency"}: {pm.currency || "CHF"}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        );
-      })() : (
-      <>
-
-      {/* KPIs */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:24}}>
-        {[
-          {label:fr?"CA Total Traité":"Total Revenue",value:totalCA.toLocaleString("fr-FR",{maximumFractionDigits:0})+currencySymbol,icon:"\u{1F4B0}",color:"var(--success)"},
-          {label:"TX Total",value:providerTxs.length,icon:"\u{1F4CB}"},
-          {label:fr?"Ce mois":"This month",value:thisMonthCA.toLocaleString("fr-FR",{maximumFractionDigits:0})+currencySymbol,icon:"\u{1F4C5}",color:"var(--accent)"},
-          {label:fr?"Paiements validés":"Validated payments",value:totalPaid.toLocaleString("fr-FR",{maximumFractionDigits:0})+currencySymbol,icon:"✅",color:"var(--success)"},
-          {label:fr?"Solde en attente":"Pending balance",value:balance.toLocaleString("fr-FR",{maximumFractionDigits:0})+currencySymbol,icon:balance>0?"⚠️":"✅",color:balance>0?"var(--warning)":"var(--success)"},
-        ].map((k,i)=>(
-          <div key={k.label} style={{background:"var(--card-bg)",border:"1px solid var(--border-subtle)",borderRadius:16,padding:"14px 16px"}}>
-            <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>{k.icon} {k.label}</div>
-            <div style={{fontSize:22,fontWeight:800,color:k.color||"var(--text-primary)"}}>{k.value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Declare payment button */}
-      <div style={{display:'flex',gap:10,marginBottom:20,flexWrap:'wrap'}}>
-        <button className="btn btn-primary" style={{width:"auto"}} onClick={()=>setShowForm(!showForm)}>
-          + {fr?"Déclarer un paiement":"Declare a payment"}
-        </button>
-      </div>
-
-      {/* Declare form */}
+      {/* ── Formulaire déclaration ── */}
       {showForm&&(
         <div className="card" style={{marginBottom:20}}>
-          <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{fr?"Nouveau paiement":"New payment"}</div>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:16}}>{fr?"Nouveau reversement":"New payment"}</div>
           <div style={{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:12}}>
             <div className="form-group-modal">
               <label className="form-label">{fr?"Montant versé *":"Amount paid *"}</label>
@@ -26059,7 +26154,7 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
             <div className="form-group-modal">
               <label className="form-label">{fr?"Devise":"Currency"}</label>
               <select className="filter-select" value={form.currency} onChange={e=>setForm({...form,currency:e.target.value})}>
-                <option value="EUR">EUR</option><option value="CHF">CHF</option><option value="USD">USD</option>
+                <option value="CHF">CHF</option><option value="EUR">EUR</option><option value="USD">USD</option>
               </select>
             </div>
             <div className="form-group-modal" style={{gridColumn:"1/-1"}}>
@@ -26068,13 +26163,13 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
                 startDate={form.period_from}
                 endDate={form.period_to}
                 onChange={({ start, end }) => setForm({...form, period_from: start || "", period_to: end || ""})}
-                placeholder="Sélectionner période"
+                placeholder={fr?"Sélectionner période":"Select period"}
               />
             </div>
             <div className="form-group-modal">
               <label className="form-label">{fr?"Méthode de paiement":"Payment method"}</label>
               <select className="filter-select" value={form.payment_method} onChange={e=>setForm({...form,payment_method:e.target.value})}>
-                <option value="virement">Virement</option><option value="crypto">Crypto</option><option value="paypal">PayPal</option><option value="revolut">Revolut</option><option value="wise">Wise</option>
+                <option value="twint">Twint</option><option value="virement">Virement</option><option value="crypto">Crypto</option><option value="paypal">PayPal</option><option value="revolut">Revolut</option><option value="wise">Wise</option>
               </select>
             </div>
             <div className="form-group-modal">
@@ -26093,142 +26188,316 @@ const ProviderComptaTab = ({user, lang, txs, providerPayouts: ppData, profiles, 
         </div>
       )}
 
-      {/* Payment history */}
-      <div className="card" style={{marginBottom:20}}>
-        <div className="section-title">
-          <div className="section-bar"></div>
-          {fr?"Historique de mes paiements":"My payment history"}
-          <span style={{marginLeft:8,padding:"2px 8px",borderRadius:10,background:"rgba(34,197,94,0.12)",color:"var(--success)",fontSize:10,fontWeight:700,verticalAlign:"middle"}}>● LIVE</span>
+      {/* ── Historique des reversements ── */}
+      <div className="ui-panel" style={{marginBottom:16}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
+          <div style={{fontSize:14,fontWeight:700,color:'var(--text)'}}>
+            {fr ? '📋 Historique des reversements' : '📋 Payment history'}
+          </div>
         </div>
-        {myPayouts.length===0?(
-          <div style={{textAlign:"center",color:"var(--text-quaternary)",padding:30,fontSize:13}}>{fr?"Aucun paiement déclaré":"No payments declared"}</div>
-        ):(
-          <div className="table-wrap">
-            <table className="table" style={{fontSize:12}}>
-              <thead><tr>
-                <th>{t(lang,"date")}</th><th>{t(lang,"amount")}</th><th>{fr?"Période":"Period"}</th>
-                <th>{fr?"Méthode":"Method"}</th><th>{fr?"Référence":"Reference"}</th><th>{t(lang,"status")}</th><th>Notes</th>
-              </tr></thead>
-              <tbody>
-                {myPayouts.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).map(p=>(
-                  <tr key={p.id} style={p.status==="validated"?{background:"rgba(34,197,94,0.04)"}:p.status==="rejected"?{background:"rgba(239,68,68,0.04)"}:{}}>
-                    <td>{fmtDate(p.created_at)}</td>
-                    <td style={{fontWeight:700}}>{Number(p.amount).toLocaleString("fr-FR",{maximumFractionDigits:0})}{p.currency==="EUR"?"€":"CHF"}</td>
-                    <td style={{fontSize:10}}>{fmtDate(p.period_from)} → {fmtDate(p.period_to)}</td>
-                    <td>{p.payment_method||"—"}</td>
-                    <td style={{fontSize:10,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis"}}>{p.reference||"—"}</td>
-                    <td>{statusBadge(p.status)}</td>
-                    <td style={{fontSize:10,maxWidth:150,overflow:"hidden",textOverflow:"ellipsis"}}>{p.notes||"—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        {myPayouts.length === 0 && (
+          <div style={{textAlign:'center',padding:'24px 0',color:'var(--muted)',fontSize:12}}>
+            {fr ? 'Aucun reversement déclaré.' : 'No payments declared yet.'}
           </div>
         )}
+        {myPayouts.sort((a,b) => new Date(b.created_at) - new Date(a.created_at)).map((p, i) => {
+          const st = statusBadge(p.status);
+          return (
+            <div key={p.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:i<myPayouts.length-1?'1px solid var(--border)':'none'}}>
+              <div>
+                <div style={{fontSize:12,fontWeight:600,color:'var(--text)'}}>
+                  {fmtAmount(convertAmount(Number(p.amount||0), p.currency))} — {p.payment_method||'virement'}
+                </div>
+                <div style={{fontSize:10,color:'var(--muted)'}}>{(p.period_from||'').slice(0,10)} → {(p.period_to||'').slice(0,10)} · {(p.created_at||'').slice(0,10)}</div>
+                {p.reference&&<div style={{fontSize:10,color:'var(--muted)'}}>Réf: {p.reference}</div>}
+                {p.notes&&p.status==='rejected'&&<div style={{fontSize:10,color:'#ef4444',marginTop:2}}>⚠️ {p.notes}</div>}
+              </div>
+              <span style={{flexShrink:0,marginLeft:8}}>{st}</span>
+            </div>
+          );
+        })}
       </div>
 
-      {/* TX list */}
-      <div className="card">
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
-          <div className="section-title" style={{margin:0}}><div className="section-bar"></div>{fr?"Mes transactions":"My transactions"}</div>
-          <div style={{display:"flex",gap:6,alignItems:"center"}}>
-            {(()=>{
-              const withInvoice = providerTxs.filter(tx=>tx.invoice_url&&tx.invoice_url!=="");
-              return withInvoice.length > 0 ? (
-                <button
-                  className="btn btn-sm"
-                  disabled={downloadingZip}
-                  onClick={async()=>{
-                    setDownloadingZip(true);
-                    setZipProgress({fetched:0,total:withInvoice.length});
-                    await downloadAllInvoicesZip(withInvoice, {
-                      fr,
-                      onProgress: (p) => setZipProgress(p),
-                      onDone: ({ total, errors }) => {
-                        addToast(fr
-                          ? `${total} facture${total>1?"s":""} téléchargée${total>1?"s":""}${errors?` (${errors} erreur${errors>1?"s":""})`:""}`
-                          : `${total} invoice${total>1?"s":""} downloaded${errors?` (${errors} error${errors>1?"s":""})`:""}`, errors?"warning":"success");
-                        setDownloadingZip(false); setZipProgress(null);
-                      },
-                      onError: (msg) => { addToast(msg,"error"); setDownloadingZip(false); setZipProgress(null); }
-                    });
-                  }}
-                  style={{fontSize:12,padding:"4px 10px",display:"inline-flex",alignItems:"center",gap:4}}
-                >{downloadingZip ? (
-                  <>{zipProgress ? `${zipProgress.fetched}/${zipProgress.total}` : "..."} ⏳</>
-                ) : (
-                  <>⬇️ {fr?`Télécharger ${withInvoice.length} facture${withInvoice.length>1?"s":""}`:`Download ${withInvoice.length} invoice${withInvoice.length>1?"s":""}`}</>
-                )}</button>
-              ) : null;
-            })()}
-            {(()=>{
-              const eligible = providerTxs.filter(tx=>(isValidTx(tx.status))&&(!tx.invoice_url||tx.invoice_url===""));
-              return eligible.length > 0 ? (
-                <button
-                  className="btn btn-sm"
-                  onClick={()=>{setBulkEligibleTxs(eligible);setBulkInvoiceOpen(true);}}
-                  style={{fontSize:12,padding:"4px 10px",display:"inline-flex",alignItems:"center",gap:4}}
-                >📄 {fr?`Générer ${eligible.length} facture${eligible.length>1?"s":""}`:`Generate ${eligible.length} invoice${eligible.length>1?"s":""}`}</button>
-              ) : null;
-            })()}
+      {/* ── Mes comptes (méthodes de paiement) ── */}
+      <div className="ui-panel">
+        <div style={{fontSize:14,fontWeight:700,color:'var(--text)',marginBottom:14}}>
+          {fr ? '🏦 Mes comptes' : '🏦 My accounts'}
+        </div>
+        {(()=>{
+          const myMethods = (providerPaymentMethods || []).filter(pm => pm.provider_id === user.id && pm.active !== false).sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+          return myMethods.length === 0 ? (
+            <div style={{textAlign:'center',padding:'24px 0',color:'var(--muted)',fontSize:12}}>
+              {fr ? 'Aucun moyen de paiement configuré. Contactez le gérant.' : 'No payment methods configured. Contact the manager.'}
+            </div>
+          ) : myMethods.map(pm => {
+            const ptc = PAYMENT_TYPE_COLORS[pm.type] || PAYMENT_TYPE_COLORS["Autre"];
+            return (
+              <div key={pm.id} style={{padding:'14px 16px',marginBottom:10,borderRadius:14,background:'var(--card-bg)',border:'1px solid var(--border-subtle)',display:'flex',alignItems:'center',gap:12}}>
+                <div style={{width:40,height:40,borderRadius:12,background:ptc.bg,display:'flex',alignItems:'center',justifyContent:'center',fontSize:18,flexShrink:0}}>{ptc.icon}</div>
+                <div style={{flex:1}}>
+                  <div style={{display:'flex',alignItems:'center',gap:8}}>
+                    <span style={{fontWeight:700,fontSize:14}}>{pm.label || pm.type}</span>
+                    {pm.is_primary && <span style={{padding:'2px 10px',borderRadius:10,background:'var(--warning-muted)',color:'var(--warning)',fontSize:10,fontWeight:700}}>⭐ PRINCIPAL</span>}
+                  </div>
+                  <div style={{fontSize:13,color:'var(--text-secondary)',marginTop:3}}>{pm.detail}</div>
+                  <div style={{fontSize:11,color:'var(--text-tertiary)',marginTop:2}}>{fr ? 'Devise' : 'Currency'}: {pm.currency || 'CHF'}</div>
+                </div>
+              </div>
+            );
+          });
+        })()}
+      </div>
+    </div>
+  );
+};
+
+// =============================================
+// PROVIDER FACTURES — Factures entrantes + sortantes
+// =============================================
+const ProviderFacturesTab = ({ user, lang, txs, providerPayouts: ppData, invoices, models, profiles, providerPaymentMethods, onRefresh }) => {
+  const addToast = useToast();
+  const { convertAmount, fmtAmount } = useCurrency();
+  const fr = lang === 'fr';
+  const [subTab, setSubTab] = useState('entrantes');
+  const [monthFilter, setMonthFilter] = useState('');
+  const [singleInvoiceTx, setSingleInvoiceTx] = useState(null);
+  const [bulkInvoiceOpen, setBulkInvoiceOpen] = useState(false);
+  const [bulkEligibleTxs, setBulkEligibleTxs] = useState([]);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [zipProgress, setZipProgress] = useState(null);
+
+  // ── Factures entrantes (TX → invoices) ──
+  const myInvoices = useMemo(() => {
+    return (invoices || [])
+      .filter(inv => inv.provider_id === user.id)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  }, [invoices, user.id]);
+
+  const myValidTxs = useMemo(() => {
+    return (txs || []).filter(tx => tx.provider_id === user.id && isValidTx(tx.status));
+  }, [txs, user.id]);
+
+  const txsWithInvoice = myValidTxs.filter(tx => tx.invoice_url && tx.invoice_url !== '');
+  const txsWithoutInvoice = myValidTxs.filter(tx => !tx.invoice_url || tx.invoice_url === '');
+  const totalFacture = myValidTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+
+  // ── Factures sortantes (reversements → reçus) ──
+  const myPayouts = useMemo(() => {
+    return (ppData || [])
+      .filter(p => p.provider_id === user.id || p.declared_by === user.id)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  }, [ppData, user.id]);
+
+  const validatedPayouts = myPayouts.filter(p => p.status === 'validated');
+  const totalReverse = validatedPayouts.reduce((s, p) => s + convertAmount(Number(p.amount || 0), p.currency), 0);
+  const payoutsWithReceipt = validatedPayouts.filter(p => p.receipt_url || p.reference);
+  const payoutsWithoutReceipt = validatedPayouts.filter(p => !p.receipt_url && !p.reference);
+
+  // ── Filtres mois ──
+  const filterByMonth = (items, dateField) => {
+    if (!monthFilter) return items;
+    return items.filter(item => (item[dateField] || item.created_at || '').startsWith(monthFilter));
+  };
+
+  const availableMonths = useMemo(() => {
+    const all = [...(myInvoices || []), ...(myPayouts || [])];
+    const months = new Set(all.map(x => (x.created_at || '').slice(0, 7)).filter(Boolean));
+    return [...months].sort().reverse();
+  }, [myInvoices, myPayouts]);
+
+  return (
+    <div style={{ padding: _isMobile ? '0 12px' : 0 }}>
+      {/* ── Sub-tab pills ── */}
+      <div className="page-tabs-bar" style={{ marginBottom: 16, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 4 }}>
+          <div className={`filter-pill${subTab === 'entrantes' ? ' active' : ''}`} onClick={() => setSubTab('entrantes')}>
+            🧾 {fr ? 'Entrantes (clients)' : 'Incoming (clients)'}
+          </div>
+          <div className={`filter-pill${subTab === 'sortantes' ? ' active' : ''}`} onClick={() => setSubTab('sortantes')}>
+            💰 {fr ? 'Sortantes (gérant)' : 'Outgoing (manager)'}
           </div>
         </div>
-        <div className="table-wrap">
-          <table className="table" style={{fontSize:12}}>
-            <thead><tr><th>{t(lang,"date")}</th><th>Spender</th><th>Model</th><th>{t(lang,"amount")}</th><th style={{fontSize:11,whiteSpace:"nowrap",textAlign:"center"}}>{fr?"Facture":"Invoice"}</th><th>{t(lang,"status")}</th></tr></thead>
-            <tbody>
-              {providerTxs.slice(0,30).map(tx=>(
-                <tr key={tx.id}>
-                  <td>{fmtDate(tx.date)}</td>
-                  <td><Tag type="spender" label={tx.spender_handle} id={tx.spender_handle}/></td>
-                  <td><Tag type="model" label={models.find(m=>m.id===tx.model_id)?.name||"?"} id={tx.model_id}/></td>
-                  <td style={{fontWeight:700}}>{fmtAmount(tx.amount,tx.currency)}</td>
-                  <td style={{textAlign:"center"}}>{tx.invoice_url ? (
-                    tx.invoice_has_fallback ? (
-                      <span style={{display:"inline-flex",alignItems:"center",gap:2}}>
-                        <span title={fr?"Voir facture (données incomplètes)":"View invoice (incomplete data)"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
-                        <button onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}} title={fr?"Regénérer avec les vraies données":"Regenerate with real data"} style={{background:"none",border:"none",cursor:"pointer",fontSize:10,padding:0,lineHeight:1}}>⚠️</button>
-                      </span>
-                    ) : (
-                      <span title={fr?"Télécharger facture":"Download invoice"} onClick={()=>window.open(tx.invoice_url,'_blank')} style={{fontSize:20,cursor:"pointer",display:"inline-block",transition:"opacity 0.15s"}} onMouseEnter={e=>e.currentTarget.style.opacity="0.6"} onMouseLeave={e=>e.currentTarget.style.opacity="1"}>📄</span>
-                    )
-                  ) : (isValidTx(tx.status)) ? (
-                    <button
-                      onClick={(e)=>{e.stopPropagation();setSingleInvoiceTx(tx);}}
-                      title={fr?"Générer facture":"Generate invoice"}
-                      style={{background:"none",border:"none",cursor:"pointer",fontSize:14,opacity:0.55,padding:"2px 4px",borderRadius:4,transition:"opacity 0.2s"}}
-                      onMouseEnter={e=>e.currentTarget.style.opacity="1"}
-                      onMouseLeave={e=>e.currentTarget.style.opacity="0.55"}
-                    >➕📄</button>
-                  ) : <span style={{color:"var(--text-quaternary)"}}>—</span>}</td>
-                  <td><StatusPill status={tx.status} lang={lang}/></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <select value={monthFilter} onChange={e => setMonthFilter(e.target.value)}
+          style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', fontSize: 12 }}>
+          <option value="">{fr ? 'Tous les mois' : 'All months'}</option>
+          {availableMonths.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
       </div>
+
+      {/* ── SOUS-PAGE A : FACTURES ENTRANTES (clients) ── */}
+      {subTab === 'entrantes' && (
+        <div>
+          {/* KPIs */}
+          <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-3'} style={{ marginBottom: 16 }}>
+            <div className="kpi-card green">
+              <div className="kpi-card-label">{fr ? 'TOTAL FACTURÉ' : 'TOTAL INVOICED'}</div>
+              <div className="kpi-card-value green">{fmtAmount(totalFacture)}</div>
+              <div className="kpi-card-hint">{myValidTxs.length} TX {fr ? 'validées' : 'validated'}</div>
+            </div>
+            <div className="kpi-card indigo">
+              <div className="kpi-card-label">{fr ? 'FACTURES GÉNÉRÉES' : 'INVOICES GENERATED'}</div>
+              <div className="kpi-card-value indigo">{txsWithInvoice.length}</div>
+              <div className="kpi-card-hint">{fr ? 'avec PDF' : 'with PDF'}</div>
+            </div>
+            <div className={`kpi-card ${txsWithoutInvoice.length > 0 ? 'amber' : 'green'}`}>
+              <div className="kpi-card-label">{fr ? 'SANS FACTURE' : 'MISSING INVOICE'}</div>
+              <div className={`kpi-card-value ${txsWithoutInvoice.length > 0 ? 'amber' : 'green'}`}>{txsWithoutInvoice.length}</div>
+              <div className="kpi-card-hint">{txsWithoutInvoice.length > 0 ? (fr ? '⚠ à générer' : '⚠ to generate') : '✓'}</div>
+            </div>
+          </div>
+
+          {/* Actions bulk */}
+          <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+            {txsWithoutInvoice.length > 0 && (
+              <button onClick={() => { setBulkEligibleTxs(txsWithoutInvoice); setBulkInvoiceOpen(true); }} style={{
+                background: 'var(--accent)', color: 'white', border: 'none', borderRadius: 8,
+                padding: '8px 16px', fontSize: 12, fontWeight: 700, cursor: 'pointer'
+              }}>
+                📄 {fr ? `Générer ${txsWithoutInvoice.length} facture(s) manquante(s)` : `Generate ${txsWithoutInvoice.length} missing invoice(s)`}
+              </button>
+            )}
+            {txsWithInvoice.length > 0 && (
+              <button disabled={downloadingZip} onClick={async () => {
+                setDownloadingZip(true);
+                setZipProgress({ fetched: 0, total: txsWithInvoice.length });
+                await downloadAllInvoicesZip(filterByMonth(txsWithInvoice, 'date'), {
+                  fr,
+                  onProgress: p => setZipProgress(p),
+                  onDone: ({ total, errors }) => {
+                    setDownloadingZip(false); setZipProgress(null);
+                    addToast(fr ? `${total} facture(s) téléchargée(s)${errors ? ` (${errors} erreur(s))` : ''}` : `${total} invoice(s) downloaded${errors ? ` (${errors} error(s))` : ''}`, errors ? 'warning' : 'success');
+                  },
+                  onError: msg => { setDownloadingZip(false); setZipProgress(null); addToast(msg, 'error'); }
+                });
+              }} style={{
+                background: 'linear-gradient(135deg, #059669, #34d399)', color: 'white', border: 'none', borderRadius: 8,
+                padding: '8px 16px', fontSize: 12, fontWeight: 700, cursor: 'pointer', opacity: downloadingZip ? 0.7 : 1
+              }}>
+                {downloadingZip ? `⏳ ${zipProgress ? `${zipProgress.fetched}/${zipProgress.total}` : '...'}` : `⬇️ ${fr ? 'Télécharger tout (ZIP)' : 'Download all (ZIP)'}`}
+              </button>
+            )}
+          </div>
+
+          {/* Liste factures entrantes */}
+          <div className="ui-panel">
+            {filterByMonth(myValidTxs, 'date').map((tx, i) => {
+              const inv = myInvoices.find(inv2 => inv2.transaction_id === tx.id);
+              const m = (models || []).find(mo => mo.id === tx.model_id);
+              const hasInv = !!tx.invoice_url;
+              return (
+                <div key={tx.id} style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '8px 0', borderBottom: i < myValidTxs.length - 1 ? '1px solid var(--border)' : 'none'
+                }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
+                      {inv?.invoice_number || (hasInv ? '🧾' : '—')} · @{tx.spender_handle || '?'}{m ? ` · ${m.name}` : ''}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.date || tx.created_at || '').slice(0, 10)}</div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>{fmtAmount(convertAmount(Number(tx.amount || 0), tx.currency))}</span>
+                    {hasInv ? (
+                      <a href={tx.invoice_url} target="_blank" rel="noopener" style={{ fontSize: 11, color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}>⬇️ PDF</a>
+                    ) : (
+                      <button onClick={() => setSingleInvoiceTx(tx)} style={{
+                        fontSize: 10, fontWeight: 700, color: 'var(--accent)', background: 'var(--accent-muted)',
+                        border: 'none', borderRadius: 6, padding: '3px 8px', cursor: 'pointer'
+                      }}>📄 {fr ? 'Générer' : 'Generate'}</button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {myValidTxs.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>
+                {fr ? 'Aucune transaction validée.' : 'No validated transactions.'}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── SOUS-PAGE B : FACTURES SORTANTES (gérant) ── */}
+      {subTab === 'sortantes' && (
+        <div>
+          {/* KPIs */}
+          <div className={_isMobile ? 'kpi-row cols-2' : 'kpi-row cols-3'} style={{ marginBottom: 16 }}>
+            <div className="kpi-card green">
+              <div className="kpi-card-label">{fr ? 'TOTAL REVERSÉ' : 'TOTAL PAID'}</div>
+              <div className="kpi-card-value green">{fmtAmount(totalReverse)}</div>
+              <div className="kpi-card-hint">{validatedPayouts.length} {fr ? 'paiements validés' : 'validated payments'}</div>
+            </div>
+            <div className="kpi-card indigo">
+              <div className="kpi-card-label">{fr ? 'REÇUS GÉNÉRÉS' : 'RECEIPTS GENERATED'}</div>
+              <div className="kpi-card-value indigo">{payoutsWithReceipt.length}</div>
+              <div className="kpi-card-hint">{fr ? 'avec référence/PDF' : 'with reference/PDF'}</div>
+            </div>
+            <div className={`kpi-card ${payoutsWithoutReceipt.length > 0 ? 'amber' : 'green'}`}>
+              <div className="kpi-card-label">{fr ? 'SANS REÇU' : 'MISSING RECEIPT'}</div>
+              <div className={`kpi-card-value ${payoutsWithoutReceipt.length > 0 ? 'amber' : 'green'}`}>{payoutsWithoutReceipt.length}</div>
+            </div>
+          </div>
+
+          {/* Liste reversements */}
+          <div className="ui-panel">
+            {filterByMonth(myPayouts, 'created_at').map((p, i) => {
+              const statusMap = {
+                pending: { bg: 'var(--warning-muted)', color: 'var(--warning)', icon: '⏳', label: fr ? 'En attente' : 'Pending' },
+                validated: { bg: 'var(--success-muted)', color: 'var(--success)', icon: '✅', label: fr ? 'Validé' : 'Validated' },
+                rejected: { bg: 'var(--danger-muted)', color: 'var(--danger)', icon: '❌', label: fr ? 'Refusé' : 'Rejected' },
+              };
+              const st = statusMap[p.status] || statusMap.pending;
+              return (
+                <div key={p.id} style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                  padding: '8px 0', borderBottom: i < myPayouts.length - 1 ? '1px solid var(--border)' : 'none'
+                }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
+                      {p.reference ? `REV-${p.reference}` : `#${(p.id || '').slice(0, 8)}`} · {p.payment_method || 'virement'}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>
+                      {(p.period_from || '').slice(0, 10)} → {(p.period_to || '').slice(0, 10)} · {(p.created_at || '').slice(0, 10)}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>{fmtAmount(convertAmount(Number(p.amount || 0), p.currency))}</span>
+                    <span style={{ padding: '3px 10px', borderRadius: 8, background: st.bg, color: st.color, fontSize: 11, fontWeight: 700 }}>
+                      {st.icon} {st.label}
+                    </span>
+                    {p.status === 'validated' && p.receipt_url && (
+                      <a href={p.receipt_url} target="_blank" rel="noopener" style={{ fontSize: 11, color: 'var(--accent)', textDecoration: 'none' }}>⬇️</a>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {myPayouts.length === 0 && (
+              <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--muted)', fontSize: 12 }}>
+                {fr ? 'Aucun reversement.' : 'No payments yet.'}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Modals factures */}
       {singleInvoiceTx && (
         <SingleInvoiceModal
-          tx={singleInvoiceTx}
-          open={!!singleInvoiceTx}
+          tx={singleInvoiceTx} open={!!singleInvoiceTx}
           onClose={() => setSingleInvoiceTx(null)}
-          lang={lang}
-          models={models}
           onSuccess={() => { setSingleInvoiceTx(null); if (onRefresh) onRefresh(); }}
+          lang={lang} models={models}
         />
       )}
       {bulkInvoiceOpen && (
         <BulkInvoiceModal
-          eligibleTxs={bulkEligibleTxs}
-          open={bulkInvoiceOpen}
+          eligibleTxs={bulkEligibleTxs} open={bulkInvoiceOpen}
           onClose={() => setBulkInvoiceOpen(false)}
-          lang={lang}
-          models={models}
           onComplete={() => { setBulkInvoiceOpen(false); if (onRefresh) onRefresh(); }}
+          lang={lang} models={models}
         />
-      )}
-      </>
       )}
     </div>
   );
@@ -62111,6 +62380,7 @@ const App = () => {
   const [notifications, setNotifications] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showNotifs, setShowNotifs] = useState(false);
+  const [showBrief, setShowBrief] = useState(false);
   // ── MANAGER CHATTER STATE ──
   const [mcChatters, setMcChatters] = useState([]);
   const [mcChatterIds, setMcChatterIds] = useState([]);
@@ -62224,6 +62494,13 @@ const App = () => {
   useEffect(() => { _tz.current = timezone; }, [timezone]);
   // Sync timezone from user profile on login (priorité: user.timezone)
   useEffect(() => { if (user?.timezone && String(user.timezone).trim()) setTimezone(user.timezone); }, [user?.id]);
+  // ── Login brief modal trigger ──
+  useEffect(() => {
+    if (user?.id) {
+      const timer = setTimeout(() => setShowBrief(true), 800);
+      return () => clearTimeout(timer);
+    }
+  }, [user?.id]);
 
   // Currency conversion helpers
   const convertAmount = useCallback((amount, fromCurrency) => {
@@ -63713,6 +63990,7 @@ const App = () => {
     <CurrencyContext.Provider value={currencyCtx}>
     <TimezoneContext.Provider value={timezone}>
     <div className="app-wrap" style={{background:"var(--bg-base)"}}>
+      {user && <LoginBriefModal open={showBrief} onClose={() => setShowBrief(false)} user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} notifications={notifications} profiles={profiles} />}
       {_dataLoadingBanner}
       {/* ═══ DESKTOP SIDEBAR Design A (hidden on mobile via CSS) ═══ */}
       {isGerant ? (
@@ -63873,14 +64151,14 @@ const App = () => {
         <div className="sidebar sidebar-desktop" style={{ transform: topbarVisible ? 'translateX(0)' : 'translateX(-100%)', transition: 'transform 0.25s ease' }}>
           <div className="s-sec">MON ESPACE</div>
           <div className={`s-item provider${tab==="provider_dashboard"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();setTab("provider_dashboard");}}>
-            <span className="s-ico">📊</span> Dashboard
-          </div>
-          <div className={`s-item provider${tab==="transactions"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();setTab("transactions");}}>
-            <span className="s-ico">💳</span> Mes Transactions
+            <span className="s-ico">📊</span> {lang==='fr'?'Mon Activité':'My Activity'}
           </div>
           <div className="s-sec">FINANCES</div>
           <div className={`s-item provider${tab==="provider_compta"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();setTab("provider_compta");}}>
-            <span className="s-ico">💸</span> Mes Paiements
+            <span className="s-ico">💰</span> {lang==='fr'?'Mes Reversements':'My Payments'}
+          </div>
+          <div className={`s-item provider${tab==="provider_factures"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();setTab("provider_factures");}}>
+            <span className="s-ico">🧾</span> {lang==='fr'?'Mes Factures':'My Invoices'}
           </div>
           <div className="s-spacer"/>
           <div className="s-footer">
@@ -63935,7 +64213,7 @@ const App = () => {
               chatter:[{id:"chatter_dashboard",icon:"📊",label:"Dash"},{id:"chatter_spenders",icon:"👤",label:"Spenders"},{id:"chatter_transactions",icon:"💳",label:"TX"},{id:"messagerie",icon:"💬",label:"Msgs"},{id:"chatter_compta",icon:"💰",label:"Compta"}],
               manager_chatter:[{id:"mc_dashboard",icon:"📊",label:"Dash"},{id:"mc_chatters",icon:"👥",label:"Chatters"},{id:"mc_transactions",icon:"💰",label:"TX"},{id:"mc_conversations",icon:"💬",label:"Convs"},{id:"mc_planning",icon:"📅",label:"Planning"}],
               modele:[{id:"model_checklist",icon:"✅",label:"Checklist"},{id:"model_content",icon:"📦",label:"Contenu"},{id:"model_tasks",icon:"📋",label:"Tâches"},{id:"model_payments",icon:"💰",label:"Paiements"}],
-              provider:[{id:"provider_dashboard",icon:"📊",label:"Dash"},{id:"transactions",icon:"💳",label:"TX"},{id:"provider_compta",icon:"💸",label:"Paiements"}],
+              provider:[{id:"provider_dashboard",icon:"📊",label:lang==='fr'?"Activité":"Activity"},{id:"provider_compta",icon:"💰",label:lang==='fr'?"Reversements":"Payments"},{id:"provider_factures",icon:"🧾",label:lang==='fr'?"Factures":"Invoices"}],
             };
             const items = _roleNav[user.role] || otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).slice(0,5).map(x=>({id:x.id,icon:typeof x.icon==="string"?x.icon:"📋",label:x.label}));
             return items.map(item=>(
@@ -64690,15 +64968,14 @@ const App = () => {
             </div>
           )}
           {/* ── Provider pages ── */}
-          {tab==="provider_dashboard"&&user.role==="provider"&&<ProviderDashboardTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} navigateTo={(t)=>setTab(t)} />}
-          {(!["provider_dashboard","transactions","provider_compta","provider_notif"].includes(tab))&&user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
-          {tab==="transactions"&&user.role==="provider"&&<TransactionsTab user={user} lang={lang} txs={txs} txSummary={txSummary} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} />}
-          {tab==="provider_compta"&&user.role==="provider"&&(<>
-            <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} spenders={spenders} onRefresh={onRefresh} onNotify={createNotification} invoices={invoices} providerPaymentMethods={providerPaymentMethods} />
-            <div style={{marginTop:24}}>
-              <ReceiverComptaTab user={user} lang={lang} paymentEvents={paymentEvents} ledgerEntries={ledgerEntries} notifications={notifications} profiles={profiles} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />
-            </div>
-          </>)}
+          {tab==="provider_dashboard"&&user.role==="provider"&&<ProviderDashboardTab user={user} lang={lang} txs={txSummary} txsPaginated={txs} providerPayouts={providerPayouts} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} navigateTo={(t)=>setTab(t)} />}
+          {(!["provider_dashboard","provider_compta","provider_factures","provider_notif"].includes(tab))&&user.role==="provider"&&<ProviderConfirmations user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} screenshotChecks={screenshotChecks} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />}
+          {tab==="provider_compta"&&user.role==="provider"&&(
+            <ProviderComptaTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} profiles={profiles} models={models} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} />
+          )}
+          {tab==="provider_factures"&&user.role==="provider"&&(
+            <ProviderFacturesTab user={user} lang={lang} txs={txSummary} providerPayouts={providerPayouts} invoices={invoices} models={models} profiles={profiles} providerPaymentMethods={providerPaymentMethods} onRefresh={onRefresh} />
+          )}
           {tab==="provider_notif"&&user.role==="provider"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />}
           {tab==="model_notif"&&user.role==="modele"&&<InternalNotificationsTab user={user} lang={lang} notifications={notifications} unreadCount={unreadCount} onMarkRead={markRead} onMarkAllRead={markAllRead} onClickNotif={openNotificationTarget} />}
           {tab==="model_compta"&&user.role==="modele"&&(<>
