@@ -62111,6 +62111,17 @@ const App = () => {
   const [mcSpenders, setMcSpenders] = useState([]);
   const [mcPendingTxCount, setMcPendingTxCount] = useState(0);
   const [mcUnreadConvCount, setMcUnreadConvCount] = useState(0);
+  const [mcConvs, setMcConvs] = useState([]);
+  const [mcConvsLoading, setMcConvsLoading] = useState(true);
+  const [mcSelectedConv, setMcSelectedConv] = useState(null);
+  const [mcMessages, setMcMessages] = useState([]);
+  const [mcMsgLoading, setMcMsgLoading] = useState(false);
+  const [mcTxFilter, setMcTxFilter] = useState("all");
+  const [mcTxChatterFilter, setMcTxChatterFilter] = useState("all");
+  const [mcTxPeriod, setMcTxPeriod] = useState("all");
+  const [mcShiftForm, setMcShiftForm] = useState(null);
+  const [mcShiftSaving, setMcShiftSaving] = useState(false);
+  const [mcConvChatterFilter, setMcConvChatterFilter] = useState("all");
   const lastScrollYRef = React.useRef(0);
   const [topbarVisible, setTopbarVisible] = React.useState(true);
 
@@ -62670,9 +62681,22 @@ const App = () => {
         // 7. Mes commissions
         const {data: commData} = await sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false});
         setMcCommissions(commData || []);
+
+        // 8. Conversations des chatters du manager
+        if (_mcIds.length > 0) {
+          const _allModelIds2 = [...new Set((mcProfiles || []).flatMap(c => c.assigned_models || []).filter(Boolean))];
+          if (_allModelIds2.length > 0) {
+            try {
+              const {data: convData} = await sb.from("conversations").select("*").in("model_id", _allModelIds2).order("updated_at", {ascending: false}).limit(200);
+              setMcConvs(convData || []);
+              setMcUnreadConvCount((convData || []).filter(c => (c.unread_count || 0) > 0).length);
+            } catch(e2) { setMcConvs([]); }
+          }
+        }
+        setMcConvsLoading(false);
       } catch (e) {
         console.error("[DADASH] Manager chatter data load failed:", e.message || e);
-        setMcChatters([]); setMcChatterIds([]); setMcTxs([]); setMcSpenders([]); setMcShifts([]); setMcCommissions([]);
+        setMcChatters([]); setMcChatterIds([]); setMcTxs([]); setMcSpenders([]); setMcShifts([]); setMcCommissions([]); setMcConvs([]); setMcConvsLoading(false);
       }
     }
     // Load notifications
@@ -64241,7 +64265,7 @@ const App = () => {
                     {mcChatters.map(ch=>{
                       const chTxs = mcTxs.filter(tx=>tx.chatter_id===ch.id);
                       const validTxs = chTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee");
-                      const chCA = validTxs.reduce((s,tx)=>s+Number(tx.amount||0),0);
+                      const chCA = validTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency),0);
                       const lastTx = chTxs.length>0 ? chTxs.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] : null;
                       const lastTxDate = lastTx ? new Date(lastTx.created_at) : null;
                       const timeAgo = lastTxDate ? (()=>{const diff=Date.now()-lastTxDate.getTime();const mins=Math.floor(diff/60000);if(mins<60)return mins+"min";const hrs=Math.floor(mins/60);if(hrs<24)return hrs+"h";const days=Math.floor(hrs/24);return days+"j";})() : null;
@@ -64292,46 +64316,364 @@ const App = () => {
               </div>
             );
           })()}
-          {tab==="mc_conversations"&&user.role==="manager_chatter"&&(
-            <div style={{padding:0}}>
-              <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💬 Conversations</h2>
-              <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
-                <div style={{fontSize:48,marginBottom:12}}>💬</div>
-                <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:8}}>Supervision des Conversations</div>
-                <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Contenu à venir — PR 2/3</div>
+          {tab==="mc_conversations"&&user.role==="manager_chatter"&&(()=>{
+            const loadMcMessages = async (convId) => {
+              setMcMsgLoading(true);
+              try {
+                const {data} = await sb.from("tg_messages").select("*").eq("conversation_id",convId).order("created_at",{ascending:false}).limit(100);
+                setMcMessages((data||[]).reverse());
+              } catch(e) { setMcMessages([]); }
+              setMcMsgLoading(false);
+            };
+            const filteredConvs = mcConvChatterFilter==="all" ? mcConvs : mcConvs.filter(conv=>{
+              const ch = mcChatters.find(c=>(c.assigned_models||[]).includes(conv.model_id));
+              return ch && ch.id===mcConvChatterFilter;
+            });
+            return (
+              <div style={{padding:0}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16,flexWrap:"wrap",gap:8}}>
+                  <h2 style={{fontSize:22,fontWeight:800,color:"var(--text)",margin:0}}>💬 {lang==="fr"?"Conversations":"Conversations"} ({filteredConvs.length})</h2>
+                  <select value={mcConvChatterFilter} onChange={e=>{setMcConvChatterFilter(e.target.value);setMcSelectedConv(null);setMcMessages([]);}} style={{padding:"6px 12px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12}}>
+                    <option value="all">{lang==="fr"?"Tous les chatters":"All chatters"}</option>
+                    {mcChatters.map(ch=><option key={ch.id} value={ch.id}>{ch.name||ch.email}</option>)}
+                  </select>
+                </div>
+                {filteredConvs.length===0&&!mcConvsLoading?(
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
+                    <div style={{fontSize:48,marginBottom:12}}>💬</div>
+                    <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:8}}>{lang==="fr"?"Aucune conversation":"No conversations"}</div>
+                    <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucune conversation trouvée pour ton équipe.":"No conversations found for your team."}</div>
+                  </div>
+                ):(
+                  <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"300px 1fr",gap:0,minHeight:500,border:"1px solid var(--border-subtle)",borderRadius:16,overflow:"hidden"}}>
+                    <div style={{background:"var(--surface)",borderRight:_isMobile?"none":"1px solid var(--border-subtle)",overflowY:"auto",maxHeight:600}}>
+                      {mcConvsLoading&&<div style={{padding:20,textAlign:"center",color:"var(--text-tertiary)"}}>{lang==="fr"?"Chargement…":"Loading…"}</div>}
+                      {filteredConvs.map(conv=>{
+                        const chatterMatch = mcChatters.find(c=>(c.assigned_models||[]).includes(conv.model_id));
+                        const chatterName = chatterMatch?.name||"—";
+                        const modelName = (models||[]).find(m=>m.id===conv.model_id)?.name||"";
+                        return (
+                          <div key={conv.id} onClick={()=>{setMcSelectedConv(conv);loadMcMessages(conv.id);}} style={{padding:"14px 18px",borderBottom:"1px solid var(--border-subtle)",cursor:"pointer",background:mcSelectedConv?.id===conv.id?"rgba(99,102,241,0.1)":"transparent"}}>
+                            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                              <span style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{conv.spender_handle||conv.spender_name||"Spender"}</span>
+                              {(conv.unread_count||0)>0&&<span style={{background:"var(--danger)",color:"#fff",fontSize:10,fontWeight:700,padding:"2px 6px",borderRadius:10}}>{conv.unread_count}</span>}
+                            </div>
+                            <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>{modelName} · {chatterName}</div>
+                            <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{conv.last_message||"..."}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{background:"var(--bg-base, var(--surface))",display:"flex",flexDirection:"column"}}>
+                      {!mcSelectedConv&&(
+                        <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:"var(--text-tertiary)",fontSize:14}}>
+                          {lang==="fr"?"Sélectionne une conversation":"Select a conversation"}
+                        </div>
+                      )}
+                      {mcSelectedConv&&(<>
+                        <div style={{padding:"14px 18px",borderBottom:"1px solid var(--border-subtle)",background:"var(--surface)"}}>
+                          <span style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>{mcSelectedConv.spender_handle||"Spender"}</span>
+                          <span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>
+                            Chatter: {mcChatters.find(c=>(c.assigned_models||[]).includes(mcSelectedConv.model_id))?.name||"—"}
+                          </span>
+                        </div>
+                        <div style={{flex:1,overflowY:"auto",padding:20,display:"flex",flexDirection:"column",gap:12,maxHeight:400}}>
+                          {mcMsgLoading&&<div style={{textAlign:"center",color:"var(--text-tertiary)",padding:20}}>{lang==="fr"?"Chargement…":"Loading…"}</div>}
+                          {!mcMsgLoading&&mcMessages.length===0&&<div style={{textAlign:"center",color:"var(--text-tertiary)",padding:20}}>{lang==="fr"?"Aucun message":"No messages"}</div>}
+                          {!mcMsgLoading&&mcMessages.map((msg,i)=>{
+                            const isOut = msg.direction==="out";
+                            return (
+                              <div key={msg.id||i} style={{display:"flex",justifyContent:isOut?"flex-end":"flex-start"}}>
+                                <div style={{maxWidth:"70%",padding:"12px 16px",borderRadius:isOut?"16px 16px 4px 16px":"16px 16px 16px 4px",background:isOut?"linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)":"#2d3250",color:"white",fontSize:14,lineHeight:1.5,wordBreak:"break-word"}}>
+                                  {msg.text||msg.content||""}
+                                  <div style={{fontSize:10,opacity:0.6,marginTop:4,textAlign:"right"}}>{msg.created_at?new Date(msg.created_at).toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"}):""}</div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div style={{padding:"12px 18px",borderTop:"1px solid var(--border-subtle)",background:"var(--surface)",textAlign:"center"}}>
+                          <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{lang==="fr"?"👁️ Mode supervision — lecture seule":"👁️ Supervision mode — read only"}</span>
+                        </div>
+                      </>)}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
-          {tab==="mc_transactions"&&user.role==="manager_chatter"&&(
-            <div style={{padding:0}}>
-              <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💰 Transactions</h2>
-              <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
-                <div style={{fontSize:48,marginBottom:12}}>💰</div>
-                <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:8}}>Validation des Transactions</div>
-                <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Contenu à venir — PR 2/3</div>
+            );
+          })()}
+          {tab==="mc_transactions"&&user.role==="manager_chatter"&&(()=>{
+            const handleMcValidate = async (txId) => {
+              const {error} = await sb.from("transactions").update({status:"validated",validated_at:new Date().toISOString()}).eq("id",txId);
+              if (error) { addToast("Erreur: "+error.message,"error"); return; }
+              setMcTxs(prev=>prev.map(tx=>tx.id===txId?{...tx,status:"validated",validated_at:new Date().toISOString()}:tx));
+              setMcPendingTxCount(prev=>Math.max(0,prev-1));
+              addToast(lang==="fr"?"TX validée ✅":"TX validated ✅","success");
+            };
+            const handleMcRefuse = async (txId) => {
+              const {error} = await sb.from("transactions").update({status:"refused"}).eq("id",txId);
+              if (error) { addToast("Erreur: "+error.message,"error"); return; }
+              setMcTxs(prev=>prev.map(tx=>tx.id===txId?{...tx,status:"refused"}:tx));
+              setMcPendingTxCount(prev=>Math.max(0,prev-1));
+              addToast(lang==="fr"?"TX refusée ❌":"TX refused ❌","error");
+            };
+            const now = new Date();
+            const weekAgo = new Date(now.getTime()-7*86400000);
+            const monthStart = new Date(now.getFullYear(),now.getMonth(),1);
+            let filtered = mcTxs;
+            if (mcTxFilter==="pending") filtered=filtered.filter(tx=>tx.status==="pending"||tx.status==="en_attente");
+            else if (mcTxFilter==="validated") filtered=filtered.filter(tx=>tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee");
+            else if (mcTxFilter==="refused") filtered=filtered.filter(tx=>tx.status==="refused");
+            if (mcTxChatterFilter!=="all") filtered=filtered.filter(tx=>tx.chatter_id===mcTxChatterFilter);
+            if (mcTxPeriod==="week") filtered=filtered.filter(tx=>new Date(tx.date||tx.created_at)>=weekAgo);
+            else if (mcTxPeriod==="month") filtered=filtered.filter(tx=>new Date(tx.date||tx.created_at)>=monthStart);
+            const caValidated = mcTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee").reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency),0);
+            const caPending = mcTxs.filter(tx=>tx.status==="pending"||tx.status==="en_attente").reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency),0);
+            const pendingCount = mcTxs.filter(tx=>tx.status==="pending"||tx.status==="en_attente").length;
+            const statusBadge = (s) => {
+              const colors = {pending:"var(--warning)",en_attente:"var(--warning)",validated:"var(--success)",confirmee:"var(--success)",payee:"var(--success)",refused:"var(--danger)"};
+              const labels = {pending:"En attente",en_attente:"En attente",validated:"Validée",confirmee:"Confirmée",payee:"Payée",refused:"Refusée"};
+              return React.createElement("span",{style:{fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:8,background:(colors[s]||"var(--text-tertiary)")+"22",color:colors[s]||"var(--text-tertiary)"}},labels[s]||s);
+            };
+            return (
+              <div style={{padding:0}}>
+                <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💰 {lang==="fr"?"Transactions":"Transactions"}</h2>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:16,marginBottom:20}}>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"EN ATTENTE":"PENDING"}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:28,fontWeight:800,color:"var(--warning)"}}>{pendingCount}</span>{pendingCount>0&&<span style={{background:"var(--danger)",color:"#fff",fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10}}>{pendingCount}</span>}</div>
+                  </div>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA VALIDÉ</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"var(--success)"}}>{fmtAmount(caValidated)}</div>
+                  </div>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA EN ATTENTE</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"var(--warning)"}}>{fmtAmount(caPending)}</div>
+                  </div>
+                </div>
+                <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
+                  {[["all",lang==="fr"?"Tous":"All"],["pending",lang==="fr"?"En attente":"Pending"],["validated",lang==="fr"?"Validées":"Validated"],["refused",lang==="fr"?"Refusées":"Refused"]].map(([v,l])=>(
+                    <button key={v} onClick={()=>setMcTxFilter(v)} style={{padding:"6px 14px",borderRadius:10,border:"1px solid "+(mcTxFilter===v?"var(--accent)":"var(--border)"),background:mcTxFilter===v?"rgba(139,92,246,0.1)":"transparent",color:mcTxFilter===v?"var(--accent)":"var(--text-secondary)",fontSize:12,fontWeight:700,cursor:"pointer"}}>{l}</button>
+                  ))}
+                  <select value={mcTxChatterFilter} onChange={e=>setMcTxChatterFilter(e.target.value)} style={{padding:"6px 12px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12}}>
+                    <option value="all">{lang==="fr"?"Tous les chatters":"All chatters"}</option>
+                    {mcChatters.map(ch=><option key={ch.id} value={ch.id}>{ch.name||ch.email}</option>)}
+                  </select>
+                  <select value={mcTxPeriod} onChange={e=>setMcTxPeriod(e.target.value)} style={{padding:"6px 12px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12}}>
+                    <option value="all">{lang==="fr"?"Toute période":"All time"}</option>
+                    <option value="week">{lang==="fr"?"Cette semaine":"This week"}</option>
+                    <option value="month">{lang==="fr"?"Ce mois":"This month"}</option>
+                  </select>
+                </div>
+                {filtered.length===0?(
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
+                    <div style={{fontSize:48,marginBottom:12}}>💰</div>
+                    <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:8}}>{lang==="fr"?"Aucune transaction":"No transactions"}</div>
+                    <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucune transaction ne correspond aux filtres.":"No transactions match the filters."}</div>
+                  </div>
+                ):(
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,overflow:"hidden"}}>
+                    <div className="table-wrap" style={{overflowX:"auto"}}>
+                      <table className="table" style={{fontSize:12}}>
+                        <thead><tr><th>Date</th><th>Spender</th><th>{lang==="fr"?"Montant":"Amount"}</th><th>Chatter</th><th>{lang==="fr"?"Modèle":"Model"}</th><th>Statut</th><th>Actions</th></tr></thead>
+                        <tbody>
+                          {filtered.map(tx=>{
+                            const chName = mcChatters.find(c=>c.id===tx.chatter_id)?.name||"—";
+                            const mName = (models||[]).find(m=>m.id===tx.model_id)?.name||"—";
+                            const isPending = tx.status==="pending"||tx.status==="en_attente";
+                            return (
+                              <tr key={tx.id}>
+                                <td>{new Date(tx.date||tx.created_at).toLocaleDateString("fr-FR")}</td>
+                                <td style={{fontWeight:600}}>{tx.spender_handle||tx.spender_name||"—"}</td>
+                                <td style={{fontWeight:700}}>{fmtAmount(convertAmount(Number(tx.amount||0),tx.currency))}</td>
+                                <td>{chName}</td>
+                                <td>{mName}</td>
+                                <td>{statusBadge(tx.status)}</td>
+                                <td>{isPending&&(
+                                  <div style={{display:"flex",gap:4}}>
+                                    <button onClick={()=>handleMcValidate(tx.id)} style={{padding:"4px 10px",borderRadius:8,border:"none",background:"rgba(16,185,129,0.15)",color:"var(--success)",fontSize:12,fontWeight:700,cursor:"pointer"}}>✅</button>
+                                    <button onClick={()=>handleMcRefuse(tx.id)} style={{padding:"4px 10px",borderRadius:8,border:"none",background:"rgba(239,68,68,0.15)",color:"var(--danger)",fontSize:12,fontWeight:700,cursor:"pointer"}}>❌</button>
+                                  </div>
+                                )}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
-          {tab==="mc_planning"&&user.role==="manager_chatter"&&(
-            <div style={{padding:0}}>
-              <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>📅 Planning</h2>
-              <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
-                <div style={{fontSize:48,marginBottom:12}}>📅</div>
-                <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:8}}>Planning & Shifts</div>
-                <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Contenu à venir — PR 2/3</div>
+            );
+          })()}
+          {tab==="mc_planning"&&user.role==="manager_chatter"&&(()=>{
+            const handleAddShift = async () => {
+              if (!mcShiftForm||!mcShiftForm.chatter_id||!mcShiftForm.date||!mcShiftForm.start_time||!mcShiftForm.end_time) { addToast(lang==="fr"?"Remplis tous les champs":"Fill all fields","error"); return; }
+              setMcShiftSaving(true);
+              const {error,data} = await sb.from("chatter_shifts").insert({chatter_id:mcShiftForm.chatter_id,manager_id:user.id,date:mcShiftForm.date,start_time:mcShiftForm.start_time,end_time:mcShiftForm.end_time,notes:mcShiftForm.notes||null,status:"planned"}).select();
+              if (error) { addToast("Erreur: "+error.message,"error"); setMcShiftSaving(false); return; }
+              setMcShifts(prev=>[...(data||[]),...prev]);
+              setMcShiftForm(null);
+              setMcShiftSaving(false);
+              addToast(lang==="fr"?"Shift ajouté ✓":"Shift added ✓","success");
+            };
+            const handleDeleteShift = async (shiftId) => {
+              const {error} = await sb.from("chatter_shifts").delete().eq("id",shiftId);
+              if (error) { addToast("Erreur: "+error.message,"error"); return; }
+              setMcShifts(prev=>prev.filter(s=>s.id!==shiftId));
+              addToast(lang==="fr"?"Shift supprimé":"Shift deleted","success");
+            };
+            const today = new Date();
+            const monday = new Date(today);
+            monday.setDate(today.getDate()-((today.getDay()+6)%7));
+            const weekDays = Array.from({length:7},(_,i)=>{const d=new Date(monday);d.setDate(monday.getDate()+i);return d;});
+            const dayNames = lang==="fr"?["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]:["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+            const inputS = {padding:"6px 10px",borderRadius:8,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12};
+            return (
+              <div style={{padding:0}}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:8}}>
+                  <h2 style={{fontSize:22,fontWeight:800,color:"var(--text)",margin:0}}>📅 Planning</h2>
+                  <button onClick={()=>setMcShiftForm(mcShiftForm?null:{chatter_id:"",date:new Date().toISOString().slice(0,10),start_time:"09:00",end_time:"17:00",notes:""})} style={{padding:"8px 16px",borderRadius:10,border:"none",background:mcShiftForm?"var(--surface2)":"#7c3aed",color:mcShiftForm?"var(--text-secondary)":"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>{mcShiftForm?(lang==="fr"?"Annuler":"Cancel"):"+ "+(lang==="fr"?"Ajouter shift":"Add shift")}</button>
+                </div>
+                {mcShiftForm&&(
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px",marginBottom:16,display:"flex",flexWrap:"wrap",gap:12,alignItems:"flex-end"}}>
+                    <div>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>Chatter</div>
+                      <select value={mcShiftForm.chatter_id} onChange={e=>setMcShiftForm({...mcShiftForm,chatter_id:e.target.value})} style={inputS}>
+                        <option value="">{lang==="fr"?"Choisir...":"Choose..."}</option>
+                        {mcChatters.map(ch=><option key={ch.id} value={ch.id}>{ch.name||ch.email}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>Date</div>
+                      <input type="date" value={mcShiftForm.date} onChange={e=>setMcShiftForm({...mcShiftForm,date:e.target.value})} style={inputS} />
+                    </div>
+                    <div>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{lang==="fr"?"Début":"Start"}</div>
+                      <input type="time" value={mcShiftForm.start_time} onChange={e=>setMcShiftForm({...mcShiftForm,start_time:e.target.value})} style={inputS} />
+                    </div>
+                    <div>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{lang==="fr"?"Fin":"End"}</div>
+                      <input type="time" value={mcShiftForm.end_time} onChange={e=>setMcShiftForm({...mcShiftForm,end_time:e.target.value})} style={inputS} />
+                    </div>
+                    <div style={{flex:"1 1 200px"}}>
+                      <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>Notes</div>
+                      <input type="text" value={mcShiftForm.notes} onChange={e=>setMcShiftForm({...mcShiftForm,notes:e.target.value})} placeholder={lang==="fr"?"Notes optionnelles...":"Optional notes..."} style={{...inputS,width:"100%"}} />
+                    </div>
+                    <button onClick={handleAddShift} disabled={mcShiftSaving} style={{padding:"8px 16px",borderRadius:10,border:"none",background:"#7c3aed",color:"#fff",fontSize:12,fontWeight:700,cursor:mcShiftSaving?"not-allowed":"pointer",opacity:mcShiftSaving?0.6:1}}>{mcShiftSaving?"...":(lang==="fr"?"Ajouter":"Add")}</button>
+                  </div>
+                )}
+                <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                  {weekDays.map((day,di)=>{
+                    const dateStr = day.toISOString().slice(0,10);
+                    const dayShifts = mcShifts.filter(s=>s.date===dateStr);
+                    const isToday = dateStr===new Date().toISOString().slice(0,10);
+                    return (
+                      <div key={dateStr} style={{background:"var(--surface)",border:"1px solid "+(isToday?"var(--accent)":"var(--border)"),borderRadius:14,padding:"16px 20px"}}>
+                        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:dayShifts.length>0?10:0}}>
+                          <span style={{fontSize:13,fontWeight:800,color:isToday?"var(--accent)":"var(--text)"}}>{dayNames[di]}</span>
+                          <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{day.toLocaleDateString("fr-FR",{day:"numeric",month:"short"})}</span>
+                          {isToday&&<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:8,background:"rgba(139,92,246,0.15)",color:"var(--accent)"}}>{lang==="fr"?"Aujourd'hui":"Today"}</span>}
+                          {dayShifts.length===0&&<span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>{lang==="fr"?"— Aucun shift":"— No shift"}</span>}
+                        </div>
+                        {dayShifts.map(sh=>{
+                          const chName = mcChatters.find(c=>c.id===sh.chatter_id)?.name||"Chatter";
+                          return (
+                            <div key={sh.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderTop:"1px solid var(--border-subtle)"}}>
+                              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                                <span style={{fontSize:12,fontWeight:700,color:"var(--text)"}}>{chName}</span>
+                                <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{sh.start_time} → {sh.end_time}</span>
+                                {sh.notes&&<span style={{fontSize:11,color:"var(--text-tertiary)",fontStyle:"italic"}}>{sh.notes}</span>}
+                              </div>
+                              <button onClick={()=>handleDeleteShift(sh.id)} style={{background:"none",border:"none",color:"var(--danger)",fontSize:14,cursor:"pointer",padding:"2px 6px"}}>🗑️</button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
-          {tab==="mc_solde"&&user.role==="manager_chatter"&&(
-            <div style={{padding:0}}>
-              <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💎 Mon Solde</h2>
-              <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
-                <div style={{fontSize:48,marginBottom:12}}>💎</div>
-                <div style={{fontSize:16,fontWeight:700,color:"var(--text)",marginBottom:8}}>Solde & Commissions</div>
-                <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Contenu à venir — PR 2/3</div>
+            );
+          })()}
+          {tab==="mc_solde"&&user.role==="manager_chatter"&&(()=>{
+            const commPct = user.manager_commission_pct||25;
+            const now = new Date();
+            const monthStart = new Date(now.getFullYear(),now.getMonth(),1);
+            const monthTxs = mcTxs.filter(tx=>(tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee")&&new Date(tx.date||tx.created_at)>=monthStart);
+            const caMonth = monthTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency),0);
+            const commMonth = caMonth*commPct/100;
+            const balance = user.manager_balance||0;
+            const chatterBreakdown = mcChatters.map(ch=>{
+              const chTxs = monthTxs.filter(tx=>tx.chatter_id===ch.id);
+              const ca = chTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency),0);
+              return {name:ch.name||ch.email||"Chatter",ca,txCount:chTxs.length};
+            }).sort((a,b)=>b.ca-a.ca);
+            const statusBadge2 = (s) => {
+              const c = s==="paid"||s==="payee"?"var(--success)":"var(--warning)";
+              const l = s==="paid"||s==="payee"?(lang==="fr"?"Payé":"Paid"):(lang==="fr"?"En attente":"Pending");
+              return React.createElement("span",{style:{fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:8,background:c+"22",color:c}},l);
+            };
+            return (
+              <div style={{padding:0}}>
+                <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💎 {lang==="fr"?"Mon Solde":"My Balance"}</h2>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:16,marginBottom:24}}>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"MON SOLDE":"MY BALANCE"}</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(balance)}</div>
+                  </div>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"COMMISSION CE MOIS":"COMMISSION THIS MONTH"}</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"var(--success)"}}>{fmtAmount(commMonth)}</div>
+                  </div>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"TAUX COMMISSION":"COMMISSION RATE"}</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"var(--text)"}}>{commPct}%</div>
+                  </div>
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:16}}>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:14,fontWeight:700,marginBottom:12,color:"var(--text)"}}>👥 {lang==="fr"?"Détail par chatter (ce mois)":"Per chatter breakdown (this month)"}</div>
+                    {chatterBreakdown.length===0?(
+                      <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucune donnée ce mois":"No data this month"}</div>
+                    ):chatterBreakdown.map((ch,i)=>(
+                      <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid var(--border-subtle)"}}>
+                        <div>
+                          <span style={{fontSize:13,fontWeight:600,color:"var(--text)"}}>{ch.name}</span>
+                          <span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>{ch.txCount} TX</span>
+                        </div>
+                        <span style={{fontSize:13,fontWeight:700,color:"var(--accent)"}}>{fmtAmount(ch.ca)}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
+                    <div style={{fontSize:14,fontWeight:700,marginBottom:12,color:"var(--text)"}}>📋 {lang==="fr"?"Historique commissions":"Commission history"}</div>
+                    {mcCommissions.length===0?(
+                      <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucun historique":"No history"}</div>
+                    ):(
+                      <div className="table-wrap" style={{overflowX:"auto"}}>
+                        <table className="table" style={{fontSize:12}}>
+                          <thead><tr><th>{lang==="fr"?"Période":"Period"}</th><th>CA</th><th>%</th><th>Commission</th><th>Statut</th></tr></thead>
+                          <tbody>
+                            {mcCommissions.map(c=>(
+                              <tr key={c.id}>
+                                <td>{c.period||new Date(c.created_at).toLocaleDateString("fr-FR",{month:"short",year:"numeric"})}</td>
+                                <td style={{fontWeight:700}}>{fmtAmount(c.ca_total||c.revenue||0)}</td>
+                                <td>{c.commission_pct||commPct}%</td>
+                                <td style={{fontWeight:700,color:"var(--success)"}}>{fmtAmount(c.commission_amount||c.amount||0)}</td>
+                                <td>{statusBadge2(c.status||"pending")}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
           {tab==="mc_parametres"&&user.role==="manager_chatter"&&(
             <div style={{padding:0}}>
               <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>⚙️ Paramètres</h2>
