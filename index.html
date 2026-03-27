@@ -28055,8 +28055,17 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
   const users = safeArray(profiles);
   const inputS = {width:"100%",padding:"9px 12px",borderRadius:9,border:"1px solid rgba(255,255,255,0.08)",background:"#131926",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"};
   const labelS = {display:"block",fontSize:10,fontWeight:600,color:"var(--text-secondary)",textTransform:"uppercase",marginBottom:5,letterSpacing:"0.8px"};
-  const openCreate = () => { setEditUser(null); setForm({name:"",email:"",role:"chatter",commission_pct:10,assigned_models:[],is_active:true}); setShowModal(true); };
-  const openEdit = (u) => { setEditUser(u); setForm({name:u.name||u.full_name||"",email:u.email||"",role:u.role||"chatter",commission_pct:u.commission_pct||u.comm_pct||10,assigned_models:u.assigned_models||[],is_active:u.is_active!==false}); setShowModal(true); };
+  const openCreate = () => { setEditUser(null); setForm({name:"",email:"",role:"chatter",commission_pct:10,assigned_models:[],is_active:true,manager_commission_pct:25,assigned_chatters:[]}); setShowModal(true); };
+  const openEdit = async (u) => {
+    setEditUser(u);
+    let assignedChatters = [];
+    if (u.role === "manager_chatter") {
+      const {data} = await sb.from("manager_chatters").select("chatter_id").eq("manager_id", u.id);
+      assignedChatters = (data||[]).map(r=>r.chatter_id);
+    }
+    setForm({name:u.name||u.full_name||"",email:u.email||"",role:u.role||"chatter",commission_pct:u.commission_pct||u.comm_pct||10,assigned_models:u.assigned_models||[],is_active:u.is_active!==false,manager_commission_pct:u.manager_commission_pct||25,assigned_chatters:assignedChatters});
+    setShowModal(true);
+  };
   const handleToggleModel = (mid) => { const cur=form.assigned_models||[]; setForm({...form,assigned_models:cur.includes(mid)?cur.filter(m=>m!==mid):[...cur,mid]}); };
   const handleSave = async () => {
     if (!form.name.trim()) { addToast(fr?"Nom requis":"Name required","error"); return; }
@@ -28078,11 +28087,21 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
             if (!existing) await sb.from("models").insert({name});
           }
         }
+        if (form.role === "manager_chatter") {
+          await sb.from("profiles").update({manager_commission_pct: Number(form.manager_commission_pct || 25)}).eq("id", editUser.id);
+          await sb.from("manager_chatters").delete().eq("manager_id", editUser.id);
+          if (form.assigned_chatters && form.assigned_chatters.length > 0) {
+            await sb.from("manager_chatters").insert(form.assigned_chatters.map(cid => ({ manager_id: editUser.id, chatter_id: cid })));
+          }
+        }
         addToast(fr?"Utilisateur mis à jour ✓":"User updated ✓","success");
       } else {
         if (!form.email.trim()) { addToast(fr?"Email requis":"Email required","error"); setSaving(false); return; }
-        const {error} = await sb.from("profiles").insert({name,email:form.email.trim(),role:form.role,commission_pct:Number(form.commission_pct),comm_pct:Number(form.commission_pct),assigned_models:form.assigned_models,is_active:true});
+        const insertPayload = {name,email:form.email.trim(),role:form.role,commission_pct:Number(form.commission_pct),comm_pct:Number(form.commission_pct),assigned_models:form.assigned_models,is_active:true};
+        if (form.role === "manager_chatter") insertPayload.manager_commission_pct = Number(form.manager_commission_pct || 25);
+        const {data:insertedData,error} = await sb.from("profiles").insert(insertPayload).select();
         if (error) throw error;
+        const newProfileId = insertedData && insertedData[0] ? insertedData[0].id : null;
         // If role is modele, also create entry in models table
         if (form.role === "modele") {
           const {data:existing} = await sb.from("models").select("id").eq("name", name).maybeSingle();
@@ -28090,6 +28109,9 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
             const {error:mErr} = await sb.from("models").insert({name});
             if (mErr) console.warn("[Models] Could not create models row:", mErr.message);
           }
+        }
+        if (form.role === "manager_chatter" && newProfileId && form.assigned_chatters && form.assigned_chatters.length > 0) {
+          await sb.from("manager_chatters").insert(form.assigned_chatters.map(cid => ({ manager_id: newProfileId, chatter_id: cid })));
         }
         addToast(fr?"Utilisateur créé ✓":"User created ✓","success");
       }
@@ -28116,8 +28138,8 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
     } catch(e) { addToast("Erreur: "+e.message,"error"); }
     setResetLoading(null);
   };
-  const roleBg = (r) => r==="gerant"?"rgba(139,92,246,0.15)":r==="chatter"?"rgba(16,185,129,0.15)":r==="modele"?"rgba(244,114,182,0.15)":"rgba(245,158,11,0.15)";
-  const roleClr = (r) => r==="gerant"?"var(--accent)":r==="chatter"?"var(--success)":r==="modele"?"var(--pink)":"var(--warning)";
+  const roleBg = (r) => r==="gerant"?"rgba(139,92,246,0.15)":r==="chatter"?"rgba(16,185,129,0.15)":r==="manager_chatter"?"rgba(245,158,11,0.15)":r==="modele"?"rgba(244,114,182,0.15)":"rgba(245,158,11,0.15)";
+  const roleClr = (r) => r==="gerant"?"var(--accent)":r==="chatter"?"var(--success)":r==="manager_chatter"?"var(--warning)":r==="modele"?"var(--pink)":"var(--warning)";
   return (
     <div>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,flexWrap:"wrap",gap:10}}>
@@ -28167,7 +28189,7 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
               {!editUser&&<div><label style={labelS}>Email</label><input style={inputS} type="email" value={form.email} onChange={e=>setForm({...form,email:e.target.value})} placeholder="email@exemple.com" /></div>}
               <div><label style={labelS}>{fr?"Rôle":"Role"}</label>
                 <select style={inputS} value={form.role} onChange={e=>setForm({...form,role:e.target.value})}>
-                  <option value="gerant">Gérant</option><option value="chatter">Chatter</option><option value="modele">Modèle</option><option value="provider">Provider</option>
+                  <option value="gerant">Gérant</option><option value="chatter">Chatter</option><option value="manager_chatter">Manager Chatter</option><option value="modele">Modèle</option><option value="provider">Provider</option>
                 </select>
               </div>
               {form.role==="chatter"&&(
@@ -28177,6 +28199,24 @@ const AdminUsersTab = ({lang, profiles, models, onRefresh}) => {
                     {safeArray(models).map(m=>(
                       <label key={m.id} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,padding:"5px 10px",borderRadius:8,border:"1px solid "+(form.assigned_models.includes(m.id)?"var(--accent)":"var(--border)"),background:form.assigned_models.includes(m.id)?"rgba(139,92,246,0.1)":"transparent",color:"var(--text)"}}>
                         <input type="checkbox" checked={form.assigned_models.includes(m.id)} onChange={()=>handleToggleModel(m.id)} style={{accentColor:"var(--accent)"}} />{m.name}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {form.role==="manager_chatter"&&(
+                <div>
+                  <label style={labelS}>Commission manager (%)</label>
+                  <input style={inputS} type="number" min="0" max="100" value={form.manager_commission_pct||25} onChange={e=>setForm({...form,manager_commission_pct:e.target.value})} placeholder="25" />
+                </div>
+              )}
+              {form.role==="manager_chatter"&&(
+                <div>
+                  <label style={labelS}>{fr?"Chatters assignés":"Assigned chatters"}</label>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:4}}>
+                    {safeArray(profiles).filter(p=>p.role==="chatter"&&p.is_active!==false).map(ch=>(
+                      <label key={ch.id} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,padding:"5px 10px",borderRadius:8,border:"1px solid "+((form.assigned_chatters||[]).includes(ch.id)?"var(--accent)":"var(--border)"),background:(form.assigned_chatters||[]).includes(ch.id)?"rgba(139,92,246,0.1)":"transparent",color:"var(--text)"}}>
+                        <input type="checkbox" checked={(form.assigned_chatters||[]).includes(ch.id)} onChange={()=>{const cur=form.assigned_chatters||[];setForm({...form,assigned_chatters:cur.includes(ch.id)?cur.filter(c=>c!==ch.id):[...cur,ch.id]});}} style={{accentColor:"var(--accent)"}} />{ch.name||ch.email}
                       </label>
                     ))}
                   </div>
@@ -64122,10 +64162,10 @@ const App = () => {
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Manager Chatter pages ── */}
           {tab==="mc_dashboard"&&user.role==="manager_chatter"&&(()=>{
-            const caTotal = mcTxs.filter(tx=>tx.status==="approved"||tx.status==="validée"||tx.status==="validated").reduce((s,tx)=>s+Number(tx.amount||0),0);
+            const caTotal = mcTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee").reduce((s,tx)=>s+Number(tx.amount||0),0);
             const nbTx = mcTxs.length;
             const nbSpenders = mcSpenders.length;
-            const commPct = user.manager_commission_pct || 3;
+            const commPct = user.manager_commission_pct || 25;
             const maCommission = caTotal * commPct / 100;
             return (
               <div style={{padding:0}}>
@@ -64133,7 +64173,7 @@ const App = () => {
                 <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:16,marginBottom:24}}>
                   <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
                     <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA VALIDÉ ÉQUIPE</div>
-                    <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{caTotal.toLocaleString("fr-FR",{maximumFractionDigits:0})} €</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(caTotal)}</div>
                   </div>
                   <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
                     <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>TRANSACTIONS</div>
@@ -64145,7 +64185,7 @@ const App = () => {
                   </div>
                   <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
                     <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>MA COMMISSION ({commPct}%)</div>
-                    <div style={{fontSize:28,fontWeight:800,color:"#10B981"}}>{maCommission.toLocaleString("fr-FR",{maximumFractionDigits:2})} €</div>
+                    <div style={{fontSize:28,fontWeight:800,color:"#10B981"}}>{fmtAmount(maCommission)}</div>
                   </div>
                 </div>
                 <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(250px,1fr))",gap:16}}>
@@ -64155,11 +64195,11 @@ const App = () => {
                       <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Aucun chatter assigné</div>
                     ):mcChatters.map(ch=>{
                       const chTxs = mcTxs.filter(tx=>tx.chatter_id===ch.id);
-                      const chCA = chTxs.filter(tx=>tx.status==="approved"||tx.status==="validée"||tx.status==="validated").reduce((s,tx)=>s+Number(tx.amount||0),0);
+                      const chCA = chTxs.filter(tx=>tx.status==="validated"||tx.status==="confirmee"||tx.status==="payee").reduce((s,tx)=>s+Number(tx.amount||0),0);
                       return (
                         <div key={ch.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid var(--border-subtle)"}}>
                           <span style={{fontSize:13,fontWeight:600,color:"var(--text)"}}>{ch.name||ch.email||"Chatter"}</span>
-                          <span style={{fontSize:13,fontWeight:700,color:"var(--accent)"}}>{chCA.toLocaleString("fr-FR",{maximumFractionDigits:0})} €</span>
+                          <span style={{fontSize:13,fontWeight:700,color:"var(--accent)"}}>{fmtAmount(chCA)}</span>
                         </div>
                       );
                     })}
