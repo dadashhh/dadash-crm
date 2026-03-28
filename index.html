@@ -62164,56 +62164,311 @@ const MultiTabMessagerieApp = ({ user, lang, spenders, models, profiles, txs }) 
 // MC EXTRACTED COMPONENTS
 // =============================================
 
-const MCDashboardRedesign = React.memo(({ user, mcTxs, mcChatters, mcSpenders, mcPendingTxCount }) => {
+const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpenders, mcPendingTxCount, models }) => {
   const { convertAmount, currencySymbol } = useCurrency();
-  const caTotal = mcTxs.filter(tx=>isValidTx(tx.status)).reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
-  const nbTx = mcTxs.length;
-  const nbSpenders = mcSpenders.length;
-  const commPct = user.manager_commission_pct || 25;
-  const maCommission = caTotal * commPct / 100;
+  const [period, setPeriod] = useState("30j");
+  const [dateStart, setDateStart] = useState("");
+  const [dateEnd, setDateEnd] = useState("");
+  const [chatterFilter, setChatterFilter] = useState("all");
+  const [soldeManager, setSoldeManager] = useState(null);
+  const [chartMode, setChartMode] = useState("line");
+
+  // Period date ranges (copied from ChatterDashboardRedesign)
+  const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
+    const now = new Date();
+    let start, end, prevStart, prevEnd;
+    if (period === "custom" && dateStart && dateEnd) {
+      start = new Date(dateStart); end = new Date(dateEnd);
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        start = new Date(now); start.setDate(start.getDate() - 30); start.setHours(0,0,0,0);
+        end = new Date(now); end.setHours(23,59,59,999);
+      }
+      const diff = end.getTime() - start.getTime();
+      prevEnd = new Date(start.getTime()); prevStart = new Date(start.getTime() - diff);
+    } else {
+      const days = period==="24h"?1:period==="7j"?7:period==="30j"?30:period==="90j"?90:99999;
+      end = new Date(now); end.setHours(23,59,59,999);
+      start = new Date(now); start.setDate(start.getDate()-days); start.setHours(0,0,0,0);
+      prevEnd = new Date(start.getTime()); prevEnd.setMilliseconds(-1);
+      prevStart = new Date(prevEnd.getTime()); prevStart.setDate(prevStart.getDate()-days);
+    }
+    return { dateDebut: start, dateFin: end, prevDateDebut: prevStart, prevDateFin: prevEnd };
+  }, [period, dateStart, dateEnd]);
+
+  // Filtered TX by period + chatter
+  const filteredTxs = useMemo(() => {
+    return mcTxs.filter(tx => {
+      if (!isValidTx(tx.status) && !isPendingTx(tx.status)) return false;
+      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      if (d < dateDebut.getTime() || d > dateFin.getTime()) return false;
+      if (chatterFilter !== "all" && tx.chatter_id !== chatterFilter) return false;
+      return true;
+    });
+  }, [mcTxs, dateDebut, dateFin, chatterFilter]);
+
+  const prevFilteredTxs = useMemo(() => {
+    return mcTxs.filter(tx => {
+      if (!isValidTx(tx.status) && !isPendingTx(tx.status)) return false;
+      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      if (d < prevDateDebut.getTime() || d > prevDateFin.getTime()) return false;
+      if (chatterFilter !== "all" && tx.chatter_id !== chatterFilter) return false;
+      return true;
+    });
+  }, [mcTxs, prevDateDebut, prevDateFin, chatterFilter]);
+
+  // 6 KPIs with deltas
+  const kpiData = useMemo(() => {
+    const valid = filteredTxs.filter(tx => isValidTx(tx.status));
+    const pending = filteredTxs.filter(tx => isPendingTx(tx.status));
+    const pValid = prevFilteredTxs.filter(tx => isValidTx(tx.status));
+    const caNet = valid.reduce((s,tx) => s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+    const pCaNet = pValid.reduce((s,tx) => s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+    const commRate = Number(user.manager_commission_pct||25)/100;
+    const maComm = caNet * commRate;
+    const pMaComm = pCaNet * commRate;
+    const txPending = pending.length;
+    const txValid = valid.length;
+    const pTxValid = pValid.length;
+    const spendersActifs = new Set(valid.map(tx=>tx.spender_handle).filter(Boolean)).size;
+    const chattersActifs = new Set(valid.map(tx=>tx.chatter_id).filter(Boolean)).size;
+    const delta = (curr, prev) => prev > 0 ? ((curr-prev)/prev*100) : (curr > 0 ? 100 : 0);
+    return { caNet, maComm, txPending, txValid, spendersActifs, chattersActifs,
+      totalChatters: mcChatters.length, commPct: Number(user.manager_commission_pct||25),
+      deltaCaNet: delta(caNet,pCaNet), deltaComm: delta(maComm,pMaComm), deltaTx: delta(txValid,pTxValid) };
+  }, [filteredTxs, prevFilteredTxs, convertAmount, user, mcChatters]);
+
+  // Chart data
+  const chartData = useMemo(() => {
+    const byDay = {};
+    filteredTxs.filter(tx => isValidTx(tx.status)).forEach(tx => {
+      const key = (tx.date||tx.created_at||"").toString().slice(0,10);
+      if (!key || key.length < 10) return;
+      if (!byDay[key]) byDay[key] = { caNet:0, commission:0, txCount:0 };
+      byDay[key].caNet += convertAmount(Number(tx.net_amount||0),tx.currency);
+      byDay[key].commission += convertAmount(Number(tx.net_amount||0),tx.currency) * (Number(user.manager_commission_pct||25)/100);
+      byDay[key].txCount += 1;
+    });
+    return Object.entries(byDay).sort((a,b)=>a[0].localeCompare(b[0])).map(([date,d]) => ({
+      date, label: new Date(date+"T12:00:00").toLocaleDateString("fr-CH",{day:"2-digit",month:"short"}),
+      ca_net: Math.round(d.caNet), commission: Math.round(d.commission), transactions: d.txCount,
+    }));
+  }, [filteredTxs, convertAmount, user]);
+
+  // Chatter performance stats
+  const chatterStats = useMemo(() => {
+    const valid = filteredTxs.filter(tx => isValidTx(tx.status));
+    const result = mcChatters.map(ch => {
+      const chTxs = valid.filter(tx => tx.chatter_id === ch.id);
+      const caNet = chTxs.reduce((s,tx) => s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+      return { name: ch.name||ch.email||"Chatter", id: ch.id, caNet, nbTx: chTxs.length };
+    });
+    const topCa = Math.max(...result.map(x=>x.caNet),1);
+    return result.map(x => ({...x, barPct: (x.caNet/topCa)*100 })).sort((a,b) => b.caNet-a.caNet);
+  }, [filteredTxs, mcChatters, convertAmount]);
+
+  // Recent TX
+  const recentTxs = useMemo(() => {
+    const list = mcTxs.slice().sort((a,b) => new Date(b.date||b.created_at||0).getTime() - new Date(a.date||a.created_at||0).getTime());
+    return list.slice(0,10);
+  }, [mcTxs]);
+
+  // Solde manager widget
+  const refreshSoldeManager = useCallback(async () => {
+    try {
+      const chatterIds = mcChatters.map(c=>c.id);
+      if (!chatterIds.length) { setSoldeManager({ solde:0, commission_brute:0, deja_verse:0 }); return; }
+      const [txRes, piRes] = await Promise.allSettled([
+        sb.from('transactions').select('net_amount, currency').in('chatter_id', chatterIds).in('status', ['validated','confirmee','payee','validé']),
+        sb.from('paiements_internes').select('montant, statut').eq('destinataire_id', user.id),
+      ]);
+      const txData = txRes.status==='fulfilled' ? (txRes.value.data||[]) : [];
+      const piData = piRes.status==='fulfilled' ? (piRes.value.data||[]) : [];
+      const commRate = Number(user.manager_commission_pct||25)/100;
+      const commBrute = txData.reduce((s,t) => s + Number(t.net_amount||0)*commRate, 0);
+      const dejaVerse = piData.filter(p=>p.statut==='validated').reduce((s,p) => s+Number(p.montant||0), 0);
+      setSoldeManager({ solde: Math.max(0, commBrute-dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
+    } catch(e) { console.warn('[SoldeManager]', e?.message); }
+  }, [user?.id, mcChatters]);
+
+  useEffect(() => { refreshSoldeManager(); }, [refreshSoldeManager]);
+
+  const sColor = s => s==="validated"||s==="validé"||s==="confirmee"||s==="payee" ? "#10b981" : s==="pending"||s==="en_attente" ? "#f59e0b" : "#ef4444";
+  const sLabel = s => ({validated:"Validée",confirmee:"Confirmée",payee:"Payée",pending:"En attente",en_attente:"En attente",refused:"Refusée"})[s]||s;
+  const DeltaBadge = ({val}) => val===0 ? null : React.createElement("div",{className:"kpi-card-delta "+(val>=0?"up":"down")},(val>=0?"↑":"↓")+" "+Math.abs(val).toFixed(1)+"% vs préc.");
+  const cardS = {background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"};
+
+  // Chart rendering
+  const MC_METRICS = [{id:"ca_net",label:"CA Net",color:"#8b5cf6"},{id:"commission",label:"Commission",color:"#10b981"},{id:"transactions",label:"TX",color:"#f59e0b"}];
+  const fmtVal = (key, v) => key==="transactions" ? v : fmtAmount(v);
+  const chartEl = chartData.length > 1 && rechartsReady ? (() => {
+    _ensureRecharts();
+    const ChartComp = chartMode==="bar" ? BarChart : LineChart;
+    return React.createElement(ResponsiveContainer, {width:"100%",height:240},
+      React.createElement(ChartComp, {data:chartData,margin:{top:5,right:10,bottom:0,left:-10}},
+        React.createElement(CartesianGrid, {stroke:"rgba(255,255,255,0.04)",vertical:false}),
+        React.createElement(XAxis, {dataKey:"label",interval:"preserveStartEnd",tick:{fill:"#64748b",fontSize:10},tickLine:false,axisLine:false}),
+        React.createElement(YAxis, {tick:{fill:"#64748b",fontSize:10},tickLine:false,axisLine:false,width:52,tickFormatter:v=>v>=1000?(v/1000).toFixed(0)+"k":String(v)}),
+        React.createElement(RechartsTooltip, {content:({active,payload,label})=>{
+          if(!active||!payload||!payload.length)return null;
+          return React.createElement("div",{style:{background:"#1a2035",border:"1px solid rgba(139,92,246,0.3)",borderRadius:10,padding:"10px 14px",boxShadow:"0 8px 24px rgba(0,0,0,0.5)"}},
+            React.createElement("div",{style:{fontSize:11,color:"#64748b",marginBottom:6}},label),
+            payload.map((p,i)=>React.createElement("div",{key:i,style:{fontSize:12,fontWeight:600,color:p.stroke||p.fill}},p.name+": "+fmtVal(p.dataKey,p.value)))
+          );
+        }}),
+        ...MC_METRICS.map(m => chartMode==="bar"
+          ? React.createElement(Bar, {key:m.id,dataKey:m.id,name:m.label,fill:m.color,radius:[3,3,0,0],opacity:0.85})
+          : React.createElement(Line, {key:m.id,type:"monotone",dataKey:m.id,name:m.label,stroke:m.color,strokeWidth:2,dot:false,activeDot:{r:5,fill:m.color,stroke:"#1a2035",strokeWidth:2}})
+        )
+      )
+    );
+  })() : null;
+
   return (
     <div style={{padding:0}}>
-      <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>📊 Dashboard Manager</h2>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:16,marginBottom:24}}>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA VALIDÉ ÉQUIPE</div>
-          <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(caTotal)}</div>
+      <h2 style={{fontSize:22,fontWeight:800,marginBottom:16,color:"var(--text)"}}>📊 Dashboard Manager</h2>
+
+      {/* Period selector + chatter filter */}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,alignItems:"center"}}>
+        {["24h","7j","30j","90j","all"].map(p => (
+          <button key={p} onClick={()=>setPeriod(p)}
+            style={{padding:"6px 14px",borderRadius:16,fontSize:12,fontWeight:600,
+              background: period===p ? "var(--accent)" : "var(--surface)",
+              color: period===p ? "#fff" : "var(--text-secondary)",
+              border: period===p ? "none" : "1px solid var(--border)",cursor:"pointer"}}>
+            {p==="all"?"All time":p.toUpperCase()}
+          </button>
+        ))}
+        <select value={chatterFilter} onChange={e=>setChatterFilter(e.target.value)}
+          style={{padding:"6px 12px",borderRadius:16,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,marginLeft:4}}>
+          <option value="all">{lang==="fr"?"Tous les chatters":"All chatters"}</option>
+          {mcChatters.map(ch=><option key={ch.id} value={ch.id}>{ch.name||ch.email}</option>)}
+        </select>
+      </div>
+
+      {/* 6 KPI cards */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:12,marginBottom:20}}>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>CA Net Équipe</div>
+          <div style={{fontSize:24,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(kpiData.caNet)}</div>
+          <DeltaBadge val={kpiData.deltaCaNet}/>
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>TRANSACTIONS</div>
-          <div style={{fontSize:28,fontWeight:800,color:"var(--text)"}}>{nbTx}</div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>Ma Commission ({kpiData.commPct}%)</div>
+          <div style={{fontSize:24,fontWeight:800,color:"#10b981"}}>{fmtAmount(kpiData.maComm)}</div>
+          <DeltaBadge val={kpiData.deltaComm}/>
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>SPENDERS ACTIFS</div>
-          <div style={{fontSize:28,fontWeight:800,color:"var(--text)"}}>{nbSpenders}</div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>TX en attente</div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:24,fontWeight:800,color:"var(--warning)"}}>{kpiData.txPending}</span>
+            {kpiData.txPending>0&&<span style={{background:"var(--danger)",color:"#fff",fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10}}>{kpiData.txPending}</span>}
+          </div>
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>MA COMMISSION ({commPct}%)</div>
-          <div style={{fontSize:28,fontWeight:800,color:"#10B981"}}>{fmtAmount(maCommission)}</div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>TX Validées</div>
+          <div style={{fontSize:24,fontWeight:800,color:"var(--text)"}}>{kpiData.txValid}</div>
+          <DeltaBadge val={kpiData.deltaTx}/>
+        </div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>Spenders Actifs</div>
+          <div style={{fontSize:24,fontWeight:800,color:"var(--text)"}}>{kpiData.spendersActifs}</div>
+        </div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>Chatters Actifs</div>
+          <div style={{fontSize:24,fontWeight:800,color:"var(--text)"}}>{kpiData.chattersActifs}<span style={{fontSize:14,color:"var(--text-tertiary)",fontWeight:600}}>/{kpiData.totalChatters}</span></div>
         </div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(250px,1fr))",gap:16}}>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:14,fontWeight:700,marginBottom:12,color:"var(--text)"}}>👥 Mon Équipe ({mcChatters.length} chatters)</div>
-          {mcChatters.length===0?(
-            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Aucun chatter assigné</div>
-          ):mcChatters.map(ch=>{
-            const chTxs = mcTxs.filter(tx=>tx.chatter_id===ch.id);
-            const chCA = chTxs.filter(tx=>isValidTx(tx.status)).reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+
+      {/* Chart */}
+      {chartData.length > 1 && (
+        <div style={{...cardS,marginBottom:20}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>📈 {lang==="fr"?"Évolution":"Trend"}</div>
+            <div style={{display:"flex",gap:4}}>
+              {["line","bar"].map(m=>(
+                <button key={m} onClick={()=>setChartMode(m)} style={{padding:"4px 10px",borderRadius:8,fontSize:11,fontWeight:600,border:"none",cursor:"pointer",
+                  background:chartMode===m?"var(--accent)":"var(--surface)",color:chartMode===m?"#fff":"var(--text-secondary)"}}>{m==="line"?"📈":"📊"}</button>
+              ))}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:12,marginBottom:10,flexWrap:"wrap"}}>
+            {MC_METRICS.map(m=>(
+              <span key={m.id} style={{fontSize:10,fontWeight:600,display:"flex",alignItems:"center",gap:4}}>
+                <span style={{width:8,height:8,borderRadius:4,background:m.color,display:"inline-block"}}/>{m.label}
+              </span>
+            ))}
+          </div>
+          {chartEl}
+        </div>
+      )}
+
+      {/* Bottom grid: chatter perf + recent TX + solde */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:16}}>
+        {/* Chatter performance */}
+        <div style={cardS}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>👥 {lang==="fr"?"Performance chatters":"Chatter performance"}</div>
+          {chatterStats.length===0?(
+            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucun chatter":"No chatters"}</div>
+          ):chatterStats.map(ch=>(
+            <div key={ch.id} style={{marginBottom:12}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{ch.name}</div>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{ch.nbTx} TX</div>
+                </div>
+                <div style={{fontSize:14,fontWeight:800,color:"var(--text)",flexShrink:0}}>{fmtAmount(ch.caNet)}</div>
+              </div>
+              <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
+                <div style={{height:"100%",width:ch.barPct+"%",background:"#8b5cf6",borderRadius:3,transition:"width 0.3s"}}/>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Recent TX */}
+        <div style={cardS}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>🕐 {lang==="fr"?"TX récentes":"Recent TX"}</div>
+          {recentTxs.length===0?(
+            <div style={{textAlign:"center",padding:16,color:"var(--text-tertiary)",fontSize:12}}>{lang==="fr"?"Aucune TX":"No TX"}</div>
+          ):recentTxs.slice(0,8).map((tx,i)=>{
+            const chName = mcChatters.find(c=>c.id===tx.chatter_id)?.name||"—";
+            const mName = (models||[]).find(m=>m.id===tx.model_id)?.name||"";
+            const sc = sColor(tx.status);
             return (
-              <div key={ch.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid var(--border-subtle)"}}>
-                <span style={{fontSize:13,fontWeight:600,color:"var(--text)"}}>{ch.name||ch.email||"Chatter"}</span>
-                <span style={{fontSize:13,fontWeight:700,color:"var(--accent)"}}>{fmtAmount(chCA)}</span>
+              <div key={tx.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:12,fontWeight:600,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>@{tx.spender_handle||"?"} · {mName||"?"}</div>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{chName} · {new Date(tx.date||tx.created_at).toLocaleDateString("fr-CH",{day:"2-digit",month:"short"})}</div>
+                </div>
+                <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2,flexShrink:0,marginLeft:8}}>
+                  <span style={{fontSize:13,fontWeight:700,color:sc}}>+{fmtAmount(convertAmount(Number(tx.net_amount||0),tx.currency))}</span>
+                  <span style={{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:6,background:sc+"22",color:sc}}>{sLabel(tx.status)}</span>
+                </div>
               </div>
             );
           })}
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:14,fontWeight:700,marginBottom:12,color:"var(--text)"}}>💰 TX en attente</div>
-          {mcPendingTxCount===0?(
-            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>Aucune transaction en attente</div>
-          ):(
-            <div style={{fontSize:13,color:"var(--warning)"}}>{mcPendingTxCount} transaction{mcPendingTxCount>1?"s":""} à valider</div>
+
+        {/* Solde Manager widget */}
+        <div style={cardS}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>💰 {lang==="fr"?"Mon Solde":"My Balance"}</div>
+          {soldeManager ? (<>
+            <div style={{textAlign:"center",marginBottom:16}}>
+              <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4}}>{lang==="fr"?"SOLDE DISPONIBLE":"AVAILABLE BALANCE"}</div>
+              <div style={{fontSize:32,fontWeight:800,color:soldeManager.solde>0?"#10b981":"var(--text)"}}>{fmtAmount(soldeManager.solde)}</div>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-around",borderTop:"1px solid var(--border-subtle)",paddingTop:12}}>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600}}>{lang==="fr"?"COMM. BRUTE":"GROSS COMM."}</div>
+                <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(soldeManager.commission_brute)}</div>
+              </div>
+              <div style={{textAlign:"center"}}>
+                <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600}}>{lang==="fr"?"DÉJÀ VERSÉ":"ALREADY PAID"}</div>
+                <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(soldeManager.deja_verse)}</div>
+              </div>
+            </div>
+          </>):(
+            <div style={{textAlign:"center",padding:20,color:"var(--text-tertiary)",fontSize:12}}>{lang==="fr"?"Chargement…":"Loading…"}</div>
           )}
         </div>
       </div>
@@ -62332,66 +62587,140 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
 
 const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissions, models }) => {
   const { convertAmount, currencySymbol } = useCurrency();
+  const [commPeriod, setCommPeriod] = useState("month");
   const commPct = user.manager_commission_pct||25;
-  const now = new Date();
-  const monthStart = new Date(now.getFullYear(),now.getMonth(),1);
-  const monthTxs = mcTxs.filter(tx=>(isValidTx(tx.status))&&new Date(tx.date||tx.created_at)>=monthStart);
-  const caMonth = monthTxs.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
-  const commMonth = caMonth*commPct/100;
-  const balance = user.manager_balance||0;
-  const chatterBreakdown = mcChatters.map(ch=>{
-    const chTxs = monthTxs.filter(tx=>tx.chatter_id===ch.id);
-    const ca = chTxs.reduce((s,tx)=>s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
-    return {name:ch.name||ch.email||"Chatter",ca,txCount:chTxs.length};
-  }).sort((a,b)=>b.ca-a.ca);
+  const commRate = commPct/100;
+  const cardS = {background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"};
+
+  // Period filtering
+  const periodData = useMemo(() => {
+    const now = new Date();
+    let start;
+    if (commPeriod==="month") start = new Date(now.getFullYear(),now.getMonth(),1);
+    else if (commPeriod==="lastmonth") { start = new Date(now.getFullYear(),now.getMonth()-1,1); }
+    else if (commPeriod==="3months") { start = new Date(now); start.setMonth(start.getMonth()-3); start.setDate(1); }
+    else start = new Date(0);
+
+    let end;
+    if (commPeriod==="lastmonth") end = new Date(now.getFullYear(),now.getMonth(),0,23,59,59,999);
+    else { end = new Date(now); end.setHours(23,59,59,999); }
+
+    const periodTxs = mcTxs.filter(tx => {
+      if (!isValidTx(tx.status)) return false;
+      const d = new Date(tx.date||tx.created_at);
+      return d >= start && d <= end;
+    });
+    const caNetPeriod = periodTxs.reduce((s,tx) => s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+    const commPeriodVal = caNetPeriod * commRate;
+
+    // All-time
+    const allValid = mcTxs.filter(tx => isValidTx(tx.status));
+    const caNetAllTime = allValid.reduce((s,tx) => s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+    const commAllTime = caNetAllTime * commRate;
+
+    // Already paid
+    const dejaVerse = (mcCommissions||[]).filter(c => c.status==='paid'||c.status==='payee')
+      .reduce((s,c) => s+Number(c.commission_amount||c.amount||0), 0);
+    const soldeDu = commAllTime - dejaVerse;
+
+    // Per-chatter breakdown
+    const totalCa = caNetPeriod || 1;
+    const chatterBreakdown = mcChatters.map(ch => {
+      const chTxs = periodTxs.filter(tx => tx.chatter_id===ch.id);
+      const ca = chTxs.reduce((s,tx) => s+convertAmount(Number(tx.net_amount||0),tx.currency),0);
+      const comm = ca * commRate;
+      return { name: ch.name||ch.email||"Chatter", ca, comm, txCount: chTxs.length, pct: caNetPeriod>0 ? (ca/totalCa*100) : 0 };
+    }).sort((a,b) => b.ca-a.ca);
+
+    return { caNetPeriod, commPeriodVal, dejaVerse, soldeDu, chatterBreakdown, periodLabel: commPeriod==="month"?(lang==="fr"?"ce mois":"this month"):commPeriod==="lastmonth"?(lang==="fr"?"mois dernier":"last month"):commPeriod==="3months"?(lang==="fr"?"3 derniers mois":"last 3 months"):"all time" };
+  }, [mcTxs, mcChatters, mcCommissions, commPeriod, convertAmount, commRate, lang]);
+
   const statusBadge2 = (s) => {
     const c = s==="paid"||s==="payee"?"var(--success)":"var(--warning)";
     const l = s==="paid"||s==="payee"?(lang==="fr"?"Payé":"Paid"):(lang==="fr"?"En attente":"Pending");
     return React.createElement("span",{style:{fontSize:11,fontWeight:700,padding:"3px 8px",borderRadius:8,background:c+"22",color:c}},l);
   };
+
   return (
     <div style={{padding:0}}>
-      <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💎 {lang==="fr"?"Mon Solde":"My Balance"}</h2>
+      <h2 style={{fontSize:22,fontWeight:800,marginBottom:16,color:"var(--text)"}}>💎 {lang==="fr"?"Ma Commission":"My Commission"}</h2>
+
+      {/* Period selector */}
+      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:20}}>
+        {[["month",lang==="fr"?"Ce mois":"This month"],["lastmonth",lang==="fr"?"Mois dernier":"Last month"],["3months","3 mois"],["all","All time"]].map(([v,l])=>(
+          <button key={v} onClick={()=>setCommPeriod(v)}
+            style={{padding:"6px 14px",borderRadius:16,fontSize:12,fontWeight:600,
+              background: commPeriod===v ? "var(--accent)" : "var(--surface)",
+              color: commPeriod===v ? "#fff" : "var(--text-secondary)",
+              border: commPeriod===v ? "none" : "1px solid var(--border)",cursor:"pointer"}}>
+            {l}
+          </button>
+        ))}
+      </div>
+
+      {/* 3 KPI cards */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:16,marginBottom:24}}>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"MON SOLDE":"MY BALANCE"}</div>
-          <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(balance)}</div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"COMMISSION":"COMMISSION"} ({periodData.periodLabel})</div>
+          <div style={{fontSize:28,fontWeight:800,color:"#10b981"}}>{fmtAmount(periodData.commPeriodVal)}</div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:4}}>CA Net: {fmtAmount(periodData.caNetPeriod)} × {commPct}%</div>
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"COMMISSION CE MOIS":"COMMISSION THIS MONTH"}</div>
-          <div style={{fontSize:28,fontWeight:800,color:"var(--success)"}}>{fmtAmount(commMonth)}</div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"TOTAL VERSÉ":"TOTAL PAID"}</div>
+          <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(periodData.dejaVerse)}</div>
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>{lang==="fr"?"TAUX COMMISSION":"COMMISSION RATE"}</div>
-          <div style={{fontSize:28,fontWeight:800,color:"var(--text)"}}>{commPct}%</div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"SOLDE DÛ":"BALANCE DUE"}</div>
+          <div style={{fontSize:28,fontWeight:800,color:periodData.soldeDu>=0?"#10b981":"#ef4444"}}>{fmtAmount(periodData.soldeDu)}</div>
         </div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:16}}>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:14,fontWeight:700,marginBottom:12,color:"var(--text)"}}>👥 {lang==="fr"?"Détail par chatter (ce mois)":"Per chatter breakdown (this month)"}</div>
-          {chatterBreakdown.length===0?(
-            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucune donnée ce mois":"No data this month"}</div>
-          ):chatterBreakdown.map((ch,i)=>(
-            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid var(--border-subtle)"}}>
-              <div>
-                <span style={{fontSize:13,fontWeight:600,color:"var(--text)"}}>{ch.name}</span>
-                <span style={{fontSize:11,color:"var(--text-tertiary)",marginLeft:8}}>{ch.txCount} TX</span>
-              </div>
-              <span style={{fontSize:13,fontWeight:700,color:"var(--accent)"}}>{fmtAmount(ch.ca)}</span>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(320px,1fr))",gap:16}}>
+        {/* Chatter breakdown with progress bars */}
+        <div style={cardS}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>👥 {lang==="fr"?"Détail par chatter":"Per chatter breakdown"} ({periodData.periodLabel})</div>
+          {periodData.chatterBreakdown.length===0?(
+            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucune donnée":"No data"}</div>
+          ):(
+            <div className="table-wrap" style={{overflowX:"auto"}}>
+              <table className="table" style={{fontSize:12}}>
+                <thead><tr><th>Chatter</th><th>{lang==="fr"?"TX val.":"Val. TX"}</th><th>CA Net</th><th>{lang==="fr"?"Comm.":"Comm."} ({commPct}%)</th><th>% total</th></tr></thead>
+                <tbody>
+                  {periodData.chatterBreakdown.map((ch,i)=>(
+                    <tr key={i}>
+                      <td style={{fontWeight:600}}>{ch.name}</td>
+                      <td>{ch.txCount}</td>
+                      <td style={{fontWeight:700}}>{fmtAmount(ch.ca)}</td>
+                      <td style={{fontWeight:700,color:"var(--success)"}}>{fmtAmount(ch.comm)}</td>
+                      <td>
+                        <div style={{display:"flex",alignItems:"center",gap:6}}>
+                          <div style={{flex:1,height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden",minWidth:40}}>
+                            <div style={{height:"100%",width:ch.pct+"%",background:"#8b5cf6",borderRadius:3}}/>
+                          </div>
+                          <span style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",minWidth:35,textAlign:"right"}}>{ch.pct.toFixed(0)}%</span>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
-          ))}
+          )}
         </div>
-        <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:14,fontWeight:700,marginBottom:12,color:"var(--text)"}}>📋 {lang==="fr"?"Historique commissions":"Commission history"}</div>
+
+        {/* Commission history */}
+        <div style={cardS}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>📋 {lang==="fr"?"Historique paiements":"Payment history"}</div>
           {mcCommissions.length===0?(
             <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucun historique":"No history"}</div>
           ):(
             <div className="table-wrap" style={{overflowX:"auto"}}>
               <table className="table" style={{fontSize:12}}>
-                <thead><tr><th>{lang==="fr"?"Période":"Period"}</th><th>CA</th><th>%</th><th>Commission</th><th>Statut</th></tr></thead>
+                <thead><tr><th>Date</th><th>{lang==="fr"?"Période":"Period"}</th><th>CA</th><th>%</th><th>Commission</th><th>Statut</th></tr></thead>
                 <tbody>
                   {mcCommissions.map(c=>(
                     <tr key={c.id}>
+                      <td style={{fontSize:11,color:"var(--text-tertiary)"}}>{new Date(c.created_at).toLocaleDateString("fr-FR",{day:"2-digit",month:"short",year:"numeric"})}</td>
                       <td>{c.period||new Date(c.created_at).toLocaleDateString("fr-FR",{month:"short",year:"numeric"})}</td>
                       <td style={{fontWeight:700}}>{fmtAmount(c.ca_total||c.revenue||0)}</td>
                       <td>{c.commission_pct||commPct}%</td>
@@ -65021,7 +65350,7 @@ const App = () => {
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Manager Chatter pages ── */}
           {tab==="mc_dashboard"&&user.role==="manager_chatter"&&(
-            <MCDashboardRedesign user={user} mcTxs={mcTxs} mcChatters={mcChatters} mcSpenders={mcSpenders} mcPendingTxCount={mcPendingTxCount} />
+            <MCDashboardRedesign user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcSpenders={mcSpenders} mcPendingTxCount={mcPendingTxCount} models={models} />
           )}
           {tab==="mc_chatters"&&user.role==="manager_chatter"&&(
             <MCEquipeTab user={user} lang={lang} mcChatters={mcChatters} mcTxs={mcTxs} mcConvs={mcConvs}
