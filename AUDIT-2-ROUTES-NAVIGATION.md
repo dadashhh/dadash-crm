@@ -159,53 +159,60 @@ admin:     users, roles, suggestions, logs, export, platforms, settings
 
 ## Composants orphelins
 
-Composants definis (const/function avec majuscule) mais **jamais rendus en JSX** (`<NomComposant` introuvable) et sans reference fonctionnelle.
+Composants definis (const/function avec majuscule) mais **jamais rendus en JSX** (`<NomComposant` introuvable) et sans reference fonctionnelle verifiee.
+
+> Verification approfondie effectuee : chaque composant a ete controle pour l'usage JSX (`<Nom`), `React.createElement(Nom`, appels de fonction, et references dans du code de sous-pages.
 
 | # | Composant | Ligne | Taille (~lignes) | Verdict |
 |---|-----------|-------|-----------------|---------|
 | 1 | TelegramTab | L.23014 | ~1185 | ORPHELIN |
-| 2 | GerantMessagerieTab | L.31659 | ~1040 | ORPHELIN |
-| 3 | MesSpendersTab | L.18835 | ~965 | ORPHELIN |
-| 4 | MessagerieGerantAdminPanel | L.49731 | ~870 | ORPHELIN |
-| 5 | TgCarlosMessagerieTab | L.45562 | ~740 | ORPHELIN |
-| 6 | WhatsAppAnalyzerTab | L.56493 | ~710 | ORPHELIN |
-| 7 | PayesTab | L.20171 | ~630 | ORPHELIN |
-| 8 | ChatterDashboardRedesign | L.30398 | ~600 | ORPHELIN |
-| 9 | ModelManagementTab | L.53524 | ~475 | ORPHELIN |
-| 10 | PushPageV1 | L.59816 | ~385 | ORPHELIN |
-| 11 | VideosTab | L.58593 | ~310 | ORPHELIN |
-| 12 | DashboardAnalytics | L.11024 | ~280 | ORPHELIN |
-| 13 | ExportRapportsTab | L.8680 | ~270 | ORPHELIN |
-| 14 | ProviderNewTxModal | L.25454 | ~245 | ORPHELIN |
-| 15 | PaymentEventsSection | L.51680 | ~220 | ORPHELIN |
-| 16 | LedgerTab | L.51031 | ~220 | ORPHELIN |
-| 17 | LogsAuditTab | L.8950 | ~200 | ORPHELIN |
-| 18 | MediaLibraryPage | L.48111 | ~190 | ORPHELIN |
-| 19 | ObjectifsTab | L.19886 | ~155 | ORPHELIN |
-| 20 | SpenderFullProfile | L.22845 | ~155 | ORPHELIN |
-| 21 | ComptaProvidersTab | L.57936 | ~155 | ORPHELIN |
-| 22 | AgentsAuditTab | L.27913 | ~140 | ORPHELIN |
-| 23 | BroadcastAnalytics | L.48715 | ~135 | ORPHELIN |
-| 24 | BroadcastsTab | L.55306 | ~125 | ORPHELIN |
-| 25 | CompetitionTab | L.20045 | ~95 | ORPHELIN |
-| 26 | ChallengesSection | L.54449 | ~95 | ORPHELIN |
-| 27 | ContentTaskManager | L.53435 | ~85 | ORPHELIN |
-| 28 | GerantPayoutRequestsPanel | L.57870 | ~63 | ORPHELIN |
-| 29 | AgencyAchievements | L.54345 | ~54 | ORPHELIN |
-| 30 | ActivityHeatmap | L.54403 | ~42 | ORPHELIN |
-| 31 | AgencyHealthScore | L.54303 | ~38 | ORPHELIN |
-| 32 | BotStatsKPIs | L.10945 | ~37 | ORPHELIN |
-| 33 | FilterBar | L.10723 | ~31 | ORPHELIN |
-| 34 | SpenderQuickCard | L.22816 | ~27 | ORPHELIN |
-| 35 | ScansTab | L.56334 | ~14 | ORPHELIN |
-| 36 | MiniSparkline (top-level) | L.8252 | ~8 | ORPHELIN (doublon : une version locale a L.12658 est utilisee) |
-| 37 | PlaceholderTab | L.9147 | ~7 | ORPHELIN |
-| 38 | MediaThumbnail | L.33904 | ~1 | ORPHELIN (alias de MediaCard, jamais reference) |
+| 2 | MesSpendersTab | L.18835 | ~965 | ORPHELIN |
+| 3 | MessagerieGerantAdminPanel | L.49731 | ~870 | ORPHELIN |
+| 4 | WhatsAppAnalyzerTab | L.56493 | ~710 | ORPHELIN |
+| 5 | PayesTab | L.20171 | ~630 | ORPHELIN |
+| 6 | ModelManagementTab | L.53524 | ~475 | ORPHELIN |
+| 7 | PushPageV1 | L.59816 | ~385 | ORPHELIN |
+| 8 | VideosTab | L.58593 | ~310 | ORPHELIN |
+| 9 | DashboardAnalytics | L.11024 | ~280 | ORPHELIN |
+| 10 | ExportRapportsTab | L.8680 | ~270 | ORPHELIN |
+| 11 | ProviderNewTxModal | L.25454 | ~245 | ORPHELIN |
+| 12 | LogsAuditTab | L.8950 | ~200 | ORPHELIN |
+| 13 | ObjectifsTab | L.19886 | ~155 | ORPHELIN |
+| 14 | ComptaProvidersTab | L.57936 | ~155 | ORPHELIN |
+| 15 | AgentsAuditTab | L.27913 | ~140 | ORPHELIN |
+| 16 | BroadcastAnalytics | L.48715 | ~135 | ORPHELIN |
+| 17 | BroadcastsTab | L.55306 | ~125 | ORPHELIN |
+| 18 | ChallengesSection | L.54449 | ~95 | ORPHELIN |
+| 19 | ContentTaskManager | L.53435 | ~85 | ORPHELIN |
+| 20 | GerantPayoutRequestsPanel | L.57870 | ~63 | ORPHELIN |
+| 21 | AgencyAchievements | L.54345 | ~54 | ORPHELIN |
+| 22 | ActivityHeatmap | L.54403 | ~42 | ORPHELIN |
+| 23 | AgencyHealthScore | L.54303 | ~38 | ORPHELIN |
+| 24 | BotStatsKPIs | L.10945 | ~37 | ORPHELIN |
+| 25 | FilterBar | L.10723 | ~31 | ORPHELIN (GlobalFilterBar est utilise a la place) |
+| 26 | ScansTab | L.56334 | ~14 | ORPHELIN |
+| 27 | PlaceholderTab | L.9147 | ~7 | ORPHELIN |
 
-**Composants exclus (faux positifs):**
-- `ChartComp` (L.62479) : Variable dynamique (BarChart/LineChart), utilisee L.62481 — **PAS orphelin**
-- `JsPDF` (L.24356) : Reference locale a `window.jspdf`, utilisee L.24357-24359 — **PAS orphelin**
-- `VarBadge` (L.12668) : Composant local defini dans une autre fonction, scope local — **PAS orphelin** (mais doublon possible)
+**Total : 27 composants orphelins, ~6 720 lignes recuperables**
+
+**Composants exclus apres verification approfondie (faux positifs initiaux) :**
+
+| Composant | Ligne | Raison de l'exclusion |
+|-----------|-------|----------------------|
+| ChartComp | L.62479 | Variable dynamique (BarChart/LineChart), utilisee `React.createElement(ChartComp,...)` L.62481 |
+| JsPDF | L.24356 | Reference locale a `window.jspdf`, utilisee L.24357-24359 |
+| VarBadge | L.12668 | Composant local, utilise via `React.createElement` L.12756, 12765, 12796, 12805 |
+| ChatterDashboardRedesign | L.30398 | Utilise via `React.createElement(ChatterDashboardRedesign,...)` L.31124 |
+| CompetitionTab | L.20045 | Composant de base pour ChatterCompetitionTab |
+| GerantMessagerieTab | L.31659 | Utilise dans la logique de sous-pages (L.31723, 31732, 31741, 31752) |
+| TgCarlosMessagerieTab | L.45562 | Utilise dans la logique de sous-pages (L.45759, 45772, 45781, 45830) |
+| LedgerTab | L.51031 | Utilise dans le rendu comptabilite (ReceiverComptaTab) |
+| PaymentEventsSection | L.51680 | Utilise dans le rendu comptabilite (ReceiverComptaTab) |
+| MediaLibraryPage | L.48111 | Reference dans le code et commentaires, utilise en contexte |
+| MediaThumbnail | L.33904 | Alias de MediaCard, reference L.33720 |
+| MiniSparkline | L.8252 | Utilise via `React.createElement(MiniSparkline,...)` L.12751+ |
+| SpenderFullProfile | L.22845 | Reference et utilise dans le code CRM |
+| SpenderQuickCard | L.22816 | Reference et utilise dans le code Telegram |
 
 ---
 
@@ -235,20 +242,20 @@ Le sous-onglet `compta/paiements` accepte 5 valeurs de subTab (`paiements`, `pai
 | **Pages actives** | 31 (gerant: 17, admin: 1, chatter: 8, mc: 4, modele: 6, provider: 4 — certaines partagees) |
 | **Pages mortes** | 2 (`chatter_messagerie`, `model_dashboard`) |
 | **Redirects legacy** | 3 (conservables pour retro-compat URL) |
-| **Composants orphelins** | 38 |
-| **Lignes orphelines estimees** | **~9 700 lignes** |
+| **Composants orphelins** | 27 |
+| **Lignes orphelines estimees** | **~6 720 lignes** |
 | **Placeholders "coming soon"** | 5 (features partielles, pas des pages entieres) |
 | **Bug sidebar trouve** | 1 (doublon `SUPERVISION` L.65172-65173 dans MC sidebar) |
-| **Total code mort estime** | **~9 700 lignes (~14.7% du fichier)** |
+| **Total code mort estime** | **~6 720 lignes (~10.2% du fichier)** |
 
 ### Recommandations de nettoyage
 
-1. **Priorite haute** — Supprimer les 38 composants orphelins (~9 700 lignes). Les plus gros :
+1. **Priorite haute** — Supprimer les 27 composants orphelins (~6 720 lignes). Les plus gros :
    - `TelegramTab` (~1185 lignes, L.23014)
-   - `GerantMessagerieTab` (~1040 lignes, L.31659)
    - `MesSpendersTab` (~965 lignes, L.18835)
    - `MessagerieGerantAdminPanel` (~870 lignes, L.49731)
-   - `TgCarlosMessagerieTab` (~740 lignes, L.45562)
+   - `WhatsAppAnalyzerTab` (~710 lignes, L.56493)
+   - `PayesTab` (~630 lignes, L.20171)
 
 2. **Priorite moyenne** — Supprimer les 2 routes mortes :
    - `chatter_messagerie` (L.65519-65528) : code de rendu + references dans otherTabs
