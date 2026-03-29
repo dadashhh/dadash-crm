@@ -51,8 +51,8 @@ CREATE POLICY conv_select_by_role ON tg_conversations
       assigned_chatter_id = auth.uid()
       OR
       -- Accès si le modèle de la conv est dans ses modèles assignés
-      model_id IN (
-        SELECT unnest(p.assigned_models)
+      model_id::text IN (
+        SELECT unnest(p.assigned_models)::text
         FROM profiles p
         WHERE p.id = auth.uid()
       )
@@ -81,8 +81,8 @@ CREATE POLICY msg_select_by_role ON tg_messages
     (SELECT role FROM profiles WHERE id = auth.uid()) IN ('chatter', 'manager_chatter')
     AND (
       -- Accès direct via model_id (backfillé depuis tg_conversations)
-      model_id IN (
-        SELECT unnest(p.assigned_models)
+      model_id::text IN (
+        SELECT unnest(p.assigned_models)::text
         FROM profiles p
         WHERE p.id = auth.uid()
       )
