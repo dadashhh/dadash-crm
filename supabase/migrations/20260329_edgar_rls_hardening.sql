@@ -52,9 +52,8 @@ CREATE POLICY conv_select_by_role ON tg_conversations
       OR
       -- Accès si le modèle de la conv est dans ses modèles assignés
       model_id IN (
-        SELECT (elem)::uuid
-        FROM profiles p,
-             jsonb_array_elements_text(COALESCE(p.assigned_models, '[]'::jsonb)) AS elem
+        SELECT unnest(p.assigned_models)
+        FROM profiles p
         WHERE p.id = auth.uid()
       )
     )
@@ -83,9 +82,8 @@ CREATE POLICY msg_select_by_role ON tg_messages
     AND (
       -- Accès direct via model_id (backfillé depuis tg_conversations)
       model_id IN (
-        SELECT (elem)::uuid
-        FROM profiles p,
-             jsonb_array_elements_text(COALESCE(p.assigned_models, '[]'::jsonb)) AS elem
+        SELECT unnest(p.assigned_models)
+        FROM profiles p
         WHERE p.id = auth.uid()
       )
       OR
@@ -266,7 +264,7 @@ COMMIT;
 --         AND model_id IN (
 --           SELECT (elem)::uuid
 --           FROM profiles p2,
---                jsonb_array_elements_text(COALESCE(p2.assigned_models, '[]'::jsonb)) AS elem
+--                unnest(p2.assigned_models)
 --           WHERE p2.id = auth.uid()
 --         )
 --       )
