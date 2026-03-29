@@ -18,11 +18,42 @@
 | `currency`           | Conversion via `convertAmount()` dans tous les calculs                             | Devise de la TX                       |
 | `status`             | Filtrage `isValidTx()` (validated, confirmee, payee…)                              | Statut de validation                  |
 
-**Trigger `calc_transaction_fees` :** Aucune référence trouvée dans le codebase. Le calcul des fees semble être fait soit côté DB (trigger non visible dans le code front), soit manuellement.
+**Trigger `calc_transaction_fees` :** INEXISTANT. Aucun trigger de calcul de fees n'existe dans les migrations.
 
-### Requêtes SQL — NON EXÉCUTÉES
+### ⚠ DÉCOUVERTE CRITIQUE — Colonnes potentiellement absentes du schéma
 
-> ⚠ Pas de credentials Supabase disponibles dans l'environnement. Les 2 requêtes demandées n'ont pas pu être exécutées. Il faut les lancer manuellement depuis le dashboard Supabase.
+L'analyse des migrations Supabase (`supabase/migrations/` et `migrations/`) révèle que **seules ces colonnes sont ajoutées à `transactions`** :
+- `currency` (TEXT, default 'CHF') — `20260225_tx_currency_columns.sql`
+- `amount_original`, `currency_original` — `20260225_tx_currency_columns.sql`
+- `invoice_url` — `20260312_transactions_invoice_url.sql`
+- `proof_url` — `20260528_tx_proofs_upload.sql`
+
+**Les colonnes suivantes ne sont PAS dans les migrations :**
+- `net_amount` — référencé dans le code mais potentiellement absent en DB
+- `chatter_commission` — référencé dans le code mais potentiellement absent en DB
+- `provider_fee` — référencé dans le code mais potentiellement absent en DB
+- `dada_fee` — référencé dans le code mais potentiellement absent en DB
+
+> Si ces colonnes n'existent pas en DB, elles retourneraient `null`/`undefined`, ce qui expliquerait les fallbacks dans le code (`tx.net_amount || tx.amount`, `tx.chatter_commission || 0`).
+
+### Architecture réelle des commissions (migrations)
+
+Le système utilise des **vues SQL** et non des colonnes TX :
+- **`vue_soldes_chatters`** : `SUM(t.amount) * COALESCE(p.commission_pct, 20) / 100.0`
+- **`vue_soldes_modeles`** : idem avec `commission_pct` du profil modèle
+- **`vue_soldes_providers`** : `SUM(t.amount) * COALESCE(p.commission_pct, 80) / 100.0`
+
+Source : `supabase/migrations/20260408_paiements_internes.sql`
+
+### Champs commission dans `profiles` (migrations)
+- `commission_rate` FLOAT default 0.30 — `20260228_paie_system.sql`
+- `commission_pct` INT — existait avant, synchronisé avec `SET commission_rate = commission_pct / 100.0`
+- `manager_commission_pct` NUMERIC(5,2) default 3.00 — `20260317_manager_chatter_role.sql`
+- `manager_balance` NUMERIC(12,2) default 0.00 — idem
+
+### Requêtes SQL — NON EXÉCUTÉES (à lancer manuellement)
+
+> ⚠ Pas de credentials Supabase disponibles dans l'environnement.
 
 ```sql
 -- Requête 1 : Échantillon transactions
@@ -138,6 +169,20 @@ const commission = validCA * commPct / 100;
 - **Implémentation B** (L19524) : `kpiCommDues` = `Σ max(0, soldeDu)` (somme des soldes restants après déduction des versements)
 - **Conséquence :** Le même KPI "COMMISSIONS DUES" montre soit le total brut des commissions (A), soit le restant dû après paiements (B). Sémantiquement, B est correct.
 
+### INCOHÉRENCE 7 — Colonnes TX potentiellement fantômes (CRITIQUE)
+- Le code front référence `net_amount`, `chatter_commission`, `provider_fee`, `dada_fee` sur les TX
+- **Ces colonnes n'apparaissent dans AUCUNE migration** du repo
+- Les vues SQL (`vue_soldes_chatters`) calculent les commissions via `amount × commission_pct` directement
+- **Conséquence :** Le P&L et les calculs de commission pourraient lire des colonnes nulles, rendant les fallbacks (`|| 0`, `|| tx.amount`) systématiques. Le code P&L afficherait 0 pour provider_fee et dada_fee.
+
+### INCOHÉRENCE 8 — Défauts DB vs Code (MAJEUR)
+
+| Champ                    | Défaut en migration        | Défaut dans le code           |
+|--------------------------|---------------------------|-------------------------------|
+| `commission_rate`        | 0.30 (30%)               | 0.20 (20%) — L20002          |
+| `manager_commission_pct` | 3.00 (3%)                | 25% (impl. A) / 5% (impl. B) |
+| `commission_pct` (vue)   | 20 (20%)                 | 3 (3%) — impl. B L19493      |
+
 ---
 
 ## 5. Cohérence avec le flow TX cible
@@ -178,12 +223,14 @@ Il n'y a pas de vérification dans le code que `net_amount == amount - provider_
 | Taux MC                | `manager_commission_pct`  | Défaut cohérent (choisir 5% ou 25%, documenter)             |
 
 ### Actions prioritaires :
-1. **Unifier les 2 implémentations** — garder une seule source de vérité pour `validCA` et `commDue`
-2. **Utiliser `net_amount`** partout au lieu de `amount` pour les labels CA
-3. **Unifier `commission_rate` et `commission_pct`** — un seul champ, un seul format
-4. **Vérifier en DB** que `net_amount = amount - provider_fee - dada_fee` (exécuter les requêtes SQL)
-5. **Renommer le label** "CA Net" des MC ou corriger le calcul pour qu'il soit réellement net
-6. **Harmoniser les défauts** de commission (3% vs 20% pour chatters, 5% vs 25% pour MC)
+1. **Vérifier en DB si les colonnes existent** — exécuter `SELECT column_name FROM information_schema.columns WHERE table_name = 'transactions'` et `SELECT viewname, definition FROM pg_views WHERE viewname LIKE 'vue_soldes%'`
+2. **Unifier les 2 implémentations** — garder une seule source de vérité pour `validCA` et `commDue`
+3. **Décider BRUT vs NET** — si `net_amount` existe et est rempli, l'utiliser pour tous les labels CA. Sinon, utiliser `amount` et l'appeler "CA Brut" (pas "CA Net").
+4. **Unifier `commission_rate` et `commission_pct`** — un seul champ, un seul format. La migration synchronise déjà `commission_rate = commission_pct / 100.0`.
+5. **Harmoniser les défauts** — la migration dit 0.30 (30%), la vue dit 20%, le code dit 20% ou 3%. Choisir UNE valeur.
+6. **Harmoniser les défauts MC** — la migration dit 3%, le code dit 25% ou 5%. Choisir UNE valeur.
+7. **Renommer le label** "CA Net" des MC ou corriger le calcul pour qu'il soit réellement net
+8. **Si les colonnes fee n'existent pas**, créer une migration pour ajouter `net_amount`, `provider_fee`, `dada_fee`, `chatter_commission` + un trigger `calc_transaction_fees`
 
 ---
 
