@@ -212,22 +212,23 @@ Même spender / modèle différent → même `selectedChatId` → les useEffect 
 
 ### 6.1 Par page
 
-| Page | TX modal ? | Création TX ? | Lien conv→spender ? | Ligne |
-|------|-----------|--------------|---------------------|-------|
-| `DadashMessagerieTab` | **OUI** | **OUI** | **OUI** (via spender_id) | L36250+ (TX slot modal) |
-| `TlgProStandalonePage` | **NON** | **NON** | Partiel (affiche LTV) | — |
-| `GridPremiumStandalonePage` | **NON** | **NON** | Partiel (affiche LTV) | — |
-| `TindadaInboxZeroPage` | **NON** | **NON** | **NON** | — |
+| Page | TX button ? | TX modal ? | spender_id lié ? | model_id lié ? | Ligne clé |
+|------|-----------|------------|-----------------|---------------|-----------|
+| `DadashMessagerieTab` | **OUI** (2 boutons : header L42246 + panel L42927) | **OUI** (L41271) | **OUI** (`activeSpender`) | **OUI** (`selectedConv.model_id`) | L41105 (`createTx`) |
+| `GridPremiumSubpage` | **OUI** (par cellule, L33085) | **OUI** (L33369) | **OUI** (résolu par tg_id ou spender_id) | **OUI** (`conv.model_id`) | L32870 (`createTxGp`) |
+| `TlgProStandalonePage` | **OUI** (`+TX` L34614, conditionnel `_standalone`) | **OUI** (L36540) | **OUI** (via `window._tlgProSlotsRef`) | **OUI** (`convRef.model_id`) | L36253 (`handleCreateTx`) |
+| `TlgProSubpage` (embarqué dans DadashMsg) | **NON** (`_standalone` non passé) | **NON** | — | — | L43594 (pas de `_onCreateTx` passé) |
+| `TindadaInboxZeroPage` | **OUI** (L35740) | **OUI** (L36033) | **OUI** (résolu depuis `currentConv`) | **OUI** (`currentConv.model_id`) | L35447 (`createTxTindada`) |
 
-### 6.2 Ce qui manque — **P1**
+### 6.2 Ce qui fonctionne
 
-**TlgPro, GridPremium, Tindada** n'ont aucun moyen de créer une transaction depuis la conversation. Le chatter doit :
-1. Noter mentalement le spender
-2. Revenir sur `/#/messagerie` (DadashMessagerieTab)
-3. Retrouver la conv
-4. Ouvrir le TX modal
+**Correction** par rapport à l'analyse initiale : les 4 pages standalone ont toutes un TX modal fonctionnel avec `spender_id`, `model_id`, et `chatter_id` correctement liés. La création de transaction est opérationnelle partout.
 
-C'est un gap UX majeur. Le manque est au niveau **composant** (pas de TX modal intégré). L'API et la DB supportent déjà la création de TX.
+### 6.3 Ce qui manque — **P2**
+
+Le seul gap TX est le **TlgProSubpage embarqué** dans DadashMessagerieTab (sous-tab "gridpremium") : le bouton `+TX` est masqué car `_standalone` n'est pas passé en prop (L43594). Le chatter doit basculer vers la sous-tab "conversations" pour créer une TX.
+
+`GridPremiumSubpage` ne reçoit pas la prop `txs` → ne peut pas afficher l'historique TX, mais peut en créer.
 
 ---
 
@@ -242,7 +243,7 @@ C'est un gap UX majeur. Le manque est au niveau **composant** (pas de TX modal i
 | 3 | **Pas de RLS sur `tg_conversations` / `tg_messages`** | **P0** | Bypass total possible via console |
 | 4 | **`/conversations` sans filtre `model_id`** côté Carlos | **P1** | Toutes les convs transitent réseau pour tous |
 | 5 | **STANDALONE_TABS bypass tous les rôles** (L8289) | **P1** | Provider/modèle peut accéder à la messagerie |
-| 6 | **Pas de TX modal dans TlgPro/GridPremium/Tindada** | **P1** | Perte de ventes, workflow cassé |
+| 6 | **TlgProSubpage embarqué : bouton +TX masqué** (`_standalone` manquant) | **P2** | Doit switch de sous-tab pour créer TX |
 | 7 | **`selectedChatId` sans `model_id`** | **P1** | useEffect ne re-trigger pas entre 2 convs même spender |
 | 8 | **Cache messages partagé par `tg_chat_id`** | **P1** | Messages cross-modèle dans le cache |
 | 9 | **`GerantMessagerieTab` code mort** | **P3** | ~300 lignes orphelines |
@@ -255,4 +256,4 @@ C'est un gap UX majeur. Le manque est au niveau **composant** (pas de TX modal i
 3. **P0 infra** : RLS Supabase sur `tg_conversations` et `tg_messages` filtrant par `model_id` selon le JWT
 4. **P1** : ajouter `model_id` au `GET /conversations` Carlos pour réduire le payload réseau
 5. **P1** : restreindre `STANDALONE_TABS` aux rôles `gerant` + `chatter` uniquement
-6. **P1** : intégrer TX modal dans les 3 pages secondaires
+6. **P2** : passer `_standalone={true}` + `_onCreateTx` au TlgProSubpage embarqué dans DadashMessagerieTab
