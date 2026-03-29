@@ -20790,6 +20790,7 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
   const [showCreate,  setShowCreate]  = useState(false);
   const [soldesC,     setSoldesC]     = useState({});
   const [soldesM,     setSoldesM]     = useState({});
+  const [soldesMC,    setSoldesMC]    = useState({});
   const [createForm,  setCreateForm]  = useState({destinataire_id:"",destinataire_type:"chatter",type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
   const [creating,    setCreating]    = useState(false);
   const [actionSaving,setActionSaving]= useState(false);
@@ -20807,6 +20808,25 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
       setPiList(data||[]);
       if (sc.data) { const m={}; sc.data.forEach(r=>{m[r.chatter_id]=r;}); setSoldesC(m); }
       if (sm.data) { const m={}; sm.data.forEach(r=>{m[r.modele_id]=r;}); setSoldesM(m); }
+      // Compute MC soldes: allocation = CA NET chatters × mc_rate, déjà payé = validated mc_payment
+      try {
+        const mcProfiles = (profiles||[]).filter(p=>p.role==="manager_chatter");
+        const mcSoldes = {};
+        for (const mc of mcProfiles) {
+          const mcRate = Number(mc.manager_commission_pct||25)/100;
+          const {data:mcLinks} = await sb.from("manager_chatters").select("chatter_id").eq("manager_id",mc.id);
+          const chIds = (mcLinks||[]).map(l=>l.chatter_id);
+          let caNet = 0;
+          if (chIds.length > 0) {
+            const {data:txData} = await sb.from("transactions").select("net_amount,currency").in("chatter_id",chIds).in("status",["validated","confirmee","payee"]);
+            caNet = (txData||[]).reduce((s,t)=>s+Number(t.net_amount||0),0);
+          }
+          const allocation = caNet * mcRate;
+          const dejaVerse = (data||[]).filter(p=>p.type==="mc_payment"&&p.destinataire_id===mc.id&&p.statut==="validated").reduce((s,p)=>s+Number(p.montant||0),0);
+          mcSoldes[mc.id] = {name:mc.name||mc.email,solde_du:Math.max(0,allocation-dejaVerse),commission_brute:allocation,deja_verse:dejaVerse,ca_net:caNet,rate:mc.manager_commission_pct||25};
+        }
+        setSoldesMC(mcSoldes);
+      } catch(_){}
     } catch(e) {}
     setLoading(false);
   }, []);
@@ -20824,6 +20844,8 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
   const filtered = piList.filter(p=>{
     if (filterFlow==="gerant_chatter") return p.createur_role==="gerant"&&p.destinataire_type==="chatter";
     if (filterFlow==="gerant_modele")  return p.createur_role==="gerant"&&p.destinataire_type==="modele";
+    if (filterFlow==="gerant_mc")      return p.type==="mc_payment";
+    if (filterFlow==="mc_chatter")     return p.type==="chatter_payment";
     if (filterFlow==="provider_gerant") return p.createur_role==="provider"&&p.destinataire_type==="gerant";
     return true;
   }).filter(p=>filterStatut==="all"||p.statut===filterStatut)
@@ -20903,6 +20925,14 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
             message: `${gerantName} vous a envoyé ${amt}. Allez dans "Ma Commission" pour valider ou contester.`,
             read: false,
           });
+        } else if (createForm.destinataire_type==="manager_chatter") {
+          await sb.from("notifications").insert({
+            user_id: createForm.destinataire_id,
+            type: "payment_pi_pending",
+            title: `💸 Nouveau paiement — ${amt}`,
+            message: `${gerantName} vous a envoyé ${amt}. Allez dans "Ma Commission" pour valider ou contester.`,
+            read: false,
+          });
         } else if (createForm.destinataire_type==="modele") {
           const modeleProfile = (profiles||[]).find(p=>p.role==="modele"&&p.name?.toLowerCase()===destName?.toLowerCase());
           if (modeleProfile) {
@@ -20957,7 +20987,7 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
       <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
         {isGerant&&<button onClick={()=>setShowCreate(true)} style={{padding:"7px 14px",borderRadius:9,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>{"+"} Nouveau paiement</button>}
         <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
-          {[["all","Tous"],["gerant_chatter","Gérant→Chatter"],["gerant_modele","Gérant→Modèle"],["provider_gerant","Provider→Gérant"]].map(([v,l])=>(
+          {[["all","Tous"],["gerant_chatter","Gérant→Chatter"],["gerant_modele","Gérant→Modèle"],["gerant_mc","Gérant→MC"],["mc_chatter","MC→Chatter"],["provider_gerant","Provider→Gérant"]].map(([v,l])=>(
             <button key={v} onClick={()=>setFilterFlow(v)} style={{padding:"5px 10px",borderRadius:8,border:`1px solid ${filterFlow===v?"var(--accent)":"var(--border)"}`,background:filterFlow===v?"var(--accent-muted)":"var(--surface2)",color:filterFlow===v?"var(--accent)":"var(--text)",fontSize:11,fontWeight:600,cursor:"pointer"}}>{l}</button>
           ))}
         </div>
@@ -21086,13 +21116,17 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
                 <select value={createForm.destinataire_id} onChange={e=>{
                   const id=e.target.value;
                   const p=profiles.find(x=>x.id===id);
-                  const dtype=p?.role==="chatter"?"chatter":"modele";
-                  const sd=dtype==="chatter"?soldesC[id]?.solde_du:soldesM[id]?.solde_du;
-                  setCreateForm({...createForm,destinataire_id:id,destinataire_type:dtype,montant:sd>0?String(Math.round(sd)):createForm.montant});
+                  const dtype=p?.role==="chatter"?"chatter":p?.role==="manager_chatter"?"manager_chatter":"modele";
+                  const sd=dtype==="chatter"?soldesC[id]?.solde_du:dtype==="manager_chatter"?soldesMC[id]?.solde_du:soldesM[id]?.solde_du;
+                  const autoType=dtype==="manager_chatter"?"mc_payment":"commission";
+                  setCreateForm({...createForm,destinataire_id:id,destinataire_type:dtype,type:autoType,montant:sd>0?String(Math.round(sd)):createForm.montant});
                 }} style={inputSt}>
                   <option value="">Choisir...</option>
                   <optgroup label="Chatters">
                     {profiles.filter(p=>p.role==="chatter").map(p=>{const sd=soldesC[p.id]?.solde_du;return <option key={p.id} value={p.id}>{p.name}{sd>0?` — ${Math.round(sd)} CHF dû`:""}</option>;})}
+                  </optgroup>
+                  <optgroup label="Managers Chatters">
+                    {profiles.filter(p=>p.role==="manager_chatter").map(p=>{const sd=soldesMC[p.id]?.solde_du;return <option key={p.id} value={p.id}>{p.name}{sd>0?` — ${Math.round(sd)} CHF dû`:""}</option>;})}
                   </optgroup>
                   <optgroup label="Modèles">
                     {profiles.filter(p=>p.role==="modele").map(p=>{const sd=soldesM[p.id]?.solde_du;return <option key={p.id} value={p.id}>{p.name}{sd>0?` — ${Math.round(sd)} CHF dû`:""}</option>;})}
@@ -21100,7 +21134,7 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
                 </select>
               </div>
               {createForm.destinataire_id&&(()=>{
-                const sd=createForm.destinataire_type==="chatter"?soldesC[createForm.destinataire_id]:soldesM[createForm.destinataire_id];
+                const sd=createForm.destinataire_type==="chatter"?soldesC[createForm.destinataire_id]:createForm.destinataire_type==="manager_chatter"?soldesMC[createForm.destinataire_id]:soldesM[createForm.destinataire_id];
                 return sd&&sd.solde_du>0?(
                   <div style={{padding:"10px 14px",borderRadius:10,background:"var(--accent-muted)",border:"1px solid var(--accent)",fontSize:12}}>
                     🧮 Solde dû : <b style={{color:"var(--warning)"}}>{Math.round(sd.solde_du)} CHF</b> · CA : {Math.round(sd.ca_genere||0)} CHF · Déjà versé : {Math.round(sd.deja_verse||0)} CHF
@@ -21112,6 +21146,8 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
                   <label style={lblSt}>Type</label>
                   <select value={createForm.type} onChange={e=>setCreateForm({...createForm,type:e.target.value})} style={inputSt}>
                     <option value="commission">Commission</option>
+                    <option value="mc_payment">Paiement MC</option>
+                    <option value="chatter_payment">Paiement MC→Chatter</option>
                     <option value="bonus">Bonus</option>
                     <option value="remboursement">Remboursement</option>
                     <option value="reversement_ca">Reversement CA</option>
@@ -58856,10 +58892,81 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
 
 const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissions, models }) => {
   const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
+  const addToast = useToast();
   const [commPeriod, setCommPeriod] = useState("month");
+  const [mcPaymentsSent, setMcPaymentsSent] = useState([]);
+  const [mcPaymentsReceived, setMcPaymentsReceived] = useState([]);
+  const [payModal, setPayModal] = useState(null); // {chatter_id, chatter_name, solde_du}
+  const [payAmount, setPayAmount] = useState("");
+  const [payNote, setPayNote] = useState("");
+  const [paying, setPaying] = useState(false);
   const commPct = user.manager_commission_pct||25;
   const commRate = commPct/100;
   const cardS = {background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"};
+
+  // Load MC payments (sent to chatters + received from gérant)
+  const refreshMcPayments = React.useCallback(async () => {
+    try {
+      const [sent, received] = await Promise.all([
+        sb.from("paiements_internes").select("*").eq("createur_id",user.id).eq("type","chatter_payment").order("created_at",{ascending:false}),
+        sb.from("paiements_internes").select("*").eq("destinataire_id",user.id).eq("type","mc_payment").order("created_at",{ascending:false}),
+      ]);
+      setMcPaymentsSent(sent.data||[]);
+      setMcPaymentsReceived(received.data||[]);
+    } catch(_){}
+  }, [user.id]);
+  React.useEffect(() => { refreshMcPayments(); }, [refreshMcPayments]);
+
+  // Per-chatter solde calculation
+  const chatterSoldes = useMemo(() => {
+    const allValid = mcTxs.filter(tx => isValidTx(tx.status));
+    return mcChatters.map(ch => {
+      const chTxs = allValid.filter(tx => tx.chatter_id === ch.id);
+      const caNet = chTxs.reduce((s,tx) => s + convertAmount(Number(tx.net_amount||0), tx.currency), 0);
+      const chatterRate = Number(ch.commission_rate || 0.20);
+      const du = caNet * chatterRate;
+      const dejaVerse = mcPaymentsSent.filter(p => p.destinataire_id === ch.id && p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+      return { id: ch.id, name: ch.name||ch.email||"Chatter", caNet, rate: chatterRate, du, dejaVerse, solde: Math.max(0, du - dejaVerse), txCount: chTxs.length };
+    }).sort((a,b) => b.solde - a.solde);
+  }, [mcTxs, mcChatters, mcPaymentsSent, convertAmount]);
+
+  // MC's own solde (received from gérant)
+  const mcSolde = useMemo(() => {
+    const allValid = mcTxs.filter(tx => isValidTx(tx.status));
+    const caNet = allValid.reduce((s,tx) => s + convertAmount(Number(tx.net_amount||0), tx.currency), 0);
+    const allocation = caNet * commRate;
+    const received = mcPaymentsReceived.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    return { allocation, received, solde: Math.max(0, allocation - received) };
+  }, [mcTxs, mcPaymentsReceived, convertAmount, commRate]);
+
+  const handlePayChatter = async () => {
+    if (!payModal || !payAmount) return;
+    const montant = parseFloat(payAmount);
+    if (isNaN(montant) || montant <= 0) { addToast("Montant invalide","error"); return; }
+    setPaying(true);
+    try {
+      await sb.from("paiements_internes").insert({
+        createur_role: "manager_chatter", createur_id: user.id, createur_name: user.name||user.email,
+        destinataire_type: "chatter", destinataire_id: payModal.id, destinataire_name: payModal.name,
+        type: "chatter_payment", montant, devise: "CHF",
+        note: payNote || null,
+        calcul_detail: { ca_genere: payModal.caNet||0, taux: (payModal.rate||0.20)*100, solde_du: payModal.solde||0 },
+        statut: "pending",
+      });
+      try {
+        await sb.from("notifications").insert({
+          user_id: payModal.id, type: "payment_pi_pending",
+          title: `💸 Paiement reçu — ${montant} CHF`,
+          message: `${user.name||"Votre manager"} vous a envoyé ${montant} CHF. Allez dans "Ma Commission" pour valider ou contester.`,
+          read: false,
+        });
+      } catch(_){}
+      addToast("Paiement créé ✓","success");
+      setPayModal(null); setPayAmount(""); setPayNote("");
+      await refreshMcPayments();
+    } catch(e) { addToast("Erreur: "+e.message,"error"); }
+    setPaying(false);
+  };
 
   // Period filtering
   const periodData = useMemo(() => {
@@ -59003,6 +59110,103 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
           )}
         </div>
       </div>
+
+      {/* ── Mon Solde (reçu du gérant) ── */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:16,marginBottom:24,marginTop:24}}>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"MON ALLOCATION":"MY ALLOCATION"}</div>
+          <div style={{fontSize:28,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(mcSolde.allocation)}</div>
+          <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:4}}>CA Net × {commPct}%</div>
+        </div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"REÇU DU GÉRANT":"RECEIVED FROM MANAGER"}</div>
+          <div style={{fontSize:28,fontWeight:800,color:"#10b981"}}>{fmtAmount(mcSolde.received)}</div>
+        </div>
+        <div style={cardS}>
+          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"MON SOLDE":"MY BALANCE"}</div>
+          <div style={{fontSize:28,fontWeight:800,color:mcSolde.solde>0?"#f59e0b":"#10b981"}}>{fmtAmount(mcSolde.solde)}</div>
+        </div>
+      </div>
+
+      {/* ── Payer mes chatters ── */}
+      <div style={cardS}>
+        <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>💸 {lang==="fr"?"Payer mes chatters":"Pay my chatters"}</div>
+        {chatterSoldes.length===0?(
+          <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucun chatter assigné":"No assigned chatters"}</div>
+        ):(
+          <div className="table-wrap" style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr><th>Chatter</th><th>CA Net</th><th>{lang==="fr"?"Taux":"Rate"}</th><th>{lang==="fr"?"Dû":"Owed"}</th><th>{lang==="fr"?"Versé":"Paid"}</th><th>{lang==="fr"?"Solde":"Balance"}</th><th>Action</th></tr></thead>
+              <tbody>
+                {chatterSoldes.map(ch=>(
+                  <tr key={ch.id}>
+                    <td style={{fontWeight:600}}>{ch.name}</td>
+                    <td>{fmtAmount(ch.caNet)}</td>
+                    <td>{Math.round(ch.rate*100)}%</td>
+                    <td style={{fontWeight:700}}>{fmtAmount(ch.du)}</td>
+                    <td style={{color:"#10b981"}}>{fmtAmount(ch.dejaVerse)}</td>
+                    <td style={{fontWeight:800,color:ch.solde>0?"#f59e0b":"#10b981"}}>{fmtAmount(ch.solde)}</td>
+                    <td>
+                      {ch.solde>0&&<button onClick={()=>{setPayModal(ch);setPayAmount(String(Math.round(ch.solde)));setPayNote("");}} style={{padding:"4px 10px",borderRadius:7,border:"none",background:"var(--accent)",color:"#fff",fontSize:11,fontWeight:700,cursor:"pointer"}}>💸 Payer</button>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Historique paiements envoyés ── */}
+      {mcPaymentsSent.length>0&&(
+        <div style={{...cardS,marginTop:16}}>
+          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>📋 {lang==="fr"?"Paiements envoyés":"Payments sent"}</div>
+          <div className="table-wrap" style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr><th>Date</th><th>Chatter</th><th>Montant</th><th>Statut</th></tr></thead>
+              <tbody>
+                {mcPaymentsSent.map(p=>(
+                  <tr key={p.id}>
+                    <td style={{fontSize:11,color:"var(--text-tertiary)"}}>{new Date(p.created_at).toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})}</td>
+                    <td style={{fontWeight:600}}>{p.destinataire_name||"—"}</td>
+                    <td style={{fontWeight:700}}>{Number(p.montant).toLocaleString()} {p.devise||"CHF"}</td>
+                    <td>{statusBadge2(p.statut||"pending")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* ── Payment Modal MC → Chatter ── */}
+      {payModal&&(
+        <div style={{position:"fixed",inset:0,zIndex:9999,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={()=>setPayModal(null)}>
+          <div style={{background:"var(--bg-raised)",borderRadius:18,width:"100%",maxWidth:420,border:"1px solid var(--border)",overflow:"hidden"}} onClick={e=>e.stopPropagation()}>
+            <div style={{padding:"18px 24px",borderBottom:"1px solid var(--border)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:16,fontWeight:800}}>💸 Payer {payModal.name}</span>
+              <button onClick={()=>setPayModal(null)} style={{background:"var(--surface2)",border:"1px solid var(--border)",color:"var(--text-tertiary)",padding:"6px 12px",borderRadius:9,cursor:"pointer",fontSize:14}}>✕</button>
+            </div>
+            <div style={{padding:"20px 24px",display:"flex",flexDirection:"column",gap:14}}>
+              <div style={{padding:"10px 14px",borderRadius:10,background:"var(--accent-muted)",border:"1px solid var(--accent)",fontSize:12}}>
+                🧮 Solde dû : <b style={{color:"var(--warning)"}}>{Math.round(payModal.solde)} CHF</b> · CA Net : {fmtAmount(payModal.caNet)} · Taux : {Math.round(payModal.rate*100)}%
+              </div>
+              <div>
+                <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Montant (CHF) *</label>
+                <input type="number" value={payAmount} onChange={e=>setPayAmount(e.target.value)} style={{width:"100%",boxSizing:"border-box",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+              </div>
+              <div>
+                <label style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:5}}>Note</label>
+                <input value={payNote} onChange={e=>setPayNote(e.target.value)} placeholder="Ex: Commission semaine 12" style={{width:"100%",boxSizing:"border-box",padding:"8px 12px",borderRadius:9,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13}}/>
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                <button onClick={()=>setPayModal(null)} style={{flex:1,padding:"9px",borderRadius:10,border:"1px solid var(--border)",background:"var(--surface2)",color:"var(--text)",fontSize:13,fontWeight:600,cursor:"pointer"}}>{lang==="fr"?"Annuler":"Cancel"}</button>
+                <button onClick={handlePayChatter} disabled={paying||!payAmount} style={{flex:2,padding:"9px",borderRadius:10,border:"none",background:"var(--accent)",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer",opacity:paying||!payAmount?0.5:1}}>{paying?"...":"📤 Créer le paiement"}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 });
