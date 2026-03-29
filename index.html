@@ -8255,7 +8255,7 @@ const ROLE_ACCESS = {
   modele: ["model_checklist","model_content","model_tasks","model_payments","model_compta","model_notif"],
   chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","messagerie","chatter_compta","chatter_competition","chatter_scan","chatter_notif"],
   provider: ["provider_dashboard","provider_compta","provider_factures","provider_notif"],
-  manager_chatter: ["mc_dashboard","mc_chatters","mc_transactions","mc_solde"]
+  manager_chatter: ["mc_dashboard","mc_chatters","mc_transactions","mc_solde","messagerie","messagerie-tlg-pro","grid-premium","messagerie-tindada","dadacast"]
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
 // Map tab IDs (ROLE_ACCESS) → feature IDs (user_permissions / DEFAULT_ROLE_PERMISSIONS)
@@ -31514,18 +31514,22 @@ const _dmsgFetch = async (path, opts = {}) => {
 
 const markConversationAsRead = async (chatId, modelId) => {
   if (!chatId) return;
+  if (!modelId) {
+    console.warn('[MARK-READ] model_id absent — opération bloquée pour chatId:', chatId);
+    return;
+  }
   try {
     await _dmsgFetch('/mark-read', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: String(chatId),
-        model_id: modelId || null
+        model_id: String(modelId)
       })
     });
-    console.log('[MARK-READ] ✅', chatId);
+    console.log('[MARK-READ] ✅', chatId, 'model_id:', modelId);
   } catch (e) {
-    console.warn('[MARK-READ] ❌', chatId, e.message);
+    console.warn('[MARK-READ] ❌', chatId, 'model_id:', modelId, e.message);
   }
 };
 
@@ -31579,6 +31583,13 @@ const _dmsgChatId = (conv) => {
   if (!conv) return null;
   return conv.tg_chat_id || conv.chat_id || conv.telegram_chat_id || conv.tg_id || conv.id || null;
 };
+
+// Composite key (tg_chat_id + model_id) — identifie UNE conversation unique
+// Un même spender peut chatter avec plusieurs modèles → clés distinctes
+const _dmsgConvKey = (conv) =>
+  conv
+    ? `${conv.tg_chat_id || conv.chat_id || conv.tg_id || ""}::${conv.model_id || ""}`
+    : null;
 
 // Objet minimal quand un spender n'existe pas encore en DB
 // Permet d'afficher au moins le nom/handle/TG ID dans la fiche
@@ -32567,7 +32578,8 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     console.log(`⏱️ [PERF] gpLoadMsgs START — slot ${idx} — chatId: ${cid}`);
     try {
       const _gpMid = conv.model_id || "";
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200" + (_gpMid ? "&model_id=" + _gpMid : ""), { timeout: 20000 });
+      if (!_gpMid) { console.warn('[GP] model_id absent — fetch bloqué pour chatId:', cid); return; }
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200&model_id=" + _gpMid, { timeout: 20000 });
       const msgs = _normalizeMsgMedia(Array.isArray(data) ? data : data.messages || data.data || []);
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] gpLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
@@ -33755,7 +33767,8 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       if (!conv) throw new Error("No conv");
       const cid = _dmsgChatId(conv);
       const _tsMid = conv.model_id || "";
-      const msgsData = await _dmsgFetch("/conversations/" + cid + "/messages?limit=5" + (_tsMid ? "&model_id=" + _tsMid : ""), { timeout: 8000 });
+      if (!_tsMid) { console.warn('[SUGGEST] model_id absent — fetch bloqué'); throw new Error("model_id missing"); }
+      const msgsData = await _dmsgFetch("/conversations/" + cid + "/messages?limit=5&model_id=" + _tsMid, { timeout: 8000 });
       const msgs = Array.isArray(msgsData) ? msgsData : msgsData.messages || msgsData.data || [];
       const lastInbound = [...msgs].reverse().find(m => !m.is_outgoing && m.direction !== "out");
       const lastText = lastInbound?.text || lastInbound?.content || "";
@@ -34033,7 +34046,8 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     console.log(`⏱️ [PERF] tLoadMsgs START — slot ${idx} — chatId: ${cid}`);
     try {
       const _tMid = conv.model_id || "";
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200" + (_tMid ? "&model_id=" + _tMid : ""), { timeout: 20000 });
+      if (!_tMid) { console.warn('[TLG] model_id absent — fetch bloqué pour chatId:', cid); return; }
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=200&model_id=" + _tMid, { timeout: 20000 });
       const msgs = _normalizeMsgMedia(Array.isArray(data) ? data : data.messages || data.data || []);
       const _ldur = Math.round(performance.now() - _lt0);
       console.log(`✅ [PERF] tLoadMsgs OK — ${_ldur}ms — slot ${idx} — ${msgs.length} messages`);
@@ -35184,7 +35198,8 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
 
     try {
       const _tdMid = currentConv?.model_id || "";
-      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=30" + (_tdMid ? "&model_id=" + _tdMid : ""), { timeout: 8000 });
+      if (!_tdMid) { console.warn('[TINDADA] model_id absent — fetch bloqué'); return; }
+      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=30&model_id=" + _tdMid, { timeout: 8000 });
       if (!mountedRef.current) return;
       if (String(currentChatIdRef.current) !== String(chatId)) return;
 
@@ -39590,16 +39605,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         .single();
 
       if (error) {
-        console.error('[MESSAGING] Profile error:', error);
-        setUserProfile({ role: 'gerant', assigned_models: [] });
+        console.error('[AUTH] Erreur fetch profil, déconnexion', error);
+        await sb.auth.signOut();
+        return;
       } else {
         setUserProfile(profile);
         console.log('[MESSAGING] ✅ Profile loaded - Role:', profile.role);
       }
 
     } catch (err) {
-      console.error('[MESSAGING] Exception:', err);
-      setUserProfile({ role: 'gerant', assigned_models: [] });
+      console.error('[AUTH] Erreur fetch profil, déconnexion', err);
+      await sb.auth.signOut();
+      return;
     } finally {
       setIsLoadingProfile(false);
     }
@@ -39760,13 +39777,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     //    API already returns cross-model entries natively (separate entries per model_id).
     //    Supabase uses DIFFERENT model_id UUIDs than API, so we CANNOT cross-reference by model_id.
     //    → Supabase dedup uses chatIdSet ONLY (blocks ALL Supabase entries whose chat_id is in API).
-    const idSet = new Set();
+    const convKeySet = new Set();
     const chatIdSet = new Set();
     const merged = [];
     for (const c of apiList) {
-      const cid = c.id || c.tg_chat_id || c.chat_id;
-      if (cid && !idSet.has(String(cid))) {
-        idSet.add(String(cid));
+      const convKey = _dmsgConvKey(c);
+      if (convKey && !convKeySet.has(convKey)) {
+        convKeySet.add(convKey);
         if (c.tg_chat_id) chatIdSet.add(String(c.tg_chat_id));
         if (c.chat_id) chatIdSet.add(String(c.chat_id));
         merged.push(c);
@@ -39774,10 +39791,10 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
     let sbAdded = 0;
     for (const c of sbList) {
-      const cid = String(c.id || "");
+      const convKey = _dmsgConvKey(c);
       const chatId = String(c.tg_chat_id || c.chat_id || "");
-      if (!idSet.has(cid) && !chatIdSet.has(chatId)) {
-        idSet.add(cid);
+      if (!convKeySet.has(convKey) && !chatIdSet.has(chatId)) {
+        convKeySet.add(convKey);
         if (chatId) chatIdSet.add(chatId);
         merged.push(c);
         sbAdded++;
@@ -39791,15 +39808,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     list.forEach(c => { const mid = c.model_id || "unknown"; byModel[mid] = (byModel[mid] || 0) + 1; });
     console.log(`[CONV] Loaded ${list.length} conversations (API: ${apiList.length}, Supabase added: ${sbAdded})`, byModel);
 
-    // Filtrage sécurité côté client pour les chatters
-    if (userProfile?.role === 'chatter') {
+    // Filtrage sécurité côté client pour les chatters et manager_chatters
+    if (userProfile?.role === 'chatter' || userProfile?.role === 'manager_chatter') {
       const assigned = userProfile.assigned_models || [];
       if (assigned.length > 0) {
         list = list.filter(c => assigned.includes(c.model_id));
-        console.log(`[CONV] Filtre chatter appliqué: ${list.length} convs (modèles: ${assigned.join(', ')})`);
+        console.log(`[CONV] Filtre ${userProfile.role} appliqué: ${list.length} convs (modèles: ${assigned.join(', ')})`);
       } else {
         list = [];
-        console.warn('[CONV] Chatter sans modèle assigné — aucune conversation visible');
+        console.warn(`[CONV] ${userProfile.role} sans modèle assigné — aucune conversation visible`);
       }
     }
 
@@ -39856,6 +39873,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     if (!chatId) return;
     if (isInitial) isInitialLoadingRef.current = true;
     const cid = String(chatId);
+    const convKey = _dmsgConvKey(selectedConvRef.current) || cid;
     if (_DADASH_DEBUG) console.log('🔍 [MSG-DIAG] Function called:', {
       functionName: 'loadMessagesById',
       subpage: 'DadashMessagerieTab',
@@ -39864,7 +39882,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       timestamp: new Date().toISOString()
     });
     // Afficher cache immédiatement si dispo et dans le TTL (60s)
-    const _cachedMsgs = _DMSG_MSG_CACHE[cid];
+    const _cachedMsgs = _DMSG_MSG_CACHE[convKey];
     const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
     if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
       setMessages(_cachedMsgs.data.map(normalizeMessage).filter(Boolean));
@@ -39876,11 +39894,16 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
     try {
       const _selMid = selectedConvRef.current?.model_id || "";
+      if (!_selMid) {
+        console.warn('[LOAD-MSG] model_id absent — fetch bloqué pour chatId:', cid);
+        if (isInitial) setMsgLoading(false);
+        return;
+      }
       if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] Fetching messages:', {
         chatId: cid,
         isInitial: isInitial,
-        modelId: _selMid || 'none',
-        url: _DMSG_API + "/conversations/" + cid + "/messages?limit=50&offset=0" + (_selMid ? "&model_id=" + _selMid : "")
+        modelId: _selMid,
+        url: _DMSG_API + "/conversations/" + cid + "/messages?limit=50&offset=0&model_id=" + _selMid
       });
       if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] chat_id sent to Carlos:', {
         rawCid: cid,
@@ -39889,7 +39912,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         looksLikeTelegramId: /^\d+$/.test(String(cid)),
         looksLikeUUID: /^[0-9a-f-]{36}$/i.test(String(cid))
       });
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=0" + (_selMid ? "&model_id=" + _selMid : ""));
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=0&model_id=" + _selMid);
       if (signal?.aborted) return;
       const _rawData = Array.isArray(data) ? data : (data?.messages || data?.data || []);
       const raw = Array.isArray(_rawData) ? _rawData : [];
@@ -39940,7 +39963,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         lastDate: nList[nList.length-1]?.date || nList[nList.length-1]?.created_at || 'N/A',
         lastText: nList[nList.length-1]?.text?.substring(0, 50) || 'N/A'
       });
-      if (nList.length > 0) _DMSG_MSG_CACHE[cid] = { data: nList, ts: Date.now() };
+      if (nList.length > 0) _DMSG_MSG_CACHE[convKey] = { data: nList, ts: Date.now() };
       if (isInitial) {
         setMessages(nList);
         setMsgOffset(0);
@@ -39970,7 +39993,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      if (isInitial && !_DMSG_MSG_CACHE[cid]?.data?.length) {
+      if (isInitial && !_DMSG_MSG_CACHE[convKey]?.data?.length) {
         try {
           if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] FALLBACK Supabase used:', {
             chatId: cid,
@@ -39991,7 +40014,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               lastText: list[list.length-1]?.text?.substring(0, 50) || 'N/A',
               lastDate: list[list.length-1]?.date || list[list.length-1]?.created_at || 'N/A'
             });
-            if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
+            if (list.length > 0) _DMSG_MSG_CACHE[convKey] = { data: list, ts: Date.now() };
             setMessages(list);
             setMsgOffset(0);
             setHasMoreMsgs(list.length >= 50);
@@ -40000,7 +40023,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         } catch (_) {
           // Ne wiper que si vraiment aucune donnée disponible (ni state ni cache)
           setMessages(prev => {
-            if (prev.length > 0 || _DMSG_MSG_CACHE[cid]?.data?.length) return prev;
+            if (prev.length > 0 || _DMSG_MSG_CACHE[convKey]?.data?.length) return prev;
             return [];
           });
         }
@@ -40021,7 +40044,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     const nextOffset = msgOffset + 50;
     try {
       const _moreMid = selectedConvRef.current?.model_id || "";
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=" + nextOffset + (_moreMid ? "&model_id=" + _moreMid : ""));
+      if (!_moreMid) { console.warn('[LOAD-MORE] model_id absent — fetch bloqué'); return; }
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=" + nextOffset + "&model_id=" + _moreMid);
       const raw = Array.isArray(data) ? data : (data.messages || data.data || []);
       console.log("[SCROLL-LOAD] offset=" + nextOffset + " count=" + raw.length);
       const older = [...raw].sort((a, b) =>
@@ -40112,7 +40136,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     });
     markConversationAsRead(_dmsgChatId(conv), conv.model_id);
     setConversations(prev => prev.map(c =>
-      String(_dmsgChatId(c)) === String(_dmsgChatId(conv))
+      _dmsgConvKey(c) === _dmsgConvKey(conv)
         ? { ...c, unread_count: 0 } : c
     ));
     // Reset last-ts pour forcer reload complet sur nouvelle conv
@@ -40141,13 +40165,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Ouvrir dans les onglets
     openTab(conv);
     const cid = String(chatId || "");
-    const cached = _DMSG_MSG_CACHE[cid];
+    const _selConvKey = _dmsgConvKey(conv) || cid;
+    const cached = _DMSG_MSG_CACHE[_selConvKey];
     if (_DADASH_DEBUG) console.log('[DEBUG-SELECT] Cache status:', {
-      cacheExists: !!_DMSG_MSG_CACHE[cid],
-      cacheFresh: _DMSG_MSG_CACHE[cid] ? (Date.now() - _DMSG_MSG_CACHE[cid].ts < 60000) : false,
-      cacheLength: _DMSG_MSG_CACHE[cid]?.data?.length || 0,
-      cacheLastMsg: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
-      cacheLastDate: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.timestamp || 'N/A'
+      cacheExists: !!_DMSG_MSG_CACHE[_selConvKey],
+      cacheFresh: _DMSG_MSG_CACHE[_selConvKey] ? (Date.now() - _DMSG_MSG_CACHE[_selConvKey].ts < 60000) : false,
+      cacheLength: _DMSG_MSG_CACHE[_selConvKey]?.data?.length || 0,
+      cacheLastMsg: _DMSG_MSG_CACHE[_selConvKey]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
+      cacheLastDate: _DMSG_MSG_CACHE[_selConvKey]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[_selConvKey]?.data?.slice(-1)[0]?.timestamp || 'N/A'
     });
     if (cached && cached.data.length > 0) {
       // Stale-while-revalidate : afficher le cache même expiré, le poll mergera les nouveaux
@@ -40248,11 +40273,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
   }, [activeTabId]);
 
-  // ── selectedChatId : clé stable pour tous les useEffect liés à la conv ──────
-  // BUG RACINE : les convs de l'API Carlos n'ont PAS de champ "id" — elles ont
-  // "chat_id" (TG ID). selectedConv?.id était toujours undefined → aucun effet
-  // ne se re-déclenchait après la 1ère sélection.
-  // Solution : utiliser le vrai Telegram chat_id comme clé de stabilité.
+  // ── selectedChatId / selectedConvKey : clés stables pour les useEffect ──────
+  // selectedConvKey = clé composite (tg_chat_id::model_id) pour distinguer les
+  // convs d'un même spender avec différents modèles.
+  // selectedChatId = tg_chat_id seul, conservé pour les appels API/Supabase.
+  const selectedConvKey = selectedConv ? (_dmsgConvKey(selectedConv) || "") : "";
   const selectedChatId = selectedConv ? String(_dmsgChatId(selectedConv) || "") : "";
 
   // ── Fiche spender : rechargement réactif à chaque changement de conversation ──
@@ -40293,7 +40318,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       .catch(() => setActiveSpender(quick || _dmsgMinimalSpender(selectedConv)))
       .finally(() => setSpenderLoading(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedChatId]);
+  }, [selectedConvKey]);
 
   // ── Panel médias messagerie : reset catégorie + chargement ───────────────
   useEffect(() => {
@@ -40321,7 +40346,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Prefetch media library in background for instant modal opening
     const mName = selectedConv?.model_name || chatterCtx?.modelName || "";
     if (mName) _prefetchMediaLibrary(mName);
-  }, [selectedChatId, activeSpender?.id]);
+  }, [selectedConvKey, activeSpender?.id]);
 
   // ── Scroll to bottom helper ──────────────────────────────────────────
   const scrollToBottom = useCallback((behavior = 'smooth') => {
@@ -40385,11 +40410,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     const t = setTimeout(() => { scrollToBottom('instant'); }, 300);
     return () => clearTimeout(t);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedChatId]);
+  }, [selectedConvKey]);
 
   // ── Auto-scroll periodic : keep at bottom every 2s unless user scrolled up ──
   useEffect(() => {
-    if (!selectedChatId) return;
+    if (!selectedConvKey) return;
     const scrollInterval = setInterval(() => {
       if (!isUserScrollRef.current && msgContainerRef.current) {
         const el = msgContainerRef.current;
@@ -40400,7 +40425,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       }
     }, 2000);
     return () => clearInterval(scrollInterval);
-  }, [selectedChatId]);
+  }, [selectedConvKey]);
 
   // ── 2.1 Realtime via global channel CustomEvents (deduplicated + debounced) ──
   useEffect(() => {
@@ -40488,7 +40513,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // ── Polling messages adaptatif : 3s actif, 10s idle (>30s sans activité) ──
   useEffect(() => {
     if (pollRef.current) clearTimeout(pollRef.current);
-    if (!selectedChatId || !chatIdRef.current) return;
+    if (!selectedConvKey || !chatIdRef.current) return;
     let cancelled = false;
     const schedule = () => {
       if (cancelled) return;
@@ -40529,7 +40554,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       if (pollRef.current) clearTimeout(pollRef.current);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [selectedChatId, loadMessagesById]);
+  }, [selectedConvKey, loadMessagesById]);
 
   // ── Ref stable vers loadConversations ───────────────────────────────────────
   // BUG RACINE POLLING AGRESSIF : loadConversations dépend de chatterCtx qui
@@ -40861,7 +40886,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         if (String(chatIdRef.current) !== String(chatId)) return;
         try {
           const _rcMid = selectedConvRef.current?.model_id || "";
-          const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50" + (_rcMid ? "&model_id=" + _rcMid : ""));
+          if (!_rcMid) return;
+          const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=50&model_id=" + _rcMid);
           const list = (Array.isArray(data) ? data : (data.messages || data.data || [])).map(normalizeMessage).filter(Boolean);
           setMessages(prev => mergeMessages(prev, list));
         } catch (_) { /* keep confirmed state */ }
@@ -40887,8 +40913,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     // Vérifier si le message a déjà été envoyé (réponse perdue)
     try {
-      const _rtMid = selectedConvRef.current?.model_id || "";
-      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=10" + (_rtMid ? "&model_id=" + _rtMid : ""));
+      const _rtMid = selectedConvRef.current?.model_id || failedMsg._modelId || "";
+      if (!_rtMid) { console.warn('[RETRY] model_id absent — skip duplicate check'); throw new Error("model_id missing"); }
+      const data = await _dmsgFetch("/conversations/" + chatId + "/messages?limit=10&model_id=" + _rtMid);
       const recentMsgs = Array.isArray(data) ? data : (data.messages || data.data || []);
       const alreadySent = recentMsgs.some(m =>
         (m.text || m.content || m.message || "").trim() === (failedMsg.text || "").trim() &&
@@ -42084,7 +42111,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         )}
         {!convLoading && !apiError && filteredConvs.map((conv, idx) => {
           const cid = _dmsgChatId(conv);
-          const isActive = selectedConv && _dmsgChatId(selectedConv) === cid;
+          const isActive = selectedConv && _dmsgConvKey(selectedConv) === _dmsgConvKey(conv);
           const name = getConvName(conv);
           const isUnread = !isActive && (
             conv.last_message_direction === "in" ||
@@ -57152,7 +57179,8 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     if (initial) setMsgLoading(true);
     try {
       const _gcMid = modelId || "";
-      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=0" + (_gcMid ? "&model_id=" + _gcMid : ""), { timeout: 8000 });
+      if (!_gcMid) { console.warn('[GRID-CELL] model_id absent — fetch bloqué'); if (initial) setMsgLoading(false); return; }
+      const data = await _dmsgFetch("/conversations/" + cid + "/messages?limit=50&offset=0&model_id=" + _gcMid, { timeout: 8000 });
       if (!mountedRef.current) return;
       const raw = Array.isArray(data) ? data : (data.messages || data.data || []);
       const list = [...raw].sort((a, b) =>
