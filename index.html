@@ -8462,11 +8462,11 @@ const ChatterDebugDump = React.memo(({user, models, txs, spenders, lang}) => {
 const GERANT_NAV = [
   { id: "dashboard",  icon: <span style={{background:"#6C63FF",color:"white",fontWeight:"bold",borderRadius:"6px",padding:"2px 6px",fontSize:"14px",lineHeight:"1.4",display:"inline-block"}}>D</span>, label: "DADASH" },
   { id: "business",  icon: "\u{1F4B5}", label: "Business" },
-  { id: "equipe",    icon: "\u{1F465}", label: "Équipe" },
-  { id: "messagerie",icon: "✈️",        label: "Messagerie" },
-  { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
-  { id: "bots",      icon: "\u{1F916}", label: "Bots" },
-  { id: "scripts",   icon: "🎬",        label: "Scripts" },
+  { id: "equipe",    icon: "\u{1F465}", label: "\u00c9quipe" },
+  { id: "messagerie",icon: "\u2709\uFE0F",        label: "Messagerie" },
+  // DISABLED PR8 — will restore later: { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
+  // DISABLED PR8 — will restore later: { id: "bots",      icon: "\u{1F916}", label: "Bots" },
+  { id: "scripts",   icon: "\ud83c\udfac",        label: "Scripts" },
   { id: "admin",     icon: "\u{1F511}", label: "Admin" },
 ];
 
@@ -8474,9 +8474,9 @@ const GERANT_NAV = [
 const MOBILE_BOTTOM_NAV = [
   { id: "dashboard",  icon: <span style={{background:"#6C63FF",color:"white",fontWeight:"bold",borderRadius:"6px",padding:"2px 6px",fontSize:"14px",lineHeight:"1.4",display:"inline-block"}}>D</span>, label: "Dash" },
   { id: "business",  icon: "\u{1F4B5}", label: "Business" },
-  { id: "equipe",    icon: "\u{1F465}", label: "Équipe" },
-  { id: "messagerie",icon: "✈️",        label: "Messagerie" },
-  { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
+  { id: "equipe",    icon: "\u{1F465}", label: "\u00c9quipe" },
+  { id: "messagerie",icon: "\u2709\uFE0F",        label: "Messagerie" },
+  // DISABLED PR8 — will restore later: { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
 ];
 
 const PAGE_TABS = {
@@ -8490,7 +8490,7 @@ const PAGE_TABS = {
     { id: "zoo",          label: "Zoo Map",       icon: "\u{1F98D}" },
   ],
   equipe: [
-    { id: "chatters",  label: "Chatters",  icon: "\u{1F4AC}" },
+    { id: "chatters",  label: "Chatting",  icon: "\u{1F4AC}" },
     { id: "modeles",   label: "Modèles",   icon: "\u{1F469}" },
     { id: "providers", label: "Providers", icon: "\u{1F3E6}" },
     { id: "catalogue", label: "Catalogue", icon: "\u{1F4E6}" },
@@ -19464,6 +19464,372 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================
+// PR8 — UNIFIED CHATTING PAGE (MC hierarchy + direct chatters)
+// =============================================
+const UnifiedChattingPage = ({user, lang, txs, profiles, models, chatterLogs, onRefresh, piRefreshKey, managerChattersData}) => {
+  const { convertAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const addToast = useToast();
+
+  // ── state ──
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all"); // all | shift | off | managers | directs
+  const [hoveredCard, setHoveredCard] = useState(null);
+  const [createModal, setCreateModal] = useState(false);
+  const [createForm, setCreateForm] = useState({name:"",handle:"",commission_pct:"3",assigned_models:[]});
+  const [createSaving, setCreateSaving] = useState(false);
+  // Reuse existing chatter modal
+  const [modalChatter, setModalChatter] = useState(null);
+  const [modalTab, setModalTab] = useState("performance");
+  // paiements internes
+  const [soldesMap, setSoldesMap] = useState({});
+  const [paiementsPI, setPaiementsPI] = useState([]);
+  const [piTab, setPiTab] = useState("pending");
+  const [piForm, setPiForm] = useState({type:"commission",montant:"",periode_debut:"",periode_fin:"",note:""});
+  const [piSaving, setPiSaving] = useState(false);
+  const [contestId, setContestId] = useState(null);
+  const [contestMsg, setContestMsg] = useState("");
+  const [paramForm, setParamForm] = useState({name:"",commission_pct:""});
+  const [paramSaving, setParamSaving] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // ── fetch soldes + paiements_internes ──
+  const refreshPI = React.useCallback(async () => {
+    try {
+      const [{ data: soldes }, { data: piData }] = await Promise.all([
+        sb.from("vue_soldes_chatters").select("*"),
+        sb.from("paiements_internes").select("*").in("destinataire_type",["chatter","mc"]).order("created_at",{ascending:false}),
+      ]);
+      if (soldes) { const m={}; soldes.forEach(r=>{m[r.chatter_id]=r;}); setSoldesMap(m); }
+      if (piData) setPaiementsPI(piData);
+    } catch(e) {}
+  }, []);
+  React.useEffect(() => { refreshPI(); }, [refreshPI, piRefreshKey]);
+
+  // ── data derivation ──
+  const mcLinks = managerChattersData || [];
+  const managerChatters = profiles.filter(p => p.role === "manager_chatter");
+  const allAssignedChatterIds = mcLinks.map(mc => mc.chatter_id);
+  const allChatters = profiles.filter(p => p.role === "chatter");
+  const directChatters = allChatters.filter(ch => !allAssignedChatterIds.includes(ch.id));
+
+  // Helper: compute chatter stats
+  const computeChatterStats = (ch) => {
+    const chTx = txs.filter(tx => tx.chatter_id === ch.id);
+    const validTx = chTx.filter(tx => isValidTx(tx.status));
+    const pendingTx = chTx.filter(tx => isPendingTx(tx.status));
+    const rejectedTx = chTx.filter(tx => tx.status === "refused" || tx.status === "rejected");
+    const validCA = validTx.reduce((s, tx) => s + convertAmount(Number(tx.net_amount || tx.amount || 0), tx.currency), 0);
+    const convRate = (validTx.length + rejectedTx.length) > 0 ? Math.round((validTx.length / (validTx.length + rejectedTx.length)) * 100) : 0;
+    const commPct = Number(ch.commission_pct || 3);
+    const commission = validCA * commPct / 100;
+    const dejaVerse = paiementsPI.filter(p => p.destinataire_id === ch.id && (p.type === "chatter_payment" || p.type === "commission") && p.statut === "validated").reduce((s, p) => s + Number(p.montant || 0), 0);
+    const soldeDu = Math.round(commission - dejaVerse);
+    const isOnShift = ch.on_shift || ch.is_online || false;
+    const assignedModels = (ch.assigned_models || []).map(mid => models.find(m => m.id === mid)).filter(Boolean);
+    const rank = ch.chatter_rank || ch.chatter_level || "rookie";
+    return { ...ch, chTx, validTx, pendingTx, rejectedTx, validCA, convRate, commPct, commission, dejaVerse, soldeDu, isOnShift, assignedModels, rank };
+  };
+
+  // Helper: compute MC stats
+  const computeMCStats = (mc) => {
+    const assignedIds = mcLinks.filter(l => l.manager_id === mc.id).map(l => l.chatter_id);
+    const assignedChatters = allChatters.filter(ch => assignedIds.includes(ch.id)).map(computeChatterStats);
+    const caNet = assignedChatters.reduce((s, ch) => s + ch.validCA, 0);
+    const commPct = Number(mc.commission_pct || 5);
+    const allocation = caNet * commPct / 100;
+    const dejaVerse = paiementsPI.filter(p => p.destinataire_id === mc.id && (p.type === "mc_payment" || p.type === "commission") && p.statut === "validated").reduce((s, p) => s + Number(p.montant || 0), 0);
+    const soldeDu = Math.round(allocation - dejaVerse);
+    const assignedModelCount = [...new Set(assignedChatters.flatMap(ch => ch.assigned_models.map(m => m.id)))].length;
+    return { ...mc, assignedChatters, caNet, commPct, allocation, dejaVerse, soldeDu, assignedModelCount, chatterCount: assignedChatters.length };
+  };
+
+  const mcStats = useMemo(() => managerChatters.map(computeMCStats), [managerChatters, mcLinks, allChatters, txs, paiementsPI, models]);
+  const directChatterStats = useMemo(() => directChatters.map(computeChatterStats), [directChatters, txs, paiementsPI, models]);
+  const allChatterStats = useMemo(() => allChatters.map(computeChatterStats), [allChatters, txs, paiementsPI, models]);
+
+  // ── KPI aggregates ──
+  const kpiCAEquipe = allChatterStats.reduce((s, ch) => s + ch.validCA, 0);
+  const kpiCommDues = mcStats.reduce((s, mc) => s + Math.max(0, mc.soldeDu), 0) + directChatterStats.reduce((s, ch) => s + Math.max(0, ch.soldeDu), 0);
+  const kpiTxValidees = allChatterStats.reduce((s, ch) => s + ch.validTx.length, 0);
+  const kpiConvRate = allChatterStats.length > 0 ? Math.round(allChatterStats.reduce((s, ch) => s + ch.convRate, 0) / allChatterStats.length) : 0;
+  const kpiChattersActifs = allChatters.filter(ch => ch.is_active !== false).length;
+
+  // ── filtering ──
+  const matchSearch = (name) => !search || (name || "").toLowerCase().includes(search.toLowerCase());
+
+  const filteredMcStats = mcStats.filter(mc => {
+    if (!matchSearch(mc.name)) return false;
+    if (filter === "directs") return false;
+    if (filter === "shift") return mc.assignedChatters.some(ch => ch.isOnShift);
+    if (filter === "off") return mc.assignedChatters.some(ch => !ch.isOnShift);
+    if (filter === "managers") return true;
+    return true;
+  });
+
+  const filteredDirectStats = directChatterStats.filter(ch => {
+    if (!matchSearch(ch.name)) return false;
+    if (filter === "managers") return false;
+    if (filter === "shift") return ch.isOnShift;
+    if (filter === "off") return !ch.isOnShift;
+    return true;
+  });
+
+  // ── avatar helpers ──
+  const _initial = (name) => (name || "?").trim()[0].toUpperCase();
+  const rankColors = { hustler: "#4caf50", closer: "#e53935", rookie: "#ff9800" };
+  const rankLabels = { hustler: "Hustler", closer: "Closer", rookie: "Rookie" };
+
+  // ── create chatter ──
+  const handleCreate = async () => {
+    if (!createForm.name.trim()) { addToast(fr ? "Nom requis" : "Name required", "error"); return; }
+    setCreateSaving(true);
+    try {
+      const {error} = await sb.from("profiles").insert({
+        name: createForm.name.trim(),
+        telegram_id: createForm.handle.trim() || null,
+        role: "chatter",
+        commission_pct: Number(createForm.commission_pct) || 3,
+        assigned_models: createForm.assigned_models,
+      });
+      if (error) throw error;
+      addToast(fr ? "Chatter cr\u00e9\u00e9 \u2713" : "Chatter created \u2713", "success");
+      setCreateModal(false);
+      setCreateForm({name:"",handle:"",commission_pct:"3",assigned_models:[]});
+      await onRefresh();
+    } catch(e) { addToast("Erreur: "+e.message, "error"); }
+    setCreateSaving(false);
+  };
+
+  // ── Render chatter card (shared between MC section and direct section) ──
+  const renderChatterCard = (ch, indent = false) => {
+    const rankColor = rankColors[ch.rank] || "#ff9800";
+    const rankLabel = rankLabels[ch.rank] || ch.rank || "Rookie";
+    return (
+      <div key={ch.id} style={{
+        background: "#141e2b", border: "1px solid #1e2d3d", borderRadius: 10, padding: "14px 16px",
+        cursor: "pointer", transition: "all 0.2s",
+        ...(hoveredCard === ch.id ? { background: "#1a2836", borderColor: "#4fc3f7" } : {}),
+      }}
+        onMouseEnter={() => setHoveredCard(ch.id)}
+        onMouseLeave={() => setHoveredCard(null)}
+        onClick={() => { setModalChatter(ch.id); setModalTab("performance"); }}
+      >
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{width:36,height:36,borderRadius:"50%",background:"#6366f1",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontWeight:800,color:"#fff"}}>
+              {_initial(ch.name)}
+            </div>
+            <div>
+              <div style={{fontSize:14,fontWeight:700,color:"#e2e8f0"}}>{ch.name}</div>
+              <div style={{fontSize:11,color:"#94a3b8"}}>{ch.assignedModels.length} mod\u00e8le{ch.assignedModels.length!==1?"s":""} \u00b7 {ch.chTx.length} TX \u00b7 {ch.isOnShift ? <span style={{color:"#4caf50"}}>\ud83d\udfe2 EN SHIFT</span> : <span style={{color:"#e53935"}}>\ud83d\udd34 OFF</span>}</div>
+            </div>
+          </div>
+          <span style={{padding:"3px 8px",borderRadius:6,fontSize:10,fontWeight:700,background:rankColor+"22",color:rankColor,border:`1px solid ${rankColor}44`}}>{rankLabel}</span>
+        </div>
+        {/* Stats */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+          <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+            <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>CA g\u00e9n\u00e9r\u00e9</div>
+            <div style={{fontSize:16,fontWeight:800,color:"#4caf50"}}>{Math.round(ch.validCA).toLocaleString()}{currencySymbol}</div>
+          </div>
+          <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+            <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Taux conv.</div>
+            <div style={{fontSize:16,fontWeight:800,color:ch.convRate>=50?"#4caf50":"#ff9800"}}>{ch.convRate}%</div>
+          </div>
+          <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+            <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Commission ({ch.commPct}%)</div>
+            <div style={{fontSize:16,fontWeight:800,color:"#ff9800"}}>{Math.round(ch.commission).toLocaleString()}{currencySymbol}</div>
+          </div>
+        </div>
+        {/* TX bar */}
+        <div style={{display:"flex",gap:10,fontSize:11,marginBottom:8}}>
+          <span style={{color:"#4caf50"}}>\u2705 {ch.validTx.length}</span>
+          <span style={{color:"#ff9800"}}>\u23f3 {ch.pendingTx.length}</span>
+          <span style={{color:"#e53935"}}>\u274c {ch.rejectedTx.length}</span>
+        </div>
+        {/* Solde */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",paddingTop:8,borderTop:"1px solid #1e2d3d"}}>
+          <span style={{fontSize:11,fontWeight:700,color:ch.soldeDu>0?"#ff9800":ch.soldeDu<0?"#e53935":"#4caf50"}}>
+            {ch.soldeDu===0?"\u2705 \u00c0 jour":ch.soldeDu>0?`\ud83d\udcb8 Solde d\u00fb : ${ch.soldeDu.toLocaleString()} CHF`:`\ud83d\udcb8 Trop pay\u00e9 : ${Math.abs(ch.soldeDu).toLocaleString()} CHF`}
+          </span>
+        </div>
+        {/* Actions */}
+        <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap"}} onClick={e=>e.stopPropagation()}>
+          <button onClick={()=>{setModalChatter(ch.id);setModalTab("performance");}} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#4fc3f7",fontSize:10,fontWeight:700,cursor:"pointer"}}>Stats</button>
+          <button onClick={()=>{setModalChatter(ch.id);setModalTab("modeles");}} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#4fc3f7",fontSize:10,fontWeight:700,cursor:"pointer"}}>Mod\u00e8les</button>
+          <button onClick={()=>{setModalChatter(ch.id);setModalTab("paiements");setPiTab("create");}} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#ff9800",fontSize:10,fontWeight:700,cursor:"pointer"}}>\ud83d\udcb0 Payer</button>
+          <button onClick={()=>{setModalChatter(ch.id);setModalTab("logs");}} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#94a3b8",fontSize:10,fontWeight:700,cursor:"pointer"}}>Bloqu\u00e9s</button>
+          <button onClick={()=>{setModalChatter(ch.id);setModalTab("parametres");}} style={{padding:"4px 10px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#94a3b8",fontSize:10,fontWeight:700,cursor:"pointer"}}>\u2699</button>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div style={{padding:_isMobile?"0 12px":0}}>
+      {/* ── KPI BAR ── */}
+      <div className={_isMobile?"kpi-row cols-2":"kpi-row cols-5"} style={{marginBottom:14,gridTemplateColumns:_isMobile?"1fr 1fr":undefined}}>
+        <div className="kpi-card green">
+          <div className="kpi-card-label">CA \u00c9QUIPE</div>
+          <div className="kpi-card-value green">{Math.round(kpiCAEquipe).toLocaleString()}{currencySymbol}</div>
+          <div className="kpi-card-delta up">\u2191 {kpiTxValidees} TX valid\u00e9es</div>
+        </div>
+        <div className="kpi-card amber">
+          <div className="kpi-card-label">COMMISSIONS DUES</div>
+          <div className="kpi-card-value amber">{Math.round(kpiCommDues).toLocaleString()}{currencySymbol}</div>
+          <div className={`kpi-card-delta ${kpiCommDues>0?"warn":"up"}`}>{kpiCommDues>0?"\u26a0 \u00e0 verser":"\u2713 \u00e0 jour"}</div>
+        </div>
+        <div className="kpi-card indigo">
+          <div className="kpi-card-label">TX VALID\u00c9ES</div>
+          <div className="kpi-card-value indigo">{kpiTxValidees}</div>
+        </div>
+        <div className="kpi-card white">
+          <div className="kpi-card-label">CONV. RATE MOY.</div>
+          <div className="kpi-card-value white">{kpiConvRate}%</div>
+          <div className={`kpi-card-delta ${kpiConvRate>=50?"up":"warn"}`}>{kpiConvRate>=50?"\u2713 bon taux":"\u2197 \u00e0 am\u00e9liorer"}</div>
+        </div>
+        <div className="kpi-card green">
+          <div className="kpi-card-label">CHATTERS ACTIFS</div>
+          <div className="kpi-card-value green">{kpiChattersActifs}</div>
+          <div className="kpi-card-delta dim">{allChatterStats.filter(c=>c.isOnShift).length} en shift</div>
+        </div>
+      </div>
+
+      {/* ── FILTER BAR ── */}
+      <div className="toolbar" style={{marginBottom:14}}>
+        <input className="f-search" type="text" placeholder={`\ud83d\udd0d ${fr?"Rechercher...":"Search..."}`} value={search} onChange={e=>setSearch(e.target.value)} />
+        <div className="filter-sep"/>
+        {[{id:"all",label:"Tous"},{id:"shift",label:"En shift"},{id:"off",label:"Off"},{id:"managers",label:"Managers"},{id:"directs",label:"Directs"}].map(f=>(
+          <div key={f.id} className={`filter-pill${filter===f.id?" active":""}`} onClick={()=>setFilter(f.id)} style={{cursor:"pointer"}}>{f.label}</div>
+        ))}
+        <div style={{marginLeft:"auto"}}>
+          <button className="btn btn-primary" onClick={()=>setCreateModal(true)}>\u2795 {fr?"Nouveau chatter":"New chatter"}</button>
+        </div>
+      </div>
+
+      {/* ══════ SECTION 1: MANAGER CHATTERS ══════ */}
+      {(filter !== "directs") && filteredMcStats.length > 0 && (
+        <div style={{marginBottom:28}}>
+          <div style={{fontSize:16,fontWeight:800,color:"#e2e8f0",marginBottom:14,display:"flex",alignItems:"center",gap:8}}>
+            <span>\ud83d\udc51</span> Manager Chatters
+          </div>
+          {filteredMcStats.map(mc => (
+            <div key={mc.id} style={{marginBottom:24}}>
+              {/* MC Card */}
+              <div style={{
+                background:"#141e2b",border:"1px solid #1e2d3d",borderRadius:10,padding:"18px 20px",
+                borderLeft:"3px solid #7c4dff",
+              }}>
+                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:10}}>
+                  <div style={{display:"flex",alignItems:"center",gap:12}}>
+                    <div style={{width:44,height:44,borderRadius:"50%",background:"linear-gradient(135deg,#7c4dff,#ab47bc)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,fontWeight:800,color:"#fff"}}>
+                      {_initial(mc.name)}
+                    </div>
+                    <div>
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <span style={{fontSize:16,fontWeight:800,color:"#e2e8f0"}}>{mc.name}</span>
+                        <span style={{padding:"2px 8px",borderRadius:6,fontSize:9,fontWeight:700,background:"#7c4dff",color:"#fff"}}>MANAGER CHATTER</span>
+                        <span style={{fontSize:10,fontWeight:700,color:mc.is_active!==false?"#4caf50":"#e53935"}}>{mc.is_active!==false?"\u25cf ACTIF":"\u25cf INACTIF"}</span>
+                      </div>
+                      <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>Commission: {mc.commPct}% \u00b7 {mc.assignedModelCount} mod\u00e8les \u00b7 {mc.chatterCount} chatters assign\u00e9s</div>
+                    </div>
+                  </div>
+                </div>
+                {/* MC Stats */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,marginBottom:12}}>
+                  <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                    <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>CA Net chatters</div>
+                    <div style={{fontSize:16,fontWeight:800,color:"#4caf50"}}>{Math.round(mc.caNet).toLocaleString()}{currencySymbol}</div>
+                  </div>
+                  <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                    <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Allocation ({mc.commPct}%)</div>
+                    <div style={{fontSize:16,fontWeight:800,color:"#ff9800"}}>{Math.round(mc.allocation).toLocaleString()}{currencySymbol}</div>
+                  </div>
+                  <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                    <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>D\u00e9j\u00e0 vers\u00e9</div>
+                    <div style={{fontSize:16,fontWeight:800,color:"#4fc3f7"}}>{Math.round(mc.dejaVerse).toLocaleString()}{currencySymbol}</div>
+                  </div>
+                  <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                    <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Solde d\u00fb</div>
+                    <div style={{fontSize:16,fontWeight:800,color:mc.soldeDu>0?"#ff9800":mc.soldeDu<0?"#e53935":"#4caf50"}}>{mc.soldeDu===0?"\u2705 \u00c0 jour":`${mc.soldeDu.toLocaleString()} CHF`}</div>
+                  </div>
+                </div>
+                {/* MC Actions */}
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <button style={{padding:"5px 12px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#4fc3f7",fontSize:11,fontWeight:700,cursor:"pointer"}}>\ud83d\udcca Stats</button>
+                  <button style={{padding:"5px 12px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#4fc3f7",fontSize:11,fontWeight:700,cursor:"pointer"}}>\ud83d\udc65 Chatters</button>
+                  {mc.soldeDu>0&&<button style={{padding:"5px 12px",borderRadius:6,border:"1px solid #7c4dff",background:"rgba(124,77,255,0.1)",color:"#ab47bc",fontSize:11,fontWeight:700,cursor:"pointer"}}>\ud83d\udcb0 Payer {mc.soldeDu.toLocaleString()} CHF</button>}
+                  <button style={{padding:"5px 12px",borderRadius:6,border:"1px solid #1e2d3d",background:"#141e2b",color:"#94a3b8",fontSize:11,fontWeight:700,cursor:"pointer"}}>\u2699 \u00c9diter</button>
+                </div>
+              </div>
+              {/* Assigned chatters (indented) */}
+              <div style={{marginLeft:32,borderLeft:"2px solid #2a4a6a",paddingLeft:16,marginTop:12}}>
+                {mc.assignedChatters.length > 0 ? (
+                  <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(340px,1fr))",gap:10}}>
+                    {mc.assignedChatters.filter(ch=>matchSearch(ch.name)).filter(ch=>{
+                      if(filter==="shift") return ch.isOnShift;
+                      if(filter==="off") return !ch.isOnShift;
+                      return true;
+                    }).map(ch => renderChatterCard(ch, true))}
+                  </div>
+                ) : (
+                  <div style={{padding:"16px 20px",background:"#141e2b",border:"1px solid #1e2d3d",borderRadius:10,color:"#64748b",fontSize:12,fontStyle:"italic"}}>Aucun chatter assign\u00e9</div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ══════ SEPARATOR ══════ */}
+      {(filter !== "directs" && filter !== "managers") && filteredMcStats.length > 0 && filteredDirectStats.length > 0 && (
+        <div style={{borderTop:"1px solid #1e2d3d",margin:"28px 0"}}/>
+      )}
+
+      {/* ══════ SECTION 2: DIRECT CHATTERS ══════ */}
+      {(filter !== "managers") && filteredDirectStats.length > 0 && (
+        <div>
+          <div style={{fontSize:16,fontWeight:800,color:"#e2e8f0",marginBottom:14,display:"flex",alignItems:"center",gap:8}}>
+            <span>\ud83d\udc64</span> Chatters directs
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(340px,1fr))",gap:10}}>
+            {filteredDirectStats.map(ch => renderChatterCard(ch))}
+          </div>
+        </div>
+      )}
+
+      {/* Empty state */}
+      {filteredMcStats.length === 0 && filteredDirectStats.length === 0 && (
+        <div style={{background:"#141e2b",border:"1px solid #1e2d3d",borderRadius:10,padding:48,textAlign:"center"}}>
+          <div style={{fontSize:32,marginBottom:8}}>{"\ud83d\udcac"}</div>
+          <div style={{fontSize:14,color:"#94a3b8"}}>{search ? (fr?"Aucun r\u00e9sultat pour cette recherche":"No results for this search") : (fr?"Aucun chatter":"No chatters yet")}</div>
+        </div>
+      )}
+
+      {/* ── CREATE CHATTER MODAL ── */}
+      {createModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:5000}} onClick={()=>setCreateModal(false)}>
+          <div style={{maxWidth:440,width:"90vw",background:"#141e2b",border:"1px solid #1e2d3d",borderRadius:10,padding:24}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:16,fontWeight:800,marginBottom:16,color:"#e2e8f0"}}>{fr?"Nouveau Chatter":"New Chatter"}</div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <input placeholder="Nom" value={createForm.name} onChange={e=>setCreateForm({...createForm,name:e.target.value})} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #1e2d3d",background:"#0f1923",color:"#e2e8f0",fontSize:13}}/>
+              <input placeholder="Handle Telegram" value={createForm.handle} onChange={e=>setCreateForm({...createForm,handle:e.target.value})} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #1e2d3d",background:"#0f1923",color:"#e2e8f0",fontSize:13}}/>
+              <input placeholder="Commission %" type="number" value={createForm.commission_pct} onChange={e=>setCreateForm({...createForm,commission_pct:e.target.value})} style={{padding:"8px 12px",borderRadius:8,border:"1px solid #1e2d3d",background:"#0f1923",color:"#e2e8f0",fontSize:13}}/>
+            </div>
+            <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginTop:16}}>
+              <button onClick={()=>setCreateModal(false)} style={{padding:"8px 16px",borderRadius:8,border:"1px solid #1e2d3d",background:"#141e2b",color:"#94a3b8",fontSize:12,fontWeight:700,cursor:"pointer"}}>Annuler</button>
+              <button onClick={handleCreate} disabled={createSaving} style={{padding:"8px 16px",borderRadius:8,border:"none",background:"#4fc3f7",color:"#0f1923",fontSize:12,fontWeight:700,cursor:"pointer",opacity:createSaving?0.5:1}}>{createSaving?"...":"Cr\u00e9er"}</button>
+            </div>
           </div>
         </div>
       )}
@@ -59711,6 +60077,8 @@ const App = () => {
   const [mcShiftForm, setMcShiftForm] = useState(null);
   const [mcShiftSaving, setMcShiftSaving] = useState(false);
   const [mcConvChatterFilter, setMcConvChatterFilter] = useState("all");
+  // ── PR8: manager_chatters table (MC→chatter assignments) ──
+  const [managerChattersData, setManagerChattersData] = useState([]);
   const lastScrollYRef = React.useRef(0);
   const [topbarVisible, setTopbarVisible] = React.useState(true);
 
@@ -60045,7 +60413,7 @@ const App = () => {
     const isProvider = scope.type === 'provider';
     const assignedModelIds = isChatter ? (Array.isArray(currentUser?.assigned_models) ? currentUser.assigned_models : []).filter(Boolean) : [];
     if (isChatter) { scope._allowedModelIds = assignedModelIds; }
-    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR;
+    let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR, mcLinksR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[], _error: r.error.message || r.error} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[], _error: e.message || e}; });
     try {
       /* DB FIX — 12s timeout on Promise.all to prevent infinite hang */
@@ -60065,7 +60433,7 @@ const App = () => {
         ? safe((async () => ({ data: [], error: null }))(), "spenders_provider_empty")
         : safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders");
 
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR] = await Promise.race([Promise.all([
+      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, leR, mcLinksR] = await Promise.race([Promise.all([
         txPromise,
         spPromise,
         safe(sb.from("profiles").select("*"), "profiles"),
@@ -60095,6 +60463,8 @@ const App = () => {
         safe(sb.from("expense_categories").select("code,label").eq("is_active",true).order("sort_order",{ascending:true}), "expense_categories"),
         /* PAYMENT SYSTEM — payment_events (gérant voit tout, autres voient from/to/created_by via RLS) */
         safe(sb.from("payment_events").select("*").order("created_at",{ascending:false}).limit(200), "payment_events"),
+        /* PR8 — manager_chatters links (MC→chatter assignments) */
+        safe(sb.from("manager_chatters").select("*"), "manager_chatters"),
       ]), _dataTimeout]);
       if (window.PERF) { window.PERF.mark('loadData_promiseAll_done'); window.PERF.measure('loadData Promise.all (network)', 'loadData_start'); }
     } catch(e) { console.error("[DATA] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
@@ -60219,6 +60589,7 @@ const App = () => {
     (()=>{ let scData=(scR&&scR.data)||[]; if(currentUser&&currentUser.role==="chatter"){ scData=scData.filter(sc=>(sc.checked_by||sc.checker_id||sc.chatter_id)===currentUser.id); } setScreenshotChecks(scData); window.__screenshotChecks=scData; setScTotal(scData.length); })();
     setBroadcasts((bcR&&bcR.data)||[]);
     setPaymentEvents((peR&&peR.data)||[]);
+    setManagerChattersData((mcLinksR&&mcLinksR.data)||[]);
     // Load escalation count for messagerie badge
     if (currentUser && currentUser.role === "gerant") {
       try {
@@ -61172,14 +61543,17 @@ const App = () => {
         </>);
       case "equipe":
         return (<>{renderGerantTabBar("equipe")}
-          {subTab==="chatters"&&<ChattersTab user={user} lang={lang} txs={txSummary} profiles={profiles} models={models} chatterLogs={chatterLogs} onRefresh={onRefresh} piRefreshKey={piRefreshKey} />}
+          {subTab==="chatters"&&<UnifiedChattingPage user={user} lang={lang} txs={txSummary} profiles={profiles} models={models} chatterLogs={chatterLogs} onRefresh={onRefresh} piRefreshKey={piRefreshKey} managerChattersData={managerChattersData} />}
           {subTab==="modeles"&&<ModelesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} expenses={expenses} expenseCategories={expenseCategories} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} modelTasks={modelTasks} contentList={contentList} checklistTemplates={checklistTemplates} checklistInstances={checklistInstances} piRefreshKey={piRefreshKey} setTxSummary={setTxSummary} />}
           {subTab==="providers"&&<PrestatairesTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} onRefresh={onRefresh} providerPayouts={providerPayouts} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} />}
           {subTab==="catalogue"&&<ProductCatalogTab user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} onRefresh={onRefresh} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} setProviderPaymentMethods={setProviderPaymentMethods} onNotify={createNotification} />}
         </>);
       case "messagerie":
         return <MessagerieHubPage user={user} lang={lang} models={models} setTab={setTab} />;
+      // DISABLED PR8 — will restore later
       case "compta":
+        navigateTo("dashboard"); return null;
+      /* DISABLED PR8 — Comptabilité route (will restore later)
         const comptaTabs = PAGE_TABS.compta;
         return (
         <div style={{width:"100%",overflowX:"hidden",minWidth:0}}>
@@ -61195,17 +61569,23 @@ const App = () => {
           {subTab==="factures"&&<InvoicesTab user={user} lang={lang} invoices={invoices} txs={txSummary} profiles={profiles} providerPayouts={providerPayouts} onRefresh={onRefresh} />}
           {(subTab==="resultats"||subTab==="resultats_dadash")&&<ResultatsDadashTab user={user} lang={lang} txs={txSummary} expenses={expenses} payouts={payouts} models={models} profiles={profiles} spenders={spenders} onRefresh={onRefresh} />}
         </div>);
+      */
       // Legacy automation/push → messagerie/push
       case "automation":
         navigateTo("messagerie","push"); return null;
       // Legacy ia-insights → bots/ia_insights
       case "ia-insights":
         navigateTo("bots","ia_insights"); return null;
+      // DISABLED PR8 — will restore later
+      case "bots":
+        navigateTo("dashboard"); return null;
+      /* DISABLED PR8 — Bots/IA Insights route (will restore later)
       case "bots":
         return (<>{renderGerantTabBar("bots")}
           {(!subTab||subTab==="bots")&&<BotsManagementPage lang={lang} user={user} />}
           {subTab==="ia_insights"&&<IAInsightsPage user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} lang={lang} onNavigate={navigateTo} />}
         </>);
+      */
       case "scripts":
         return <ScriptsPage user={user} lang={lang} />;
       case "admin":
@@ -61326,18 +61706,18 @@ const App = () => {
           {/* ── SECTION ÉQUIPE ── */}
           <div className="s-sec">ÉQUIPE</div>
           <div className={`s-item${tab==="equipe"&&subTab==="chatters"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("equipe","chatters");}}>
-            <span className="s-ico">👥</span> Chatters
+            <span className="s-ico">💬</span> Chatting
           </div>
           <div className={`s-item${tab==="equipe"&&subTab==="modeles"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("equipe","modeles");}}>
-            <span className="s-ico">✈️</span> Modèles
+            <span className="s-ico">✨</span> Modèles
           </div>
           <div className={`s-item${tab==="equipe"&&subTab==="providers"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("equipe","providers");}}>
-            <span className="s-ico">🏛️</span> Providers
+            <span className="s-ico">🏦</span> Providers
           </div>
           <div className={`s-item${tab==="equipe"&&subTab==="catalogue"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("equipe","catalogue");}}>
-            <span className="s-ico">📦</span> Catalogue
+            <span className="s-ico">🎁</span> Catalogue
           </div>
-          {/* ── SECTION FINANCE & IA ── */}
+          {/* DISABLED PR8 — will restore later
           <div className="s-sec">FINANCE &amp; IA</div>
           <div className={`s-item${tab==="compta"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("compta");}}>
             <span className="s-ico">💰</span> Comptabilité
@@ -61345,11 +61725,12 @@ const App = () => {
           <div className={`s-item${tab==="bots"&&subTab==="ia_insights"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("bots","ia_insights");}}>
             <span className="s-ico">🧠</span> IA Insights
           </div>
+          */}
           {/* ── SPACER + Messagerie / Bots / Admin ── */}
           <div className="s-spacer"/>
           <div className="s-footer">
             <div className={`s-item${tab==="messagerie"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("messagerie");}}>
-              <span className="s-ico">✈️</span> Messagerie
+              <span className="s-ico">✉️</span> Messagerie
               {escalationCount>0&&<span className="s-badge">{escalationCount>9?"9+":escalationCount}</span>}
             </div>
             <div className={`s-item${tab==="admin"&&!drillDown?" active":""}`} onClick={()=>{closeDrill();navigateTo("admin");}}>
