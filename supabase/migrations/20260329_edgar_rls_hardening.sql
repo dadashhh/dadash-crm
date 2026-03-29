@@ -20,13 +20,13 @@ BEGIN;
 -- RÈGLE 1 — tg_conversations SELECT
 -- ─────────────────────────────────────────────────────────────────────────────
 -- AVANT :
---   tg_conv_gerant_all     → gérant FOR ALL (OK, on garde)
+--   tg_conv_gerant_all     → gerant FOR ALL (OK, on garde)
 --   tg_conv_chatter_select → chatter SELECT avec assigned_chatter_id OR
 --                            (can_view_all_assigned AND model_id IN assigned_models)
 --                            Problème : trop restrictif si can_view_all_assigned = false,
 --                            et ne couvre pas manager_chatter.
 -- APRÈS :
---   tg_conv_gerant_all     → inchangé (gérant full access)
+--   tg_conv_gerant_all     → inchangé (gerant full access)
 --   conv_select_by_role    → chatter + manager_chatter voient model_id IN assigned_models
 --                            (simplifié : plus besoin de can_view_all_assigned car
 --                             le modèle est maintenant toujours renseigné)
@@ -64,7 +64,7 @@ CREATE POLICY conv_select_by_role ON tg_conversations
 -- RÈGLE 2 — tg_messages SELECT
 -- ─────────────────────────────────────────────────────────────────────────────
 -- AVANT :
---   tg_msg_gerant_all      → gérant FOR ALL (OK, on garde)
+--   tg_msg_gerant_all      → gerant FOR ALL (OK, on garde)
 --   tg_msg_chatter_select  → chatter SELECT via sub-select sur tg_conversations
 --                            (lourd, indirection via conversation_id)
 -- APRÈS :
@@ -193,7 +193,7 @@ CREATE POLICY manager_commissions_own_select ON manager_commissions
 -- RÈGLE 4 — Vérification : pas de INSERT/UPDATE chatter sur tg_conversations
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Design validé par audit :
---   - tg_conv_gerant_all = FOR ALL → gérant peut INSERT/UPDATE/DELETE
+--   - tg_conv_gerant_all = FOR ALL → gerant peut INSERT/UPDATE/DELETE
 --   - Aucune policy INSERT/UPDATE pour chatter → deny par défaut (RLS ON)
 --   - Bot écrit via service_role → bypass RLS
 -- → Rien à modifier. Ce bloc est un diagnostic de confirmation.
@@ -212,11 +212,11 @@ BEGIN
       AND cmd IN ('INSERT', 'UPDATE')
       AND policyname NOT LIKE '%gerant%'
   LOOP
-    RAISE WARNING '[EDGAR-RLS] ⚠ Policy non-gérant INSERT/UPDATE trouvée : % (cmd=%)', rec.policyname, rec.cmd;
+    RAISE WARNING '[EDGAR-RLS] ⚠ Policy non-gerant INSERT/UPDATE trouvée : % (cmd=%)', rec.policyname, rec.cmd;
     v_found := true;
   END LOOP;
   IF NOT v_found THEN
-    RAISE NOTICE '[EDGAR-RLS] ✓ Aucune policy INSERT/UPDATE non-gérant → deny par défaut OK';
+    RAISE NOTICE '[EDGAR-RLS] ✓ Aucune policy INSERT/UPDATE non-gerant → deny par défaut OK';
   END IF;
 END;
 $$;
