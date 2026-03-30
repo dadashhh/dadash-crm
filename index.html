@@ -61034,8 +61034,11 @@ const App = () => {
     let txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, mcLinksR;
     const safe = (promise, label) => Promise.resolve(promise).then(r => { if(r.error) { console.warn("[DADASH] Query error" + (label ? " ("+label+")" : "") + ":", r.error.message || r.error); } return r.error ? {data:[], _error: r.error.message || r.error} : r; }).catch(e => { console.error("[DADASH] Query failed" + (label ? " ("+label+")" : "") + ":", e.message || e); return {data:[], _error: e.message || e}; });
     try {
-      /* DB FIX — 15s timeout on Promise.all to prevent infinite hang */
-      const _dataTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: les données n'ont pas pu être chargées en 15 secondes")), 15000));
+      /* ══════════════════════════════════════════════════════════
+       * WAVE 1 — CRITICAL DATA (dashboard, TX table, nav)
+       * Only 5 queries → UI renders in ~2s instead of waiting for all 28
+       * ══════════════════════════════════════════════════════════ */
+      const _w1Timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: données critiques non chargées en 10s")), 10000));
 
       // RBAC: chatter/provider use scoped API — no global transaction/spender fetch
       const txPromise = isChatter
@@ -61043,7 +61046,6 @@ const App = () => {
         : isProvider
         ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_provider")
         : safe(sb.from("transactions").select("*",{count:"exact"}).order("date",{ascending:false}), "transactions");
-      const txSumPromise = safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_reuse");
       // Spenders: deferred for chatter (needs TX first) — providers never see spenders
       const spPromise = isChatter
         ? safe((async () => ({ data: [], error: null }))(), "spenders_chatter_deferred")
@@ -61051,11 +61053,93 @@ const App = () => {
         ? safe((async () => ({ data: [], error: null }))(), "spenders_provider_empty")
         : safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders");
 
-      [txR, spR, prR, moR, paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR, mcLinksR] = await Promise.race([Promise.all([
+      [txR, spR, prR, moR, mcLinksR] = await Promise.race([Promise.all([
         txPromise,
         spPromise,
         safe(sb.from("profiles").select("id,name,role,commission_pct,commission_rate,assigned_models,active,created_at,updated_at,goal_currency,messaging_permissions,is_active,comm_pct,daily_goal,weekly_goal,billing_company_name,billing_address,billing_siret,billing_vat_number,manager_commission_pct,manager_balance"), "profiles"),
         safe(sb.from("models").select("id,name,platform,monthly_cost,active,created_at,color,emoji,last_activity_at,message_count_7d,account_status"), "models"),
+        safe(sb.from("manager_chatters").select("id,manager_id,chatter_id,assigned_at"), "manager_chatters"),
+      ]), _w1Timeout]);
+      if (window.PERF) { window.PERF.mark('loadData_wave1_done'); window.PERF.measure('loadData Wave1 (critical)', 'loadData_start'); }
+    } catch(e) { console.error("[DATA] loadData Wave1 failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
+    if (thisVersion !== _loadVersion.current) return;
+
+    let txData = txR.data||[];
+    let txSumData = txData;
+    let modelData = dedupModels(moR.data);
+    _syncModelIdMap(modelData);
+    _syncSpenderModelFilter(modelData);
+
+    // PR1: chatter spender fetch (deferred — needs txData to build scope)
+    if (isChatter) {
+      try {
+        scope._chatterTxs = txSumData;
+        const chatterSpenders = await apiFetchSpenders({ scope });
+        spR = { data: chatterSpenders, error: null };
+      } catch (e) { console.warn("[SPENDERS] chatter fetch failed:", e?.message || e); spR = { data: [], error: e }; }
+    }
+
+    // Filter data based on user role (defense-in-depth — server queries already scoped)
+    if(currentUser) {
+      if(isChatter) {
+        if (assignedModelIds.length > 0) {
+          txData    = txData.filter(tx => assignedModelIds.includes(tx.model_id));
+          txSumData = txSumData.filter(tx => assignedModelIds.includes(tx.model_id));
+        } else {
+          txData = []; txSumData = [];
+        }
+        modelData = modelData.filter(m=>assignedModelIds.includes(m.id));
+      } else if(isProvider) {
+        txData = txData.filter(tx=>tx.provider_id===currentUser.id);
+        txSumData = txSumData.filter(tx=>tx.provider_id===currentUser.id);
+        const modelIds = new Set(txSumData.map(tx=>tx.model_id));
+        modelData = modelData.filter(m=>modelIds.has(m.id));
+      } else if(currentUser.role==="modele") {
+        txData = []; txSumData = []; modelData = [];
+      } else if(currentUser.role==="manager_chatter") {
+        txData = []; txSumData = [];
+      }
+    }
+
+    // Filter sensitive data based on role (Wave 1 — only spenders/profiles)
+    let spenderData = spR.data||[];
+    let profileData = prR.data||[];
+    if(currentUser) {
+      if(isChatter) {
+        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter"||p.role==="provider");
+      } else if(isProvider) {
+        spenderData = [];
+        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
+      } else if(currentUser.role==="modele") {
+        spenderData = [];
+        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
+      } else if(currentUser.role==="manager_chatter") {
+        spenderData = [];
+        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter");
+      }
+    }
+
+    // ── SET WAVE 1 STATE → UI renders immediately ──
+    setTxs(txData);
+    setTxSummary(txSumData);
+    setTxTotal(txR.count||txData.length||0);
+    const dedupedSpenders = Array.from(new Map((spenderData||[]).filter(Boolean).map(s=>[s.id,s])).values());
+    setSpenders(dedupedSpenders);
+    console.info("[BOOT] Wave1 done — spenders n=" + dedupedSpenders.length);
+    const dedupedProfiles = Array.from(new Map((profileData||[]).filter(Boolean).map(p=>[p.id,p])).values());
+    setProfiles(dedupedProfiles);
+    setModels(modelData);
+    setManagerChattersData((mcLinksR&&mcLinksR.data)||[]);
+    if (window.PERF) { window.PERF.mark('loadData_wave1_setState'); window.PERF.measure('loadData Wave1→setState', 'loadData_start'); }
+
+    /* ══════════════════════════════════════════════════════════
+     * WAVE 2 — SECONDARY DATA (loaded in background, non-blocking)
+     * Dashboard/TX table already visible. This fills in payouts,
+     * expenses, products, checklists, bot stats, etc.
+     * ══════════════════════════════════════════════════════════ */
+    try {
+      const _w2Timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: données secondaires non chargées en 15s")), 15000));
+      [paR, exR, ppR, prodR, ptagR, mpR, mtR, clR, ctplR, ciR, alR, bsR, invR, mvR, vsR, ppmR, chLogR, scR, bcR, psR, txSumR, ecR, peR] = await Promise.race([Promise.all([
         (isChatter || isProvider) ? safe(sb.from("payouts").select("*").eq("user_id", currentUser.id).order("date",{ascending:false}), "payouts") : safe(sb.from("payouts").select("*").order("date",{ascending:false}), "payouts"),
         (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("*"), "expenses"),
         isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("*").eq("provider_id", currentUser.id).order("created_at",{ascending:false}), "provider_payouts") : safe(sb.from("provider_payouts").select("*").order("created_at",{ascending:false}), "provider_payouts"),
@@ -61075,107 +61159,32 @@ const App = () => {
         safe(sb.from("chatter_logs").select("*",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "chatter_logs"),
         safe(sb.from("screenshot_checks").select("*",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "screenshot_checks"),
         safe(sb.from("broadcasts").select("*").order("created_at",{ascending:false}).limit(200), "broadcasts"),
-        /* CHRISTINE FIX — payslips.period may not exist, fallback to created_at */
         safe(sb.from("payslips").select("*").order("created_at",{ascending:false}).limit(200), "payslips"),
-        txSumPromise,
+        safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_reuse"),
         safe(sb.from("expense_categories").select("code,label").eq("is_active",true).order("sort_order",{ascending:true}), "expense_categories"),
-        /* PAYMENT SYSTEM — payment_events (gérant voit tout, autres voient from/to/created_by via RLS) */
         safe(sb.from("payment_events").select("*").order("created_at",{ascending:false}).limit(200), "payment_events"),
-        /* PR8 — manager_chatters links (MC→chatter assignments) */
-        safe(sb.from("manager_chatters").select("id,manager_id,chatter_id,assigned_at"), "manager_chatters"),
-      ]), _dataTimeout]);
-      if (window.PERF) { window.PERF.mark('loadData_promiseAll_done'); window.PERF.measure('loadData Promise.all (network)', 'loadData_start'); }
-    } catch(e) { console.error("[DATA] loadData failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
+      ]), _w2Timeout]);
+      if (window.PERF) { window.PERF.mark('loadData_wave2_done'); window.PERF.measure('loadData Wave2 (secondary)', 'loadData_wave1_setState'); }
+    } catch(e) { console.warn("[DATA] loadData Wave2 failed (non-critical):", e.message || e); /* Wave2 timeout = keep going with what we have */ }
     if (thisVersion !== _loadVersion.current) return;
 
-    let txData = txR.data||[];
-    // RBAC: for chatter/provider, txSumData = same as txData (already server-filtered)
-    let txSumData = txData;
-    let modelData = dedupModels(moR.data);
-    _syncModelIdMap(modelData);
-    _syncSpenderModelFilter(modelData);
-
-    // PR1: chatter spender fetch (deferred — needs txData to build scope)
-    if (isChatter) {
-      try {
-        scope._chatterTxs = txSumData;
-        const chatterSpenders = await apiFetchSpenders({ scope });
-        spR = { data: chatterSpenders, error: null };
-      } catch (e) { console.warn("[SPENDERS] chatter fetch failed:", e?.message || e); spR = { data: [], error: e }; }
-    }
-
-    // Filter data based on user role (defense-in-depth — server queries already scoped)
+    // ── SET WAVE 2 STATE ──
+    let payoutData = (paR&&paR.data)||[];
+    let expenseData = (exR&&exR.data)||[];
+    let ppData = (ppR&&ppR.data)||[];
     if(currentUser) {
       if(isChatter) {
-        // Defense-in-depth : garder uniquement les TX des modèles assignés (tous chatters confondus)
-        if (assignedModelIds.length > 0) {
-          txData    = txData.filter(tx => assignedModelIds.includes(tx.model_id));
-          txSumData = txSumData.filter(tx => assignedModelIds.includes(tx.model_id));
-        } else {
-          txData = []; txSumData = [];
-        }
-        modelData = modelData.filter(m=>assignedModelIds.includes(m.id));
-      } else if(isProvider) {
-        // txData already server-filtered by apiFetchTransactions(provider scope) — extra defense-in-depth
-        txData = txData.filter(tx=>tx.provider_id===currentUser.id);
-        txSumData = txSumData.filter(tx=>tx.provider_id===currentUser.id);
-        const modelIds = new Set(txSumData.map(tx=>tx.model_id));
-        modelData = modelData.filter(m=>modelIds.has(m.id));
-      } else if(currentUser.role==="modele") {
-        txData = [];
-        txSumData = [];
-        modelData = [];
-      } else if(currentUser.role==="manager_chatter") {
-        // Manager chatter: no global TX (uses mcTxs loaded separately)
-        txData = [];
-        txSumData = [];
-      }
-    }
-
-    // Filter sensitive data based on role (defense-in-depth alongside Supabase RLS)
-    let spenderData = spR.data||[];
-    let profileData = prR.data||[];
-    let payoutData = paR.data||[];
-    let expenseData = exR.data||[];
-    let ppData = ppR.data||[];
-    if(currentUser) {
-      if(isChatter) {
-        // Chatter sees spenders scoped to their assigned models (fetched via apiFetchSpenders)
-        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter"||p.role==="provider");
         payoutData = payoutData.filter(p=>p.user_id===currentUser.id);
-        expenseData = [];
-        ppData = [];
+        expenseData = []; ppData = [];
       } else if(isProvider) {
-        // Provider: no spenders, only own profile + gérant, only own provider_payouts
-        spenderData = [];
-        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
-        payoutData = [];
-        expenseData = [];
-        ppData = ppData.filter(p=>p.provider_id===currentUser.id||p.declared_by===currentUser.id);
+        payoutData = []; expenseData = [];
+        ppData = (ppData||[]).filter(p=>p.provider_id===currentUser.id||p.declared_by===currentUser.id);
       } else if(currentUser.role==="modele") {
-        spenderData = [];
-        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant");
-        payoutData = [];
-        expenseData = [];
-        ppData = [];
+        payoutData = []; expenseData = []; ppData = [];
       } else if(currentUser.role==="manager_chatter") {
-        // Manager chatter: no global spenders (uses mcSpenders), only see own chatters + self + gerant
-        spenderData = [];
-        profileData = profileData.filter(p=>p.id===currentUser.id||p.role==="gerant"||p.role==="chatter");
-        payoutData = [];
-        expenseData = [];
-        ppData = [];
+        payoutData = []; expenseData = []; ppData = [];
       }
     }
-    setTxs(txData);
-    setTxSummary(txSumData);
-    setTxTotal(txR.count||txData.length||0);
-    const dedupedSpenders = Array.from(new Map((spenderData||[]).filter(Boolean).map(s=>[s.id,s])).values());
-    setSpenders(dedupedSpenders);
-    console.info("[BOOT] spenders hydrated n=" + dedupedSpenders.length, dedupedSpenders[0] ? { id: dedupedSpenders[0].id, handle: dedupedSpenders[0].handle || dedupedSpenders[0].name, tg: dedupedSpenders[0].tg_user_id } : "empty");
-    const dedupedProfiles = Array.from(new Map((profileData||[]).filter(Boolean).map(p=>[p.id,p])).values());
-    setProfiles(dedupedProfiles);
-    setModels(modelData);
     const normPayouts = normalizePayouts(payoutData);
     setPayouts(normPayouts);
     if (currentUser?.role==="gerant" && normPayouts.length > 0 && typeof console !== "undefined") console.log("[DADASH Compta] Payouts chargés:", normPayouts.length, "| sample:", normPayouts[0]?.id, normPayouts[0]?._beneficiaryType || normPayouts[0]?.type, normPayouts[0]?._date?.slice?.(0,10));
@@ -61203,11 +61212,10 @@ const App = () => {
     setVideoSessions((vsR&&vsR.data)||[]);
     setProviderPaymentMethods((ppmR&&ppmR.data)||[]);
     setChatterLogs((chLogR&&chLogR.data)||[]);
-    setClTotal(chLogR.count||(chLogR.data||[]).length||0);
+    setClTotal((chLogR&&chLogR.count)||(chLogR&&chLogR.data||[]).length||0);
     (()=>{ let scData=(scR&&scR.data)||[]; if(currentUser&&currentUser.role==="chatter"){ scData=scData.filter(sc=>(sc.checked_by||sc.checker_id||sc.chatter_id)===currentUser.id); } setScreenshotChecks(scData); window.__screenshotChecks=scData; setScTotal(scData.length); })();
     setBroadcasts((bcR&&bcR.data)||[]);
     setPaymentEvents((peR&&peR.data)||[]);
-    setManagerChattersData((mcLinksR&&mcLinksR.data)||[]);
     // Load escalation count for messagerie badge
     if (currentUser && currentUser.role === "gerant") {
       try {
