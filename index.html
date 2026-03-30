@@ -31855,7 +31855,7 @@ const getModelColor = (modelName) => {
 };
 
 // Stable message key — API may use different field names for the ID.
-const _msgKey = (m) => String(m.id || m.message_id || m.tg_message_id || m._localId || "");
+const _msgKey = (m) => String(m.tg_message_id || m.message_id || m.id || m._localId || "");
 
 // Merge server message list into current local state.
 // - Keeps pending/error messages that haven't been confirmed yet.
@@ -40610,6 +40610,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             setMessages(prev => {
               let updated = [...prev];
               for (const msg of batch) {
+                const msgKey = _msgKey(msg);
+                if (msgKey && updated.some(m => _msgKey(m) === msgKey)) continue;
                 if (updated.some(m => String(m.id) === String(msg.id))) continue;
                 const pendingIdx = updated.findIndex(m =>
                   m.pending && m.text.trim() === msg.text.trim() && m.isOutgoing
@@ -43033,7 +43035,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               {/* Avatar + nom + âge + TG */}
               <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, marginBottom: 10 }}>
                 {(() => {
-                  const _spModelName = activeSpender?.ai_model_used || selectedConv?.model_name || "";
+                  const _spModelName = selectedConv?.model_name || activeSpender?.ai_model_used || "";
                   const _spAvatarGrad = getModelMeta(_spModelName).gradient;
                   return (
                     <div style={{ position: "relative" }}>
@@ -43076,11 +43078,15 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                     {activeSpender.relationship_status}
                   </span>
                 )}
-                {(spModelName || activeSpender.ai_model_used) && (
-                  <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, background: "#2d1b4e", color: "#c084fc" }}>
-                    👤 {activeSpender.ai_model_used || spModelName}
-                  </span>
-                )}
+                {(() => {
+                  const _convModel = selectedConv?.model_name || (selectedConv?.model_id ? ((models || []).find(m => m.id === selectedConv.model_id)?.name || null) : null) || activeSpender?.ai_model_used || spModelName;
+                  if (!_convModel) return null;
+                  return (
+                    <span style={{ padding: "3px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, background: "#2d1b4e", color: "#c084fc" }}>
+                      👤 {_convModel}
+                    </span>
+                  );
+                })()}
               </div>
 
               {/* VIP score bar */}
@@ -46629,9 +46635,12 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
   }, [selectedConv, msgInput, sending, user?.id, effectiveUser?.role, getMessagingPerm, fr, addToast, loadMessages, simuActive]);
 
   const getSpenderName = (conv) => {
-    if (!conv?.spender_id) return conv?.tg_chat_id || "—";
-    const sp = (spenders || []).find(s => s.id === conv.spender_id);
-    return sp?.first_name || sp?.handle || conv?.tg_chat_id || "—";
+    if (conv?.spender_id) {
+      const sp = (spenders || []).find(s => s.id === conv.spender_id);
+      if (sp) return sp.first_name || sp.handle || sp.name || "—";
+    }
+    return conv?.display_name || conv?.first_name || conv?.username || conv?.tg_username
+      || (conv?.tg_chat_id ? ("Spender " + String(conv.tg_chat_id).slice(-6)) : "—");
   };
 
   const botUrl = (window.TELEGRAM_BOT_URL || "").replace(/\/$/, "");
@@ -46643,15 +46652,47 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
     if (debouncedSearch.trim()) {
       const q = debouncedSearch.toLowerCase();
       list = list.filter(conv => {
-        const tgChatId = (conv?.tg_chat_id || "").toLowerCase();
-        const sp = (spenders || []).find(s => s.id === conv?.spender_id);
-        const handle = (sp?.handle || "").toLowerCase();
-        const firstName = (sp?.first_name || "").toLowerCase();
-        return tgChatId.includes(q) || handle.includes(q) || firstName.includes(q);
+        // 1. Champs directs sur la conversation (fournis par Carlos API)
+        const convFields = [
+          conv?.display_name,
+          conv?.first_name,
+          conv?.username,
+          conv?.tg_username,
+          conv?.tg_chat_id,
+          conv?.chat_id,
+        ];
+        if (convFields.some(f => f && String(f).toLowerCase().includes(q))) return true;
+
+        // 2. Lookup spender par spender_id
+        const sp = conv?.spender_id
+          ? (spenders || []).find(s => s.id === conv.spender_id)
+          : null;
+        if (sp) {
+          const spFields = [sp.first_name, sp.handle, sp.name, sp.username, sp.telegram_username];
+          if (spFields.some(f => f && String(f).toLowerCase().includes(q))) return true;
+        }
+
+        // 3. Lookup spender par tg_chat_id (si spender_id absent)
+        if (!sp) {
+          const tgId = String(conv?.tg_chat_id || conv?.chat_id || "");
+          const spByTg = tgId
+            ? (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === tgId)
+            : null;
+          if (spByTg) {
+            const spFields = [spByTg.first_name, spByTg.handle, spByTg.name, spByTg.username];
+            if (spFields.some(f => f && String(f).toLowerCase().includes(q))) return true;
+          }
+        }
+
+        // 4. Fallback : getConvName (le nom affiché dans la liste)
+        const displayedName = getConvName(conv);
+        if (displayedName && displayedName.toLowerCase().includes(q)) return true;
+
+        return false;
       });
     }
     return list;
-  }, [conversations, debouncedSearch, spenders]);
+  }, [conversations, debouncedSearch, spenders, getConvName]);
 
   const getModelName = (modelId) => {
     const m = (models || []).find(x => x.id === modelId);
