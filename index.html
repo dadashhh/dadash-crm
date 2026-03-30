@@ -31609,6 +31609,13 @@ const _dmsgChatId = (conv) => {
   return conv.tg_chat_id || conv.chat_id || conv.telegram_chat_id || conv.tg_id || conv.id || null;
 };
 
+// Composite key (tg_chat_id + model_id) — identifie UNE conversation unique
+// Un même spender peut chatter avec plusieurs modèles → clés distinctes
+const _dmsgConvKey = (conv) =>
+  conv
+    ? `${_dmsgChatId(conv) || ""}::${conv.model_id || ""}`
+    : null;
+
 // Objet minimal quand un spender n'existe pas encore en DB
 // Permet d'afficher au moins le nom/handle/TG ID dans la fiche
 const _dmsgMinimalSpender = (conv) => {
@@ -39785,17 +39792,43 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       if (!error && sbData) sbList = sbData;
     }
 
+    // ── Normalize Carlos model_id → Supabase UUID BEFORE merge ──
+    const _normModelNameToIds = {};
+    (models || []).forEach(m => {
+      const n = (m.name || "").toLowerCase();
+      if (n && m.id) {
+        if (!_normModelNameToIds[n]) _normModelNameToIds[n] = [];
+        _normModelNameToIds[n].push(String(m.id));
+      }
+    });
+    const _normModelIdValid = new Set();
+    (models || []).forEach(m => { if (m.id) _normModelIdValid.add(String(m.id)); });
+
+    for (const c of apiList) {
+      // Normalize tg_chat_id from Carlos chat_id
+      if (!c.tg_chat_id && c.chat_id) {
+        c.tg_chat_id = String(c.chat_id);
+      }
+      // Resolve Carlos model_id → Supabase UUID via model_name
+      if (c.model_name && (!c.model_id || !_normModelIdValid.has(String(c.model_id)))) {
+        const ids = _normModelNameToIds[c.model_name.toLowerCase()];
+        if (ids && ids.length > 0) {
+          c.model_id = ids[0];
+        }
+      }
+    }
+
     // 3. Merge: API results take priority, Supabase fills gaps ONLY for missing chat_ids
     //    API already returns cross-model entries natively (separate entries per model_id).
     //    Supabase uses DIFFERENT model_id UUIDs than API, so we CANNOT cross-reference by model_id.
-    //    → Supabase dedup uses chatIdSet ONLY (blocks ALL Supabase entries whose chat_id is in API).
-    const idSet = new Set();
+    //    → Supabase dedup uses convKeySet (tg_chat_id::model_id) to allow multi-model convs.
+    const convKeySet = new Set();
     const chatIdSet = new Set();
     const merged = [];
     for (const c of apiList) {
-      const cid = c.id || c.tg_chat_id || c.chat_id;
-      if (cid && !idSet.has(String(cid))) {
-        idSet.add(String(cid));
+      const convKey = _dmsgConvKey(c);
+      if (convKey && !convKeySet.has(convKey)) {
+        convKeySet.add(convKey);
         if (c.tg_chat_id) chatIdSet.add(String(c.tg_chat_id));
         if (c.chat_id) chatIdSet.add(String(c.chat_id));
         merged.push(c);
@@ -39803,13 +39836,30 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     }
     let sbAdded = 0;
     for (const c of sbList) {
-      const cid = String(c.id || "");
+      const convKey = _dmsgConvKey(c);
       const chatId = String(c.tg_chat_id || c.chat_id || "");
-      if (!idSet.has(cid) && !chatIdSet.has(chatId)) {
-        idSet.add(cid);
-        if (chatId) chatIdSet.add(chatId);
-        merged.push(c);
-        sbAdded++;
+      // Supabase conv added ONLY if convKey is new AND chatId not already covered by API
+      // Exception: if chatId exists but convKey is different → multi-model → ADD
+      if (!convKeySet.has(convKey)) {
+        const isMultiModel = chatIdSet.has(chatId) && convKey;
+        if (isMultiModel || !chatIdSet.has(chatId)) {
+          convKeySet.add(convKey);
+          if (chatId) chatIdSet.add(chatId);
+          merged.push(c);
+          sbAdded++;
+        }
+      }
+    }
+
+    // Enrich spender_id for Carlos convs (they lack it)
+    for (const c of merged) {
+      if (!c.spender_id && (c.tg_chat_id || c.chat_id)) {
+        const tid = String(c.tg_chat_id || c.chat_id);
+        const sp = (spenders || []).find(s =>
+          String(s.tg_user_id || "") === tid ||
+          String(s.telegram_id || "") === tid
+        );
+        if (sp) c.spender_id = sp.id;
       }
     }
 
@@ -39885,6 +39935,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     if (!chatId) return;
     if (isInitial) isInitialLoadingRef.current = true;
     const cid = String(chatId);
+    const convKey = _dmsgConvKey(selectedConvRef.current) || cid;
     if (_DADASH_DEBUG) console.log('🔍 [MSG-DIAG] Function called:', {
       functionName: 'loadMessagesById',
       subpage: 'DadashMessagerieTab',
@@ -39893,7 +39944,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       timestamp: new Date().toISOString()
     });
     // Afficher cache immédiatement si dispo et dans le TTL (60s)
-    const _cachedMsgs = _DMSG_MSG_CACHE[cid];
+    const _cachedMsgs = _DMSG_MSG_CACHE[convKey];
     const _cachedMsgsValid = _cachedMsgs && Date.now() - _cachedMsgs.ts < 60000;
     if (isInitial && _cachedMsgsValid && _cachedMsgs.data.length > 0) {
       setMessages(_cachedMsgs.data.map(normalizeMessage).filter(Boolean));
@@ -39969,7 +40020,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         lastDate: nList[nList.length-1]?.date || nList[nList.length-1]?.created_at || 'N/A',
         lastText: nList[nList.length-1]?.text?.substring(0, 50) || 'N/A'
       });
-      if (nList.length > 0) _DMSG_MSG_CACHE[cid] = { data: nList, ts: Date.now() };
+      if (nList.length > 0) _DMSG_MSG_CACHE[convKey] = { data: nList, ts: Date.now() };
       if (isInitial) {
         setMessages(nList);
         setMsgOffset(0);
@@ -39977,6 +40028,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         setTimeout(() => scrollToBottom('instant'), 100);
       } else {
         if (nList.length === 0) return;
+        // Guard: discard stale polling response if user switched conversation
+        if (String(chatIdRef.current) !== cid) return;
         setMessages(prev => {
           const prevConfirmed = prev.filter(m => !m.pending && !m.error);
           const prevKeys = new Set(prevConfirmed.map(m => _msgKey(m)));
@@ -39999,7 +40052,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       }
     } catch (e) {
       if (e.name === "AbortError") return;
-      if (isInitial && !_DMSG_MSG_CACHE[cid]?.data?.length) {
+      if (isInitial && !_DMSG_MSG_CACHE[convKey]?.data?.length) {
         try {
           if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] FALLBACK Supabase used:', {
             chatId: cid,
@@ -40020,7 +40073,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               lastText: list[list.length-1]?.text?.substring(0, 50) || 'N/A',
               lastDate: list[list.length-1]?.date || list[list.length-1]?.created_at || 'N/A'
             });
-            if (list.length > 0) _DMSG_MSG_CACHE[cid] = { data: list, ts: Date.now() };
+            if (list.length > 0) _DMSG_MSG_CACHE[convKey] = { data: list, ts: Date.now() };
+            // Guard: discard stale Supabase fallback if user switched conversation
+            if (String(chatIdRef.current) !== cid) return;
             setMessages(list);
             setMsgOffset(0);
             setHasMoreMsgs(list.length >= 50);
@@ -40028,8 +40083,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           }
         } catch (_) {
           // Ne wiper que si vraiment aucune donnée disponible (ni state ni cache)
+          if (String(chatIdRef.current) !== cid) return;
           setMessages(prev => {
-            if (prev.length > 0 || _DMSG_MSG_CACHE[cid]?.data?.length) return prev;
+            if (prev.length > 0 || _DMSG_MSG_CACHE[convKey]?.data?.length) return prev;
             return [];
           });
         }
@@ -40170,13 +40226,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     // Ouvrir dans les onglets
     openTab(conv);
     const cid = String(chatId || "");
-    const cached = _DMSG_MSG_CACHE[cid];
+    const _selConvKey = _dmsgConvKey(conv) || cid;
+    const cached = _DMSG_MSG_CACHE[_selConvKey];
     if (_DADASH_DEBUG) console.log('[DEBUG-SELECT] Cache status:', {
-      cacheExists: !!_DMSG_MSG_CACHE[cid],
-      cacheFresh: _DMSG_MSG_CACHE[cid] ? (Date.now() - _DMSG_MSG_CACHE[cid].ts < 60000) : false,
-      cacheLength: _DMSG_MSG_CACHE[cid]?.data?.length || 0,
-      cacheLastMsg: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
-      cacheLastDate: _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[cid]?.data?.slice(-1)[0]?.timestamp || 'N/A'
+      cacheExists: !!_DMSG_MSG_CACHE[_selConvKey],
+      cacheFresh: _DMSG_MSG_CACHE[_selConvKey] ? (Date.now() - _DMSG_MSG_CACHE[_selConvKey].ts < 60000) : false,
+      cacheLength: _DMSG_MSG_CACHE[_selConvKey]?.data?.length || 0,
+      cacheLastMsg: _DMSG_MSG_CACHE[_selConvKey]?.data?.slice(-1)[0]?.text?.substring(0, 50) || 'N/A',
+      cacheLastDate: _DMSG_MSG_CACHE[_selConvKey]?.data?.slice(-1)[0]?.created_at || _DMSG_MSG_CACHE[_selConvKey]?.data?.slice(-1)[0]?.timestamp || 'N/A'
     });
     if (cached && cached.data.length > 0) {
       // Stale-while-revalidate : afficher le cache même expiré, le poll mergera les nouveaux
@@ -42113,7 +42170,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         )}
         {!convLoading && !apiError && filteredConvs.map((conv, idx) => {
           const cid = _dmsgChatId(conv);
-          const isActive = selectedConv && _dmsgChatId(selectedConv) === cid;
+          const isActive = selectedConv && _dmsgConvKey(selectedConv) === _dmsgConvKey(conv);
           const name = getConvName(conv);
           const isUnread = !isActive && (
             conv.last_message_direction === "in" ||
