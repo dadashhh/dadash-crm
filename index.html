@@ -11536,12 +11536,34 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
     const now = new Date();
     let start, end, prevStart, prevEnd;
+
+    // Helper: compute midnight (00:00:00.000) and end-of-day (23:59:59.999)
+    // in the CRM timezone (timezone from TimezoneContext, e.g. "Europe/Paris")
+    // Returns UTC timestamps that correspond to those wall-clock times in the CRM TZ.
+    const tzMidnight = (dateStr) => {
+      // dateStr = "YYYY-MM-DD" — compute UTC ms for 00:00:00 in CRM timezone
+      const [y, m, d] = dateStr.split("-").map(Number);
+      // Create a date at noon UTC on that day to avoid DST edge cases
+      const probe = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+      // Format that probe's hours in the CRM timezone to find the UTC offset
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone, hour: "numeric", hour12: false,
+        year: "numeric", month: "numeric", day: "numeric"
+      }).formatToParts(probe);
+      const pH = parseInt(parts.find(p => p.type === "hour")?.value || "12");
+      // offset in hours = pH - 12 (probe is noon UTC, pH is the local hour)
+      const offsetMs = (pH - 12) * 3600000;
+      // Midnight in CRM TZ = Date.UTC(y, m-1, d, 0, 0, 0) - offsetMs
+      return Date.UTC(y, m - 1, d, 0, 0, 0, 0) - offsetMs;
+    };
+    const tzEndOfDay = (dateStr) => tzMidnight(dateStr) + 86399999; // +23:59:59.999
+
+    // Get "today" date string in the CRM timezone
+    const todayStr = now.toLocaleDateString("en-CA", { timeZone: timezone }); // "YYYY-MM-DD"
+
     if (period === "custom" && dateStart && dateEnd) {
-      // Parse date strings as LOCAL (not UTC) — "2026-03-30" → local midnight
-      const [sy, sm, sd] = dateStart.split("-").map(Number);
-      const [ey, em, ed] = dateEnd.split("-").map(Number);
-      start = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
-      end = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+      start = new Date(tzMidnight(dateStart));
+      end = new Date(tzEndOfDay(dateEnd));
       const diff = end.getTime() - start.getTime();
       prevEnd = new Date(start.getTime()); prevStart = new Date(start.getTime() - diff);
     } else if (period === "24h") {
@@ -11551,20 +11573,27 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       prevEnd = new Date(start.getTime());
       prevStart = new Date(prevEnd.getTime() - 24 * 60 * 60 * 1000);
     } else if (period === "today") {
-      // Aujourd'hui : minuit local → 23:59:59 local
-      start = new Date(now); start.setHours(0, 0, 0, 0);
-      end = new Date(now); end.setHours(23, 59, 59, 999);
-      prevStart = new Date(start); prevStart.setDate(prevStart.getDate() - 1);
-      prevEnd = new Date(prevStart); prevEnd.setHours(23, 59, 59, 999);
+      // Aujourd'hui : minuit CRM TZ → 23:59:59 CRM TZ
+      start = new Date(tzMidnight(todayStr));
+      end = new Date(tzEndOfDay(todayStr));
+      const yesterdayMs = tzMidnight(todayStr) - 86400000;
+      const yDate = new Date(yesterdayMs);
+      const yesterdayStr = yDate.toISOString().slice(0, 10); // close enough for offset calc
+      prevStart = new Date(tzMidnight(yesterdayStr));
+      prevEnd = new Date(tzEndOfDay(yesterdayStr));
     } else {
       const days = period === "7j" ? 7 : period === "30j" ? 30 : period === "90j" ? 90 : 99999;
-      end = new Date(now); end.setHours(23, 59, 59, 999);
-      start = new Date(now); start.setDate(start.getDate() - days); start.setHours(0, 0, 0, 0);
-      prevEnd = new Date(start.getTime()); prevEnd.setMilliseconds(-1);
-      prevStart = new Date(prevEnd.getTime()); prevStart.setDate(prevStart.getDate() - days);
+      end = new Date(tzEndOfDay(todayStr));
+      const startDate = new Date(tzMidnight(todayStr) - days * 86400000);
+      const startStr = startDate.toISOString().slice(0, 10);
+      start = new Date(tzMidnight(startStr));
+      prevEnd = new Date(start.getTime() - 1);
+      const prevStartDate = new Date(start.getTime() - days * 86400000);
+      const prevStartStr = prevStartDate.toISOString().slice(0, 10);
+      prevStart = new Date(tzMidnight(prevStartStr));
     }
     return { dateDebut: start, dateFin: end, prevDateDebut: prevStart, prevDateFin: prevEnd };
-  }, [period, dateStart, dateEnd]);
+  }, [period, dateStart, dateEnd, timezone]);
 
   const filteredTxs = useMemo(() => {
     const dStart = dateDebut.getTime();
