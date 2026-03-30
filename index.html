@@ -7646,33 +7646,65 @@ const mapUiToSpender = (row) => {
   };
 };
 // ═══ PR1 — CENTRALIZED API LAYER (chatter data isolation) ═══
+// ═══ SPENDER CACHE — avoid re-fetching 2118 rows × 77 cols on every call ═══
+const _spenderCache = { data: null, ts: 0, promise: null };
+const SPENDER_CACHE_TTL = 60000; // 60s
+const invalidateSpenderCache = () => { _spenderCache.data = null; _spenderCache.ts = 0; _spenderCache.promise = null; console.log("[SPENDERS] cache invalidated"); };
+window._invalidateSpenderCache = invalidateSpenderCache; // expose for console debug
+
 const _fetchSpendersGlobal = async () => {
-  console.log('[SPENDERS_QUERY]', 'sb.from("spenders").select("*").order("updated_at", desc)', { filters: 'NONE — no model_id filter on query' });
-  const _fetchAll = async (table, mapper, label) => {
-    const PAGE = 1000;
-    let all = [], from = 0, done = false;
-    while (!done) {
-      const { data, error } = await sb.from(table).select("*").order("updated_at", { ascending: false }).range(from, from + PAGE - 1);
-      if (error || !data || data.length === 0) { done = true; break; }
-      all = all.concat(data);
-      from += PAGE;
-      if (data.length < PAGE) done = true;
-    }
-    if (all.length > 0) { console.log("[SPENDERS] " + label + " n=" + all.length); return all.map(mapper); }
-    return null;
+  // Cache hit — return immediately
+  if (_spenderCache.data && (Date.now() - _spenderCache.ts) < SPENDER_CACHE_TTL) {
+    console.log("[SPENDERS] cache hit n=" + _spenderCache.data.length + " age=" + Math.round((Date.now() - _spenderCache.ts)/1000) + "s");
+    return _spenderCache.data;
+  }
+  // Dedup — if a fetch is already in flight, piggyback on it
+  if (_spenderCache.promise) {
+    console.log("[SPENDERS] dedup — awaiting in-flight fetch");
+    return _spenderCache.promise;
+  }
+  const _doFetch = async () => {
+    console.log('[SPENDERS_QUERY]', 'parallel pagination', { filters: 'NONE — no model_id filter on query' });
+    // Parallel pagination: count first, then all pages in Promise.all
+    const _fetchAllParallel = async (table, mapper, label) => {
+      const PAGE = 1000;
+      // 1. Count query (fast, head-only)
+      const { count, error: cErr } = await sb.from(table).select("id", { count: "exact", head: true });
+      if (cErr || !count || count === 0) return null;
+      // 2. Fire all pages in parallel
+      const nPages = Math.ceil(count / PAGE);
+      const pagePromises = [];
+      for (let i = 0; i < nPages; i++) {
+        pagePromises.push(sb.from(table).select("*").order("updated_at", { ascending: false }).range(i * PAGE, (i + 1) * PAGE - 1));
+      }
+      const results = await Promise.all(pagePromises);
+      const all = results.flatMap(r => r.data || []);
+      if (all.length > 0) { console.log("[SPENDERS] " + label + " n=" + all.length + " pages=" + nPages + " (parallel)"); return all.map(mapper); }
+      return null;
+    };
+    try {
+      const result = await _fetchAllParallel("spenders", mapUiToSpender, "spenders");
+      if (result) return result;
+    } catch (e) { console.warn("[SPENDERS] spenders fallback:", e?.message || e); }
+    try {
+      const result = await _fetchAllParallel("v_spenders_canon", mapCanonToSpender, "v_spenders_canon");
+      if (result) return result;
+    } catch (e) { console.warn("[SPENDERS] v_spenders_canon fallback:", e?.message || e); }
+    const { data, error } = await sb.from("spenders").select("*");
+    if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
+    console.log("[SPENDERS] spenders n=" + (data?.length || 0));
+    return data || [];
   };
+  // Set promise to dedup concurrent calls
+  _spenderCache.promise = _doFetch();
   try {
-    const result = await _fetchAll("spenders", mapUiToSpender, "spenders");
-    if (result) return result;
-  } catch (e) { console.warn("[SPENDERS] spenders fallback:", e?.message || e); }
-  try {
-    const result = await _fetchAll("v_spenders_canon", mapCanonToSpender, "v_spenders_canon");
-    if (result) return result;
-  } catch (e) { console.warn("[SPENDERS] v_spenders_canon fallback:", e?.message || e); }
-  const { data, error } = await sb.from("spenders").select("*");
-  if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
-  console.log("[SPENDERS] spenders n=" + (data?.length || 0));
-  return data || [];
+    const result = await _spenderCache.promise;
+    _spenderCache.data = result;
+    _spenderCache.ts = Date.now();
+    return result;
+  } finally {
+    _spenderCache.promise = null;
+  }
 };
 
 const apiFetchTransactions = async ({ scope, filters } = {}) => {
@@ -7709,10 +7741,10 @@ const apiFetchTransactions = async ({ scope, filters } = {}) => {
     const rows = (data || []).filter(tx => tx.provider_id === s.provider_user_id);
     return { data: rows, count: rows.length };
   }
-  const full = sb.from("transactions").select("*").order("date", { ascending: false });
-  const paged = sb.from("transactions").select("*", { count: "exact" }).order("date", { ascending: false }).range(0, 99);
-  const [fullR, pagedR] = await Promise.all([full, paged]);
-  return { data: pagedR.data || [], dataSummary: fullR.data || [], count: pagedR.count || 0 };
+  // Single fetch with count (dataSummary was never read — killed double fetch)
+  const { data, error, count } = await sb.from("transactions").select("*", { count: "exact" }).order("date", { ascending: false });
+  if (error) { console.warn("[API_TX] global fetch error:", error.message); return { data: [], count: 0 }; }
+  return { data: data || [], count: count || 0 };
 };
 
 const apiFetchKpis = ({ scope, txs, convertAmount: cvt }) => {
@@ -60962,6 +60994,7 @@ const App = () => {
 
   // ── GLOBAL REFRESH ORCHESTRATOR ──
   const loadData = async (currentUser = null) => {
+    invalidateSpenderCache(); // Fresh data on every full reload
     if (window.PERF) window.PERF.mark('loadData_start');
     const thisVersion = ++_loadVersion.current;
     const scope = getScope(currentUser);
@@ -61163,21 +61196,24 @@ const App = () => {
         let mcProfiles = [];
 
         if (_mcIds.length > 0) {
-          // 2. Profiles de mes chatters
-          const {data: _mcProfiles} = await sb.from("profiles").select("*").in("id", _mcIds);
-          mcProfiles = _mcProfiles || [];
-          setMcChatters(mcProfiles || []);
-
-          // 3. Tous les model_ids de mes chatters
-          const allModelIds = [...new Set((mcProfiles || []).flatMap(c => c.assigned_models || []).filter(Boolean))];
-
-          // 4. TX de mes chatters + mes propres TX (quand le MC était chatter)
+          // 2+4+6+7 in parallel (profiles, TX, shifts, commissions — all independent after step 1)
           const _allIds = [...new Set([..._mcIds, currentUser.id])];
-          const {data: mcTxData} = await sb.from("transactions").select("*").in("chatter_id", _allIds).order("date", {ascending: false});
-          setMcTxs(mcTxData || []);
-          setMcPendingTxCount((mcTxData || []).filter(tx => isPendingTx(tx.status)).length);
+          const [_mcProfilesR, mcTxR, shiftR, commR] = await Promise.all([
+            sb.from("profiles").select("*").in("id", _mcIds),
+            sb.from("transactions").select("*").in("chatter_id", _allIds).order("date", {ascending: false}),
+            sb.from("chatter_shifts").select("*").eq("manager_id", currentUser.id).order("date", {ascending: false}),
+            sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false}),
+          ]);
+          mcProfiles = _mcProfilesR.data || [];
+          setMcChatters(mcProfiles);
+          const mcTxData = mcTxR.data || [];
+          setMcTxs(mcTxData);
+          setMcPendingTxCount(mcTxData.filter(tx => isPendingTx(tx.status)).length);
+          setMcShifts(shiftR.data || []);
+          setMcCommissions(commR.data || []);
 
-          // 5. Spenders via model_ids
+          // 5. Spenders via model_ids (cache hit — already loaded in main Promise.all)
+          const allModelIds = [...new Set(mcProfiles.flatMap(c => c.assigned_models || []).filter(Boolean))];
           if (allModelIds.length > 0) {
             try {
               const spData = await apiFetchSpenders();
@@ -61193,15 +61229,14 @@ const App = () => {
           setMcChatters([]);
           setMcTxs([]);
           setMcSpenders([]);
+          // 6+7 still needed even with 0 chatters
+          const [shiftR, commR] = await Promise.all([
+            sb.from("chatter_shifts").select("*").eq("manager_id", currentUser.id).order("date", {ascending: false}),
+            sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false}),
+          ]);
+          setMcShifts(shiftR.data || []);
+          setMcCommissions(commR.data || []);
         }
-
-        // 6. Shifts
-        const {data: shiftData} = await sb.from("chatter_shifts").select("*").eq("manager_id", currentUser.id).order("date", {ascending: false});
-        setMcShifts(shiftData || []);
-
-        // 7. Mes commissions
-        const {data: commData} = await sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false});
-        setMcCommissions(commData || []);
 
         // 8. Conversations des chatters du manager
         if (_mcIds.length > 0) {
