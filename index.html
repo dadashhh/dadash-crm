@@ -39475,6 +39475,14 @@ function normalizeMessage(raw) {
   const sent = raw._sent || false;
   const error = raw._error || false;
 
+  // ── Meta / call enrichment (Carlos PR #2-3) ──
+  const meta = raw.meta || {};
+  const isCallEnriched = isCall || meta.type === 'call';
+  const callType = meta.call_type || raw.call_status || null;
+  const callDurationVal = meta.duration || raw.call_duration || null;
+  const callMissedVal = !!(callType === 'missed' || raw.missed_call === true);
+  const isVideo = meta.is_video || false;
+
   return {
     _normalized: true,
     // ── Canonical fields ──
@@ -39484,16 +39492,21 @@ function normalizeMessage(raw) {
     date,
     mediaUrl,
     mediaType,
-    isCall,
-    callStatus: raw.call_status || null,
-    callMissed: !!(raw.call_status === 'missed' || raw.missed_call === true),
-    callDuration: raw.call_duration || null,
+    isCall: isCallEnriched,
+    callStatus: callType,
+    callMissed: callMissedVal,
+    callDuration: callDurationVal,
+    callIsVideo: isVideo,
     pending,
     sent,
     error,
-    sender: raw.sender || null,
+    sender: raw.sender || raw.sent_by_name || meta.sent_by_name || null,
+    sentByName: raw.sent_by_name || meta.sent_by_name || null,
+    sentBy: raw.sent_by || meta.sent_by || null,
+    meta: meta,
     // ── Backward-compat fields (mergeMessages, _msgKey, _shouldShowDateSep) ──
     created_at: date,
+    timestamp: date,
     direction: isOutgoing ? 'out' : 'in',
     is_outgoing: isOutgoing,
     _pending: pending,
@@ -39501,6 +39514,8 @@ function normalizeMessage(raw) {
     _error: error,
     media_url: mediaUrl,
     media_type: rawType || null,
+    tg_message_id: raw.tg_message_id || null,
+    message_id: raw.message_id || null,
     // ── Preserved for specific features ──
     conversation_id: raw.conversation_id || null,
     _chatId: raw._chatId || null,
@@ -39618,6 +39633,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const [availableScripts, setAvailableScripts] = useState([]);
   const [isSendingStep, setIsSendingStep] = useState(false);
   const [isSendingMedia, setIsSendingMedia] = useState(false);
+  // Socket.IO enriched states (Carlos PR #1-3)
+  const [readReceipts, setReadReceipts] = useState({}); // { "chatId::modelId": { max_id, read_at } }
+  const [typingUsers, setTypingUsers] = useState({});   // { "chatId::modelId": timestamp }
 
   // Galerie médias
   const [showMediaGallery, setShowMediaGallery] = React.useState(false);
@@ -39630,6 +39648,62 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const [inlineIASuggestions, setInlineIASuggestions] = useState([]);
   const [inlineIALoading, setInlineIALoading] = useState(false);
   const [inlineIAError, setInlineIAError] = useState(null);
+
+  // ── Socket.IO enriched listeners (Carlos PR #1-3) ──
+  useEffect(() => {
+    const socket = window.__dadashSocket;
+    if (!socket) return;
+
+    const onMessageRead = (data) => {
+      if (!data?.chat_id || !data?.max_id) return;
+      const convKey = `${data.chat_id}::${data.model_id || ''}`;
+      setReadReceipts(prev => ({
+        ...prev,
+        [convKey]: { max_id: parseInt(data.max_id, 10), read_at: data.read_at || new Date().toISOString() }
+      }));
+    };
+
+    const onUserTyping = (data) => {
+      if (!data?.chat_id) return;
+      const convKey = `${data.chat_id}::${data.model_id || ''}`;
+      setTypingUsers(prev => {
+        const next = { ...prev };
+        if (data.is_typing) {
+          next[convKey] = Date.now();
+        } else {
+          delete next[convKey];
+        }
+        return next;
+      });
+    };
+
+    socket.on('message_read', onMessageRead);
+    socket.on('user_typing', onUserTyping);
+    return () => {
+      socket.off('message_read', onMessageRead);
+      socket.off('user_typing', onUserTyping);
+    };
+  }, []);
+
+  // Cleanup typing (timeout 5s — auto-remove stale entries)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTypingUsers(prev => {
+        const now = Date.now();
+        const next = {};
+        let changed = false;
+        for (const [key, ts] of Object.entries(prev)) {
+          if (now - ts < 5000) {
+            next[key] = ts;
+          } else {
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // État courant du script = scriptStates[chatId] ou null
   const _scriptChatId = () => selectedConv ? String(_dmsgChatId(selectedConv) || '') : '';
@@ -46614,6 +46688,8 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
           conversation_id: selectedConv.id,
           text: msgInput.trim(),
           sender_profile_id: user?.id || null,
+          sent_by: user?.id || null,
+          sent_by_name: user?.prenom || user?.first_name || user?.name || user?.email || null,
           ...(selectedConv.model_id ? { model_id: selectedConv.model_id } : {}),
         }),
       });
