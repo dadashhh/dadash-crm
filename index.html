@@ -39767,6 +39767,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       });
       setConvLoading(false);
       convLoadedRef.current = true;
+      return; // empêcher le fetch API d'écraser le cache valide
     } else {
       setConvLoading(true);
     }
@@ -39791,7 +39792,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     if (_convApiRes.status === "fulfilled") {
       const data = _convApiRes.value;
       apiList = Array.isArray(data) ? data : (data.conversations || data.data || []);
-      apiOk_ = true;
+      apiOk_ = apiList.length > 0;
+      if (!apiOk_) console.warn("[CONV] Carlos API returned empty array — falling back to Supabase");
     } else {
       console.warn("[CONV] Carlos API error, will use Supabase only:", _convApiRes.reason?.message);
     }
@@ -39900,6 +39902,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       return db - da;
     });
 
+    const prevCacheLen = _DMSG_CONV_CACHE.list.length;
+    if (list.length < prevCacheLen * 0.5 && prevCacheLen > 10) {
+      console.warn(`[CONV] Fetch returned ${list.length} convs vs ${prevCacheLen} cached — keeping cache (probable partial fetch)`);
+      setConvLoading(false);
+      convLoadedRef.current = true;
+      return;
+    }
     convsCache.current = { data: list, lastFetch: now };
     _DMSG_CONV_CACHE.list = list;
     _DMSG_CONV_CACHE.ts = now;
@@ -40916,7 +40925,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       new Date(a.last_message_at || a.updated_at || 0).getTime()
     );
     _DMSG_CONV_CACHE.list = updatedConvs;
-    setConversations(updatedConvs);
+    _DMSG_CONV_CACHE.ts = Date.now();
+    setConversations(prev => {
+      const cacheKeys = new Set(updatedConvs.map(c => _dmsgConvKey(c)).filter(Boolean));
+      const extras = prev.filter(c => {
+        const k = _dmsgConvKey(c);
+        return k && !cacheKeys.has(k);
+      });
+      if (extras.length === 0) return updatedConvs;
+      return [...updatedConvs, ...extras].sort((a, b) =>
+        new Date(b.last_message_at || b.updated_at || 0).getTime() -
+        new Date(a.last_message_at || a.updated_at || 0).getTime()
+      );
+    });
 
     try {
       const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0] || undefined;
