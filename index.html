@@ -6751,18 +6751,27 @@ function _ensureRecharts() {
 // Returns hourly slots for today, or rawData unchanged for other periods.
 // =============================================
 function getChartData(rawData, dateField, valueFields, activePeriod) {
-  const isToday = activePeriod === "Aujourd'hui" || activePeriod === "today" || activePeriod === "24h";
+  const isHourly = activePeriod === "Aujourd'hui" || activePeriod === "today" || activePeriod === "24h";
 
-  if (isToday) {
+  if (isHourly) {
     const now = new Date();
     const currentHour = now.getHours();
+    const todayStr = now.toDateString();
     const slots = [];
 
     for (let h = 0; h <= currentHour; h++) {
       const label = String(h).padStart(2, '0') + 'h';
+      // Use created_at (full ISO timestamp) — tx.date is DATE-only and parses as UTC midnight
       const hourTxs = rawData.filter(item => {
-        const d = new Date(item[dateField]);
-        return d.getHours() === h && d.toDateString() === now.toDateString();
+        const d = new Date(item[dateField] || item.created_at || item.date);
+        if (isNaN(d.getTime())) return false;
+        // For "today": only show today's hours
+        // For "24h": show all filtered TX bucketed by hour (filteredTxs already date-filtered)
+        if (activePeriod === "today" || activePeriod === "Aujourd'hui") {
+          return d.getHours() === h && d.toDateString() === todayStr;
+        }
+        // "24h": just bucket by hour — filteredTxs already contains only last-24h TX
+        return d.getHours() === h;
       });
       const validHour = hourTxs.filter(tx => isValidTx(tx.status));
       const pendingHour = hourTxs.filter(tx => isPendingTx(tx.status));
@@ -8112,7 +8121,7 @@ const computeSpenderBadges = (sp) => {
   const lastTxDate = sortedTx.length > 0 ? new Date(sortedTx[0].date) : (sp.last_purchase_date ? new Date(sp.last_purchase_date) : null);
   const daysSinceLast = lastTxDate ? Math.floor((Date.now() - lastTxDate.getTime()) / 86400000) : Infinity;
   const now30 = Date.now() - 30 * 86400000;
-  const txLast30 = validTxArr.filter(tx => new Date(tx.date).getTime() > now30).length;
+  const txLast30 = validTxArr.filter(tx => new Date(tx.created_at||tx.date).getTime() > now30).length;
   const tierInfo = getBadgeFromSpent(ltv);
   badges.push({ icon: tierInfo.icon, label: tierInfo.label.toUpperCase(), color: tierInfo.color, bg: tierInfo.bg });
   if (daysSinceLast <= 7 && cnt > 0) badges.push({ icon: "🔥", label: "ACTIF", color: "var(--success)", bg: "var(--success-muted)" });
@@ -8133,7 +8142,7 @@ const computeVIPScore = (sp) => {
   const lastTxDate = sortedTx.length > 0 ? new Date(sortedTx[0].date) : (sp.last_purchase_date ? new Date(sp.last_purchase_date) : null);
   const daysSinceLast = lastTxDate ? Math.floor((Date.now() - lastTxDate.getTime()) / 86400000) : 365;
   const now30 = Date.now() - 30 * 86400000;
-  const txLast30 = validTxArr.filter(tx => new Date(tx.date).getTime() > now30).length;
+  const txLast30 = validTxArr.filter(tx => new Date(tx.created_at||tx.date).getTime() > now30).length;
   const ltvScore = Math.min(ltv / 1000, 1) * 40;
   const freqScore = Math.min(txLast30 / 5, 1) * 25;
   const recencyScore = Math.max(1 - daysSinceLast / 90, 0) * 20;
@@ -8674,7 +8683,7 @@ const LogsAuditTab = ({lang, txs, chatterLogs, screenshotChecks, broadcasts, pro
         type: "tx",
         icon: "\u{1F4B0}",
         color: tx.status === "validated" ? "var(--success)" : tx.status === "refused" ? "var(--danger)" : "var(--warning)",
-        date: tx.date || tx.created_at,
+        date: tx.created_at || tx.date,
         title: (fr ? "Transaction " : "Transaction ") + (tx.status === "validated" ? (fr ? "validée" : "validated") : tx.status === "refused" ? (fr ? "refusée" : "refused") : (fr ? "en attente" : "pending")),
         detail: "@" + (tx.spender_handle || "?") + " → " + fmtAmount(Number(tx.amount), tx.currency),
         sub: (profile ? profile.name : "") + (tx.model_id ? "" : ""),
@@ -11515,7 +11524,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     const dFin = dateFin.getTime();
     if (isNaN(dStart) || isNaN(dFin)) return [];
     return allTxs.filter(tx => {
-      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
       if (isNaN(d)) return false;
       if (d < dStart || d > dFin) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
@@ -11528,7 +11537,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     const pFin = prevDateFin.getTime();
     if (isNaN(pStart) || isNaN(pFin)) return [];
     return allTxs.filter(tx => {
-      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
       if (isNaN(d)) return false;
       if (d < pStart || d > pFin) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
@@ -11579,12 +11588,12 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   };
 
   const chartData = useMemo(() => {
-    if (period === "24h") return getChartData(filteredTxs, "date", ["ca_brut", "ca_net", "total", "valid", "pending", "ma_commission", "panier_moyen", "taux_validation"], period);
+    if (period === "24h" || period === "today") return getChartData(filteredTxs, "created_at", ["ca_brut", "ca_net", "total", "valid", "pending", "ma_commission", "panier_moyen", "taux_validation"], period);
     // Build map directly from transactions — O(n) instead of O(days + n)
     // Group by LOCAL date (not UTC) so timezone-aware
     const byDay = {};
     filteredTxs.forEach(tx => {
-      const raw = tx.date || tx.created_at || "";
+      const raw = tx.created_at || tx.date || "";
       if (!raw) return;
       const key = new Date(raw).toLocaleDateString('fr-CA');
       if (!key || key.length < 10) return;
@@ -11616,7 +11625,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     const allEntities = dedupModels([...(allModels || []), ...(modeleProfiles || [])]);
     const result = allEntities.map(m => {
       const mTxs = validFilteredTxs.filter(tx => tx.model_id === m.id);
-      const allMTxs = allTxs.filter(tx => tx.model_id === m.id && isValidTx(tx.status)).sort((a, b) => new Date(b.date || b.created_at) - new Date(a.date || a.created_at));
+      const allMTxs = allTxs.filter(tx => tx.model_id === m.id && isValidTx(tx.status)).sort((a, b) => new Date(b.created_at || b.date) - new Date(a.created_at || a.date));
       const prevMTxs = validPrevFilteredTxs.filter(tx => tx.model_id === m.id);
       const ca = mTxs.reduce((s, tx) => s + txAmountCHF(tx), 0);
       const prevCa = prevMTxs.reduce((s, tx) => s + txAmountCHF(tx), 0);
@@ -11626,7 +11635,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       for (let w = 7; w >= 0; w--) {
         const ws = new Date(); ws.setDate(ws.getDate() - (w + 1) * 7); ws.setHours(0, 0, 0, 0);
         const we = new Date(); we.setDate(we.getDate() - w * 7); we.setHours(23, 59, 59, 999);
-        const wc = allMTxs.filter(tx => { const d = new Date(tx.date || tx.created_at); return d >= ws && d <= we; }).reduce((s, tx) => s + txAmountCHF(tx), 0);
+        const wc = allMTxs.filter(tx => { const d = new Date(tx.created_at || tx.date); return d >= ws && d <= we; }).reduce((s, tx) => s + txAmountCHF(tx), 0);
         weeklyCA.push({ label: `S${8 - w}`, ca: Math.round(wc) });
       }
       return { name: m.name || "—", id: m.id, ca, prevCa, convs, actives, pct: total > 0 ? (ca / total) * 100 : 0, allMTxs, weeklyCA };
@@ -11675,7 +11684,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     });
     allTxs.filter(tx => tx.status === "refused").slice(0, 3).forEach(tx => {
       const m = allModels.find(x => x.id === tx.model_id) || modeleProfiles.find(p => p.id === tx.model_id);
-      const days = Math.floor((Date.now() - new Date(tx.date || tx.created_at).getTime()) / 86400000);
+      const days = Math.floor((Date.now() - new Date(tx.created_at || tx.date).getTime()) / 86400000);
       items.push({ severity: "red", icon: "❌", msg: `TX refusée ${convertAmount(Number(tx.amount), tx.currency).toFixed(0)}${tx.currency || "CHF"} @${tx.spender_handle || "?"} · ${m?.name || "?"}`, days, nav: () => { navigateTo && navigateTo("dashboard"); setPopup(null); } });
     });
     const pendingCount = allTxs.filter(tx => isPendingTx(tx.status)).length;
@@ -11966,7 +11975,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
                 <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
                   <div style={{ textAlign: "right" }}>
                     <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {currencySymbol}</div>
-                    <div style={{ fontSize: 10, color: "#64748b" }}>{new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" })}</div>
+                    <div style={{ fontSize: 10, color: "#64748b" }}>{new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" })}</div>
                   </div>
                   <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: "#f59e0b22", color: "#f59e0b", minWidth: 50, textAlign: "center" }}>PEND.</span>
                 </div>
@@ -12143,7 +12152,7 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
       const spTxs = allTxs.filter(tx => tx.spender_handle === sp.handle);
       if (spTxs.length === 0) return;
       const lastTx = spTxs.reduce((latest, tx) => {
-        const d = new Date(tx.date).getTime();
+        const d = new Date(tx.created_at || tx.date).getTime();
         return d > latest ? d : latest;
       }, 0);
       const totalSpent = spTxs.filter(tx => isValidTx(tx.status)).reduce((s, tx) => s + txAmountCHF(tx), 0);
@@ -12169,13 +12178,13 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
     const days = period === "24h" ? 1 : period === "7j" ? 7 : period === "30j" ? 30 : period === "90j" ? 90 : 99999;
     const ms = days * 86400000;
     const current = allTxs.filter(tx => {
-      const age = now - new Date(tx.date || tx.created_at).getTime();
+      const age = now - new Date(tx.created_at || tx.date).getTime();
       if (age > ms) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
       return true;
     });
     const previous = allTxs.filter(tx => {
-      const age = now - new Date(tx.date || tx.created_at).getTime();
+      const age = now - new Date(tx.created_at || tx.date).getTime();
       if (age < ms || age > ms * 2) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
       return true;
@@ -12204,7 +12213,7 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
       const dayStart = now - (i+1)*86400000;
       const dayEnd = now - i*86400000;
       const dayCA = allTxs.filter(tx => {
-        const t = new Date(tx.date||tx.created_at).getTime();
+        const t = new Date(tx.created_at||tx.date).getTime();
         return t >= dayStart && t < dayEnd && isValidTx(tx.status);
       }).reduce((s,tx) => s + txAmountCHF(tx), 0);
       spark.push(dayCA);
@@ -12251,7 +12260,7 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
       if (!map[h]) map[h] = { handle: h, total: 0, count: 0, lastDate: 0 };
       map[h].total += txAmountCHF(tx);
       map[h].count += 1;
-      const d = new Date(tx.date).getTime();
+      const d = new Date(tx.created_at || tx.date).getTime();
       if (d > map[h].lastDate) map[h].lastDate = d;
     });
     return Object.values(map)
@@ -12303,14 +12312,14 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
   // ═══════════════════════════════════════════════════
   const activityFeed = useMemo(() => {
     return [...allTxs]
-      .sort((a, b) => new Date(b.date) - new Date(a.date))
+      .sort((a, b) => new Date(b.created_at || b.date) - new Date(a.created_at || a.date))
       .slice(0, 10)
       .map(tx => {
         const chatterName = allProfiles.find(p => p.id === tx.chatter_id)?.name || "?";
         const modelName = allModels.find(m => m.id === tx.model_id)?.name || "?";
         const sp = allSpenders.find(s => s.handle === tx.spender_handle);
         const flag = sp && sp.langue ? (LANG_FLAGS[sp.langue] || "") : "";
-        const diff = Date.now() - new Date(tx.date).getTime();
+        const diff = Date.now() - new Date(tx.created_at || tx.date).getTime();
         const mins = Math.floor(diff / 60000);
         const ago = mins < 1 ? (fr ? "maintenant" : "now") : mins < 60 ? `${mins}min` : Math.floor(mins/60) < 24 ? `${Math.floor(mins/60)}h` : `${Math.floor(mins/60/24)}${fr?"j":"d"}`;
         const icon = tx.status === "validated" ? "✅" : tx.status === "refused" ? "❌" : "\u{1F4B0}";
@@ -12853,13 +12862,13 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
       const avgTicket  = validated.length>0 ? Math.round(ca/validated.length) : 0;
       const chatters   = [...new Set(mTxs.map(tx=>tx.chatter_id).filter(Boolean))];
       const now        = Date.now();
-      const last7dCA   = validated.filter(tx=>(now-new Date(tx.date).getTime())<7*86400000).reduce((s,tx)=>s+txAmountCHF(tx),0);
+      const last7dCA   = validated.filter(tx=>(now-new Date(tx.created_at||tx.date).getTime())<7*86400000).reduce((s,tx)=>s+txAmountCHF(tx),0);
       // Weekly CA
       const weeklyCA = [];
       for(let w=7;w>=0;w--){
         const ws=new Date(); ws.setDate(ws.getDate()-ws.getDay()+1-w*7); ws.setHours(0,0,0,0);
         const we=new Date(ws); we.setDate(we.getDate()+6); we.setHours(23,59,59,999);
-        const wCA=validated.filter(tx=>{const d=new Date(tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+txAmountCHF(tx),0);
+        const wCA=validated.filter(tx=>{const d=new Date(tx.created_at||tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+txAmountCHF(tx),0);
         weeklyCA.push({label:`S${8-w}`,ca:Math.round(wCA)});
       }
       const spenderMap={};
@@ -15059,7 +15068,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
   const txChartData = React.useMemo(()=>{
     const g={};
     (_kpiAllTxs||[]).forEach(tx=>{
-      const raw=tx.date||tx.created_at||"";
+      const raw=tx.created_at||tx.date||"";
       if(!raw)return;
       const d=new Date(raw).toLocaleDateString('fr-CA');
       if(!d||d.length<10)return;
@@ -15538,7 +15547,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
                 const canEdit = tx.status === "pending" && (user.role === "gerant" || user.role === "chatter" || (user.role === "provider" && tx.provider_id === user.id));
                 return (
                   <tr key={tx.id} className={`tx-row ${tx.status==="pending"?"pending-row":""} ${tx.status==="cancelled"?"tx-cancelled":""} ${processingIds.has(tx.id)?"status-changing":""}`}>
-                    <td style={{fontFamily:"monospace",fontSize:12,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{(()=>{const d=new Date(tx.date);const tz=timezone||"Europe/Zurich";try{const parts=new Intl.DateTimeFormat("fr-CH",{timeZone:tz,day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(d);const dd=parts.find(p=>p.type==="day")?.value||"";const mm=parts.find(p=>p.type==="month")?.value||"";const hh=parts.find(p=>p.type==="hour")?.value||"";const mi=parts.find(p=>p.type==="minute")?.value||"";return `${dd}.${mm} ${hh}:${mi}`;}catch(e){return formatTxDateTime(tx.date,timezone);}})()}</td>
+                    <td style={{fontFamily:"monospace",fontSize:12,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{(()=>{const d=new Date(tx.created_at||tx.date);const tz=timezone||"Europe/Zurich";try{const parts=new Intl.DateTimeFormat("fr-CH",{timeZone:tz,day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).formatToParts(d);const dd=parts.find(p=>p.type==="day")?.value||"";const mm=parts.find(p=>p.type==="month")?.value||"";const hh=parts.find(p=>p.type==="hour")?.value||"";const mi=parts.find(p=>p.type==="minute")?.value||"";return `${dd}.${mm} ${hh}:${mi}`;}catch(e){return formatTxDateTime(tx.date,timezone);}})()}</td>
                     <td style={{fontSize:14,fontWeight:800,color:"var(--text-primary)",whiteSpace:"nowrap"}}>
                       {(tx.currency||"CHF")==="EUR"
                         ? <span style={{display:"inline-flex",alignItems:"center",gap:5}}><span style={{padding:"2px 5px",borderRadius:5,background:"rgba(249,115,22,0.18)",color:"#F97316",fontSize:10,fontWeight:700}}>EUR</span>{Number(tx.amount||0).toLocaleString("fr-FR",{maximumFractionDigits:0})} EUR{exchangeRate?<span style={{color:"var(--text-tertiary)",fontSize:11,fontWeight:400}}> ({Math.round(Number(tx.amount||0)*exchangeRate).toLocaleString("fr-FR")} CHF)</span>:null}</span>
@@ -16832,7 +16841,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
     const scopedSpenders = spenders.filter(s => !filterModel || s.model_id === filterModel);
     scopedSpenders.forEach(s => {
       (s.txs || []).forEach(tx => {
-        const d = tx.date ? new Date(tx.date).toLocaleDateString('fr-CA', { timeZone: tz }) : null;
+        const d = tx.date ? new Date(tx.created_at||tx.date).toLocaleDateString('fr-CA', { timeZone: tz }) : null;
         if (d && counts[d]) counts[d].actifs.add(s.name);
       });
       const createdDay = s.created_at ? new Date(s.created_at).toLocaleDateString('fr-CA', { timeZone: tz }) : null;
@@ -18873,7 +18882,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
     const rid = versForm.recipient_id;
     const role = versForm.recipient_role;
     const filteredTxs = (txs||[]).filter(tx => {
-      const d = (tx.date||tx.created_at||"").slice(0,10);
+      const d = (tx.created_at||tx.date||"").slice(0,10);
       if (d < from || d > to) return false;
       if (tx.status !== "validated") return false;
       return role === "chatter" ? tx.chatter_id === rid : tx.model_id === rid;
@@ -18895,7 +18904,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
   const getChatterData = (chatterId) => {
     const chTx = payFilteredTxs.filter(tx=>tx.chatter_id===chatterId && isValidTx(tx.status));
     const totalComm = chTx.reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
-    const earnedThisMonth = chTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
+    const earnedThisMonth = chTx.filter(tx=>new Date(tx.created_at||tx.date)>=monthStart).reduce((s,tx)=>s+convertAmount(Number(tx.chatter_commission||0),tx.currency),0);
     const paidAmount = salaireExpenses.filter(e=>e.assigned_to_id===chatterId && e.paid===true).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     const pendingAmount = salaireExpenses.filter(e=>e.assigned_to_id===chatterId && e.paid===false).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     const chPayslips = (payslips||[]).filter(p=>p.user_id===chatterId);
@@ -18906,7 +18915,7 @@ const PayesTab = ({user, lang, txs, payouts, payslips, profiles, models, onRefre
   const getModelData = (modelId) => {
     const mTx = payFilteredTxs.filter(tx=>tx.model_id===modelId && isValidTx(tx.status));
     const totalNet = mTx.reduce((s,tx)=>s+txNetAmountCHF(tx),0);
-    const earnedThisMonth = mTx.filter(tx=>new Date(tx.date)>=monthStart).reduce((s,tx)=>s+txNetAmountCHF(tx),0);
+    const earnedThisMonth = mTx.filter(tx=>new Date(tx.created_at||tx.date)>=monthStart).reduce((s,tx)=>s+txNetAmountCHF(tx),0);
     const paidAmount = salaireExpenses.filter(e=>e.assigned_to_id===modelId && e.paid===true).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     const pendingAmount = salaireExpenses.filter(e=>e.assigned_to_id===modelId && e.paid===false).reduce((s,e)=>s+convertAmount(Number(e.amount),e.currency||"EUR"),0);
     return {totalEarned:totalNet, earnedThisMonth, paidAmount, pendingAmount, balance:totalNet-paidAmount};
@@ -20090,7 +20099,7 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
       for(let w=7;w>=0;w--){
         const ws=new Date(); ws.setDate(ws.getDate()-ws.getDay()+1-w*7); ws.setHours(0,0,0,0);
         const we=new Date(ws); we.setDate(we.getDate()+6); we.setHours(23,59,59,999);
-        const wCA = validTx.filter(tx=>{const d=new Date(tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+txNetAmountCHF(tx),0);
+        const wCA = validTx.filter(tx=>{const d=new Date(tx.created_at||tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+txNetAmountCHF(tx),0);
         weeklyCA.push({label:`S${8-w}`,ca:Math.round(wCA)});
       }
       // CA per model
@@ -20174,7 +20183,7 @@ const ChattersTab = ({user, lang, txs, profiles, models, chatterLogs, onRefresh,
     const mcTx = txs.filter(tx => mc.assignedChatters.some(ch => ch.id === tx.chatter_id));
     const validTx = mcTx.filter(tx => isValidTx(tx.status));
     const pendingTx = mcTx.filter(tx => isPendingTx(tx.status));
-    const weeklyCA = []; for(let w=7;w>=0;w--){ const ws=new Date(); ws.setDate(ws.getDate()-ws.getDay()+1-w*7); ws.setHours(0,0,0,0); const we=new Date(ws); we.setDate(we.getDate()+6); we.setHours(23,59,59,999); const wCA=validTx.filter(tx=>{const d=new Date(tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+txAmountCHF(tx),0); weeklyCA.push({label:`S${8-w}`,ca:Math.round(wCA)}); }
+    const weeklyCA = []; for(let w=7;w>=0;w--){ const ws=new Date(); ws.setDate(ws.getDate()-ws.getDay()+1-w*7); ws.setHours(0,0,0,0); const we=new Date(ws); we.setDate(we.getDate()+6); we.setHours(23,59,59,999); const wCA=validTx.filter(tx=>{const d=new Date(tx.created_at||tx.date);return d>=ws&&d<=we;}).reduce((s,tx)=>s+txAmountCHF(tx),0); weeklyCA.push({label:`S${8-w}`,ca:Math.round(wCA)}); }
     const assignedModels = [...new Set(mc.assignedChatters.flatMap(ch=>(ch.assigned_models||[]).map(m=>m.id)))].map(mid=>models.find(m=>m.id===mid)).filter(Boolean);
     const caByModel = {}; assignedModels.forEach(m=>{ const mCA=validTx.filter(tx=>tx.model_id===m.id).reduce((s,tx)=>s+txAmountCHF(tx),0); caByModel[m.id]={name:m.name,ca:mCA}; });
     const spenders = [...new Set(mcTx.map(tx=>tx.spender_handle).filter(Boolean))];
@@ -20935,7 +20944,7 @@ const ComptaTab = ({user, lang, txs, expenses, expenseCategories, payouts, model
       byMonth[key] = { month: key, label: d.toLocaleDateString("fr-CH", { month: "short", year: "2-digit" }), ca_brut: 0, ca_net: 0, charges: 0, marge_nette: 0 };
     }
     validTxs.forEach(tx => {
-      const key = (tx.date || tx.created_at || "").toString().slice(0, 7);
+      const key = (tx.created_at || tx.date || "").toString().slice(0, 7);
       if (byMonth[key]) {
         byMonth[key].ca_brut += convertAmount(txAmount(tx), tx.currency);
         byMonth[key].ca_net += convertAmount(txNet(tx), tx.currency);
@@ -21717,7 +21726,7 @@ const ResultatsDadashTab = ({user, lang, txs, expenses, payouts, models, profile
       byMonth[key] = { month: key, label: d.toLocaleDateString("fr-CH", { month: "short", year: "2-digit" }), ca_net: 0, commission_dadash: 0, charges_chatters: 0, charges_modeles: 0, resultat_net: 0 };
     }
     validTxs.forEach(tx => {
-      const key = (tx.date || tx.created_at || "").toString().slice(0, 7);
+      const key = (tx.created_at || tx.date || "").toString().slice(0, 7);
       if (byMonth[key]) {
         const net = txNetAmountCHF(tx);
         byMonth[key].ca_net += net;
@@ -21876,13 +21885,13 @@ const computeSpenderProfile = (handle, txs, models, profiles, spenders) => {
   const d7 = new Date(now.getTime()-7*86400000);
   const d30 = new Date(now.getTime()-30*86400000);
   const d90 = new Date(now.getTime()-90*86400000);
-  const ca7d = sTxs.filter(tx=>new Date(tx.date)>=d7).reduce((s,tx)=>s+Number(tx.amount),0);
-  const ca30d = sTxs.filter(tx=>new Date(tx.date)>=d30).reduce((s,tx)=>s+Number(tx.amount),0);
-  const ca90d = sTxs.filter(tx=>new Date(tx.date)>=d90).reduce((s,tx)=>s+Number(tx.amount),0);
+  const ca7d = sTxs.filter(tx=>new Date(tx.created_at||tx.date)>=d7).reduce((s,tx)=>s+Number(tx.amount),0);
+  const ca30d = sTxs.filter(tx=>new Date(tx.created_at||tx.date)>=d30).reduce((s,tx)=>s+Number(tx.amount),0);
+  const ca90d = sTxs.filter(tx=>new Date(tx.created_at||tx.date)>=d90).reduce((s,tx)=>s+Number(tx.amount),0);
 
   // Trend 30d vs previous 30d
   const d60 = new Date(now.getTime()-60*86400000);
-  const caPrev30d = sTxs.filter(tx=>{const d=new Date(tx.date);return d>=d60&&d<d30;}).reduce((s,tx)=>s+Number(tx.amount),0);
+  const caPrev30d = sTxs.filter(tx=>{const d=new Date(tx.created_at||tx.date);return d>=d60&&d<d30;}).reduce((s,tx)=>s+Number(tx.amount),0);
   const trend = caPrev30d>0 ? ((ca30d-caPrev30d)/caPrev30d*100).toFixed(0) : ca30d>0?"new":0;
 
   // Top models (rank + montant)
@@ -21909,7 +21918,7 @@ const computeSpenderProfile = (handle, txs, models, profiles, spenders) => {
   const hourMap = {};
   sTxs.forEach(tx=>{
     if(!tx.date) return;
-    const h = new Date(tx.date).getHours();
+    const h = new Date(tx.created_at||tx.date).getHours();
     hourMap[h] = (hourMap[h]||0) + 1;
   });
 
@@ -21917,12 +21926,12 @@ const computeSpenderProfile = (handle, txs, models, profiles, spenders) => {
   const dayMap = {};
   sTxs.forEach(tx=>{
     if(!tx.date) return;
-    const d = new Date(tx.date).getDay();
+    const d = new Date(tx.created_at||tx.date).getDay();
     dayMap[d] = (dayMap[d]||0) + 1;
   });
 
   // Purchase cadence (avg days between purchases)
-  const dates = sTxs.map(tx=>new Date(tx.date).getTime()).sort((a,b)=>a-b);
+  const dates = sTxs.map(tx=>new Date(tx.created_at||tx.date).getTime()).sort((a,b)=>a-b);
   let cadence = 0;
   if(dates.length>1){
     const gaps = [];
@@ -22898,7 +22907,7 @@ async function resolveInvoiceData(tx, supabaseClient, models) {
   const invoiceData = {
     amount: Number(tx.amount),
     currency: tx.currency || 'CHF',
-    date: tx.date || tx.created_at,
+    date: tx.created_at || tx.date,
     notes: tx.notes || tx.description || (modelName ? `Prestation — ${modelName}` : 'Prestation'),
     txId: tx.id,
   };
@@ -23058,7 +23067,7 @@ const SingleInvoiceModal = ({ tx, open, onClose, onSuccess, lang, models }) => {
               }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
                   <div><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>{fr ? 'Montant' : 'Amount'}</span><div style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{Number(tx.amount).toLocaleString('fr-FR', { maximumFractionDigits: 2 })} {tx.currency || 'CHF'}</div></div>
-                  <div><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>Date</span><div style={{ fontWeight: 600 }}>{tx.date ? new Date(tx.date).toLocaleDateString('fr-FR') : '—'}</div></div>
+                  <div><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>Date</span><div style={{ fontWeight: 600 }}>{tx.date ? new Date(tx.created_at||tx.date).toLocaleDateString('fr-FR') : '—'}</div></div>
                   <div style={{ gridColumn: '1/-1' }}><span style={{ fontSize: 10, color: 'var(--text-quaternary)', textTransform: 'uppercase' }}>Spender</span><div style={{ fontWeight: 600 }}>{tx.spender_handle || '—'}</div></div>
                 </div>
               </div>
@@ -24053,7 +24062,7 @@ const ProviderDashboardTab = ({ user, lang, txs, txsPaginated, providerPayouts: 
 
   const filteredTxs = useMemo(() => {
     return (txs || []).filter(tx => {
-      const d = new Date(tx.date || tx.created_at);
+      const d = new Date(tx.created_at || tx.date);
       return d >= dateDebut && d <= dateFin;
     });
   }, [txs, dateDebut, dateFin]);
@@ -24103,7 +24112,7 @@ const ProviderDashboardTab = ({ user, lang, txs, txsPaginated, providerPayouts: 
     if (period === "24h") return getChartData(filteredTxs, "date", ["ca", "tx", "pending"], period);
     const byDay = {};
     filteredTxs.forEach(tx => {
-      const key = (tx.date || tx.created_at || '').slice(0, 10);
+      const key = (tx.created_at || tx.date || '').slice(0, 10);
       if (!key || key.length < 10) return;
       if (!byDay[key]) byDay[key] = { ca: 0, tx: 0, pending: 0 };
       const amt = convertAmount(Number(tx.amount || 0), tx.currency);
@@ -24294,7 +24303,7 @@ const ProviderDashboardTab = ({ user, lang, txs, txsPaginated, providerPayouts: 
                       <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                         @{tx.spender_handle || '?'}{m ? ` · ${m.name}` : ''}
                       </div>
-                      <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.date || tx.created_at || '').slice(0, 10)}</div>
+                      <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.created_at || tx.date || '').slice(0, 10)}</div>
                     </div>
                     <div style={{ fontSize: 12, fontWeight: 700, color: clr, flexShrink: 0, marginLeft: 8 }}>{ico} {fmtAmount(Number(tx.amount || 0), tx.currency)}</div>
                   </div>
@@ -24688,7 +24697,7 @@ const ProviderFacturesTab = ({ user, lang, txs, providerPayouts: ppData, invoice
                     <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
                       {inv?.invoice_number || (hasInv ? '🧾' : '—')} · @{tx.spender_handle || '?'}{m ? ` · ${m.name}` : ''}
                     </div>
-                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.date || tx.created_at || '').slice(0, 10)}</div>
+                    <div style={{ fontSize: 10, color: 'var(--muted)' }}>{(tx.created_at || tx.date || '').slice(0, 10)}</div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>{fmtAmount(Number(tx.amount || 0), tx.currency)}</span>
@@ -24868,7 +24877,7 @@ const PrestatairesTab = React.memo(({user, lang, txs, models, profiles, onRefres
       if (provPP.length > 0) {
         const delays = provPP.map(pp => {
           const ppDate = new Date(pp.validated_at || pp.created_at);
-          const relevantTxs = validatedTxs.filter(tx => new Date(tx.date) <= ppDate);
+          const relevantTxs = validatedTxs.filter(tx => new Date(tx.created_at||tx.date) <= ppDate);
           if (relevantTxs.length === 0) return 0;
           const lastTx = relevantTxs.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
           return Math.max(0, (ppDate - new Date(lastTx.date)) / 86400000);
@@ -25385,7 +25394,7 @@ const PrestatairesTab = React.memo(({user, lang, txs, models, profiles, onRefres
                   months.push({ year: d.getFullYear(), month: d.getMonth(), label: d.toLocaleDateString("fr-FR", { month: "short", year: "2-digit" }) });
                 }
                 const txChartData = months.map(m => {
-                  const mTxs = selectedProv.pTxs.filter(tx => { const d = new Date(tx.date); return d.getFullYear() === m.year && d.getMonth() === m.month; });
+                  const mTxs = selectedProv.pTxs.filter(tx => { const d = new Date(tx.created_at||tx.date); return d.getFullYear() === m.year && d.getMonth() === m.month; });
                   const validated = mTxs.filter(tx => isValidTx(tx.status));
                   const ca = validated.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
                   return { name: m.label, tx: mTxs.length, ca: Math.round(ca) };
@@ -25400,7 +25409,7 @@ const PrestatairesTab = React.memo(({user, lang, txs, models, profiles, onRefres
                   if (mPP.length === 0) return { name: m.label, delay: 0 };
                   const delays = mPP.map(pp => {
                     const ppDate = new Date(pp.validated_at || pp.created_at);
-                    const validTxs = selectedProv.pTxs.filter(tx => (isValidTx(tx.status)) && new Date(tx.date) <= ppDate);
+                    const validTxs = selectedProv.pTxs.filter(tx => (isValidTx(tx.status)) && new Date(tx.created_at||tx.date) <= ppDate);
                     if (validTxs.length === 0) return 0;
                     const lastTx = validTxs.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
                     return Math.max(0, (ppDate - new Date(lastTx.date)) / 86400000);
@@ -26158,8 +26167,8 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
 
   // ── DATE FILTERS ──
   const now = new Date();
-  const last7d = useMemo(() => txs.filter(tx => (now - new Date(tx.date)) < 7*86400000), [txs]);
-  const last30d = useMemo(() => txs.filter(tx => (now - new Date(tx.date)) < 30*86400000), [txs]);
+  const last7d = useMemo(() => txs.filter(tx => (now - new Date(tx.created_at||tx.date)) < 7*86400000), [txs]);
+  const last30d = useMemo(() => txs.filter(tx => (now - new Date(tx.created_at||tx.date)) < 30*86400000), [txs]);
   const pending = useMemo(() => txs.filter(tx => isPendingTx(tx.status)), [txs]);
   const validated = useMemo(() => txs.filter(tx => isValidTx(tx.status)), [txs]);
 
@@ -26167,7 +26176,7 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
   const recommendations = useMemo(() => {
     const recs = [];
     // Old pending (>48h)
-    const oldPending = pending.filter(tx => (now - new Date(tx.date)) > 48*3600000);
+    const oldPending = pending.filter(tx => (now - new Date(tx.created_at||tx.date)) > 48*3600000);
     if (oldPending.length > 0) {
       recs.push({level:"urgent",icon:"🔴",title:fr?`${oldPending.length} transaction(s) en attente depuis +48h`:`${oldPending.length} transaction(s) pending for 48h+`,desc:fr?"Ces transactions risquent d'expirer. Validez ou refusez-les rapidement.":"These transactions may expire. Validate or refuse them quickly.",action:fr?"Voir les transactions":"View transactions",actionTab:"transactions"});
     }
@@ -26183,7 +26192,7 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
     // Best day of week
     const dayTotals = [0,0,0,0,0,0,0];
     const dayCounts = [0,0,0,0,0,0,0];
-    last30d.forEach(tx => { const d = new Date(tx.date).getDay(); dayTotals[d]+=Number(tx.amount||0); dayCounts[d]++; });
+    last30d.forEach(tx => { const d = new Date(tx.created_at||tx.date).getDay(); dayTotals[d]+=Number(tx.amount||0); dayCounts[d]++; });
     const bestDay = dayTotals.indexOf(Math.max(...dayTotals));
     const dayNamesFr = ["Dimanche","Lundi","Mardi","Mercredi","Jeudi","Vendredi","Samedi"];
     const dayNamesEn = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
@@ -26215,8 +26224,8 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
       const amt = Number(tx.amount||0);
       map[h].total += amt;
       map[h].count++;
-      if ((now - new Date(tx.date)) < 7*86400000) map[h].last7d += amt;
-      const dayKey = new Date(tx.date).toISOString().slice(0,10);
+      if ((now - new Date(tx.created_at||tx.date)) < 7*86400000) map[h].last7d += amt;
+      const dayKey = new Date(tx.created_at||tx.date).toISOString().slice(0,10);
       map[h].byDay[dayKey] = (map[h].byDay[dayKey]||0) + amt;
     });
     const all = Object.values(map);
@@ -26241,8 +26250,8 @@ const AgentsAuditTab = ({lang, txs, models, profiles, onNavigate}) => {
       map[mid].total += Number(tx.amount||0);
       map[mid].count++;
       if(isValidTx(tx.status)) map[mid].validated++;
-      if((now-new Date(tx.date))<7*86400000) map[mid].last7dTotal+=Number(tx.amount||0);
-      if((now-new Date(tx.date))<30*86400000) map[mid].last30dTotal+=Number(tx.amount||0);
+      if((now-new Date(tx.created_at||tx.date))<7*86400000) map[mid].last7dTotal+=Number(tx.amount||0);
+      if((now-new Date(tx.created_at||tx.date))<30*86400000) map[mid].last30dTotal+=Number(tx.amount||0);
     });
     return Object.values(map).map(m => {
       const mod = (models||[]).find(x=>x.id===m.id);
@@ -27582,7 +27591,7 @@ const TransactionSuggestionsTab = ({lang, user, profiles, spenders, onRefresh}) 
         .limit(5);
       if (data && data.length > 0) {
         const sugDate = new Date(s.suggested_date).getTime();
-        const match = data.find(tx => Math.abs(new Date(tx.date).getTime() - sugDate) <= 86400000);
+        const match = data.find(tx => Math.abs(new Date(tx.created_at||tx.date).getTime() - sugDate) <= 86400000);
         if (match) return match;
       }
     }
@@ -28041,7 +28050,7 @@ const SpenderDetailView = ({spenderId, txs, models, profiles, lang}) => {
   const aov = cnt>0?ltv/cnt:0;
   const seg = getSpenderSegment(ltv);
   const {sort, onSort, doSort} = useSortable("date","desc");
-  const sorted = doSort(spTx, {date:tx=>new Date(tx.date), amount:tx=>Number(tx.amount)});
+  const sorted = doSort(spTx, {date:tx=>new Date(tx.created_at||tx.date), amount:tx=>Number(tx.amount)});
   return (
     <div className="fade-in">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
@@ -28144,7 +28153,7 @@ const ModelDetailView = ({modelId, txs, models, profiles, lang}) => {
   const cnt = mTx.length;
   const spenders = [...new Set(mTx.map(tx=>tx.spender_handle))];
   const {sort, onSort, doSort} = useSortable("date","desc");
-  const sorted = doSort(mTx, {date:tx=>new Date(tx.date), amount:tx=>Number(tx.amount)});
+  const sorted = doSort(mTx, {date:tx=>new Date(tx.created_at||tx.date), amount:tx=>Number(tx.amount)});
   return (
     <div className="fade-in">
       <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
@@ -28522,7 +28531,7 @@ const calculateXP = (chatterId, txs, convertAmount) => {
 const calculateStreak = (chatterId, txs) => {
   const dates = txs
     .filter(tx => tx.chatter_id === chatterId && (isValidTx(tx.status)))
-    .map(tx => new Date(tx.date).toISOString().slice(0, 10))
+    .map(tx => new Date(tx.created_at||tx.date).toISOString().slice(0, 10))
     .filter((v, i, a) => a.indexOf(v) === i)
     .sort().reverse();
   if (!dates.length) return 0;
@@ -28555,7 +28564,7 @@ const getWeeklyProgress = (chatterId, txs, convertAmount) => {
   monday.setDate(now.getDate() - ((now.getDay() + 6) % 7));
   monday.setHours(0, 0, 0, 0);
   return txs
-    .filter(tx => tx.chatter_id === chatterId && (isValidTx(tx.status)) && new Date(tx.date) >= monday)
+    .filter(tx => tx.chatter_id === chatterId && (isValidTx(tx.status)) && new Date(tx.created_at||tx.date) >= monday)
     .reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
 };
 
@@ -28748,7 +28757,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
     const dFin = dateFin.getTime();
     if (isNaN(dStart) || isNaN(dFin)) return [];
     return safeArr(allTxs).filter(tx => {
-      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
       if (isNaN(d)) return false;
       if (d < dStart || d > dFin) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
@@ -28761,7 +28770,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
     const pFin = prevDateFin.getTime();
     if (isNaN(pStart) || isNaN(pFin)) return [];
     return safeArr(allTxs).filter(tx => {
-      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
       if (isNaN(d)) return false;
       if (d < pStart || d > pFin) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
@@ -28795,8 +28804,8 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
     const _now = new Date();
     const _monthStart = new Date(_now.getFullYear(), _now.getMonth(), 1);
     const _30dAgo = new Date(_now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const txCeMois = safeArr(allTxs).filter(tx => new Date(tx.date || tx.created_at) >= _monthStart).length;
-    const spendersActifs = new Set(safeArr(allTxs).filter(tx => new Date(tx.date || tx.created_at) >= _30dAgo).map(tx => tx.spender_handle).filter(Boolean)).size;
+    const txCeMois = safeArr(allTxs).filter(tx => new Date(tx.created_at || tx.date) >= _monthStart).length;
+    const spendersActifs = new Set(safeArr(allTxs).filter(tx => new Date(tx.created_at || tx.date) >= _30dAgo).map(tx => tx.spender_handle).filter(Boolean)).size;
     return {
       caBrut, caNet, txCount, txPending, caBrutPending, panierMoyen, tauxValidation,
       maCommission, txCeMois, spendersActifs,
@@ -28821,7 +28830,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
     // O(n) — build directly from transactions, no day-by-day pre-fill loop
     const byDay = {};
     filteredTxs.forEach(tx => {
-      const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
+      const key = (tx.created_at || tx.date || "").toString().slice(0, 10);
       if (!key || key.length < 10) return;
       if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
       const amtBrut = convertAmount(Number(tx.amount || 0), tx.currency);
@@ -28853,7 +28862,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
     const isVal = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee";
     const result = safeArr(myModels).map(m => {
       const mTxs = safeArr(allTxs).filter(tx => tx.model_id === m.id);
-      const monthTxs = mTxs.filter(tx => { const d = new Date(tx.date || tx.created_at); return d >= mStart && d <= mEnd; });
+      const monthTxs = mTxs.filter(tx => { const d = new Date(tx.created_at || tx.date); return d >= mStart && d <= mEnd; });
       const validMonthTxs = monthTxs.filter(tx => isVal(tx.status));
       const caMois = validMonthTxs.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
       const nbTxMois = monthTxs.length;
@@ -29028,7 +29037,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
                   React.createElement("div", { style: { width: 32, height: 32, borderRadius: 8, background: isVal ? "var(--gs)" : isPend ? "var(--ams)" : "var(--rs)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, flexShrink: 0 } }, isVal ? "✅" : isPend ? "⏳" : "❌"),
                   React.createElement("div", { style: { flex: 1, minWidth: 0 } },
                     React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "var(--text-ds)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "@" + (tx.spender_handle || "?") + " · " + modelName),
-                    React.createElement("div", { style: { fontSize: 10, color: "var(--muted-ds)" } }, (tx.date || tx.created_at || "").toString().slice(0, 10) + " · " + (tx.product || "—"))
+                    React.createElement("div", { style: { fontSize: 10, color: "var(--muted-ds)" } }, (tx.created_at || tx.date || "").toString().slice(0, 10) + " · " + (tx.product || "—"))
                   ),
                   React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color, flexShrink: 0 } }, convertAmount(Number(tx.net_amount || 0), tx.currency).toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol)
                 );
@@ -29252,7 +29261,7 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
       return React.createElement("div", { key: tx.id || i, style: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" } },
         React.createElement("div", { style: { flex: 1, minWidth: 0 } },
           React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "@" + (tx.spender_handle || "?") + " · " + (m ? m.name : "?")),
-          React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" }))
+          React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" }))
         ),
         React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0, marginLeft: 8 } },
           React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color: sc } }, "+" + convertAmount(Number(tx.net_amount || 0), tx.currency).toFixed(0) + " " + (tx.currency || currencySymbol)),
@@ -29418,7 +29427,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const txChartData = useMemo(()=>{
     const map = {};
     myTxs.forEach(tx=>{
-      const raw = tx.date || tx.created_at || "";
+      const raw = tx.created_at || tx.date || "";
       const d = raw ? new Date(raw).toLocaleDateString('fr-CA') : "?";
       if(!map[d]) map[d]={label:d,validated:0,pending:0,nbV:0,nbP:0};
       const amt = txNetAmountCHF(tx);
@@ -37067,7 +37076,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
                             {tx.note && <span style={{ fontSize: 9, color: "#6b7280", fontWeight: 400, marginLeft: 4 }}>{tx.note}</span>}
                           </div>
                           <div style={{ fontSize: 9, color: "#4b5563" }}>
-                            {(tx.date || tx.created_at) ? new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH") : "—"}
+                            {(tx.created_at || tx.date) ? new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH") : "—"}
                           </div>
                         </div>
                         <div style={{ textAlign: "right", flexShrink: 0 }}>
@@ -43286,7 +43295,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                                 {tx.note && <span style={{ fontSize: 9, color: "var(--text-tertiary)", fontWeight: 400, marginLeft: 4 }}>{tx.note}</span>}
                               </div>
                               <div style={{ fontSize: 9, color: "var(--text-quaternary)" }}>
-                                {(tx.date || tx.created_at) ? new Date(tx.date || tx.created_at).toLocaleDateString("fr-CH") : "—"}
+                                {(tx.created_at || tx.date) ? new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH") : "—"}
                               </div>
                             </div>
                             <div style={{ textAlign: "right", flexShrink: 0 }}>
@@ -47525,7 +47534,7 @@ const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayout
   const monthLabel = now.toLocaleDateString(fr?"fr-FR":"en-US",{month:"long",year:"numeric"});
 
   const commissionsThisMonth = useMemo(() => {
-    return myTxs.filter(tx=>new Date(tx.date||tx.created_at||0)>=monthStart).reduce((s,tx)=>{
+    return myTxs.filter(tx=>new Date(tx.created_at||tx.date||0)>=monthStart).reduce((s,tx)=>{
       const amt = Number(tx.amount||0);
       const cur = tx.currency||"EUR";
       const stored = Number(tx.chatter_commission||0);
@@ -49540,7 +49549,7 @@ const ChatterCommissionTab = ({user, lang, txs, models}) => {
                 const model = (models || []).find(m => m.id === tx.model_id);
                 return (
                   <tr key={tx.id}>
-                    <td style={{ whiteSpace: "nowrap" }}>{fmtDate(tx.date || tx.created_at)}</td>
+                    <td style={{ whiteSpace: "nowrap" }}>{fmtDate(tx.created_at || tx.date)}</td>
                     <td>{tx.spender_handle || "—"}</td>
                     <td>{model?.name || "—"}</td>
                     <td style={{ fontWeight: 700 }}>{fmtAmount(net, tx.currency || "EUR")}</td>
@@ -49589,12 +49598,12 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
     return chatters.map(ch => {
       const ctx = getChatterContext(ch, models);
       const chModelIds = ctx.assignedModelIds;
-      const chTxs = allTxs.filter(tx => (chModelIds.includes(tx.model_id) || tx.chatter_id === ch.id) && new Date(tx.date || 0) >= periodFilter && new Date(tx.date || 0) < periodEnd);
+      const chTxs = allTxs.filter(tx => (chModelIds.includes(tx.model_id) || tx.chatter_id === ch.id) && new Date(tx.created_at || tx.date || 0) >= periodFilter && new Date(tx.created_at || tx.date || 0) < periodEnd);
       const validTxs = chTxs.filter(tx => isValidTx(tx.status));
       const ca = validTxs.reduce((s, tx) => s + convertAmount(Number(txNetAmount(tx)), tx.currency || "EUR"), 0);
       const nbTx = chTxs.length;
       const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 3600000);
-      const spenderHandles = new Set(chTxs.filter(tx => new Date(tx.date || 0) >= thirtyDaysAgo).map(tx => tx.spender_handle).filter(Boolean));
+      const spenderHandles = new Set(chTxs.filter(tx => new Date(tx.created_at || tx.date || 0) >= thirtyDaysAgo).map(tx => tx.spender_handle).filter(Boolean));
       const activeSpenders = spenderHandles.size;
       const allSpenderHandles = new Set(allTxs.filter(tx => chModelIds.includes(tx.model_id) || tx.chatter_id === ch.id).map(tx => tx.spender_handle).filter(Boolean));
       const totalSpenders = allSpenderHandles.size;
@@ -49661,8 +49670,8 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-    const txsThisMonth = validMyTxs.filter(tx => { const d = new Date(tx.date || 0); return d >= monthStart && d < monthEnd; });
-    const allMonthsWithTx = [...new Set(validMyTxs.map(tx => { const d = new Date(tx.date || 0); return d.getMonth() + d.getFullYear() * 12; }))].sort((a,b)=>a-b);
+    const txsThisMonth = validMyTxs.filter(tx => { const d = new Date(tx.created_at || tx.date || 0); return d >= monthStart && d < monthEnd; });
+    const allMonthsWithTx = [...new Set(validMyTxs.map(tx => { const d = new Date(tx.created_at || tx.date || 0); return d.getMonth() + d.getFullYear() * 12; }))].sort((a,b)=>a-b);
     const isFirstMonthEver = allMonthsWithTx.length > 0 && allMonthsWithTx[0] === (now.getMonth() + now.getFullYear() * 12);
     const rookieOfMonth = txsThisMonth.length > 0 && isFirstMonthEver;
 
@@ -49685,7 +49694,7 @@ const ChatterCompetitionTab = ({user, lang, txs, spenders, models, profiles}) =>
       const mStart = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const mEnd = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
       const label = mStart.toLocaleDateString(fr ? "fr-FR" : "en-US", { month: "short" });
-      const mTxs = allTxs.filter(tx => (chModelIds.includes(tx.model_id) || tx.chatter_id === user.id) && new Date(tx.date || 0) >= mStart && new Date(tx.date || 0) < mEnd);
+      const mTxs = allTxs.filter(tx => (chModelIds.includes(tx.model_id) || tx.chatter_id === user.id) && new Date(tx.created_at || tx.date || 0) >= mStart && new Date(tx.created_at || tx.date || 0) < mEnd);
       const valid = mTxs.filter(tx => isValidTx(tx.status));
       const ca = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency || "EUR"), 0);
       const spH = new Set(mTxs.map(tx => tx.spender_handle).filter(Boolean)).size;
@@ -51106,7 +51115,7 @@ const AgencyHealthScore = ({txs, profiles}) => {
   const score = useMemo(() => {
     let s = 100;
     const now = Date.now();
-    const pendingOld = txs.filter(tx => tx.status === "pending" && (now - new Date(tx.date).getTime()) > 24 * 3600000);
+    const pendingOld = txs.filter(tx => tx.status === "pending" && (now - new Date(tx.created_at||tx.date).getTime()) > 24 * 3600000);
     s -= Math.min(pendingOld.length * 2, 20);
     const decided = txs.filter(tx => tx.status !== "pending");
     const validated = txs.filter(tx => isValidTx(tx.status));
@@ -51114,7 +51123,7 @@ const AgencyHealthScore = ({txs, profiles}) => {
     if (convRate < 60) s -= 15; else if (convRate < 75) s -= 5;
     const chatters = profiles.filter(p => p.role === "chatter");
     const weekAgo = now - 7 * 86400000;
-    const inactiveChatters = chatters.filter(ch => !txs.some(tx => tx.chatter_id === ch.id && new Date(tx.date).getTime() > weekAgo));
+    const inactiveChatters = chatters.filter(ch => !txs.some(tx => tx.chatter_id === ch.id && new Date(tx.created_at||tx.date).getTime() > weekAgo));
     s -= Math.min(inactiveChatters.length * 5, 15);
     return Math.max(0, Math.min(100, Math.round(s)));
   }, [txs, profiles]);
@@ -51150,8 +51159,8 @@ const AgencyAchievements = ({txs, profiles, models, expenses, convertAmount}) =>
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const monday = new Date(now); monday.setDate(now.getDate() - ((now.getDay() + 6) % 7)); monday.setHours(0, 0, 0, 0);
     const validated = txs.filter(tx => isValidTx(tx.status));
-    const monthlyCA = validated.filter(tx => new Date(tx.date) >= monthStart).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
-    const weeklyTxCount = txs.filter(tx => new Date(tx.date) >= monday && (isValidTx(tx.status))).length;
+    const monthlyCA = validated.filter(tx => new Date(tx.created_at||tx.date) >= monthStart).reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+    const weeklyTxCount = txs.filter(tx => new Date(tx.created_at||tx.date) >= monday && (isValidTx(tx.status))).length;
     const modelStats = models.map(m => {
       const mTxs = validated.filter(tx => tx.model_id === m.id);
       const ca = mTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
@@ -51160,7 +51169,7 @@ const AgencyAchievements = ({txs, profiles, models, expenses, convertAmount}) =>
     });
     const highMarginModels = modelStats.filter(m => m.margin >= 80).length;
     const now48h = Date.now() - 48 * 3600000;
-    const oldPending = txs.filter(tx => tx.status === "pending" && new Date(tx.date).getTime() < now48h).length;
+    const oldPending = txs.filter(tx => tx.status === "pending" && new Date(tx.created_at||tx.date).getTime() < now48h).length;
     const chatters = profiles.filter(p => p.role === "chatter");
     const allGoalsMet = chatters.length > 0 && chatters.every(ch => {
       const goal = Number(ch.daily_goal) || 500;
@@ -51169,7 +51178,7 @@ const AgencyAchievements = ({txs, profiles, models, expenses, convertAmount}) =>
     });
     const allStreaks7 = chatters.length > 0 && chatters.every(ch => calculateStreak(ch.id, txs) >= 7);
     const spenderWeekly = {};
-    txs.filter(tx => new Date(tx.date) >= monday && (isValidTx(tx.status))).forEach(tx => {
+    txs.filter(tx => new Date(tx.created_at||tx.date) >= monday && (isValidTx(tx.status))).forEach(tx => {
       const k = tx.spender_handle || "?";
       spenderWeekly[k] = (spenderWeekly[k] || 0) + convertAmount(Number(tx.amount), tx.currency);
     });
@@ -51207,7 +51216,7 @@ const ActivityHeatmap = ({txs, convertAmount, currencySymbol}) => {
     const data = {};
     txs.forEach(tx => {
       if (isValidTx(tx.status)) {
-        const day = new Date(tx.date).toISOString().slice(0, 10);
+        const day = new Date(tx.created_at||tx.date).toISOString().slice(0, 10);
         if (!data[day]) data[day] = 0;
         data[day] += convertAmount(Number(tx.amount), tx.currency);
       }
@@ -51288,7 +51297,7 @@ const ChallengesSection = ({user, lang, txs, profiles, convertAmount, currencySy
     const end = new Date(ch.end_date);
     const chatters = profiles.filter(p => p.role === "chatter");
     return chatters.map(chatter => {
-      const cTxs = txs.filter(tx => tx.chatter_id === chatter.id && new Date(tx.date) >= start && new Date(tx.date) <= end && (isValidTx(tx.status)));
+      const cTxs = txs.filter(tx => tx.chatter_id === chatter.id && new Date(tx.created_at||tx.date) >= start && new Date(tx.created_at||tx.date) <= end && (isValidTx(tx.status)));
       let val = 0;
       if (ch.metric === "ca") val = cTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
       else if (ch.metric === "tx_count") val = cTxs.length;
@@ -55993,7 +56002,7 @@ const IAInsightsPage = ({ user, txs, spenders, profiles, models, lang, onNavigat
     const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
     const whaleSpenders = allSpenders.filter((sp) => {
       const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
-      const recent = spTxs.filter((tx) => new Date(tx.date || tx.created_at).getTime() >= thirtyDaysAgo);
+      const recent = spTxs.filter((tx) => new Date(tx.created_at || tx.date).getTime() >= thirtyDaysAgo);
       const total = spTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
       const maxTx = spTxs.length > 0 ? Math.max(...spTxs.map((tx) => convertAmount(Number(tx.amount || 0), tx.currency))) : 0;
       return recent.length >= 3 && total >= 100 && total < 500 && maxTx < 100;
@@ -56009,12 +56018,12 @@ const IAInsightsPage = ({ user, txs, spenders, profiles, models, lang, onNavigat
     const churnSpenders = allSpenders.filter((sp) => {
       const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
       if (spTxs.length === 0) return false;
-      const lastTx = Math.max(...spTxs.map((tx) => new Date(tx.date || tx.created_at).getTime()));
+      const lastTx = Math.max(...spTxs.map((tx) => new Date(tx.created_at || tx.date).getTime()));
       return lastTx < fourteenDaysAgo;
     }).map((sp) => {
       const spTxs = validTxs.filter((tx) => tx.spender_handle === sp.handle);
       const total = spTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-      const lastTxTime = Math.max(...spTxs.map((tx) => new Date(tx.date || tx.created_at).getTime()));
+      const lastTxTime = Math.max(...spTxs.map((tx) => new Date(tx.created_at || tx.date).getTime()));
       const daysInactive = Math.floor((now - lastTxTime) / (24 * 60 * 60 * 1000));
       return { handle: sp.handle, total: Math.round(total), daysInactive };
     }).sort((a, b) => b.total - a.total);
@@ -56038,7 +56047,7 @@ const IAInsightsPage = ({ user, txs, spenders, profiles, models, lang, onNavigat
     // 4. Best Time — grouper TX validées par heure
     const hourBuckets = {};
     validTxs.forEach((tx) => {
-      const h = new Date(tx.date || tx.created_at).getHours();
+      const h = new Date(tx.created_at || tx.date).getHours();
       if (!hourBuckets[h]) hourBuckets[h] = { hour: h, count: 0, ca: 0 };
       hourBuckets[h].count += 1;
       hourBuckets[h].ca += convertAmount(Number(tx.amount || 0), tx.currency);
@@ -56071,10 +56080,10 @@ const IAInsightsPage = ({ user, txs, spenders, profiles, models, lang, onNavigat
     const dayOfMonth = today.getDate();
     const daysLeft = daysInMonth - dayOfMonth;
     const last7Start = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const last7Txs = validTxs.filter((tx) => new Date(tx.date || tx.created_at) >= last7Start);
+    const last7Txs = validTxs.filter((tx) => new Date(tx.created_at || tx.date) >= last7Start);
     const last7CA = last7Txs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
     const avgPerDay = last7CA / 7;
-    const monthTxs = validTxs.filter((tx) => new Date(tx.date || tx.created_at) >= monthStart);
+    const monthTxs = validTxs.filter((tx) => new Date(tx.created_at || tx.date) >= monthStart);
     const monthCA = monthTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
     const projection = Math.round(monthCA + avgPerDay * daysLeft);
     const modelBreakdown = (models || []).map((m) => {
@@ -56331,7 +56340,7 @@ const UserSearchModal = ({open, onClose, lang, user, txs, spenders, onNavigate})
       const notes  = tx.notes || "";
       if (handle.toLowerCase().includes(q) || notes.toLowerCase().includes(q) || String(tx.amount).includes(q)) {
         const statusColors = {pending:"#F59E0B",validated:"#10B981",refused:"#EF4444",en_attente:"#F59E0B",validee:"#10B981",refusee:"#EF4444",confirmee:"#10B981"};
-        out.push({cat:"transactions", type:"tx", id:tx.id, label:handle + " — " + fmtAmount(tx.amount, tx.currency), icon:"\u{1F4B0}", sub:tx.status, meta:tx.date ? new Date(tx.date).toLocaleDateString("fr-FR") : "", statusColor: statusColors[tx.status] || "#6B7280"});
+        out.push({cat:"transactions", type:"tx", id:tx.id, label:handle + " — " + fmtAmount(tx.amount, tx.currency), icon:"\u{1F4B0}", sub:tx.status, meta:tx.date ? new Date(tx.created_at||tx.date).toLocaleDateString("fr-FR") : "", statusColor: statusColors[tx.status] || "#6B7280"});
       }
     });
     // Spenders (chatter only)
@@ -59171,7 +59180,7 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
   const filteredTxs = useMemo(() => {
     return mcTxs.filter(tx => {
       if (!isValidTx(tx.status) && !isPendingTx(tx.status)) return false;
-      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
       if (d < dateDebut.getTime() || d > dateFin.getTime()) return false;
       if (chatterFilter !== "all" && tx.chatter_id !== chatterFilter) return false;
       return true;
@@ -59181,7 +59190,7 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
   const prevFilteredTxs = useMemo(() => {
     return mcTxs.filter(tx => {
       if (!isValidTx(tx.status) && !isPendingTx(tx.status)) return false;
-      const d = new Date(tx.date || tx.created_at || 0).getTime();
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
       if (d < prevDateDebut.getTime() || d > prevDateFin.getTime()) return false;
       if (chatterFilter !== "all" && tx.chatter_id !== chatterFilter) return false;
       return true;
@@ -59415,7 +59424,7 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
               <div key={tx.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{fontSize:12,fontWeight:600,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>@{tx.spender_handle||"?"} · {mName||"?"}</div>
-                  <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{chName} · {new Date(tx.date||tx.created_at).toLocaleDateString("fr-CH",{day:"2-digit",month:"short"})}</div>
+                  <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{chName} · {new Date(tx.created_at||tx.date).toLocaleDateString("fr-CH",{day:"2-digit",month:"short"})}</div>
                 </div>
                 <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2,flexShrink:0,marginLeft:8}}>
                   <span style={{fontSize:13,fontWeight:700,color:sc}}>+{fmtAmount(Number(tx.net_amount||0),tx.currency)}</span>
@@ -59479,8 +59488,8 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
   else if (mcTxFilter==="validated") filtered=filtered.filter(tx=>isValidTx(tx.status));
   else if (mcTxFilter==="refused") filtered=filtered.filter(tx=>tx.status==="refused");
   if (mcTxChatterFilter!=="all") filtered=filtered.filter(tx=>tx.chatter_id===mcTxChatterFilter);
-  if (mcTxPeriod==="week") filtered=filtered.filter(tx=>new Date(tx.date||tx.created_at)>=weekAgo);
-  else if (mcTxPeriod==="month") filtered=filtered.filter(tx=>new Date(tx.date||tx.created_at)>=monthStart);
+  if (mcTxPeriod==="week") filtered=filtered.filter(tx=>new Date(tx.created_at||tx.date)>=weekAgo);
+  else if (mcTxPeriod==="month") filtered=filtered.filter(tx=>new Date(tx.created_at||tx.date)>=monthStart);
   const caValidated = mcTxs.filter(tx=>isValidTx(tx.status)).reduce((s,tx)=>s+convertAmount(txNetAmount(tx),tx.currency),0);
   const caPending = mcTxs.filter(tx=>isPendingTx(tx.status)).reduce((s,tx)=>s+convertAmount(txNetAmount(tx),tx.currency),0);
   const pendingCount = mcTxs.filter(tx=>isPendingTx(tx.status)).length;
@@ -59538,7 +59547,7 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
                   const isPending = isPendingTx(tx.status);
                   return (
                     <tr key={tx.id}>
-                      <td>{new Date(tx.date||tx.created_at).toLocaleDateString("fr-FR")}</td>
+                      <td>{new Date(tx.created_at||tx.date).toLocaleDateString("fr-FR")}</td>
                       <td style={{fontWeight:600}}>{tx.spender_handle||tx.spender_name||"—"}</td>
                       <td style={{fontWeight:700}}>{fmtAmount(Number(tx.amount||0),tx.currency)}</td>
                       <td style={{fontWeight:700,color:"var(--success)"}}>{fmtAmount(Number(tx.net_amount||0),tx.currency)}</td>
@@ -59656,7 +59665,7 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
 
     const periodTxs = mcTxs.filter(tx => {
       if (!isValidTx(tx.status)) return false;
-      const d = new Date(tx.date||tx.created_at);
+      const d = new Date(tx.created_at||tx.date);
       return d >= start && d <= end;
     });
     const caNetPeriod = periodTxs.reduce((s,tx) => s+convertAmount(txNetAmount(tx),tx.currency),0);
