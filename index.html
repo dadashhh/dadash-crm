@@ -6760,21 +6760,27 @@ function getChartData(rawData, dateField, valueFields, activePeriod) {
 
     for (let h = 0; h <= currentHour; h++) {
       const label = String(h).padStart(2, '0') + 'h';
-      const slot = { time: label };
-
-      valueFields.forEach(field => {
-        slot[field] = rawData.filter(item => {
-          const d = new Date(item[dateField]);
-          return d.getHours() === h &&
-                 d.toDateString() === now.toDateString();
-        }).length;
+      const hourTxs = rawData.filter(item => {
+        const d = new Date(item[dateField]);
+        return d.getHours() === h && d.toDateString() === now.toDateString();
       });
-
-      slots.push(slot);
+      const validHour = hourTxs.filter(tx => isValidTx(tx.status));
+      const pendingHour = hourTxs.filter(tx => isPendingTx(tx.status));
+      slots.push({
+        time: label,
+        ca_brut: Math.round(validHour.reduce((s, tx) => s + txAmountCHF(tx), 0)),
+        ca_net: Math.round(validHour.reduce((s, tx) => s + txNetAmountCHF(tx), 0)),
+        total: hourTxs.length,
+        valid: validHour.length,
+        pending: pendingHour.length,
+        ma_commission: Math.round(validHour.reduce((s, tx) => s + txConvertCHF(Number(tx.chatter_commission || 0), tx), 0)),
+        transactions: Math.round(pendingHour.reduce((s, tx) => s + txAmountCHF(tx), 0)),
+        panier_moyen: validHour.length > 0 ? Math.round(validHour.reduce((s, tx) => s + txAmountCHF(tx), 0) / validHour.length) : 0,
+        taux_validation: (validHour.length + pendingHour.length) > 0 ? Math.round((validHour.length / (validHour.length + pendingHour.length)) * 100) : 0,
+      });
     }
     return slots;
   } else {
-    // Groupement par JOUR (logique existante — ne pas changer)
     return rawData;
   }
 }
@@ -9473,12 +9479,12 @@ const getViewerTimezone = (user) => (user?.timezone && String(user.timezone).tri
 const fmtDate = (d) => {
   if(!d) return "";
   const dt = new Date(d);
-  return dt.toLocaleDateString("fr-CH", { timeZone: 'Europe/Zurich', day:"2-digit", month:"2-digit", year:"numeric" });
+  return dt.toLocaleDateString("fr-CH", { timeZone: getUserTimezone(), day:"2-digit", month:"2-digit", year:"numeric" });
 };
 const fmtTime = (d) => {
   if(!d) return "";
   const dt = new Date(d);
-  return dt.toLocaleTimeString("fr-CH",{hour:"2-digit",minute:"2-digit", timeZone: 'Europe/Zurich'});
+  return dt.toLocaleTimeString("fr-CH",{hour:"2-digit",minute:"2-digit", timeZone: getUserTimezone()});
 };
 const fmtDayTime = (d) => {
   if(!d) return "";
@@ -11412,7 +11418,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const soldeGerant = useMemo(() => {
     const caTotal = (txs || [])
       .filter(t => isValidTx(t.status))
-      .reduce((s, t) => s + convertAmount(Number(t.amount || 0), t.currency), 0);
+      .reduce((s, t) => s + txAmountCHF(t), 0);
     const alreadyPaid = (providerPayouts || [])
       .filter(p => p.status === 'validated')
       .reduce((s, p) => s + Number(p.amount || 0), 0);
@@ -11556,10 +11562,12 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const chartData = useMemo(() => {
     if (period === "24h") return getChartData(filteredTxs, "date", ["ca_brut", "ca_net", "total", "valid", "pending", "ma_commission", "panier_moyen", "taux_validation"], period);
     // Build map directly from transactions — O(n) instead of O(days + n)
-    // Avoids up to 99999 date iterations for "All time" period
+    // Group by LOCAL date (not UTC) so timezone-aware
     const byDay = {};
     filteredTxs.forEach(tx => {
-      const key = (tx.date || tx.created_at || "").toString().slice(0, 10);
+      const raw = tx.date || tx.created_at || "";
+      if (!raw) return;
+      const key = new Date(raw).toLocaleDateString('fr-CA');
       if (!key || key.length < 10) return;
       if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
       const amt = txAmountCHF(tx);
@@ -11641,7 +11649,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     const items = [];
     allProfiles.filter(p => p.role === "provider").forEach(prov => {
       const validated = allTxs.filter(tx => tx.provider_id === prov.id && (isValidTx(tx.status)));
-      const totalCA = validated.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+      const totalCA = validated.reduce((s, tx) => s + txAmountCHF(tx), 0);
       const paid = (providerPayouts || []).filter(p => p.provider_id === prov.id).reduce((s, p) => s + Number(p.amount || 0), 0);
       const unpaid = totalCA - paid;
       if (unpaid > 100) items.push({ severity: "red", icon: "🔴", msg: `${prov.name} : ${unpaid.toLocaleString("fr-FR", { maximumFractionDigits: 0 })} ${currencySymbol} non reversés`, ongoing: true, nav: () => { navigateTo && navigateTo("equipe", "providers"); setPopup(null); } });
@@ -15022,8 +15030,10 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
   const txChartData = React.useMemo(()=>{
     const g={};
     (_kpiAllTxs||[]).forEach(tx=>{
-      const d=(tx.date||tx.created_at||"").slice(0,10);
-      if(!d)return;
+      const raw=tx.date||tx.created_at||"";
+      if(!raw)return;
+      const d=new Date(raw).toLocaleDateString('fr-CA');
+      if(!d||d.length<10)return;
       if(!g[d])g[d]={day:d,validated:0,pending:0,nbV:0,nbP:0};
       const a=txAmountCHF(tx);
       if(isValidTx(tx.status)){g[d].validated+=a;g[d].nbV++;}
@@ -27520,7 +27530,7 @@ const TransactionSuggestionsTab = ({lang, user, profiles, spenders, onRefresh}) 
     return p ? (p.name || p.email || pid.slice(0,8)) : pid.slice(0,8) + "...";
   };
 
-  const fmtDt = (d) => d ? new Date(d).toLocaleString("fr-CH", { timeZone:"Europe/Zurich", day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" }) : "—";
+  const fmtDt = (d) => d ? new Date(d).toLocaleString("fr-CH", { timeZone:getUserTimezone(), day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" }) : "—";
 
   const checkDuplicate = async (s) => {
     if (s.suggestion_type !== "create") return null;
@@ -29379,9 +29389,10 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const txChartData = useMemo(()=>{
     const map = {};
     myTxs.forEach(tx=>{
-      const d = tx.date ? tx.date.slice(0,10) : "?";
+      const raw = tx.date || tx.created_at || "";
+      const d = raw ? new Date(raw).toLocaleDateString('fr-CA') : "?";
       if(!map[d]) map[d]={label:d,validated:0,pending:0,nbV:0,nbP:0};
-      const amt = txNetAmount(tx);
+      const amt = txNetAmountCHF(tx);
       if(isValidTx(tx.status)){ map[d].validated+=amt; map[d].nbV++; }
       else if(isPendingTx(tx.status)){ map[d].pending+=amt; map[d].nbP++; }
     });
