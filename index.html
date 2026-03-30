@@ -8517,6 +8517,7 @@ const GERANT_NAV = [
   { id: "messagerie",icon: "\u2709\uFE0F",        label: "Messagerie" },
   // DISABLED PR8 — will restore later: { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
   // DISABLED PR8 — will restore later: { id: "bots",      icon: "\u{1F916}", label: "Bots" },
+  { id: "gestion",   icon: "\u{1F4CB}", label: "Gestion" },
   { id: "scripts",   icon: "\ud83c\udfac",        label: "Scripts" },
   { id: "admin",     icon: "\u{1F511}", label: "Admin" },
 ];
@@ -11422,7 +11423,241 @@ const DashTabs = ({ tabs, active, onSelect }) => (
   </div>
 );
 
-const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spenders, providerPayouts, providerPaymentMethods, botStats, alerts, navigateTo, navigateToSpender, onDismissAlert, onToggleAlertRead, alertsReading, onPeriodChange, onModelFilterChange, onDateRangeChange }) => {
+// ═══ GESTION PAGE V2 — Todo + Modèles actifs + Alertes + Agenda ═══
+const GestionPage = React.memo(({ user, lang, txs, models, profiles, alerts, onDismissAlert, onToggleAlertRead, alertsReading, navigateTo }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const { convertAmount, currencySymbol } = useCurrency();
+
+  // ── TODOS ──
+  const [todos, setTodos] = useState([]);
+  const [newTodoText, setNewTodoText] = useState("");
+  const [newTodoPriority, setNewTodoPriority] = useState("P1");
+  useEffect(() => {
+    (async () => {
+      try { const { data } = await sb.from("todos").select("*").order("created_at", { ascending: false }).limit(100); if (data) setTodos(data); } catch (e) {}
+    })();
+  }, []);
+  const addTodo = async () => {
+    const text = newTodoText.trim(); if (!text) return; setNewTodoText("");
+    const tempId = "tmp-" + Date.now();
+    setTodos(prev => [{ id: tempId, text, done: false, priority: newTodoPriority, created_at: new Date().toISOString() }, ...prev]);
+    try { const { data } = await sb.from("todos").insert({ text, created_by: user?.id, priority: newTodoPriority }).select(); if (data?.[0]) setTodos(prev => prev.map(t => t.id === tempId ? data[0] : t)); } catch (e) {}
+  };
+  const toggleTodo = async (id) => { const t = todos.find(x => x.id === id); if (!t) return; setTodos(prev => prev.map(x => x.id === id ? { ...x, done: !x.done } : x)); try { await sb.from("todos").update({ done: !t.done }).eq("id", id); } catch (e) {} };
+  const deleteTodo = async (id) => { setTodos(prev => prev.filter(x => x.id !== id)); try { await sb.from("todos").delete().eq("id", id); } catch (e) {} };
+
+  // ── MODELES ACTIFS ──
+  const modeleProfiles = React.useMemo(() => {
+    const allP = (profiles || []).filter(p => p.role === "modele");
+    const allM = models || [];
+    return dedupModels([...allM, ...allP]);
+  }, [profiles, models]);
+  const modelColors = ["#f97316","#a855f7","#06b6d4","#ef4444","#eab308","#22c55e","#3b82f6","#ec4899"];
+
+  // ── AGENDA (from shifts/scheduling if available) ──
+  const [agenda, setAgenda] = useState([]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        const { data } = await sb.from("shifts").select("*").gte("date", today).lte("date", today).order("start_time", { ascending: true });
+        if (data && data.length > 0) {
+          setAgenda(data.map(s => ({
+            id: s.id, time: `${s.start_time || "?"} – ${s.end_time || "?"}`,
+            who: (profiles || []).find(p => p.id === s.chatter_id)?.name || "?",
+            models: (s.model_ids || []).map(mid => (models || []).find(m => m.id === mid)?.name || modeleProfiles.find(m => m.id === mid)?.name || "?"),
+            type: "shift", current: false,
+          })));
+        }
+      } catch (e) {}
+    })();
+  }, [profiles, models, modeleProfiles]);
+
+  const cardStyle = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "18px 22px", marginBottom: 18 };
+  const sectionTitle = (icon, text) => React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 14, display: "flex", alignItems: "center", gap: 8 } }, icon, " ", text);
+  const prioColors = { P0: "#f87171", P1: "#fb923c", P2: "#22d3ee", P3: "#8b95b0" };
+
+  return React.createElement("div", { style: { padding: "20px 28px", maxWidth: 1200, margin: "0 auto" } },
+    // Header
+    React.createElement("div", { style: { marginBottom: 22 } },
+      React.createElement("h2", { style: { fontSize: 22, fontWeight: 800, color: "var(--text)", margin: 0 } }, "\u{1F4CB} Gestion"),
+      React.createElement("p", { style: { fontSize: 12, color: "var(--muted)", marginTop: 4 } }, fr ? "Todo, modèles actifs, alertes et agenda du jour" : "Todos, active models, alerts and today's agenda")
+    ),
+
+    // Grid layout — 2 columns
+    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18, alignItems: "start" } },
+
+      // ── LEFT COLUMN ──
+      React.createElement("div", null,
+        // TODO LIST
+        React.createElement("div", { style: cardStyle },
+          sectionTitle("✅", fr ? "Todo list" : "Todo list"),
+          // Add form
+          React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 14 } },
+            React.createElement("select", {
+              value: newTodoPriority, onChange: e => setNewTodoPriority(e.target.value),
+              style: { background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 8, padding: "7px 10px", fontSize: 12, color: prioColors[newTodoPriority] || "var(--text)", fontWeight: 700, cursor: "pointer" }
+            }, ["P0","P1","P2","P3"].map(p => React.createElement("option", { key: p, value: p }, p))),
+            React.createElement("input", {
+              value: newTodoText, onChange: e => setNewTodoText(e.target.value),
+              onKeyDown: e => e.key === "Enter" && addTodo(),
+              placeholder: fr ? "Nouvelle tâche..." : "New task...",
+              style: { flex: 1, background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 8, padding: "7px 14px", fontSize: 13, color: "var(--text)", outline: "none" }
+            }),
+            React.createElement("button", { onClick: addTodo, style: { background: "#818cf8", color: "white", border: "none", borderRadius: 8, padding: "7px 14px", fontSize: 13, fontWeight: 700, cursor: "pointer" } }, "+")
+          ),
+          // Todo items
+          todos.filter(t => !t.done).map(t => React.createElement("div", {
+            key: t.id, style: { display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }
+          },
+            React.createElement("input", { type: "checkbox", checked: t.done, onChange: () => toggleTodo(t.id), style: { cursor: "pointer", accentColor: "#818cf8" } }),
+            React.createElement("span", { style: { fontSize: 11, fontWeight: 800, color: prioColors[t.priority] || "#8b95b0", minWidth: 26 } }, t.priority || "P1"),
+            React.createElement("span", { style: { flex: 1, fontSize: 13, color: "var(--text)" } }, t.text),
+            React.createElement("button", { onClick: () => deleteTodo(t.id), style: { background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: 14, padding: "2px 6px" } }, "✕")
+          )),
+          // Done section
+          todos.filter(t => t.done).length > 0 && React.createElement("div", { style: { marginTop: 12 } },
+            React.createElement("div", { style: { fontSize: 11, color: "var(--muted)", marginBottom: 6, fontWeight: 600 } }, fr ? `✓ ${todos.filter(t => t.done).length} terminée(s)` : `✓ ${todos.filter(t => t.done).length} done`),
+            todos.filter(t => t.done).slice(0, 5).map(t => React.createElement("div", {
+              key: t.id, style: { display: "flex", alignItems: "center", gap: 10, padding: "5px 0", opacity: 0.5 }
+            },
+              React.createElement("input", { type: "checkbox", checked: true, onChange: () => toggleTodo(t.id), style: { cursor: "pointer" } }),
+              React.createElement("span", { style: { flex: 1, fontSize: 12, color: "var(--muted)", textDecoration: "line-through" } }, t.text)
+            ))
+          )
+        ),
+
+        // AGENDA DU JOUR
+        React.createElement("div", { style: cardStyle },
+          sectionTitle("\u{1F4C5}", fr ? "Agenda du jour" : "Today's agenda"),
+          agenda.length === 0
+            ? React.createElement("div", { style: { fontSize: 12, color: "var(--muted)", padding: "12px 0" } }, fr ? "Aucun shift programmé aujourd'hui" : "No shifts scheduled today")
+            : agenda.map(a => React.createElement("div", {
+                key: a.id, style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }
+              },
+                React.createElement("div", { style: { minWidth: 110, fontSize: 12, fontWeight: 700, color: a.current ? "#818cf8" : "var(--text)" } }, a.time),
+                React.createElement("div", { style: { fontSize: 13, color: "var(--text)" } }, a.who),
+                React.createElement("div", { style: { display: "flex", gap: 4 } },
+                  (a.models || []).map((mn, i) => React.createElement("span", {
+                    key: i, style: { background: "#818cf815", color: "#818cf8", padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 600 }
+                  }, mn))
+                )
+              ))
+        )
+      ),
+
+      // ── RIGHT COLUMN ──
+      React.createElement("div", null,
+        // MODELES ACTIFS
+        React.createElement("div", { style: cardStyle },
+          sectionTitle("\u{1F469}", fr ? "Modèles actifs" : "Active models"),
+          React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 } },
+            modeleProfiles.map((m, idx) => {
+              const mColor = modelColors[idx % modelColors.length];
+              const mTxs = (txs || []).filter(t => t.model_id === m.id && isValidTx(t.status));
+              const mPending = (txs || []).filter(t => t.model_id === m.id && isPendingTx(t.status));
+              const ca = mTxs.reduce((s, t) => s + txAmountCHF(t), 0);
+              return React.createElement("div", {
+                key: m.id, onClick: () => navigateTo && navigateTo("equipe", "modeles"),
+                style: { background: "var(--surface2)", borderRadius: 12, padding: "14px 16px", cursor: "pointer", border: `1px solid ${mColor}20`, transition: "all 0.15s" },
+                onMouseEnter: e => e.currentTarget.style.borderColor = mColor + "60",
+                onMouseLeave: e => e.currentTarget.style.borderColor = mColor + "20",
+              },
+                React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 8 } },
+                  React.createElement("span", { style: { width: 28, height: 28, borderRadius: "50%", background: mColor + "25", color: mColor, fontSize: 12, fontWeight: 800, display: "inline-flex", alignItems: "center", justifyContent: "center" } }, (m.name || "?")[0]),
+                  React.createElement("span", { style: { fontSize: 14, fontWeight: 700, color: "var(--text)" } }, m.name || "—")
+                ),
+                React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--muted)" } },
+                  React.createElement("span", null, `${mTxs.length} TX`),
+                  React.createElement("span", { style: { color: mPending.length > 0 ? "#fb923c" : "var(--muted)" } }, `${mPending.length} pending`),
+                  React.createElement("span", { style: { fontWeight: 700, color: mColor } }, `${Math.round(ca)} CHF`)
+                )
+              );
+            })
+          )
+        ),
+
+        // ALERTES
+        React.createElement("div", { style: cardStyle },
+          sectionTitle("\u{1F514}", fr ? "Alertes" : "Alerts"),
+          (!alerts || alerts.length === 0)
+            ? React.createElement("div", { style: { fontSize: 12, color: "var(--muted)", padding: "12px 0" } }, fr ? "Aucune alerte" : "No alerts")
+            : (alerts || []).slice(0, 10).map(a => {
+                const typeColors = { danger: "#f87171", warning: "#fb923c", info: "#818cf8", success: "#34d399" };
+                const c = typeColors[a.type] || "#8b95b0";
+                const isRead = alertsReading && alertsReading.has(a.id);
+                return React.createElement("div", {
+                  key: a.id, style: { display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.04)", opacity: isRead ? 0.5 : 1 }
+                },
+                  React.createElement("span", { style: { width: 8, height: 8, borderRadius: "50%", background: c, marginTop: 5, flexShrink: 0, boxShadow: `0 0 6px ${c}55` } }),
+                  React.createElement("div", { style: { flex: 1 } },
+                    React.createElement("div", { style: { fontSize: 12, color: "var(--text)", lineHeight: 1.4 } }, a.message || a.text || "—"),
+                    React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 3 } }, a.created_at ? new Date(a.created_at).toLocaleString("fr-CH", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "")
+                  ),
+                  React.createElement("div", { style: { display: "flex", gap: 4, flexShrink: 0 } },
+                    onToggleAlertRead && React.createElement("button", { onClick: () => onToggleAlertRead(a.id), style: { background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "var(--muted)", padding: 4 } }, isRead ? "👁️" : "✓"),
+                    onDismissAlert && React.createElement("button", { onClick: () => onDismissAlert(a.id), style: { background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "var(--muted)", padding: 4 } }, "✕")
+                  )
+                );
+              })
+        )
+      )
+    )
+  );
+});
+
+// ═══ DASHBOARD V2 — FilterPill dropdown component ═══
+const DashFilterPill = ({ label, options, value, onChange, color }) => {
+  const [open, setOpen] = React.useState(false);
+  const ref = React.useRef(null);
+  const isActive = value !== options[0]?.value && value !== "" && value !== undefined;
+  const displayColor = isActive ? (color || "#818cf8") : "var(--muted)";
+  const displayLabel = isActive ? (options.find(o => o.value === value)?.label || value) : label;
+  React.useEffect(() => {
+    if (!open) return;
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+  return React.createElement("div", { ref, style: { position: "relative", display: "inline-block" } },
+    React.createElement("button", {
+      onClick: () => setOpen(!open),
+      style: {
+        display: "flex", alignItems: "center", gap: 6,
+        background: isActive ? displayColor + "15" : "transparent",
+        border: `1.5px solid ${isActive ? displayColor : "var(--border)"}`,
+        borderRadius: 20, padding: "5px 14px", fontSize: 12, cursor: "pointer",
+        color: isActive ? displayColor : "var(--muted)", fontWeight: isActive ? 700 : 400,
+        transition: "all 0.15s",
+      }
+    },
+      isActive && React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", background: displayColor } }),
+      displayLabel,
+      React.createElement("span", { style: { fontSize: 10, opacity: 0.6, marginLeft: 2 } }, "\u25BE")
+    ),
+    open && React.createElement("div", {
+      style: {
+        position: "absolute", top: "100%", left: 0, marginTop: 4, zIndex: 50,
+        background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10,
+        padding: 4, minWidth: 180, boxShadow: "0 8px 30px rgba(0,0,0,0.4)",
+      }
+    },
+      options.map(opt => React.createElement("div", {
+        key: opt.value, onClick: () => { onChange(opt.value); setOpen(false); },
+        style: {
+          padding: "8px 14px", borderRadius: 6, cursor: "pointer", fontSize: 12,
+          color: opt.value === value ? "var(--text)" : "var(--text-secondary)", fontWeight: opt.value === value ? 700 : 400,
+          background: opt.value === value ? "#818cf815" : "transparent",
+        },
+        onMouseEnter: (e) => { if (opt.value !== value) e.currentTarget.style.background = "var(--surface2)"; },
+        onMouseLeave: (e) => { if (opt.value !== value) e.currentTarget.style.background = "transparent"; },
+      }, opt.label))
+    )
+  );
+};
+
+const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spenders, providerPayouts, providerPaymentMethods, botStats, alerts, navigateTo, navigateToSpender, onDismissAlert, onToggleAlertRead, alertsReading, onPeriodChange, onModelFilterChange, onDateRangeChange, onStatusFilterChange, onProviderFilterChange, onChatterFilterChange }) => {
   const { convertAmount, currencySymbol } = useCurrency();
   const timezone = useTimezone();
   const addToast = useToast();
@@ -11441,6 +11676,14 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   const setModelFilter = (m) => { _setModelFilter(m); onModelFilterChange && onModelFilterChange(m === "all" ? "" : m); };
   const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut", "ca_net"]));
   const [chartView, setChartView] = useState("curve");
+
+  // ── V2 Dashboard Filters (status / provider / chatter / method) ──
+  const [dashStatusFilter, setDashStatusFilter] = useState("");
+  const [dashProviderFilter, setDashProviderFilter] = useState("");
+  const [dashChatterFilter, setDashChatterFilter] = useState("");
+  const handleStatusFilter = (v) => { setDashStatusFilter(v); onStatusFilterChange && onStatusFilterChange(v); };
+  const handleProviderFilter = (v) => { setDashProviderFilter(v); onProviderFilterChange && onProviderFilterChange(v); };
+  const handleChatterFilter = (v) => { setDashChatterFilter(v); onChatterFilterChange && onChatterFilterChange(v); };
 
   // ── MON SOLDE Gérant ──
   const [equipeOwed, setEquipeOwed] = useState(0);
@@ -11604,9 +11847,13 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       if (isNaN(d)) return false;
       if (d < dStart || d > dFin) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      // V2 filters
+      if (dashStatusFilter && !((dashStatusFilter === "validated" && isValidTx(tx.status)) || (dashStatusFilter === "pending" && isPendingTx(tx.status)) || (dashStatusFilter === "refused" && isRefusedTx(tx.status)))) return false;
+      if (dashProviderFilter && tx.provider_id !== dashProviderFilter) return false;
+      if (dashChatterFilter && tx.chatter_id !== dashChatterFilter) return false;
       return true;
     });
-  }, [allTxs, dateDebut, dateFin, modelFilter]);
+  }, [allTxs, dateDebut, dateFin, modelFilter, dashStatusFilter, dashProviderFilter, dashChatterFilter]);
 
   const prevFilteredTxs = useMemo(() => {
     const pStart = prevDateDebut.getTime();
@@ -11809,36 +12056,92 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
           placeholder="Période personnalisée"
         />
         <div className="filter-sep"/>
-        <select value={modelFilter} onChange={e => setModelFilter(e.target.value)} className="f-select">
-          <option value="all">Tous les modèles</option>
-          {modelOptions.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
-        </select>
+        {/* Model pills V2 */}
+        <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
+          <button onClick={() => setModelFilter("all")} style={{
+            background: modelFilter === "all" ? "var(--surface)" : "transparent",
+            border: `1.5px solid ${modelFilter === "all" ? "#818cf8" : "var(--border)"}`,
+            borderRadius: 20, padding: "5px 14px", fontSize: 12, cursor: "pointer",
+            color: modelFilter === "all" ? "var(--text)" : "var(--muted)", fontWeight: modelFilter === "all" ? 600 : 400,
+          }}>Tous les modèles</button>
+          {modelOptions.map(m => {
+            const isAct = modelFilter === m.id;
+            const mColor = ["#f97316","#a855f7","#06b6d4","#ef4444","#eab308","#22c55e"][modelOptions.indexOf(m) % 6];
+            return (
+              <button key={m.id} onClick={() => setModelFilter(isAct ? "all" : m.id)} style={{
+                background: isAct ? mColor + "20" : "transparent",
+                border: `1.5px solid ${isAct ? mColor : "var(--border)"}`,
+                borderRadius: 20, padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                color: isAct ? mColor : "var(--muted)", fontWeight: isAct ? 700 : 400,
+                display: "flex", alignItems: "center", gap: 5,
+              }}>
+                <span style={{ width: 16, height: 16, borderRadius: "50%", background: mColor + "30", color: mColor, fontSize: 10, fontWeight: 800, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{(m.name || "?")[0]}</span>
+                {m.name}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      {/* 2. KPI STRIP — style .kpi-card unifié */}
+      {/* V2 — Status / Provider / Chatter filter pills */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+        <DashFilterPill label="Tous les statuts" value={dashStatusFilter} onChange={handleStatusFilter}
+          color={dashStatusFilter === "validated" ? "#34d399" : dashStatusFilter === "pending" ? "#fb923c" : dashStatusFilter === "refused" ? "#f87171" : undefined}
+          options={[
+            { value: "", label: "Tous les statuts" },
+            { value: "validated", label: "Validée" },
+            { value: "pending", label: "En attente" },
+            { value: "refused", label: "Refusée / Annulée" },
+          ]} />
+        <DashFilterPill label="Tous les providers" value={dashProviderFilter} onChange={handleProviderFilter} color="#818cf8"
+          options={[{ value: "", label: "Tous les providers" }, ...(allProfiles.filter(p => p.role === "provider").map(p => ({ value: p.id, label: p.name || "—" })))]} />
+        <DashFilterPill label="Tous les chatters" value={dashChatterFilter} onChange={handleChatterFilter} color="#a78bfa"
+          options={[{ value: "", label: "Tous les chatters" }, ...(allProfiles.filter(p => p.role === "chatter" || p.role === "manager_chatter").map(p => ({ value: p.id, label: p.name || "—" })))]} />
+        {/* Reset button */}
+        {(dashStatusFilter || dashProviderFilter || dashChatterFilter || modelFilter !== "all") && (
+          <button onClick={() => { handleStatusFilter(""); handleProviderFilter(""); handleChatterFilter(""); setModelFilter("all"); }} style={{
+            display: "flex", alignItems: "center", gap: 4, background: "#f8717115", border: "1px solid #f8717140",
+            borderRadius: 20, padding: "5px 12px", fontSize: 11, cursor: "pointer", color: "#f87171", fontWeight: 600,
+          }}>✕ Reset filtres</button>
+        )}
+      </div>
+
+      {/* 2. KPI STRIP — V2: click = filtre TX, double-click = drill panel */}
       {(()=>{
-        const _metricColorMap = {ca_brut:"indigo", ca_net:"green", transactions:"amber", tx_pending:"amber", panier_moyen:"white", taux_validation:"green"};
+        const _metricColorMap = {ca_brut:"indigo", ca_net:"green", transactions:"amber", tx_pending:"amber", tx_cancelled:"red", ca_cancelled:"red", panier_moyen:"white", taux_validation:"green"};
         const _deltaKeys = {ca_brut:"deltaCaBrut",ca_net:"deltaCaNet",transactions:"deltaCaBrutPending",tx_pending:"deltaTxPending",panier_moyen:"deltaPanier",taux_validation:"deltaTaux"};
+        // Map KPI id → status filter value
+        const _kpiToStatus = { ca_brut: "validated", ca_net: "validated", transactions: "pending", tx_pending: "pending", tx_cancelled: "refused", ca_cancelled: "refused" };
         return (
           <div className={_isMobile ? "kpi-row cols-2" : "kpi-row cols-7"} style={{ marginBottom: 18 }}>
             {DASHBOARD_METRICS.map(m => {
               const val = m.calc(kpiData);
               const delta = kpiData[_deltaKeys[m.id]];
               const colorClass = _metricColorMap[m.id] || "white";
-              const isPendingListCard = m.id === "tx_pending";
-              const handleClick = m.inGraph ? () => toggleMetric(m.id) : isPendingListCard ? () => setPopup("pending_list") : undefined;
-              const isActive = m.inGraph && activeMetrics.has(m.id);
+              const filterStatus = _kpiToStatus[m.id];
+              // Click = filter TX by status (toggle) + also toggle graph metric
+              const handleClick = () => {
+                if (filterStatus) handleStatusFilter(dashStatusFilter === filterStatus ? "" : filterStatus);
+                if (m.inGraph) toggleMetric(m.id);
+                if (m.id === "tx_pending") setPopup("pending_list");
+              };
+              const isFilterActive = filterStatus && dashStatusFilter === filterStatus;
+              const isGraphActive = m.inGraph && activeMetrics.has(m.id);
               return (
                 <div key={m.id} onClick={handleClick}
                   className={`kpi-card ${colorClass}`}
-                  style={{cursor: handleClick?"pointer":undefined, boxShadow: isActive ? `0 0 0 2px ${m.color}` : undefined}}>
+                  style={{
+                    cursor: "pointer",
+                    boxShadow: isFilterActive ? `0 0 0 2px ${m.color}, 0 0 20px ${m.color}15` : isGraphActive ? `0 0 0 2px ${m.color}` : undefined,
+                    transition: "all 0.2s",
+                  }}>
                   <div className="kpi-card-label">{m.label}</div>
                   <div className={`kpi-card-value ${colorClass}`}>{fmtVal(m.id, val)}</div>
                   {delta!=null && !isNaN(delta) && (
                     <div className={`kpi-card-delta ${delta>=0?"up":"down"}`}>{delta>=0?"↑":"↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>
                   )}
-                  {m.inGraph && <div className="kpi-card-hint">Cliquer → graphe</div>}
-                  {isPendingListCard && <div className="kpi-card-hint">Cliquer → liste</div>}
+                  {isFilterActive && <div className="kpi-card-hint" style={{color:m.color}}>🔍 Filtre actif</div>}
+                  {!isFilterActive && m.inGraph && <div className="kpi-card-hint">Cliquer → filtre + graphe</div>}
                 </div>
               );
             })}
@@ -14964,7 +15267,7 @@ const UnifiedSpenderModal = React.memo(({
 // =============================================
 // TRANSACTIONS TAB
 // =============================================
-const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, txTotal: initialTotal, models, profiles, dbSpenders, onRefresh, onNotify, products, productTags, modelPrices, providerPaymentMethods, navigateToSpender, setTxs, setTxSummary, dashboardMode, dashboardPeriod, dashboardModel, dashboardDateStart, dashboardDateEnd}) => {
+const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, txTotal: initialTotal, models, profiles, dbSpenders, onRefresh, onNotify, products, productTags, modelPrices, providerPaymentMethods, navigateToSpender, setTxs, setTxSummary, dashboardMode, dashboardPeriod, dashboardModel, dashboardDateStart, dashboardDateEnd, dashboardStatus, dashboardProvider, dashboardChatter}) => {
   const addToast = useToast();
   const setProofLightboxUrl = useProofLightbox();
   const { convertAmount, fmtAmount, currencySymbol, exchangeRate } = useCurrency();
@@ -15000,6 +15303,19 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
     if (!dashboardMode) return;
     setModel(dashboardModel || "");
   }, [dashboardModel, dashboardMode]);
+  // V2: sync dashboard status/provider/chatter filters
+  useEffect(() => {
+    if (!dashboardMode) return;
+    setStatus(dashboardStatus || "");
+  }, [dashboardStatus, dashboardMode]);
+  useEffect(() => {
+    if (!dashboardMode) return;
+    setTxProvider(dashboardProvider || "");
+  }, [dashboardProvider, dashboardMode]);
+  useEffect(() => {
+    if (!dashboardMode) return;
+    setChatter(dashboardChatter || "");
+  }, [dashboardChatter, dashboardMode]);
   const [showForm, setShowForm] = useState(false);
   const [saving, setSaving] = useState(false);
   const [form, setForm] = useState({spender_handle:"",telegram_id:"",amount:"",currency:"CHF",model_id:"",chatter_id:user.id,provider_id:"",product:"",tag:"","product_id":"",product_tag_id:"",notes:"",payment_method:"",product_contents:Array()});
@@ -60468,6 +60784,10 @@ const App = () => {
   const [dashDateStart, setDashDateStart] = useState("");
   const [dashDateEnd, setDashDateEnd] = useState("");
   const handleDashDateRange = useCallback((s, e) => { setDashDateStart(s || ""); setDashDateEnd(e || ""); }, []);
+  // V2 dashboard filters
+  const [dashStatusFilter, setDashStatusFilter] = useState("");
+  const [dashProviderFilter, setDashProviderFilter] = useState("");
+  const [dashChatterFilter, setDashChatterFilter] = useState("");
   const [fabOpen, setFabOpen] = useState(false);
   const [fabSpenderModal, setFabSpenderModal] = useState(false);
   const [fabTodoModal, setFabTodoModal] = useState(false);
@@ -62160,7 +62480,7 @@ const App = () => {
       case "spenders":
         navigateTo("business","spenders"); return null;
       case "dashboard":
-        return <><DashboardRedesign user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} botStats={botStats} alerts={alerts} navigateTo={navigateTo} navigateToSpender={navigateToSpender} onDismissAlert={dismissAlert} onToggleAlertRead={toggleAlertRead} alertsReading={alertsReading} onPeriodChange={setDashPeriod} onModelFilterChange={setDashModelFilter} onDateRangeChange={handleDashDateRange} /><TransactionsTab user={user} lang={lang} txs={txs} txSummary={txSummary} txTotal={txTotal} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} dashboardMode={true} dashboardPeriod={dashPeriod} dashboardModel={dashModelFilter} dashboardDateStart={dashDateStart} dashboardDateEnd={dashDateEnd} /></>;
+        return <><DashboardRedesign user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} spenders={spenders} providerPayouts={providerPayouts} providerPaymentMethods={providerPaymentMethods} botStats={botStats} alerts={alerts} navigateTo={navigateTo} navigateToSpender={navigateToSpender} onDismissAlert={dismissAlert} onToggleAlertRead={toggleAlertRead} alertsReading={alertsReading} onPeriodChange={setDashPeriod} onModelFilterChange={setDashModelFilter} onDateRangeChange={handleDashDateRange} onStatusFilterChange={setDashStatusFilter} onProviderFilterChange={setDashProviderFilter} onChatterFilterChange={setDashChatterFilter} /><TransactionsTab user={user} lang={lang} txs={txs} txSummary={txSummary} txTotal={txTotal} models={models} profiles={profiles} dbSpenders={spenders} onRefresh={onRefresh} onNotify={createNotification} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} navigateToSpender={navigateToSpender} setTxs={setTxs} setTxSummary={setTxSummary} dashboardMode={true} dashboardPeriod={dashPeriod} dashboardModel={dashModelFilter} dashboardDateStart={dashDateStart} dashboardDateEnd={dashDateEnd} dashboardStatus={dashStatusFilter} dashboardProvider={dashProviderFilter} dashboardChatter={dashChatterFilter} /></>;
       case "business":
         // Redirect legacy business/catalogue → equipe/catalogue
         if (subTab === "catalogue") { navigateTo("equipe", "catalogue"); return null; }
@@ -62214,6 +62534,8 @@ const App = () => {
           {subTab==="ia_insights"&&<IAInsightsPage user={user} txs={txSummary} spenders={spenders} profiles={profiles} models={models} lang={lang} onNavigate={navigateTo} />}
         </>);
       */
+      case "gestion":
+        return <GestionPage user={user} lang={lang} txs={txSummary} models={models} profiles={profiles} alerts={alerts} onDismissAlert={dismissAlert} onToggleAlertRead={toggleAlertRead} alertsReading={alertsReading} navigateTo={navigateTo} />;
       case "scripts":
         return <ScriptsPage user={user} lang={lang} />;
       case "admin":
