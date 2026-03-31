@@ -13411,6 +13411,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const [modalTab,        setModalTab]        = useState("performance");
   const [hoveredCard,     setHoveredCard]     = useState(null);
   const [saving,          setSaving]          = useState(false);
+  const [gerantPassportModel, setGerantPassportModel] = useState(null);
   const [modalSaving,     setModalSaving]     = useState(false);
   const [showNewModel,    setShowNewModel]    = useState(false);
   const [newModelName,    setNewModelName]    = useState("");
@@ -13837,8 +13838,8 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
                 {/* ACTIONS */}
                 <div className="ma-actions" onClick={e=>e.stopPropagation()}>
                   <button className="ma-act primary" onClick={()=>{setModalModel(m.id);setModalTab("performance");}}>📊 Stats</button>
+                  <button className="ma-act" style={{borderColor:"rgba(168,85,247,0.4)",color:"#a855f7"}} onClick={()=>{ const full = models.find(x=>x.id===m.id); if(full) setGerantPassportModel(full); }}>📋 Fiche</button>
                   <button className="ma-act" onClick={()=>{setModalModel(m.id);setModalTab("parametres");}}>✏️ Éditer</button>
-                  <button className="ma-act" onClick={()=>{setModalModel(m.id);setModalTab("performance");}}>👥 Chatters</button>
                   <button className="ma-act" style={{borderColor:"rgba(16,185,129,0.4)",color:"#10b981"}} onClick={()=>{setModalModel(m.id);setModalTab("paiements");setPiTabM("create");}}>💰 Payer</button>
                 </div>
               </div>
@@ -13886,6 +13887,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
                       <div style={{fontSize:20,fontWeight:900,color:soldeDu>0?"var(--warning)":"var(--success)"}}>{soldeDu>0?`${Math.round(soldeDu).toLocaleString()} CHF`:"✅ À jour"}</div>
                       {mPend.length>0&&<div style={{fontSize:11,color:"var(--danger)",fontWeight:700,marginTop:2}}>{"🔔"} {mPend.length} en attente</div>}
                     </div>
+                    <button onClick={(e)=>{e.stopPropagation();const full=models.find(x=>x.id===selM.id);if(full)setGerantPassportModel(full);}} style={{padding:"7px 14px",borderRadius:9,border:"1px solid rgba(168,85,247,0.4)",background:"rgba(168,85,247,0.1)",color:"#c4b5fd",fontSize:12,fontWeight:600,cursor:"pointer"}}>📋 Fiche</button>
                     <button onClick={()=>setModalModel(null)} style={{background:"var(--surface2)",border:"1px solid var(--border)",fontSize:14,cursor:"pointer",color:"var(--text-tertiary)",padding:"6px 12px",borderRadius:9}}>{"✕"}</button>
                   </div>
                 </div>
@@ -14200,6 +14202,15 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
 
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={()=>setEditingTx(null)} saving={saving} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
       <ConfirmModal open={!!confirmRefuse} lang={lang} title={fr?"Refuser cette transaction ?":"Refuse this transaction?"} message={confirmRefuse?`${fr?"Voulez-vous vraiment refuser la transaction de":"Do you really want to refuse the transaction from"} @${confirmRefuse.spender_handle} (${fmtAmount(confirmRefuse.amount,confirmRefuse.currency)}) ?`:""} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)} />
+      {gerantPassportModel && (
+        <ModelPassportCard
+          model={gerantPassportModel}
+          lang={lang}
+          onClose={() => setGerantPassportModel(null)}
+          editable={user?.role === "gerant"}
+          onSave={(updated) => { setGerantPassportModel(updated); }}
+        />
+      )}
     </div>
   );
 });
@@ -61562,6 +61573,267 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
 });
 
 // =============================================
+// MC MODELES TAB — Espace Modèle Manager Chatter (lecture seule, sans paiements)
+// =============================================
+const MCModelesTab = React.memo(({ user, lang, mcTxs = [], mcChatters = [], models = [], products = [] }) => {
+  const { convertAmount, fmtAmount, currencySymbol } = useCurrency();
+  const fr = lang === "fr";
+  const _isMobile = window.innerWidth < 768;
+  const [modalModel, setModalModel] = useState(null);
+  const [passportModel, setPassportModel] = useState(null);
+
+  // ── Derive MC's models: all models their chatters work on ──
+  const mcModelIds = useMemo(() => {
+    const ids = new Set();
+    (mcChatters || []).forEach(ch => {
+      (ch.assigned_models || []).forEach(mid => ids.add(mid));
+    });
+    // Also include models from TX if not already covered
+    (mcTxs || []).forEach(tx => { if (tx.model_id) ids.add(tx.model_id); });
+    return ids;
+  }, [mcChatters, mcTxs]);
+
+  const mcModels = useMemo(() => (models || []).filter(m => mcModelIds.has(m.id)), [models, mcModelIds]);
+
+  // ── Model stats from MC transactions ──
+  const modelStats = useMemo(() => {
+    return mcModels.map(m => {
+      const mTxs = (mcTxs || []).filter(tx => tx.model_id === m.id);
+      const validated = mTxs.filter(tx => isValidTx(tx.status));
+      const pending = mTxs.filter(tx => isPendingTx(tx.status));
+      const ca = validated.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
+      const caPending = pending.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
+      const convRate = mTxs.length > 0 ? Math.round((validated.length / mTxs.length) * 100) : 0;
+      const avgTicket = validated.length > 0 ? Math.round(ca / validated.length) : 0;
+      const chatterIds = [...new Set(mTxs.map(tx => tx.chatter_id).filter(Boolean))];
+      const chatters = chatterIds.map(cid => (mcChatters || []).find(ch => ch.id === cid)).filter(Boolean);
+      const spenderSet = new Set();
+      validated.forEach(tx => { if (tx.spender_handle) spenderSet.add(tx.spender_handle); });
+      // Weekly CA
+      const weeklyCA = [];
+      for (let w = 7; w >= 0; w--) {
+        const ws = new Date(); ws.setDate(ws.getDate() - ws.getDay() + 1 - w * 7); ws.setHours(0,0,0,0);
+        const we = new Date(ws); we.setDate(we.getDate() + 6); we.setHours(23,59,59,999);
+        const wCA = validated.filter(tx => { const d = new Date(tx.created_at || tx.date); return d >= ws && d <= we; }).reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
+        weeklyCA.push({ label: `S${8-w}`, ca: Math.round(wCA) });
+      }
+      // Top spenders
+      const spenderMap = {};
+      validated.forEach(tx => { const h = tx.spender_handle; if (!h) return; spenderMap[h] = (spenderMap[h] || 0) + convertAmount(txNetAmount(tx), tx.currency); });
+      const topSpenders = Object.entries(spenderMap).sort((a, b) => b[1] - a[1]).slice(0, 5);
+      // Products sold
+      const productMap = {};
+      validated.forEach(tx => { if (tx.product_id) productMap[tx.product_id] = (productMap[tx.product_id] || 0) + 1; });
+      const topProducts = Object.entries(productMap).map(([pid, cnt]) => {
+        const p = (products || []).find(x => x.id === pid);
+        return { name: p?.name || pid, count: cnt };
+      }).sort((a, b) => b.count - a.count).slice(0, 5);
+
+      return { ...m, mTxs, validated, pending, ca, caPending, convRate, avgTicket, chatters, chatterIds, spenders: [...spenderSet], txCount: mTxs.length, validatedCount: validated.length, weeklyCA, topSpenders, topProducts };
+    }).sort((a, b) => b.ca - a.ca);
+  }, [mcTxs, mcModels, mcChatters, products, convertAmount]);
+
+  // ── Global aggregates ──
+  const globalCA = modelStats.reduce((s, m) => s + m.ca, 0);
+  const totalValidated = modelStats.reduce((s, m) => s + m.validatedCount, 0);
+  const avgConvRate = modelStats.length > 0 ? Math.round(modelStats.reduce((s, m) => s + m.convRate, 0) / modelStats.length) : 0;
+  const totalSpenders = [...new Set(modelStats.flatMap(m => m.spenders))].length;
+
+  const selM = modalModel ? modelStats.find(m => m.id === modalModel) : null;
+  const _avatarColor = (id) => { let h = 0; for (let i = 0; i < (id || "").length; i++) h = (id || "").charCodeAt(i) + ((h << 5) - h); return `hsl(${Math.abs(h) % 360},60%,50%)`; };
+  const _initial = (name) => (name || "?").trim()[0].toUpperCase();
+
+  return (
+    <div style={{ padding: _isMobile ? "0 12px" : 0 }}>
+      {/* KPI Row */}
+      <div className={_isMobile ? "kpi-row cols-2" : "kpi-row cols-4"} style={{ marginBottom: 14, gridTemplateColumns: _isMobile ? "1fr 1fr" : undefined }}>
+        <div className="kpi-card green">
+          <div className="kpi-card-label">{fr ? "CA NET TOTAL" : "TOTAL NET REV"}</div>
+          <div className="kpi-card-value green">{Math.round(globalCA).toLocaleString()}{currencySymbol}</div>
+          <div className="kpi-card-delta up">↑ {totalValidated} TX</div>
+        </div>
+        <div className="kpi-card indigo">
+          <div className="kpi-card-label">{fr ? "TX VALIDÉES" : "VALID TX"}</div>
+          <div className="kpi-card-value indigo">{totalValidated}</div>
+        </div>
+        <div className="kpi-card white">
+          <div className="kpi-card-label">{fr ? "MODÈLES" : "MODELS"}</div>
+          <div className="kpi-card-value white">{modelStats.filter(m => m.ca > 0).length}<span style={{ color: "var(--text-tertiary)", fontWeight: 400, fontSize: 12 }}>/{modelStats.length}</span></div>
+        </div>
+        <div className="kpi-card amber">
+          <div className="kpi-card-label">SPENDERS</div>
+          <div className="kpi-card-value amber">{totalSpenders}</div>
+        </div>
+      </div>
+
+      {/* Model Cards */}
+      <div className={_isMobile ? "" : "model-grid-a"} style={_isMobile ? { display: "grid", gridTemplateColumns: "1fr", gap: 10, marginBottom: 18 } : { marginBottom: 18 }}>
+        {modelStats.map(m => {
+          const isActive = m.ca > 0 || m.txCount > 0;
+          const _meta = getModelMeta(m.name);
+          const _emoji = m.emoji || _meta.emoji || "✨";
+          const _coverColor = m.name === "Carla" ? "indigo" : m.name === "Sophie" ? "pink" : m.name === "Bella" ? "amber" : m.name === "Nadia" ? "purple" : m.name === "Maria" ? "rose" : "teal";
+          return (
+            <div key={m.id} className="ma" onClick={() => setModalModel(m.id)}>
+              <div className={`ma-cover ${_coverColor}`} />
+              <div className="ma-body">
+                <div className="ma-head">
+                  <div className="ma-head-left">
+                    <div className="ma-avatar">{_emoji}</div>
+                    <div>
+                      <div className="ma-name">{m.name}</div>
+                      <div className="ma-handle">@{(m.name || "").toLowerCase()}</div>
+                    </div>
+                  </div>
+                  <span className={`ma-badge ${isActive ? "online" : "offline"}`}>{isActive ? "● ONLINE" : "○ OFFLINE"}</span>
+                </div>
+                <div className="ma-kpis">
+                  <div className="ma-kpi"><div className="ma-kpi-lbl">CA NET</div><div className="ma-kpi-v green">{Math.round(m.ca || 0).toLocaleString()}{currencySymbol}</div></div>
+                  <div className="ma-kpi"><div className="ma-kpi-lbl">TX</div><div className="ma-kpi-v indigo">{m.txCount || 0}</div></div>
+                  <div className="ma-kpi"><div className="ma-kpi-lbl">SPENDERS</div><div className="ma-kpi-v">{(m.spenders || []).length}</div></div>
+                  <div className="ma-kpi"><div className="ma-kpi-lbl">CONV.</div><div className="ma-kpi-v">{m.convRate || 0}%</div></div>
+                </div>
+                <div className="ma-chatters">
+                  <div className="ma-chips">
+                    {m.chatters.slice(0, 4).map((ch, j) => (
+                      <div key={ch.id || j} className="ma-chip" style={{ background: ["#6366f1", "#ec4899", "#f59e0b", "#10b981"][j % 4], marginLeft: j > 0 ? -6 : 0, position: "relative", zIndex: 10 - j }}>
+                        {(ch.name || "?")[0].toUpperCase()}
+                      </div>
+                    ))}
+                  </div>
+                  <span style={{ fontSize: 10 }}>{m.chatters.length} chatter{m.chatters.length > 1 ? "s" : ""}</span>
+                </div>
+                <div className="ma-actions" onClick={e => e.stopPropagation()}>
+                  <button className="ma-act primary" onClick={() => setModalModel(m.id)}>📊 Stats</button>
+                  <button className="ma-act" style={{ borderColor: "rgba(168,85,247,0.4)", color: "#a855f7" }} onClick={() => { const full = models.find(x => x.id === m.id); if (full) setPassportModel(full); }}>📋 Fiche</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {modelStats.length === 0 && (
+        <div style={{ background: "var(--bg2)", border: "1px solid var(--border-ds)", borderRadius: 14, padding: 48, textAlign: "center" }}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>👩</div>
+          <div style={{ fontSize: 14, color: "var(--muted-ds)" }}>{fr ? "Aucun modèle assigné" : "No assigned models"}</div>
+        </div>
+      )}
+
+      {/* ── MODAL STATS MODÈLE (MC = lecture seule, Performance uniquement) ── */}
+      {selM && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: _isMobile ? "flex-end" : "center", justifyContent: "center", zIndex: 5000 }} onClick={() => setModalModel(null)}>
+          <div style={{ maxWidth: 820, width: "95vw", maxHeight: "90vh", overflowY: "auto", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: _isMobile ? "20px 20px 0 0" : 14, boxShadow: "0 24px 64px rgba(0,0,0,0.6)" }} onClick={e => e.stopPropagation()}>
+
+            {/* Modal Header */}
+            <div style={{ padding: "20px 24px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <div style={{ width: 48, height: 48, borderRadius: "50%", background: _avatarColor(selM.id), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, fontWeight: 800, color: "#fff" }}>{selM.emoji || _initial(selM.name)}</div>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 800 }}>{selM.name}</div>
+                  <div style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{selM.chatters.length} chatter{selM.chatters.length > 1 ? "s" : ""} · {selM.spenders.length} spenders</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <button onClick={(e) => { e.stopPropagation(); const full = models.find(x => x.id === selM.id); if (full) setPassportModel(full); }} style={{ padding: "7px 14px", borderRadius: 9, border: "1px solid rgba(168,85,247,0.4)", background: "rgba(168,85,247,0.1)", color: "#c4b5fd", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>📋 Fiche</button>
+                <button onClick={() => setModalModel(null)} style={{ background: "var(--surface2)", border: "1px solid var(--border)", fontSize: 14, cursor: "pointer", color: "var(--text-tertiary)", padding: "6px 12px", borderRadius: 9 }}>✕</button>
+              </div>
+            </div>
+
+            <div style={{ padding: 24 }}>
+              {/* KPIs */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 20 }}>
+                {[
+                  { l: "CA NET", v: `${Math.round(selM.ca).toLocaleString()} CHF`, c: "var(--success)" },
+                  { l: "TX VALIDÉES", v: selM.validatedCount, c: "#818cf8" },
+                  { l: fr ? "EN ATTENTE" : "PENDING", v: `${selM.pending.length} (${Math.round(selM.caPending).toLocaleString()} CHF)`, c: "var(--warning)" },
+                  { l: "CONV. RATE", v: `${selM.convRate}%`, c: selM.convRate >= 50 ? "var(--success)" : "var(--warning)" },
+                  { l: "TICKET MOYEN", v: `${selM.avgTicket.toLocaleString()} CHF`, c: "#818cf8" },
+                  { l: "SPENDERS", v: selM.spenders.length, c: "#f59e0b" },
+                ].map((kpi, i) => (
+                  <div key={i} style={{ padding: "10px 12px", borderRadius: 10, background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                    <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{kpi.l}</div>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: kpi.c }}>{kpi.v}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Weekly CA Chart */}
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--text-secondary)" }}>{fr ? "CA Hebdomadaire" : "Weekly Revenue"}</div>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height: 80 }}>
+                  {selM.weeklyCA.map((w, i) => {
+                    const maxW = Math.max(...selM.weeklyCA.map(x => x.ca), 1);
+                    const pct = (w.ca / maxW) * 100;
+                    return (
+                      <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+                        <div style={{ fontSize: 9, fontWeight: 600, color: "var(--muted)" }}>{w.ca > 0 ? w.ca : ""}</div>
+                        <div style={{ width: "100%", height: `${Math.max(pct, 3)}%`, background: i === selM.weeklyCA.length - 1 ? "#6366f1" : "rgba(99,102,241,0.3)", borderRadius: 4, transition: "height 0.3s" }} />
+                        <div style={{ fontSize: 8, color: "var(--text-tertiary)" }}>{w.label}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Top Spenders */}
+              {selM.topSpenders.length > 0 && (
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--text-secondary)" }}>Top Spenders</div>
+                  {selM.topSpenders.map(([handle, amount], i) => (
+                    <div key={handle} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < selM.topSpenders.length - 1 ? "1px solid var(--border)" : "none" }}>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>{i + 1}. {handle}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: "var(--success)" }}>{Math.round(amount).toLocaleString()} CHF</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Top Products Sold */}
+              {selM.topProducts.length > 0 && (
+                <div style={{ marginBottom: 20 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--text-secondary)" }}>{fr ? "Produits les plus vendus" : "Top Products Sold"}</div>
+                  {selM.topProducts.map((p, i) => (
+                    <div key={p.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < selM.topProducts.length - 1 ? "1px solid var(--border)" : "none" }}>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>{p.name}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: "#818cf8" }}>{p.count}x</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Chatters on this model */}
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--text-secondary)" }}>{fr ? "Chatters assignés" : "Assigned Chatters"}</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {selM.chatters.map(ch => (
+                    <div key={ch.id} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 8, background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                      <div style={{ width: 24, height: 24, borderRadius: "50%", background: _avatarColor(ch.id), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, color: "#fff" }}>{_initial(ch.name)}</div>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>{ch.name || "?"}</span>
+                    </div>
+                  ))}
+                  {selM.chatters.length === 0 && <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{fr ? "Aucun chatter" : "No chatters"}</span>}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Passport Modal */}
+      {passportModel && (
+        <ModelPassportCard
+          model={passportModel}
+          lang={lang}
+          onClose={() => setPassportModel(null)}
+          editable={false}
+        />
+      )}
+    </div>
+  );
+});
+
+// =============================================
 // MAIN APP
 // =============================================
 const App = () => {
@@ -63700,7 +63972,7 @@ const App = () => {
           {(()=>{
             const _roleNav = {
               chatter:[{id:"chatter_dashboard",icon:"📊",label:"Dash"},{id:"chatter_spenders",icon:"👤",label:"Spenders"},{id:"chatter_transactions",icon:"💳",label:"TX"},{id:"messagerie",icon:"💬",label:"Msgs"},{id:"chatter_compta",icon:"💰",label:"Compta"}],
-              manager_chatter:[{id:"mc_dashboard",icon:"📊",label:"Dash"},{id:"mc_chatters",icon:"👥",label:"Équipe"},{id:"messagerie",icon:"✉️",label:"Msgs"},{id:"mc_solde",icon:"💎",label:"Comm."}],
+              manager_chatter:[{id:"mc_dashboard",icon:"📊",label:"Dash"},{id:"mc_chatters",icon:"👥",label:"Équipe"},{id:"mc_modeles",icon:"👩",label:"Modèles"},{id:"messagerie",icon:"✉️",label:"Msgs"},{id:"mc_solde",icon:"💎",label:"Comm."}],
               modele:[{id:"model_checklist",icon:"✅",label:"Checklist"},{id:"model_content",icon:"📦",label:"Contenu"},{id:"model_tasks",icon:"📋",label:"Tâches"},{id:"model_payments",icon:"💰",label:"Paiements"}],
               provider:[{id:"provider_dashboard",icon:"📊",label:lang==='fr'?"Activité":"Activity"},{id:"provider_compta",icon:"💰",label:lang==='fr'?"Reversements":"Payments"},{id:"provider_factures",icon:"🧾",label:lang==='fr'?"Factures":"Invoices"}],
             };
@@ -63971,6 +64243,9 @@ const App = () => {
           )}
           {tab==="mc_solde"&&user.role==="manager_chatter"&&(
             <MCCommissionTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcCommissions={mcCommissions} models={models} />
+          )}
+          {tab==="mc_modeles"&&user.role==="manager_chatter"&&(
+            <MCModelesTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} models={models} products={products} />
           )}
           {/* ── MC Messagerie: same hub + sub-tabs as gérant ── */}
           {user.role==="manager_chatter"&&tab==="messagerie"&&<MessagerieHubPage user={user} lang={lang} models={models} setTab={setTab} />}
