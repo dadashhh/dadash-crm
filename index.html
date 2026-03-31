@@ -26523,6 +26523,62 @@ const ProductCatalogTab = ({user, lang, txs, models, profiles, products, product
   const [filterModel, setFilterModel] = useState("all");
   const [filterCat, setFilterCat] = useState("all");
   const [showInactive, setShowInactive] = useState(false);
+  // Phase 2D — Product content media
+  const [productMedia, setProductMedia] = useState({});
+  const [prodMediaLoading, setProdMediaLoading] = useState(false);
+  const [prodUploading, setProdUploading] = useState(false);
+  const [prodMediaPreview, setProdMediaPreview] = useState(null);
+  const prodFileRef = React.useRef(null);
+
+  const loadProductMedia = React.useCallback(async () => {
+    setProdMediaLoading(true);
+    try {
+      const { data, error } = await sb.from("media_library").select("*").not("product_id","is",null).order("created_at",{ascending:false});
+      if (!error && data) {
+        const byProd = {};
+        data.forEach(m => { if (!byProd[m.product_id]) byProd[m.product_id] = []; byProd[m.product_id].push(m); });
+        setProductMedia(byProd);
+      }
+    } catch(e) { console.error("loadProductMedia",e); }
+    setProdMediaLoading(false);
+  }, []);
+
+  React.useEffect(() => { loadProductMedia(); }, [loadProductMedia]);
+
+  const uploadProductMedia = async (productId, files) => {
+    if (!productId || !files?.length) return;
+    const prod = products.find(p=>p.id===productId);
+    const modelName = prod?.model_id ? (models.find(m=>m.id===prod.model_id)?.name||"generic") : "generic";
+    setProdUploading(true);
+    let ok = 0;
+    for (const file of files) {
+      try {
+        const ext = file.name.split(".").pop()||"jpg";
+        const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const path = `${modelName.toLowerCase()}/${filename}`;
+        const { error: stErr } = await sb.storage.from("media-library").upload(path, file, { cacheControl:"3600", upsert:false });
+        if (stErr) throw stErr;
+        const { data: urlData } = sb.storage.from("media-library").getPublicUrl(path);
+        const { error: dbErr } = await sb.from("media_library").insert({
+          url: urlData.publicUrl, name: file.name, filename: file.name,
+          type: file.type.startsWith("video") ? "video" : "photo",
+          model: modelName.toLowerCase(), category: prod?.category || "Autres",
+          product_id: productId, size: file.size, created_at: new Date().toISOString(),
+        });
+        if (dbErr) throw dbErr;
+        ok++;
+      } catch(e) { addToast("Erreur upload: "+e.message,"error"); }
+    }
+    if (ok) addToast(`✅ ${ok} média(s) lié(s) au produit`,"success");
+    await loadProductMedia();
+    setProdUploading(false);
+  };
+
+  const unlinkProductMedia = async (mediaId) => {
+    const { error } = await sb.from("media_library").update({ product_id: null }).eq("id", mediaId);
+    if (!error) { await loadProductMedia(); addToast("Média délié du produit","success"); }
+    else addToast("Erreur: "+error.message,"error");
+  };
 
   const filteredTxs = dr.filterByDate(txs, "date");
   const activeModels = models.filter(m => m.active !== false);
@@ -26634,6 +26690,7 @@ const ProductCatalogTab = ({user, lang, txs, models, profiles, products, product
         <KPICard label={fr?"Modèles couverts":"Models Covered"} value={new Set(activeProducts.filter(p=>p.model_id).map(p=>p.model_id)).size + "/" + activeModels.length} icon="\u{1F464}"/>
         <KPICard label="CA Total" value={`${totalCA.toLocaleString("fr-FR",{maximumFractionDigits:0})}${currencySymbol}`} icon="\u{1F4B0}"/>
         <KPICard label={fr?"Ventes":"Sales"} value={totalSales} icon="\u{1F4CB}"/>
+        <KPICard label={fr?"Contenus liés":"Linked Media"} value={Object.values(productMedia).reduce((s,arr)=>s+arr.length,0)} icon="\u{1F4F8}"/>
       </div>
 
       {/* ═══ TABS BAR ═══ */}
@@ -26706,7 +26763,7 @@ const ProductCatalogTab = ({user, lang, txs, models, profiles, products, product
                         </div>
                       </div>
                       {p.description && <div style={{fontSize:11,color:"var(--text-secondary)",marginBottom:8,lineHeight:1.4,display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical",overflow:"hidden"}}>{p.description}</div>}
-                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:6}}>
                         <div style={{padding:"5px 8px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
                           <div style={{fontSize:7,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:1}}>{fr?"Prix":"Price"}</div>
                           <div style={{fontSize:13,fontWeight:800}}>{p.price_chf?`${p.price_chf} CHF`:"—"}</div>
@@ -26719,7 +26776,26 @@ const ProductCatalogTab = ({user, lang, txs, models, profiles, products, product
                           <div style={{fontSize:7,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:1}}>CA</div>
                           <div style={{fontSize:12,fontWeight:800,color:"var(--success)"}}>{ps&&ps.ca>0?Math.round(ps.ca)+currencySymbol:"—"}</div>
                         </div>
+                        <div style={{padding:"5px 8px",borderRadius:8,background:"rgba(255,255,255,0.04)"}}>
+                          <div style={{fontSize:7,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:1}}>{"\u{1F4F8}"} Media</div>
+                          <div style={{fontSize:13,fontWeight:800,color:(productMedia[p.id]?.length||0)>0?"#60a5fa":"var(--text-secondary)"}}>{productMedia[p.id]?.length||0}</div>
+                        </div>
                       </div>
+                      {/* Mini thumbnails preview */}
+                      {productMedia[p.id]?.length>0&&(
+                        <div style={{display:"flex",gap:4,marginTop:8,overflow:"hidden"}}>
+                          {productMedia[p.id].slice(0,5).map(m=>(
+                            <div key={m.id} style={{width:36,height:36,borderRadius:6,overflow:"hidden",flexShrink:0,position:"relative",border:"1px solid rgba(255,255,255,0.08)"}}>
+                              {m.type==="video"?(
+                                <div style={{width:"100%",height:"100%",background:"rgba(139,92,246,0.15)",display:"flex",alignItems:"center",justifyContent:"center"}}><span style={{fontSize:14}}>{"\u{1F3AC}"}</span></div>
+                              ):(
+                                <img src={m.url} style={{width:"100%",height:"100%",objectFit:"cover"}} loading="lazy"/>
+                              )}
+                            </div>
+                          ))}
+                          {productMedia[p.id].length>5&&<div style={{width:36,height:36,borderRadius:6,background:"rgba(255,255,255,0.06)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,color:"var(--text-tertiary)",fontWeight:700,flexShrink:0}}>+{productMedia[p.id].length-5}</div>}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -26761,7 +26837,60 @@ const ProductCatalogTab = ({user, lang, txs, models, profiles, products, product
                   <input type="checkbox" checked={prodForm.active} onChange={e=>setProdForm({...prodForm,active:e.target.checked})}/>
                   {fr?"Actif (visible dans les TX)":"Active (visible in TX)"}
                 </label>
+
+                {/* ═══ Phase 2D — Contenu média du produit ═══ */}
+                {prodModal.mode==="edit"&&prodModal.data?.id&&(
+                  <div style={{marginTop:8,padding:"14px 16px",borderRadius:12,background:"rgba(255,255,255,0.03)",border:"1px solid var(--border-subtle)"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                      <div style={{fontSize:13,fontWeight:800,color:"var(--text-primary)"}}>{"\u{1F4F8}"} {fr?"Contenu lié":"Linked content"} <span style={{fontSize:11,fontWeight:500,color:"var(--text-tertiary)"}}>({productMedia[prodModal.data.id]?.length||0})</span></div>
+                      <div style={{display:"flex",gap:6}}>
+                        <input ref={prodFileRef} type="file" multiple accept="image/*,video/*" style={{display:"none"}} onChange={e=>{
+                          if(e.target.files?.length) uploadProductMedia(prodModal.data.id, Array.from(e.target.files));
+                          e.target.value="";
+                        }}/>
+                        <button onClick={()=>prodFileRef.current?.click()} disabled={prodUploading} style={{fontSize:11,padding:"4px 12px",borderRadius:8,border:"1px solid rgba(96,165,250,0.3)",background:"rgba(96,165,250,0.08)",color:"#60a5fa",cursor:"pointer",fontWeight:700,display:"flex",alignItems:"center",gap:4}}>
+                          {prodUploading?React.createElement(Spinner,{size:12}):"+"} {fr?"Ajouter":"Add"}
+                        </button>
+                      </div>
+                    </div>
+                    {(productMedia[prodModal.data.id]?.length||0)===0?(
+                      <div style={{textAlign:"center",padding:"16px 0",color:"var(--text-quaternary)",fontSize:12}}>{fr?"Aucun contenu lié — ajoutez des photos/vidéos":"No linked content — add photos/videos"}</div>
+                    ):(
+                      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(80px,1fr))",gap:8}}>
+                        {productMedia[prodModal.data.id].map(m=>(
+                          <div key={m.id} style={{position:"relative",borderRadius:8,overflow:"hidden",border:"1px solid rgba(255,255,255,0.08)",aspectRatio:"1",cursor:"pointer"}} onClick={()=>setProdMediaPreview(m)}>
+                            {m.type==="video"?(
+                              <div style={{width:"100%",height:"100%",background:"rgba(139,92,246,0.12)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:2}}>
+                                <span style={{fontSize:22}}>{"\u{1F3AC}"}</span>
+                                <span style={{fontSize:8,color:"var(--text-tertiary)"}}>{m.name?.slice(0,12)}</span>
+                              </div>
+                            ):(
+                              <img src={m.url} style={{width:"100%",height:"100%",objectFit:"cover"}} loading="lazy"/>
+                            )}
+                            <button onClick={e=>{e.stopPropagation();unlinkProductMedia(m.id);}} title={fr?"Délier du produit":"Unlink from product"} style={{position:"absolute",top:3,right:3,width:18,height:18,borderRadius:"50%",border:"none",background:"rgba(0,0,0,0.7)",color:"#f87171",fontSize:10,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1}}>{"✕"}</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
+
+              {/* Media Preview Lightbox */}
+              {prodMediaPreview&&(
+                <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:6000}} onClick={()=>setProdMediaPreview(null)}>
+                  <div style={{maxWidth:"90vw",maxHeight:"85vh",position:"relative"}} onClick={e=>e.stopPropagation()}>
+                    <button onClick={()=>setProdMediaPreview(null)} style={{position:"absolute",top:-12,right:-12,width:28,height:28,borderRadius:"50%",border:"none",background:"rgba(255,255,255,0.15)",color:"#fff",fontSize:14,cursor:"pointer",zIndex:1,display:"flex",alignItems:"center",justifyContent:"center"}}>{"✕"}</button>
+                    {prodMediaPreview.type==="video"?(
+                      <video src={prodMediaPreview.url} controls autoPlay style={{maxWidth:"90vw",maxHeight:"85vh",borderRadius:12}}/>
+                    ):(
+                      <img src={prodMediaPreview.url} style={{maxWidth:"90vw",maxHeight:"85vh",borderRadius:12,objectFit:"contain"}}/>
+                    )}
+                    <div style={{position:"absolute",bottom:-28,left:0,right:0,textAlign:"center",fontSize:11,color:"var(--text-tertiary)"}}>{prodMediaPreview.name}</div>
+                  </div>
+                </div>
+              )}
+
               <div style={{padding:"16px 24px",borderTop:"1px solid var(--border-subtle)",display:"flex",gap:12,justifyContent:"space-between",alignItems:"center",position:"sticky",bottom:0,background:"var(--bg-raised,#12121F)"}}>
                 {prodModal.mode==="edit"&&<button className="btn btn-danger" style={{fontSize:11}} onClick={()=>deleteProd(prodModal.data)}>{"\u{1F5D1}"} {fr?"Supprimer":"Delete"}</button>}
                 <div style={{display:"flex",gap:8,marginLeft:"auto"}}>
