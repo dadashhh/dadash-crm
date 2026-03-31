@@ -8101,9 +8101,9 @@ const ModelPassportCard = ({ model, lang, onClose, editable, onSave }) => {
   const [fields, setFields] = useState({
     age: model?.age || "",
     nationality: model?.nationality || "",
-    languages: model?.languages || "",
+    languages: Array.isArray(model?.languages) ? model.languages.join(", ") : (model?.languages || ""),
     personality: model?.personality || "",
-    specialties: model?.specialties || "",
+    specialties: Array.isArray(model?.specialties) ? model.specialties.join(", ") : (model?.specialties || ""),
     bio: model?.bio || "",
     schedule: model?.schedule || "",
     notes_internes: model?.notes_internes || "",
@@ -8112,9 +8112,17 @@ const ModelPassportCard = ({ model, lang, onClose, editable, onSave }) => {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const { error } = await sb.from("models").update(fields).eq("id", model.id);
+      // Convert comma-separated strings back to arrays for text[] DB columns
+      const dbFields = { ...fields };
+      if (typeof dbFields.languages === "string") {
+        dbFields.languages = dbFields.languages.split(",").map(s => s.trim()).filter(Boolean);
+      }
+      if (typeof dbFields.specialties === "string") {
+        dbFields.specialties = dbFields.specialties.split(",").map(s => s.trim()).filter(Boolean);
+      }
+      const { error } = await sb.from("models").update(dbFields).eq("id", model.id);
       if (error) throw error;
-      onSave && onSave({ ...model, ...fields });
+      onSave && onSave({ ...model, ...dbFields });
       addToast(fr ? "Fiche modèle mise à jour" : "Model passport updated", "success");
     } catch (e) {
       addToast(fr ? "Erreur de sauvegarde" : "Save error", "error");
@@ -43471,10 +43479,14 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               onClick={() => {
                 const mid = selectedConv?.model_id;
                 let mdl = mid ? models.find(m => String(m.id) === String(mid)) : null;
-                if (!mdl && selectedConv?.model_name) {
-                  mdl = models.find(m => (m.name || "").toLowerCase() === selectedConv.model_name.toLowerCase());
+                if (!mdl) {
+                  const modelName = selectedConv?.model_name || getModelName(mid, models) || "";
+                  if (modelName) {
+                    mdl = models.find(m => (m.name || "").toLowerCase() === modelName.toLowerCase());
+                  }
                 }
                 if (mdl) setMsgPassportModel(mdl);
+                else if (addToast) addToast("Modèle non trouvé", "error");
               }}
               title="Fiche modèle"
               style={{ background: 'transparent', border: '1.5px solid rgba(168,85,247,0.5)', padding: '7px 14px', borderRadius: '6px', color: '#c4b5fd', fontSize: '13px', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', transition: 'all 0.2s', flexShrink: 0 }}
@@ -44967,8 +44979,31 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         open={!!scammerTarget}
         spender={scammerTarget}
         onCancel={() => setScammerTarget(null)}
-        onConfirm={(reason) => {
-          _toggleScammerFn(scammerTarget.id, true, reason, addToast, () => { setActiveSpender(prev => prev ? { ...prev, is_scammer: true, scammer_reason: reason, scammer_flagged_at: new Date().toISOString() } : prev); });
+        onConfirm={async (reason) => {
+          let spId = scammerTarget.id;
+          // If no DB id (minimal spender from Carlos), try to find/create by telegram_id
+          if (!spId && (scammerTarget.tg_user_id || scammerTarget.telegram_id)) {
+            const tgId = String(scammerTarget.tg_user_id || scammerTarget.telegram_id);
+            try {
+              let { data: existing } = await sb.from('spenders').select('id').eq('tg_user_id', tgId).maybeSingle();
+              if (!existing) {
+                const { data: created } = await sb.from('spenders').insert({
+                  tg_user_id: tgId,
+                  telegram_id: tgId,
+                  name: scammerTarget.name || scammerTarget.first_name || null,
+                  handle: scammerTarget.handle || null,
+                  telegram_username: scammerTarget.telegram_username || null,
+                }).select('id').single();
+                existing = created;
+              }
+              spId = existing?.id;
+            } catch (e) { console.error("[ScammerFlag] upsert error:", e); }
+          }
+          if (spId) {
+            _toggleScammerFn(spId, true, reason, addToast, () => { setActiveSpender(prev => prev ? { ...prev, id: spId, is_scammer: true, scammer_reason: reason, scammer_flagged_at: new Date().toISOString() } : prev); });
+          } else {
+            addToast("Spender introuvable — impossible de flagger", "error");
+          }
           setScammerTarget(null);
         }}
       />
