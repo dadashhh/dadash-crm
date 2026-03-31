@@ -21717,7 +21717,7 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
       setPiList(data||[]);
       if (sc.data) { const m={}; sc.data.forEach(r=>{m[r.chatter_id]=r;}); setSoldesC(m); }
       if (sm.data) { const m={}; sm.data.forEach(r=>{m[r.modele_id]=r;}); setSoldesM(m); }
-      // Compute MC soldes: allocation = CA NET chatters × mc_rate, déjà payé = validated mc_payment
+      // Compute MC soldes: allocation = CA NET (chatters + MC propres TX) × mc_rate, déjà payé = validated mc_payment
       try {
         const mcProfiles = (profiles||[]).filter(p=>p.role==="manager_chatter");
         const mcSoldes = {};
@@ -21725,9 +21725,11 @@ const PaiementsHubTab = ({user, lang, profiles, onRefresh}) => {
           const mcRate = getCommissionRate(mc, "manager_chatter");
           const {data:mcLinks} = await sb.from("manager_chatters").select("chatter_id").eq("manager_id",mc.id);
           const chIds = (mcLinks||[]).map(l=>l.chatter_id);
+          // Include MC's own ID — when MC chatters himself, his TX count toward his allocation
+          const allIds = [...new Set([...chIds, mc.id])];
           let caNet = 0;
-          if (chIds.length > 0) {
-            const {data:txData} = await sb.from("transactions").select("net_amount,currency").in("chatter_id",chIds).in("status",["validated","confirmee","payee"]);
+          if (allIds.length > 0) {
+            const {data:txData} = await sb.from("transactions").select("net_amount,currency").in("chatter_id",allIds).in("status",["validated","confirmee","payee"]);
             caNet = (txData||[]).reduce((s,t)=>s+Number(t.net_amount||0),0);
           }
           const allocation = caNet * mcRate;
@@ -60063,6 +60065,44 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
     return { allocation, received, solde: Math.max(0, allocation - received) };
   }, [mcTxs, mcPaymentsReceived, commRate]);
 
+  // ── BÉNÉFICE NET MC ──
+  // Gérant doit au MC (allocation) — MC doit aux chatters = bénéfice net
+  const mcChatterIds = useMemo(() => mcChatters.map(c => c.id), [mcChatters]);
+  const beneficeNet = useMemo(() => {
+    const allValid = mcTxs.filter(tx => isValidTx(tx.status));
+    // Split: TX propres du MC vs TX de ses chatters
+    const ownTxs = allValid.filter(tx => tx.chatter_id === user.id);
+    const teamTxs = allValid.filter(tx => tx.chatter_id !== user.id && mcChatterIds.includes(tx.chatter_id));
+    const ownCaNet = ownTxs.reduce((s,tx) => s + txNetAmountCHF(tx), 0);
+    const teamCaNet = teamTxs.reduce((s,tx) => s + txNetAmountCHF(tx), 0);
+    const totalCaNet = ownCaNet + teamCaNet;
+    // Ce que le gérant doit au MC = 25% du CA net total (own + team)
+    const gerantDoitMC = totalCaNet * commRate;
+    // Ce que le MC doit à ses chatters = somme (CA net chatter × taux chatter)
+    const detailChatters = mcChatters.map(ch => {
+      const chTxs = allValid.filter(tx => tx.chatter_id === ch.id);
+      const caNet = chTxs.reduce((s,tx) => s + txNetAmountCHF(tx), 0);
+      const chatterRate = getCommissionRate(ch, "chatter");
+      return { id: ch.id, name: ch.name||ch.email||"Chatter", caNet, rate: chatterRate, du: caNet * chatterRate, txCount: chTxs.length };
+    });
+    const mcDoitChatters = detailChatters.reduce((s,ch) => s + ch.du, 0);
+    // Déjà versé aux chatters
+    const dejaVerseChatters = mcPaymentsSent.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    // Déjà reçu du gérant
+    const dejaRecuGerant = mcPaymentsReceived.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    // Bénéfice net = ce qu'il gagne - ce qu'il doit
+    const benefBrut = gerantDoitMC - mcDoitChatters;
+    // Solde réel = (reçu du gérant - versé aux chatters)
+    const soldeReel = dejaRecuGerant - dejaVerseChatters;
+    return {
+      ownCaNet, teamCaNet, totalCaNet,
+      gerantDoitMC, mcDoitChatters, benefBrut,
+      dejaRecuGerant, dejaVerseChatters, soldeReel,
+      ownTxCount: ownTxs.length, teamTxCount: teamTxs.length,
+      detailChatters,
+    };
+  }, [mcTxs, mcChatters, mcPaymentsSent, mcPaymentsReceived, commRate, user.id, mcChatterIds]);
+
   const handlePayChatter = async () => {
     if (!payModal || !payAmount) return;
     const montant = parseFloat(payAmount);
@@ -60172,6 +60212,48 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
         <div style={cardS}>
           <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>{lang==="fr"?"SOLDE DÛ":"BALANCE DUE"}</div>
           <div style={{fontSize:28,fontWeight:800,color:periodData.soldeDu>=0?"#10b981":"#ef4444"}}>{fmtAmount(periodData.soldeDu)}</div>
+        </div>
+      </div>
+
+      {/* ── BÉNÉFICE NET MC ── */}
+      <div style={{...cardS,marginBottom:24,background:"linear-gradient(135deg, rgba(139,92,246,0.06), rgba(16,185,129,0.04))",border:"1px solid rgba(139,92,246,0.2)"}}>
+        <div style={{fontSize:16,fontWeight:800,color:"var(--text)",marginBottom:16}}>📊 {lang==="fr"?"Mon Bénéfice Net":"My Net Profit"}</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12,marginBottom:16}}>
+          <div style={{padding:"12px 16px",borderRadius:10,background:"var(--surface2)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{lang==="fr"?"GÉRANT ME DOIT":"MANAGER OWES ME"}</div>
+            <div style={{fontSize:22,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(beneficeNet.gerantDoitMC)}</div>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>CA Net {fmtAmount(beneficeNet.totalCaNet)} × {Math.round(commRate*100)}%</div>
+          </div>
+          <div style={{padding:"12px 16px",borderRadius:10,background:"var(--surface2)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{lang==="fr"?"JE DOIS AUX CHATTERS":"I OWE CHATTERS"}</div>
+            <div style={{fontSize:22,fontWeight:800,color:"#ef4444"}}>{fmtAmount(beneficeNet.mcDoitChatters)}</div>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>{beneficeNet.detailChatters.filter(c=>c.du>0).length} chatter{beneficeNet.detailChatters.filter(c=>c.du>0).length>1?"s":""}</div>
+          </div>
+          <div style={{padding:"12px 16px",borderRadius:10,background:beneficeNet.benefBrut>0?"rgba(16,185,129,0.08)":"rgba(239,68,68,0.08)",border:beneficeNet.benefBrut>0?"1px solid rgba(16,185,129,0.2)":"1px solid rgba(239,68,68,0.2)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{lang==="fr"?"BÉNÉFICE NET":"NET PROFIT"}</div>
+            <div style={{fontSize:22,fontWeight:800,color:beneficeNet.benefBrut>0?"#10b981":"#ef4444"}}>{fmtAmount(beneficeNet.benefBrut)}</div>
+            <div style={{fontSize:10,color:"var(--text-tertiary)",marginTop:2}}>{lang==="fr"?"Allocation - dû chatters":"Allocation - owed to chatters"}</div>
+          </div>
+        </div>
+        {/* Détail sources */}
+        <div style={{display:"flex",gap:16,flexWrap:"wrap",fontSize:12,color:"var(--text-secondary)",padding:"10px 14px",borderRadius:10,background:"rgba(255,255,255,0.02)"}}>
+          <div>🧑‍💻 <b>{lang==="fr"?"Mes TX":"My TX"}</b>: {beneficeNet.ownTxCount} TX · CA Net {fmtAmount(beneficeNet.ownCaNet)} <span style={{color:"var(--text-tertiary)"}}>(100% pour moi)</span></div>
+          <div>👥 <b>{lang==="fr"?"Équipe":"Team"}</b>: {beneficeNet.teamTxCount} TX · CA Net {fmtAmount(beneficeNet.teamCaNet)}</div>
+        </div>
+        {/* Solde réel (cash flow) */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:12,marginTop:14}}>
+          <div style={{padding:"10px 14px",borderRadius:10,background:"var(--surface2)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:3}}>{lang==="fr"?"REÇU DU GÉRANT":"RECEIVED"}</div>
+            <div style={{fontSize:18,fontWeight:700,color:"#10b981"}}>{fmtAmount(beneficeNet.dejaRecuGerant)}</div>
+          </div>
+          <div style={{padding:"10px 14px",borderRadius:10,background:"var(--surface2)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:3}}>{lang==="fr"?"VERSÉ AUX CHATTERS":"PAID TO CHATTERS"}</div>
+            <div style={{fontSize:18,fontWeight:700,color:"#ef4444"}}>{fmtAmount(beneficeNet.dejaVerseChatters)}</div>
+          </div>
+          <div style={{padding:"10px 14px",borderRadius:10,background:beneficeNet.soldeReel>=0?"rgba(16,185,129,0.06)":"rgba(239,68,68,0.06)"}}>
+            <div style={{fontSize:10,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:3}}>{lang==="fr"?"SOLDE RÉEL":"REAL BALANCE"}</div>
+            <div style={{fontSize:18,fontWeight:700,color:beneficeNet.soldeReel>=0?"#10b981":"#ef4444"}}>{fmtAmount(beneficeNet.soldeReel)}</div>
+          </div>
         </div>
       </div>
 
