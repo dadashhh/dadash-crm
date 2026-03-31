@@ -13412,6 +13412,12 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const [hoveredCard,     setHoveredCard]     = useState(null);
   const [saving,          setSaving]          = useState(false);
   const [gerantPassportModel, setGerantPassportModel] = useState(null);
+  // Catalogue inline product form
+  const [showCatProdModal, setShowCatProdModal] = useState(false);
+  const [editProdId, setEditProdId] = useState(null);
+  const [prodFormModel, setProdFormModel] = useState(null);
+  const [catProdForm, setCatProdForm] = useState({name:"",icon:"📦",category:"Cam",price_chf:"",duration_minutes:"",description:"",details:"",active:true});
+  const [catProdSaving, setCatProdSaving] = useState(false);
   const [modalSaving,     setModalSaving]     = useState(false);
   const [showNewModel,    setShowNewModel]    = useState(false);
   const [newModelName,    setNewModelName]    = useState("");
@@ -13709,6 +13715,39 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
     setNewModelSaving(false);
   };
 
+  // ── Catalogue product save handler ──
+  const handleSaveCatProd = async () => {
+    const name = (catProdForm.name||"").trim();
+    if (!name) { addToast(fr?"Nom requis":"Name required","error"); return; }
+    setCatProdSaving(true);
+    try {
+      const row = {
+        name,
+        icon: catProdForm.icon || "📦",
+        category: catProdForm.category || "Cam",
+        price_chf: catProdForm.price_chf ? parseFloat(catProdForm.price_chf) : null,
+        duration_minutes: catProdForm.duration_minutes ? parseInt(catProdForm.duration_minutes) : null,
+        model_id: prodFormModel || null,
+        description: catProdForm.description || null,
+        details: catProdForm.details || null,
+        active: catProdForm.active !== false,
+      };
+      if (editProdId) {
+        const { error } = await sb.from("products").update(row).eq("id", editProdId);
+        if (error) throw error;
+        addToast("✓ " + (fr ? "Produit mis à jour" : "Product updated"), "success");
+      } else {
+        row.sort_order = (products||[]).length;
+        const { error } = await sb.from("products").insert(row);
+        if (error) throw error;
+        addToast("✓ " + (fr ? "Produit créé" : "Product created"), "success");
+      }
+      setShowCatProdModal(false);
+      if (onRefresh) await onRefresh();
+    } catch(e) { addToast("Erreur: " + e.message, "error"); }
+    setCatProdSaving(false);
+  };
+
   // ── Selected modal model ──
   const selM = modalModel ? modelStats.find(m => m.id === modalModel) : null;
 
@@ -13898,6 +13937,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
             <div style={{display:"flex",flexWrap:"wrap",gap:8,padding:"12px 24px",borderBottom:"1px solid var(--border)"}}>
               {[
                 {id:"performance",label:"Performance",icon:"📊"},
+                {id:"catalogue",  label:"Catalogue",  icon:"📦", badge:(products||[]).filter(p=>p.model_id===selM.id&&p.active).length||0},
                 {id:"checklist",  label:"Checklist",  icon:"📋"},
                 {id:"paiements",  label:"Paiements",  icon:"💰", badge:paiementsM.filter(p=>p.destinataire_id===selM.id&&p.statut==="pending").length||0},
                 {id:"parametres", label:fr?"Paramètres":"Settings",icon:"⚙️"},
@@ -13970,6 +14010,125 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
                   )}
                 </div>
               )}
+
+              {/* ── TAB CATALOGUE — Inventaire contenu par modèle ── */}
+              {modalTab==="catalogue" && (() => {
+                const mProducts = (products||[]).filter(p => p.model_id === selM.id);
+                const activeProducts = mProducts.filter(p => p.active);
+                const inactiveProducts = mProducts.filter(p => !p.active);
+                const mTxsValidated = selM.validated || [];
+                // Stats per product
+                const prodStats = mProducts.map(p => {
+                  const pTxs = mTxsValidated.filter(tx => tx.product_id === p.id);
+                  const ca = pTxs.reduce((s, tx) => s + convertAmount(Number(tx.amount), tx.currency), 0);
+                  return { ...p, sales: pTxs.length, ca };
+                }).sort((a, b) => b.ca - a.ca);
+                // Category breakdown
+                const catStats = {};
+                PRODUCT_CATEGORIES.forEach(cat => { catStats[cat] = { count: 0, sales: 0, ca: 0 }; });
+                prodStats.forEach(p => {
+                  const cat = p.category || "Autre";
+                  if (!catStats[cat]) catStats[cat] = { count: 0, sales: 0, ca: 0 };
+                  catStats[cat].count++;
+                  catStats[cat].sales += p.sales;
+                  catStats[cat].ca += p.ca;
+                });
+                const activeCats = Object.entries(catStats).filter(([, v]) => v.count > 0);
+                const totalCA = prodStats.reduce((s, p) => s + p.ca, 0);
+                const totalSales = prodStats.reduce((s, p) => s + p.sales, 0);
+
+                return (
+                  <div>
+                    {/* KPIs catalogue */}
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:16}}>
+                      {[
+                        {l:fr?"PRODUITS ACTIFS":"ACTIVE PRODUCTS", v:activeProducts.length, c:"#818cf8"},
+                        {l:fr?"CATÉGORIES":"CATEGORIES", v:activeCats.length, c:"#f59e0b"},
+                        {l:fr?"VENTES TOTALES":"TOTAL SALES", v:totalSales, c:"var(--success)"},
+                        {l:"CA PRODUITS", v:`${Math.round(totalCA).toLocaleString()} CHF`, c:"var(--success)"},
+                      ].map((k,i) => (
+                        <div key={i} style={{padding:"10px 12px",borderRadius:10,background:"var(--surface2)",border:"1px solid var(--border)"}}>
+                          <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>{k.l}</div>
+                          <div style={{fontSize:18,fontWeight:800,color:k.c}}>{k.v}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Category breakdown */}
+                    {activeCats.length > 0 && (
+                      <div style={{marginBottom:16}}>
+                        <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:"var(--text-secondary)"}}>{fr?"Par catégorie":"By Category"}</div>
+                        <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                          {activeCats.map(([cat, st]) => (
+                            <div key={cat} style={{padding:"6px 12px",borderRadius:8,background:"var(--surface2)",border:"1px solid var(--border)",display:"flex",alignItems:"center",gap:6}}>
+                              <span style={{fontSize:14}}>{CATEGORY_ICONS[cat]||"📦"}</span>
+                              <span style={{fontSize:12,fontWeight:700}}>{cat}</span>
+                              <span style={{fontSize:11,color:"var(--text-tertiary)"}}>{st.count} prod · {st.sales} ventes · {Math.round(st.ca).toLocaleString()} CHF</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Product list */}
+                    <div style={{fontSize:12,fontWeight:700,marginBottom:8,color:"var(--text-secondary)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span>{fr?"Produits":"Products"} ({activeProducts.length} {fr?"actifs":"active"}{inactiveProducts.length>0?`, ${inactiveProducts.length} ${fr?"inactifs":"inactive"}`:""})</span>
+                      <button onClick={()=>{
+                        setProdFormModel(selM.id);
+                        setEditProdId(null);
+                        setCatProdForm({name:"",icon:"📦",category:"Cam",price_chf:"",duration_minutes:"",description:"",details:"",active:true});
+                        setShowCatProdModal(true);
+                      }} style={{padding:"5px 12px",borderRadius:8,border:"1px solid rgba(139,92,246,0.4)",background:"rgba(139,92,246,0.1)",color:"#c4b5fd",fontSize:11,fontWeight:700,cursor:"pointer"}}>
+                        + {fr?"Nouveau produit":"New product"}
+                      </button>
+                    </div>
+
+                    {prodStats.length === 0 ? (
+                      <div style={{textAlign:"center",padding:32,color:"var(--text-tertiary)"}}>
+                        <div style={{fontSize:28,marginBottom:8}}>📦</div>
+                        <div style={{fontSize:13}}>{fr?"Aucun produit pour ce modèle":"No products for this model"}</div>
+                        <div style={{fontSize:11,marginTop:4}}>{fr?"Ajoutez des produits pour tracker les ventes":"Add products to track sales"}</div>
+                      </div>
+                    ) : (
+                      <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                        {prodStats.map(p => (
+                          <div key={p.id} style={{
+                            display:"flex",alignItems:"center",gap:12,padding:"10px 14px",
+                            borderRadius:10,background:"var(--surface2)",border:`1px solid ${p.active?"var(--border)":"rgba(239,68,68,0.2)"}`,
+                            opacity:p.active?1:0.5
+                          }}>
+                            <span style={{fontSize:20,width:28,textAlign:"center"}}>{p.icon||CATEGORY_ICONS[p.category]||"📦"}</span>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                                <span style={{fontSize:13,fontWeight:700,color:p.active?"var(--text)":"var(--text-tertiary)"}}>{p.name}</span>
+                                <span style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:"rgba(139,92,246,0.15)",color:"#a78bfa",fontWeight:600}}>{p.category}</span>
+                                {!p.active&&<span style={{fontSize:9,padding:"2px 6px",borderRadius:4,background:"rgba(239,68,68,0.15)",color:"#ef4444",fontWeight:600}}>INACTIF</span>}
+                              </div>
+                              {p.description&&<div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>{p.description}</div>}
+                              {p.details&&<div style={{fontSize:10,color:"var(--text-tertiary)",fontStyle:"italic",marginTop:1}}>{p.details}</div>}
+                            </div>
+                            <div style={{textAlign:"right",flexShrink:0}}>
+                              {p.price_chf&&<div style={{fontSize:13,fontWeight:800,color:"var(--success)"}}>{p.price_chf} CHF</div>}
+                              {p.duration_minutes&&<div style={{fontSize:10,color:"var(--text-tertiary)"}}>{p.duration_minutes} min</div>}
+                            </div>
+                            <div style={{textAlign:"right",flexShrink:0,minWidth:60}}>
+                              <div style={{fontSize:12,fontWeight:700,color:"#818cf8"}}>{p.sales}x</div>
+                              <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{Math.round(p.ca).toLocaleString()} CHF</div>
+                            </div>
+                            <button onClick={(e)=>{
+                              e.stopPropagation();
+                              setProdFormModel(selM.id);
+                              setEditProdId(p.id);
+                              setCatProdForm({name:p.name||"",icon:p.icon||"📦",category:p.category||"Cam",price_chf:p.price_chf||"",duration_minutes:p.duration_minutes||"",description:p.description||"",details:p.details||"",active:p.active!==false});
+                              setShowCatProdModal(true);
+                            }} style={{padding:"4px 8px",borderRadius:6,border:"1px solid var(--border)",background:"transparent",color:"var(--text-tertiary)",fontSize:11,cursor:"pointer"}}>✏️</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* ── TAB CHECKLIST ── */}
               {modalTab==="checklist" && (() => {
@@ -14202,6 +14361,65 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
 
       {editingTx && <EditTxModal tx={editingTx} lang={lang} onSave={handleEditSave} onCancel={()=>setEditingTx(null)} saving={saving} models={models} profiles={profiles} products={products} productTags={productTags} modelPrices={modelPrices} providerPaymentMethods={providerPaymentMethods} />}
       <ConfirmModal open={!!confirmRefuse} lang={lang} title={fr?"Refuser cette transaction ?":"Refuse this transaction?"} message={confirmRefuse?`${fr?"Voulez-vous vraiment refuser la transaction de":"Do you really want to refuse the transaction from"} @${confirmRefuse.spender_handle} (${fmtAmount(confirmRefuse.amount,confirmRefuse.currency)}) ?`:""} onConfirm={()=>{const tx=confirmRefuse;setConfirmRefuse(null);handleStatus(tx.id,"refused");}} onCancel={()=>setConfirmRefuse(null)} />
+      {/* ── Catalogue Product Modal (create/edit) ── */}
+      {showCatProdModal && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:10000}} onClick={()=>setShowCatProdModal(false)}>
+          <div onClick={e=>e.stopPropagation()} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,padding:24,width:440,maxWidth:"95vw",maxHeight:"85vh",overflowY:"auto"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+              <div style={{fontSize:15,fontWeight:800}}>{editProdId?(fr?"Modifier produit":"Edit product"):(fr?"Nouveau produit":"New product")}</div>
+              <button onClick={()=>setShowCatProdModal(false)} style={{background:"none",border:"none",color:"var(--text-tertiary)",fontSize:18,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:12}}>
+              <div>
+                <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>{fr?"Nom *":"Name *"}</label>
+                <input value={catProdForm.name} onChange={e=>setCatProdForm(f=>({...f,name:e.target.value}))} placeholder="Ex: Cam privée 10min" style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13,boxSizing:"border-box"}} autoFocus />
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <div>
+                  <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>{fr?"Catégorie":"Category"}</label>
+                  <select value={catProdForm.category} onChange={e=>setCatProdForm(f=>({...f,category:e.target.value}))} style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13}}>
+                    {PRODUCT_CATEGORIES.map(c=><option key={c} value={c}>{CATEGORY_ICONS[c]||"📦"} {c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>Emoji</label>
+                  <input value={catProdForm.icon} onChange={e=>setCatProdForm(f=>({...f,icon:e.target.value}))} style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13,boxSizing:"border-box"}} />
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+                <div>
+                  <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>{fr?"Prix CHF":"Price CHF"}</label>
+                  <input type="number" value={catProdForm.price_chf} onChange={e=>setCatProdForm(f=>({...f,price_chf:e.target.value}))} placeholder="—" style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13,boxSizing:"border-box"}} />
+                </div>
+                <div>
+                  <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>{fr?"Durée (min)":"Duration (min)"}</label>
+                  <input type="number" value={catProdForm.duration_minutes} onChange={e=>setCatProdForm(f=>({...f,duration_minutes:e.target.value}))} placeholder="—" style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13,boxSizing:"border-box"}} />
+                </div>
+              </div>
+              <div>
+                <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>{fr?"Description courte":"Short description"}</label>
+                <input value={catProdForm.description} onChange={e=>setCatProdForm(f=>({...f,description:e.target.value}))} placeholder={fr?"Ex: Cam privée avec son, angle fixe":"E.g. Private cam with sound, fixed angle"} style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13,boxSizing:"border-box"}} />
+              </div>
+              <div>
+                <label style={{fontSize:10,fontWeight:700,color:"var(--text-secondary)",textTransform:"uppercase",letterSpacing:0.5,display:"block",marginBottom:4}}>{fr?"Détails contenu inclus":"Content details included"}</label>
+                <textarea value={catProdForm.details} onChange={e=>setCatProdForm(f=>({...f,details:e.target.value}))} rows={2} placeholder={fr?"Ex: Son inclus, HD 1080p, durée variable, sans visage":"E.g. Sound included, HD 1080p, variable length, no face"} style={{width:"100%",padding:"8px 12px",borderRadius:8,border:"1px solid var(--border)",background:"var(--bg-card,#0D0D1A)",color:"var(--text)",fontSize:13,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit"}} />
+              </div>
+              <label style={{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"var(--text-secondary)",cursor:"pointer"}}>
+                <input type="checkbox" checked={catProdForm.active} onChange={e=>setCatProdForm(f=>({...f,active:e.target.checked}))} />
+                {fr?"Produit actif (visible dans TX)":"Active product (visible in TX)"}
+              </label>
+            </div>
+            <div style={{display:"flex",gap:10,justifyContent:"flex-end",marginTop:20}}>
+              <button onClick={()=>setShowCatProdModal(false)} style={{padding:"8px 20px",borderRadius:10,border:"1px solid var(--border)",background:"transparent",color:"var(--text-secondary)",fontSize:13,cursor:"pointer"}}>
+                {fr?"Annuler":"Cancel"}
+              </button>
+              <button onClick={handleSaveCatProd} disabled={catProdSaving||!catProdForm.name.trim()} style={{padding:"8px 20px",borderRadius:10,border:"none",background:catProdForm.name.trim()&&!catProdSaving?"#7c3aed":"rgba(255,255,255,0.06)",color:catProdForm.name.trim()&&!catProdSaving?"#fff":"#6B7280",fontSize:13,fontWeight:700,cursor:catProdForm.name.trim()&&!catProdSaving?"pointer":"not-allowed"}}>
+                {catProdSaving?"...":(editProdId?(fr?"✓ Sauvegarder":"✓ Save"):(fr?"✓ Créer":"✓ Create"))}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {gerantPassportModel && (
         <ModelPassportCard
           model={gerantPassportModel}
@@ -61581,6 +61799,7 @@ const MCModelesTab = React.memo(({ user, lang, mcTxs = [], mcChatters = [], mode
   const _isMobile = window.innerWidth < 768;
   const [modalModel, setModalModel] = useState(null);
   const [passportModel, setPassportModel] = useState(null);
+  const [mcModalTab, setMcModalTab] = useState("performance");
 
   // ── Derive MC's models: all models their chatters work on ──
   const mcModelIds = useMemo(() => {
@@ -61740,7 +61959,22 @@ const MCModelesTab = React.memo(({ user, lang, mcTxs = [], mcChatters = [], mode
               </div>
             </div>
 
+            {/* Tab bar */}
+            <div style={{ display: "flex", gap: 8, padding: "12px 24px", borderBottom: "1px solid var(--border)" }}>
+              {[
+                { id: "performance", label: "Performance", icon: "📊" },
+                { id: "catalogue", label: "Catalogue", icon: "📦", badge: (products || []).filter(p => p.model_id === selM.id && p.active).length || 0 },
+              ].map(mt => (
+                <button key={mt.id} onClick={() => setMcModalTab(mt.id)} style={{ padding: "7px 13px", borderRadius: 9, border: `1px solid ${mcModalTab === mt.id ? "#8b5cf6" : "var(--border)"}`, background: mcModalTab === mt.id ? "rgba(139,92,246,0.15)" : "var(--surface2)", color: mcModalTab === mt.id ? "#c4b5fd" : "var(--text)", fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
+                  {mt.icon} {mt.label}
+                  {mt.badge > 0 && <span style={{ background: "rgba(139,92,246,0.3)", color: "#c4b5fd", borderRadius: "50%", fontSize: 9, fontWeight: 800, width: 16, height: 16, display: "flex", alignItems: "center", justifyContent: "center" }}>{mt.badge}</span>}
+                </button>
+              ))}
+            </div>
+
             <div style={{ padding: 24 }}>
+              {/* ── PERFORMANCE TAB ── */}
+              {mcModalTab === "performance" && (<>
               {/* KPIs */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 20 }}>
                 {[
@@ -61815,6 +62049,89 @@ const MCModelesTab = React.memo(({ user, lang, mcTxs = [], mcChatters = [], mode
                   {selM.chatters.length === 0 && <span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{fr ? "Aucun chatter" : "No chatters"}</span>}
                 </div>
               </div>
+              </>)}
+
+              {/* ── CATALOGUE TAB (MC = read-only) ── */}
+              {mcModalTab === "catalogue" && (() => {
+                const mProducts = (products || []).filter(p => p.model_id === selM.id);
+                const activeProds = mProducts.filter(p => p.active);
+                const mTxsValid = selM.validated || [];
+                const prodStats = mProducts.map(p => {
+                  const pTxs = mTxsValid.filter(tx => tx.product_id === p.id);
+                  const ca = pTxs.reduce((s, tx) => s + Number(tx.amount || 0), 0);
+                  return { ...p, sales: pTxs.length, ca };
+                }).sort((a, b) => b.ca - a.ca);
+                const catStats = {};
+                prodStats.forEach(p => {
+                  const cat = p.category || "Autre";
+                  if (!catStats[cat]) catStats[cat] = { count: 0, sales: 0, ca: 0 };
+                  catStats[cat].count++; catStats[cat].sales += p.sales; catStats[cat].ca += p.ca;
+                });
+                const activeCats = Object.entries(catStats).filter(([, v]) => v.count > 0);
+                const totalSales = prodStats.reduce((s, p) => s + p.sales, 0);
+                const totalCA = prodStats.reduce((s, p) => s + p.ca, 0);
+
+                return (
+                  <div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 16 }}>
+                      {[
+                        { l: fr ? "PRODUITS ACTIFS" : "ACTIVE PRODUCTS", v: activeProds.length, c: "#818cf8" },
+                        { l: fr ? "VENTES" : "SALES", v: totalSales, c: "var(--success)" },
+                        { l: "CA", v: `${Math.round(totalCA).toLocaleString()} CHF`, c: "var(--success)" },
+                      ].map((k, i) => (
+                        <div key={i} style={{ padding: "10px 12px", borderRadius: 10, background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                          <div style={{ fontSize: 10, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{k.l}</div>
+                          <div style={{ fontSize: 18, fontWeight: 800, color: k.c }}>{k.v}</div>
+                        </div>
+                      ))}
+                    </div>
+                    {activeCats.length > 0 && (
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, color: "var(--text-secondary)" }}>{fr ? "Par catégorie" : "By Category"}</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {activeCats.map(([cat, st]) => (
+                            <div key={cat} style={{ padding: "6px 12px", borderRadius: 8, background: "var(--surface2)", border: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ fontSize: 14 }}>{CATEGORY_ICONS[cat] || "📦"}</span>
+                              <span style={{ fontSize: 12, fontWeight: 700 }}>{cat}</span>
+                              <span style={{ fontSize: 11, color: "var(--text-tertiary)" }}>{st.count} · {st.sales} ventes</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {prodStats.length === 0 ? (
+                      <div style={{ textAlign: "center", padding: 32, color: "var(--text-tertiary)" }}>
+                        <div style={{ fontSize: 28, marginBottom: 8 }}>📦</div>
+                        <div style={{ fontSize: 13 }}>{fr ? "Aucun produit pour ce modèle" : "No products for this model"}</div>
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {prodStats.map(p => (
+                          <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 10, background: "var(--surface2)", border: `1px solid ${p.active ? "var(--border)" : "rgba(239,68,68,0.2)"}`, opacity: p.active ? 1 : 0.5 }}>
+                            <span style={{ fontSize: 20, width: 28, textAlign: "center" }}>{p.icon || CATEGORY_ICONS[p.category] || "📦"}</span>
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ fontSize: 13, fontWeight: 700 }}>{p.name}</span>
+                                <span style={{ fontSize: 9, padding: "2px 6px", borderRadius: 4, background: "rgba(139,92,246,0.15)", color: "#a78bfa", fontWeight: 600 }}>{p.category}</span>
+                              </div>
+                              {p.description && <div style={{ fontSize: 11, color: "var(--text-tertiary)", marginTop: 2 }}>{p.description}</div>}
+                              {p.details && <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontStyle: "italic", marginTop: 1 }}>{p.details}</div>}
+                            </div>
+                            <div style={{ textAlign: "right", flexShrink: 0 }}>
+                              {p.price_chf && <div style={{ fontSize: 13, fontWeight: 800, color: "var(--success)" }}>{p.price_chf} CHF</div>}
+                              {p.duration_minutes && <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>{p.duration_minutes} min</div>}
+                            </div>
+                            <div style={{ textAlign: "right", flexShrink: 0, minWidth: 60 }}>
+                              <div style={{ fontSize: 12, fontWeight: 700, color: "#818cf8" }}>{p.sales}x</div>
+                              <div style={{ fontSize: 10, color: "var(--text-tertiary)" }}>{Math.round(p.ca).toLocaleString()} CHF</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>
