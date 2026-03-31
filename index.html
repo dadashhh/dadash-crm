@@ -11346,12 +11346,12 @@ const DASHBOARD_METRICS = [
 ];
 
 const CHATTER_DASHBOARD_METRICS = [
-  { id: "ca_brut",         label: "CA BRUT",         color: "#8b5cf6", calc: (d) => (d && d.caBrut != null) ? d.caBrut : 0,                       fmt: "currency", inGraph: true  },
-  { id: "ca_net",          label: "CA NET",           color: "#10b981", calc: (d) => (d && d.caNet != null) ? d.caNet : 0,                         fmt: "currency", inGraph: true  },
-  { id: "ma_commission",   label: "MA COMMISSION",   color: "#f59e0b", calc: (d) => (d && d.maCommission != null) ? d.maCommission : 0,            fmt: "currency", inGraph: true  },
-  { id: "tx_mois",         label: "TX CE MOIS",      color: "#10b981", calc: (d) => (d && d.txCeMois != null) ? d.txCeMois : 0,                   fmt: "number",   inGraph: false },
-  { id: "spenders_actifs", label: "SPENDERS ACTIFS", color: "#06b6d4", calc: (d) => (d && d.spendersActifs != null) ? d.spendersActifs : 0,       fmt: "number",   inGraph: false },
-  { id: "tx_pending",      label: "TX EN ATTENTE",   color: "#f97316", calc: (d) => (d && d.txPending != null) ? d.txPending : 0,                 fmt: "number",   inGraph: false },
+  { id: "ca_brut",         label: "CA BRUT",          color: "#8b5cf6", calc: (d) => d?.caBrut ?? 0,         fmt: "currency", inGraph: true  },
+  { id: "ca_net",          label: "CA NET",            color: "#10b981", calc: (d) => d?.caNet ?? 0,          fmt: "currency", inGraph: true  },
+  { id: "ma_commission",   label: "MA COMMISSION",     color: "#f59e0b", calc: (d) => d?.maCommission ?? 0,   fmt: "currency", inGraph: true  },
+  { id: "tx_pending",      label: "TX EN COURS",       color: "#f97316", calc: (d) => d?.txPending ?? 0,      fmt: "number",   inGraph: false },
+  { id: "spenders_actifs", label: "SPENDERS ACTIFS",   color: "#06b6d4", calc: (d) => d?.spendersActifs ?? 0, fmt: "number",   inGraph: true  },
+  { id: "tx_cancelled",    label: "TX ANNULÉES",       color: "#ef4444", calc: (d) => d?.txCancelled ?? 0,    fmt: "number",   inGraph: false },
 ];
 
 // ── useCarlosPing — latence Carlos en temps réel ──
@@ -28927,40 +28927,165 @@ const StreakBadge = ({ streak }) => {
 };
 
 // =============================================
-// CHATTER DASHBOARD REDESIGN — Clone UI gérant (PR1A+PR1B+PR1C)
-// Même look que DashboardRedesign, données chatter uniquement
+// CHATTER DASHBOARD V2 — Aligned with DashboardRedesign gérant
+// Model pills, DashFilterPill, KPI click-to-filter, graph, TX table direct
 // =============================================
-const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models, profiles }) => {
-  const { convertAmount, currencySymbol } = useCurrency();
-  const cardModal = useCardModal();
+const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models, profiles, onStatusFilterChange, onPeriodChange, onModelFilterChange, onDateRangeChange }) => {
+  const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
+  const timezone = useTimezone();
+  const addToast = useToast();
   const fr = lang === "fr";
+
+  // ── States ──
+  const [period, _setPeriod] = useState("30j");
+  const setPeriod = (p) => { _setPeriod(p); onPeriodChange && onPeriodChange(p); };
+  const [dateStart, _setDateStart] = useState("");
+  const [dateEnd, _setDateEnd] = useState("");
+  const setDateStart = (v) => { _setDateStart(v); };
+  const setDateEnd = (v) => { _setDateEnd(v); };
+  useEffect(() => { onDateRangeChange && onDateRangeChange(dateStart, dateEnd); }, [dateStart, dateEnd]);
+  const [modelFilter, _setModelFilter] = useState("all");
+  const setModelFilter = (m) => { _setModelFilter(m); onModelFilterChange && onModelFilterChange(m === "all" ? "" : m); };
+  const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut", "ca_net"]));
+  const [chartView, setChartView] = useState("curve");
+  const [popup, setPopup] = useState(null);
+  const [soldeChatter, setSoldeChatter] = useState(null);
+
+  // ── V2 Dashboard Filter ──
+  const [dashStatusFilter, setDashStatusFilter] = useState("");
+  const handleStatusFilter = (v) => { setDashStatusFilter(v); onStatusFilterChange && onStatusFilterChange(v); };
+
+  const _isMobile = window.innerWidth < 768;
+  const sb = window.sb;
+  const toggleMetric = (id) => setActiveMetrics(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+
+  // ── Context modèles ──
   const ctx = getChatterContext(user, models);
   const { assignedModelIds, assignedModels } = ctx;
   const myModelIds = Array.isArray(assignedModelIds) ? assignedModelIds : [];
   const myModels = Array.isArray(assignedModels) ? assignedModels : [];
 
-  const safeArr = (v) => Array.isArray(v) ? v : [];
-  const safeNum = (v) => (v != null && !isNaN(Number(v))) ? Number(v) : 0;
+  // ── TX du chatter ──
+  const allTxs = useMemo(() => {
+    return (txs || []).filter(tx => tx.chatter_id === user?.id);
+  }, [txs, user?.id]);
 
-  const [period, setPeriod] = useState("30j");
-  const [dateStart, setDateStart] = useState("");
-  const [dateEnd, setDateEnd] = useState("");
-  const [modelFilter, setModelFilter] = useState("all");
-  const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut"]));
-  const [chartView, setChartView] = useState("curve");
-  const [popup, setPopup] = useState(null);
-  const [todos, setTodos] = useState([]);
-  const [newTodoText, setNewTodoText] = useState("");
-  // ── Recherche globale ──
-  const [searchQuery, setSearchQuery] = useState("");
-  const [showSearchPanel, setShowSearchPanel] = useState(false);
-  const searchRef = React.useRef(null);
+  // ── Period bounds (same logic as gérant) ──
+  const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
+    const now = new Date();
+    let end = new Date(now);
+    let start;
+    if (period === "custom" && dateStart && dateEnd) {
+      start = new Date(dateStart + "T00:00:00");
+      end = new Date(dateEnd + "T23:59:59");
+    } else if (period === "today") {
+      start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    } else if (period === "24h") {
+      start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    } else if (period === "all") {
+      start = new Date(2020, 0, 1);
+    } else {
+      const daysMap = { "7j": 7, "30j": 30, "90j": 90 };
+      const days = daysMap[period] || 30;
+      start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    }
+    const diff = end.getTime() - start.getTime();
+    return {
+      dateDebut: start, dateFin: end,
+      prevDateDebut: new Date(start.getTime() - diff),
+      prevDateFin: new Date(start.getTime() - 1),
+    };
+  }, [period, dateStart, dateEnd]);
 
-  // ── MON SOLDE Chatter ──
-  const [soldeChatter, setSoldeChatter] = useState(null);
+  // ── Filtered TX (by period + model + status) ──
+  const filteredTxs = useMemo(() => {
+    const dStart = dateDebut.getTime();
+    const dFin = dateFin.getTime();
+    if (isNaN(dStart) || isNaN(dFin)) return [];
+    return safeArr(allTxs).filter(tx => {
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
+      if (isNaN(d) || d < dStart || d > dFin) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      if (dashStatusFilter) {
+        if (dashStatusFilter === "validated" && !isValidTx(tx.status)) return false;
+        if (dashStatusFilter === "pending" && !isPendingTx(tx.status)) return false;
+        if (dashStatusFilter === "refused" && !isRefusedTx(tx.status)) return false;
+      }
+      return true;
+    });
+  }, [allTxs, dateDebut, dateFin, modelFilter, dashStatusFilter]);
+
+  const prevFilteredTxs = useMemo(() => {
+    const dStart = prevDateDebut.getTime();
+    const dFin = prevDateFin.getTime();
+    if (isNaN(dStart) || isNaN(dFin)) return [];
+    return safeArr(allTxs).filter(tx => {
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
+      if (isNaN(d) || d < dStart || d > dFin) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      return true;
+    });
+  }, [allTxs, prevDateDebut, prevDateFin, modelFilter]);
+
+  // ── KPI Data ──
+  const kpiData = useMemo(() => {
+    const valid = safeArr(filteredTxs).filter(tx => isValidTx(tx.status));
+    const pending = safeArr(filteredTxs).filter(tx => isPendingTx(tx.status));
+    const refused = safeArr(filteredTxs).filter(tx => isRefusedTx(tx.status));
+    const pValid = safeArr(prevFilteredTxs).filter(tx => isValidTx(tx.status));
+
+    // CA BRUT = tx.amount, CA NET = tx.net_amount with fallback
+    const caBrut = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const caNet = valid.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
+    const maCommission = valid.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
+    const txPending = pending.length;
+    const txCancelled = refused.length;
+    const caBrutPending = pending.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const spendersActifs = new Set(valid.map(tx => tx.spender_handle).filter(Boolean)).size;
+
+    const pCaBrut = pValid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
+    const pCaNet = pValid.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
+    const pMaCommission = pValid.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
+    const pTxPending = safeArr(prevFilteredTxs).filter(tx => isPendingTx(tx.status)).length;
+
+    const delta = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
+
+    return {
+      caBrut, caNet, maCommission, txPending, txCancelled, spendersActifs, caBrutPending,
+      deltaCaBrut: delta(caBrut, pCaBrut), deltaCaNet: delta(caNet, pCaNet),
+      deltaCommission: delta(maCommission, pMaCommission), deltaTxPending: delta(txPending, pTxPending),
+    };
+  }, [filteredTxs, prevFilteredTxs, convertAmount]);
+
+  // ── Chart Data ──
+  const chartData = useMemo(() => {
+    const byDay = {};
+    filteredTxs.forEach(tx => {
+      const raw = tx.created_at || tx.date || "";
+      if (!raw) return;
+      const key = new Date(raw).toLocaleDateString('fr-CA');
+      if (!key || key.length < 10) return;
+      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, ma_commission: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, spenders: new Set() };
+      const amtBrut = convertAmount(Number(tx.amount || 0), tx.currency);
+      const amtNet = convertAmount(txNetAmount(tx), tx.currency);
+      const comm = convertAmount(Number(tx.chatter_commission || 0), tx.currency);
+      const isVal = isValidTx(tx.status);
+      const isPend = isPendingTx(tx.status);
+      if (isVal) { byDay[key].ca_brut += amtBrut; byDay[key].ca_net += amtNet; byDay[key].ma_commission += comm; byDay[key].valid += 1; }
+      byDay[key].total += 1;
+      if (isPend) { byDay[key].pending += 1; byDay[key].ca_brut_pending += amtBrut; }
+      if (tx.spender_handle) byDay[key].spenders.add(tx.spender_handle);
+    });
+    return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
+      date, label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
+      ca_brut: Math.round(d.ca_brut), ca_net: Math.round(d.ca_net), ma_commission: Math.round(d.ma_commission),
+      spenders_actifs: d.spenders.size, tx_pending: d.pending,
+    }));
+  }, [filteredTxs, convertAmount]);
+
+  // ── Solde Chatter (commissions - payé) ──
   const refreshSoldeChatter = useCallback(async () => {
     try {
-      // Calcul direct depuis les tables brutes — vue_soldes_chatters peut être stale/incorrecte
       const [txRes, piRes, profRes] = await Promise.allSettled([
         sb.from('transactions')
           .select('amount, net_amount, currency, chatter_commission')
@@ -28975,11 +29100,9 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
           .maybeSingle(),
       ]);
       const allTxData = txRes.status === 'fulfilled' ? (txRes.value.data || []) : [];
-      const piData    = piRes.status === 'fulfilled' ? (piRes.value.data || []) : [];
-      const profile   = profRes.status === 'fulfilled' ? profRes.value.data : null;
-
+      const piData = piRes.status === 'fulfilled' ? (piRes.value.data || []) : [];
+      const profile = profRes.status === 'fulfilled' ? profRes.value.data : null;
       const rate = getCommissionRate(profile, "chatter");
-      // Utiliser chatter_commission si disponible, sinon amount * rate
       const commBrute = allTxData.reduce((s, t) => {
         const explicit = Number(t.chatter_commission || 0);
         return s + (explicit > 0 ? explicit : convertAmountSimple(txNetAmount(t), t.currency) * rate);
@@ -28988,684 +29111,252 @@ const ChatterDashboardRedesign = React.memo(({ user, lang, txs, spenders, models
       setSoldeChatter({ solde: Math.max(0, commBrute - dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
     } catch (e) { console.warn('[SoldeChatter]', e?.message); }
   }, [user?.id]);
-  useEffect(() => {
-    refreshSoldeChatter();
-    window.__refreshSolde = refreshSoldeChatter;
-    return () => { if (window.__refreshSolde === refreshSoldeChatter) window.__refreshSolde = null; };
-  }, [refreshSoldeChatter]);
+  useEffect(() => { refreshSoldeChatter(); }, [refreshSoldeChatter]);
 
-  useEffect(() => {
-    if (modelFilter !== "all" && myModelIds.length > 0 && !myModelIds.includes(modelFilter)) {
-      setModelFilter("all");
-    }
-  }, [modelFilter, myModelIds]);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const { data, error } = await sb.from("todos").select("*").eq("created_by", user.id).order("created_at", { ascending: false }).limit(50);
-        if (error) { console.warn("[SB_ERR] todos:", error.message||error); return; }
-        if (data) {
-          setTodos(data);
-        }
-      } catch (e) { console.warn("[SB_ERR] todos (catch):", e.message||e); }
-    })();
-  }, [user?.id]);
-
-  const addTodo = async () => {
-    const text = newTodoText.trim();
-    if (!text) return;
-    setNewTodoText("");
-    const tempId = "tmp-" + Date.now();
-    setTodos(prev => [{ id: tempId, text, done: false, priority: "normale", created_at: new Date().toISOString() }, ...prev]);
-    try {
-      const { data } = await sb.from("todos").insert({ text, created_by: user?.id, priority: "normale" }).select();
-      if (data?.[0]) setTodos(prev => prev.map(t => t.id === tempId ? data[0] : t));
-    } catch (e) { /* local only */ }
-  };
-  const toggleTodo = async (id) => {
-    const t = todos.find(x => x.id === id);
-    if (!t) return;
-    setTodos(prev => prev.map(x => x.id === id ? { ...x, done: !x.done } : x));
-    try { await sb.from("todos").update({ done: !t.done }).eq("id", id); } catch (e) {}
-  };
-
-  const allTxs = useMemo(() => {
-    return (txs || []).filter(tx => tx.chatter_id === user?.id);
-  }, [txs, user?.id]);
-  const allModels = models || [];
-  const modelOptions = useMemo(() => safeArr(myModels).map(m => ({ id: m.id, name: m.name || "—" })), [myModels]);
-
-  const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
-    const now = new Date();
-    let start, end, prevStart, prevEnd;
-    if (period === "custom" && dateStart && dateEnd) {
-      start = new Date(dateStart);
-      end = new Date(dateEnd);
-      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-        start = new Date(now); start.setDate(start.getDate() - 30); start.setHours(0, 0, 0, 0);
-        end = new Date(now); end.setHours(23, 59, 59, 999);
-      }
-      const diff = end.getTime() - start.getTime();
-      prevEnd = new Date(start.getTime());
-      prevStart = new Date(start.getTime() - diff);
-    } else {
-      const days = period === "24h" ? 1 : period === "7j" ? 7 : period === "30j" ? 30 : period === "90j" ? 90 : 99999;
-      end = new Date(now); end.setHours(23, 59, 59, 999);
-      start = new Date(now); start.setDate(start.getDate() - days); start.setHours(0, 0, 0, 0);
-      prevEnd = new Date(start.getTime()); prevEnd.setMilliseconds(-1);
-      prevStart = new Date(prevEnd.getTime()); prevStart.setDate(prevStart.getDate() - days);
-    }
-    return { dateDebut: start, dateFin: end, prevDateDebut: prevStart, prevDateFin: prevEnd };
-  }, [period, dateStart, dateEnd]);
-
-  const filteredTxs = useMemo(() => {
-    const dStart = dateDebut.getTime();
-    const dFin = dateFin.getTime();
-    if (isNaN(dStart) || isNaN(dFin)) return [];
-    return safeArr(allTxs).filter(tx => {
-      const d = new Date(tx.created_at || tx.date || 0).getTime();
-      if (isNaN(d)) return false;
-      if (d < dStart || d > dFin) return false;
-      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
-      return true;
-    });
-  }, [allTxs, dateDebut, dateFin, modelFilter]);
-
-  const prevFilteredTxs = useMemo(() => {
-    const pStart = prevDateDebut.getTime();
-    const pFin = prevDateFin.getTime();
-    if (isNaN(pStart) || isNaN(pFin)) return [];
-    return safeArr(allTxs).filter(tx => {
-      const d = new Date(tx.created_at || tx.date || 0).getTime();
-      if (isNaN(d)) return false;
-      if (d < pStart || d > pFin) return false;
-      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
-      return true;
-    });
-  }, [allTxs, prevDateDebut, prevDateFin, modelFilter]);
-
-  const kpiData = useMemo(() => {
-    const valid = safeArr(filteredTxs).filter(tx => isValidTx(tx.status));
-    const pending = safeArr(filteredTxs).filter(tx => isPendingTx(tx.status));
-    const caBrut = valid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-    const caNet = valid.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
-    const txCount = valid.length;
-    const txPending = pending.length;
-    const caBrutPending = pending.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-    const panierMoyen = txCount > 0 ? caBrut / txCount : 0;
-    const tauxValidation = (txCount + txPending) > 0 ? (txCount / (txCount + txPending)) * 100 : 0;
-    const pValid = prevFilteredTxs.filter(tx => isValidTx(tx.status));
-    const pPending = prevFilteredTxs.filter(tx => isPendingTx(tx.status));
-    const pCaBrut = pValid.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-    const pCaNet = pValid.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
-    const pTxCount = pValid.length;
-    const pTxPending = pPending.length;
-    const pCaBrutPending = pPending.reduce((s, tx) => s + convertAmount(Number(tx.amount || 0), tx.currency), 0);
-    const pPanierMoyen = pTxCount > 0 ? pCaBrut / pTxCount : 0;
-    const pTauxVal = (pTxCount + pTxPending) > 0 ? (pTxCount / (pTxCount + pTxPending)) * 100 : 0;
-    // Commission nette du chatter sur la période
-    const maCommission = valid.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
-    const pMaCommission = pValid.reduce((s, tx) => s + convertAmount(Number(tx.chatter_commission || 0), tx.currency), 0);
-    const delta = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
-    const _now = new Date();
-    const _monthStart = new Date(_now.getFullYear(), _now.getMonth(), 1);
-    const _30dAgo = new Date(_now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const txCeMois = safeArr(allTxs).filter(tx => new Date(tx.created_at || tx.date) >= _monthStart).length;
-    const spendersActifs = new Set(safeArr(allTxs).filter(tx => new Date(tx.created_at || tx.date) >= _30dAgo).map(tx => tx.spender_handle).filter(Boolean)).size;
-    return {
-      caBrut, caNet, txCount, txPending, caBrutPending, panierMoyen, tauxValidation,
-      maCommission, txCeMois, spendersActifs,
-      deltaCaBrut: delta(caBrut, pCaBrut), deltaCaNet: delta(caNet, pCaNet), deltaTx: delta(txCount, pTxCount),
-      deltaTxPending: delta(txPending, pTxPending), deltaCaBrutPending: delta(caBrutPending, pCaBrutPending),
-      deltaPanier: delta(panierMoyen, pPanierMoyen), deltaTaux: tauxValidation - pTauxVal,
-      deltaCommission: delta(maCommission, pMaCommission),
-    };
-  }, [filteredTxs, prevFilteredTxs, convertAmount, allTxs]);
-
-  const toggleMetric = (id) => {
-    setActiveMetrics(prev => {
-      const next = new Set(prev);
-      if (next.has(id) && next.size <= 1) return prev;
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  };
-
-  const chartData = useMemo(() => {
-    if (period === "24h" || period === "today") return getChartData(filteredTxs, "created_at", ["ca_brut", "ca_net", "total", "valid", "pending", "ma_commission", "panier_moyen", "taux_validation"], period);
-    // O(n) — build directly from transactions, no day-by-day pre-fill loop
-    const byDay = {};
-    filteredTxs.forEach(tx => {
-      const raw = tx.created_at || tx.date || "";
-      if (!raw) return;
-      const key = new Date(raw).toLocaleDateString('fr-CA');
-      if (!key || key.length < 10) return;
-      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
-      const amtBrut = convertAmount(Number(tx.amount || 0), tx.currency);
-      const amtNet = convertAmount(txNetAmount(tx), tx.currency);
-      const comm = convertAmount(Number(tx.chatter_commission || 0), tx.currency);
-      const isVal = isValidTx(tx.status);
-      const isPend = isPendingTx(tx.status);
-      if (isVal) { byDay[key].ca_brut += amtBrut; byDay[key].ca_net += amtNet; byDay[key].commission += comm; }
-      byDay[key].total += 1;
-      if (isVal) byDay[key].valid += 1;
-      if (isPend) { byDay[key].pending += 1; byDay[key].ca_brut_pending += amtBrut; }
-    });
-    return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
-      date,
-      label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
-      ca_brut: Math.round(d.ca_brut),
-      ca_net: Math.round(d.ca_net),
-      ma_commission: Math.round(d.commission),
-      transactions: Math.round(d.ca_brut_pending),
-      panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
-      taux_validation: (d.valid + d.pending) > 0 ? Math.round((d.valid / (d.valid + d.pending)) * 100) : 0,
-    }));
-  }, [filteredTxs, convertAmount, period]);
-
-  const modelStats = useMemo(() => {
-    const now = new Date();
-    const mStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const mEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-    const isVal = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee";
-    const result = safeArr(myModels).map(m => {
-      const mTxs = safeArr(allTxs).filter(tx => tx.model_id === m.id);
-      const monthTxs = mTxs.filter(tx => { const d = new Date(tx.created_at || tx.date); return d >= mStart && d <= mEnd; });
-      const validMonthTxs = monthTxs.filter(tx => isVal(tx.status));
-      const caMois = validMonthTxs.reduce((s, tx) => s + convertAmount(txNetAmount(tx), tx.currency), 0);
-      const nbTxMois = monthTxs.length;
-      return { name: m.name || "—", id: m.id, caMois, nbTxMois, photo: m.avatar_url || m.photo_url || null };
-    });
-    const topCa = Math.max(...result.map(x => x.caMois), 1);
-    return result.map(x => ({ ...x, barPct: (x.caMois / topCa) * 100 }));
-  }, [allTxs, myModels, convertAmount]);
-
-  const recentAllTxs = useMemo(() => {
-    const list = safeArr(allTxs).slice();
-    list.sort((a, b) => new Date(b.date || b.created_at || 0).getTime() - new Date(a.date || a.created_at || 0).getTime());
-    return list.slice(0, 20);
-  }, [allTxs]);
-
-  const chatterProfilesForCard = useMemo(() => {
-    if (user) return [{ id: user.id, name: user.name || (fr ? "Moi" : "Me"), assigned_models: user.assigned_models || [] }];
-    return [];
-  }, [user, fr]);
-
-  // Fermer search panel au clic extérieur
-  useEffect(() => {
-    if (!showSearchPanel) return;
-    const h = (e) => { if (searchRef.current && !searchRef.current.contains(e.target)) setShowSearchPanel(false); };
-    document.addEventListener("mousedown", h);
-    return () => document.removeEventListener("mousedown", h);
-  }, [showSearchPanel]);
-
+  // ── Helpers ──
   const fmtVal = (id, v) => {
     const m = CHATTER_DASHBOARD_METRICS.find(x => x.id === id);
-    if (!m) return String(v);
-    if (m.fmt === "currency") return (v || 0).toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol;
-    if (m.fmt === "percent") return (v || 0).toFixed(1) + "%";
-    return String(Math.round(v || 0));
+    if (!m) return v;
+    if (m.fmt === "currency") return fmtAmount(v);
+    if (m.fmt === "percent") return Math.round(v) + "%";
+    return String(Math.round(v));
   };
 
-  const CHATTER_MODEL_COLORS = ["#8b5cf6", "#10b981", "#f59e0b", "#06b6d4"];
-  const modelColors = {};
-  myModels.forEach((m, i) => { modelColors[m.name || m.id] = CHATTER_MODEL_COLORS[i % CHATTER_MODEL_COLORS.length]; });
-  const sColor = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee" ? "#10b981" : s === "pending" ? "#f59e0b" : "#ef4444";
-  const sLabel = s => s === "validated" || s === "validé" || s === "confirmee" || s === "payee" ? "VALID" : s === "pending" ? "PEND." : "REFUSÉE";
-  const kpiCardStyle = (id) => {
-    const m = CHATTER_DASHBOARD_METRICS.find(x => x.id === id);
-    const active = activeMetrics.has(id);
-    const bg = active ? (m ? m.color + "12" : "var(--surface)") : "var(--surface)";
-    const borderBottom = active && m ? "2px solid " + m.color : "2px solid transparent";
-    return { background: bg, border: "1px solid var(--border)", borderBottom, borderRadius: 12, padding: "14px 16px", cursor: "pointer", transition: "all 0.2s" };
-  };
+  // ── Model options ──
+  const modelOptions = useMemo(() => myModels.map(m => ({ id: m.id, name: m.name || "—" })).sort((a, b) => (a.name || "").localeCompare(b.name || "")), [myModels]);
 
-  const dashboardAlerts = useMemo(() => {
-    const items = [];
-    const pendingCount = safeArr(allTxs).filter(tx => isPendingTx(tx.status)).length;
-    if (pendingCount >= 5) {
-      items.push({ severity: "gold", icon: "⚠️", msg: pendingCount + " TX " + (fr ? "en attente de validation" : "pending validation"), ongoing: true });
-    }
-    return items;
-  }, [allTxs, fr]);
+  // ── KPI click-to-filter mapping ──
+  const _kpiToStatus = { ca_brut: "validated", ca_net: "validated", ma_commission: "validated", tx_pending: "pending", spenders_actifs: null, tx_cancelled: "refused" };
+  const _deltaKeys = { ca_brut: "deltaCaBrut", ca_net: "deltaCaNet", ma_commission: "deltaCommission", tx_pending: "deltaTxPending" };
+  const _metricColorMap = { ca_brut: "indigo", ca_net: "green", ma_commission: "amber", tx_pending: "amber", spenders_actifs: "white", tx_cancelled: "red" };
 
-  const botStatusList = [];
+  // ── Pending TX list for popup ──
+  const pendingTxs = useMemo(() => safeArr(allTxs).filter(tx => isPendingTx(tx.status)).sort((a, b) => new Date(b.created_at || b.date) - new Date(a.created_at || a.date)).slice(0, 30), [allTxs]);
 
-  // ── Résultats de recherche globale ──
-  const searchResults = useMemo(() => {
-    const q = (searchQuery || "").toLowerCase().trim();
-    if (!q || q.length < 2) return { txs: [], spenders: [], models: [] };
-    const matchTxs = safeArr(allTxs).filter(tx => {
-      const handle = (tx.spender_handle || "").toLowerCase();
-      const amt = String(tx.net_amount || "");
-      const model = safeArr(allModels).find(m => m.id === tx.model_id)?.name || "";
-      return handle.includes(q) || amt.includes(q) || model.toLowerCase().includes(q);
-    }).slice(0, 8);
-    const matchSpenders = safeArr(spenders).filter(sp => {
-      const h = (sp.handle || sp.name || "").toLowerCase();
-      const fname = (sp.first_name || "").toLowerCase();
-      const city = (sp.city || "").toLowerCase();
-      return h.includes(q) || fname.includes(q) || city.includes(q);
-    }).filter(sp => {
-      // Seulement les spenders qui ont au moins une TX de ce chatter
-      return safeArr(allTxs).some(tx => tx.spender_handle && tx.spender_handle.toLowerCase() === (sp.handle || sp.name || "").toLowerCase());
-    }).slice(0, 5);
-    const matchModels = safeArr(myModels).filter(m => (m.name || "").toLowerCase().includes(q)).slice(0, 3);
-    return { txs: matchTxs, spenders: matchSpenders, models: matchModels };
-  }, [searchQuery, allTxs, spenders, myModels, allModels]);
+  return (
+    <div style={{ padding: _isMobile ? "0 12px" : 0 }}>
 
-  const totalResults = searchResults.txs.length + searchResults.spenders.length + searchResults.models.length;
+      {/* 1. FILTRE GLOBAL — Period + Model pills */}
+      <div className="toolbar" style={{ marginBottom: 16 }}>
+        <div className="period-filters">
+          {[{id:"today",label:"Aujourd'hui"},{id:"24h",label:"24h"},{id:"7j",label:"7j"},{id:"30j",label:"30j"},{id:"90j",label:"90j"},{id:"all",label:"All time"}].map(p => (
+            <div key={p.id} className={`filter-pill${period === p.id ? " active" : ""}`}
+              onClick={() => { setPeriod(p.id); setDateStart(""); setDateEnd(""); }}>
+              {p.label}
+            </div>
+          ))}
+        </div>
+        <div className="filter-sep"/>
+        <DateRangePicker
+          startDate={dateStart} endDate={dateEnd}
+          onChange={({ start, end }) => { setDateStart(start || ""); setDateEnd(end || ""); setPeriod("custom"); }}
+          placeholder="Période personnalisée"
+        />
+        <div className="filter-sep"/>
+        {/* Model pills V2 */}
+        <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
+          <button onClick={() => setModelFilter("all")} style={{
+            background: modelFilter === "all" ? "var(--surface)" : "transparent",
+            border: `1.5px solid ${modelFilter === "all" ? "#818cf8" : "var(--border)"}`,
+            borderRadius: 20, padding: "5px 14px", fontSize: 12, cursor: "pointer",
+            color: modelFilter === "all" ? "var(--text)" : "var(--muted)", fontWeight: modelFilter === "all" ? 600 : 400,
+          }}>Tous les modèles</button>
+          {modelOptions.map(m => {
+            const isAct = modelFilter === m.id;
+            const mColor = ["#f97316","#a855f7","#06b6d4","#ef4444","#eab308","#22c55e"][modelOptions.indexOf(m) % 6];
+            return (
+              <button key={m.id} onClick={() => setModelFilter(isAct ? "all" : m.id)} style={{
+                background: isAct ? mColor + "20" : "transparent",
+                border: `1.5px solid ${isAct ? mColor : "var(--border)"}`,
+                borderRadius: 20, padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                color: isAct ? mColor : "var(--muted)", fontWeight: isAct ? 700 : 400,
+                display: "flex", alignItems: "center", gap: 5,
+              }}>
+                <span style={{ width: 16, height: 16, borderRadius: "50%", background: mColor + "30", color: mColor, fontSize: 10, fontWeight: 800, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{(m.name || "?")[0]}</span>
+                {m.name}
+              </button>
+            );
+          })}
+        </div>
+      </div>
 
-  // Fermer le panel en cliquant ailleurs
-  React.useEffect(() => {
-    const handler = (e) => { if (searchRef.current && !searchRef.current.contains(e.target)) setShowSearchPanel(false); };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, []);
+      {/* V2 — Status filter pill */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+        <DashFilterPill label="Tous les statuts" value={dashStatusFilter} onChange={handleStatusFilter}
+          color={dashStatusFilter === "validated" ? "#34d399" : dashStatusFilter === "pending" ? "#fb923c" : dashStatusFilter === "refused" ? "#f87171" : undefined}
+          options={[
+            { value: "", label: "Tous les statuts" },
+            { value: "validated", label: "Validée" },
+            { value: "pending", label: "En attente" },
+            { value: "refused", label: "Refusée / Annulée" },
+          ]} />
+        {(dashStatusFilter || modelFilter !== "all") && (
+          <button onClick={() => { handleStatusFilter(""); setModelFilter("all"); }} style={{
+            display: "flex", alignItems: "center", gap: 4, background: "#f8717115", border: "1px solid #f8717140",
+            borderRadius: 20, padding: "5px 12px", fontSize: 11, cursor: "pointer", color: "#f87171", fontWeight: 600,
+          }}>✕ Reset filtres</button>
+        )}
+      </div>
 
-  const searchBarEl = React.createElement("div", { ref: searchRef, style: { position: "relative", marginBottom: 16 } },
-    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-      React.createElement("input", {
-        type: "text",
-        className: "f-search",
-        placeholder: fr ? "🔍 Rechercher — spender, montant, modèle…" : "🔍 Search — spender, amount, model…",
-        value: searchQuery,
-        onChange: e => { setSearchQuery(e.target.value); setShowSearchPanel(true); },
-        onFocus: () => setShowSearchPanel(true),
-        style: { flex: 1, fontSize: 13, padding: "10px 16px", borderRadius: 12 },
-      }),
-      searchQuery && React.createElement("div", {
-        className: "filter-pill",
-        onClick: () => { setSearchQuery(""); setShowSearchPanel(false); },
-        style: { cursor: "pointer", flexShrink: 0 }
-      }, "✕ Effacer")
-    ),
-    // Panel résultats
-    showSearchPanel && searchQuery.length >= 2 && React.createElement("div", {
-      style: {
-        position: "absolute", top: "calc(100% + 6px)", left: 0, right: 0, zIndex: 1000,
-        background: "var(--bg2)", border: "1px solid var(--border-ds)", borderRadius: 14,
-        boxShadow: "0 12px 40px rgba(0,0,0,0.45)", maxHeight: 420, overflowY: "auto",
-      }
-    },
-      totalResults === 0
-        ? React.createElement("div", { style: { padding: "20px 18px", textAlign: "center", color: "var(--muted-ds)", fontSize: 13 } }, fr ? "Aucun résultat" : "No results")
-        : React.createElement("div", null,
-            // Section Spenders
-            searchResults.spenders.length > 0 && React.createElement("div", null,
-              React.createElement("div", { style: { padding: "10px 16px 6px", fontSize: 9, fontWeight: 700, color: "var(--dim-ds)", textTransform: "uppercase", letterSpacing: ".1em" } }, "👤 Spenders"),
-              searchResults.spenders.map(sp => React.createElement("div", {
-                key: sp.id || sp.handle,
-                style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", cursor: "pointer", transition: "background .12s" },
-                onMouseEnter: e => e.currentTarget.style.background = "rgba(255,255,255,0.04)",
-                onMouseLeave: e => e.currentTarget.style.background = "transparent",
-                onClick: () => { setShowSearchPanel(false); setSearchQuery(""); },
-              },
-                React.createElement("div", { style: { width: 32, height: 32, borderRadius: "50%", background: "var(--accent-s)", border: "1px solid var(--accent-b)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, color: "#a5b4fc", flexShrink: 0 } }, (sp.handle || sp.name || "?")[0].toUpperCase()),
-                React.createElement("div", { style: { minWidth: 0 } },
-                  React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--text-ds)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "@" + (sp.handle || sp.name || "?")),
-                  React.createElement("div", { style: { fontSize: 10, color: "var(--muted-ds)" } }, [sp.first_name, sp.city, sp.langue].filter(Boolean).join(" · ") || "—")
-                ),
-                React.createElement("div", { style: { marginLeft: "auto", fontSize: 12, fontWeight: 700, color: "var(--green-c)", flexShrink: 0 } },
-                  (() => { const ltv = safeArr(allTxs).filter(tx => tx.spender_handle === (sp.handle || sp.name)).reduce((s, tx) => s + (isValidTx(tx.status) ? convertAmount(Number(tx.net_amount || 0), tx.currency) : 0), 0); return ltv > 0 ? Math.round(ltv).toLocaleString() + " " + currencySymbol : ""; })()
-                )
-              ))
-            ),
-            // Section Modèles
-            searchResults.models.length > 0 && React.createElement("div", null,
-              React.createElement("div", { style: { padding: "10px 16px 6px", fontSize: 9, fontWeight: 700, color: "var(--dim-ds)", textTransform: "uppercase", letterSpacing: ".1em" } }, "✈️ Mes modèles"),
-              searchResults.models.map(m => React.createElement("div", {
-                key: m.id,
-                style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", cursor: "pointer" },
-                onMouseEnter: e => e.currentTarget.style.background = "rgba(255,255,255,0.04)",
-                onMouseLeave: e => e.currentTarget.style.background = "transparent",
-                onClick: () => { setModelFilter(m.id); setShowSearchPanel(false); setSearchQuery(""); },
-              },
-                React.createElement("div", { style: { width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg,#6366f1,#8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 } }, "✨"),
-                React.createElement("div", { style: { minWidth: 0 } },
-                  React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--text-ds)" } }, m.name),
-                  React.createElement("div", { style: { fontSize: 10, color: "var(--muted-ds)" } }, fr ? "Cliquer pour filtrer" : "Click to filter")
-                )
-              ))
-            ),
-            // Section Transactions
-            searchResults.txs.length > 0 && React.createElement("div", null,
-              React.createElement("div", { style: { padding: "10px 16px 6px", fontSize: 9, fontWeight: 700, color: "var(--dim-ds)", textTransform: "uppercase", letterSpacing: ".1em" } }, "💳 Transactions récentes"),
-              searchResults.txs.map((tx, i) => {
-                const isVal = isValidTx(tx.status);
-                const isPend = isPendingTx(tx.status);
-                const color = isVal ? "var(--green-c)" : isPend ? "var(--amber)" : "var(--red-c)";
-                const modelName = safeArr(allModels).find(m => m.id === tx.model_id)?.name || "—";
-                return React.createElement("div", {
-                  key: tx.id || i,
-                  style: { display: "flex", alignItems: "center", gap: 12, padding: "10px 16px" },
-                  onMouseEnter: e => e.currentTarget.style.background = "rgba(255,255,255,0.04)",
-                  onMouseLeave: e => e.currentTarget.style.background = "transparent",
-                },
-                  React.createElement("div", { style: { width: 32, height: 32, borderRadius: 8, background: isVal ? "var(--gs)" : isPend ? "var(--ams)" : "var(--rs)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, flexShrink: 0 } }, isVal ? "✅" : isPend ? "⏳" : "❌"),
-                  React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-                    React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "var(--text-ds)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "@" + (tx.spender_handle || "?") + " · " + modelName),
-                    React.createElement("div", { style: { fontSize: 10, color: "var(--muted-ds)" } }, (tx.created_at || tx.date || "").toString().slice(0, 10) + " · " + (tx.product || "—"))
-                  ),
-                  React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color, flexShrink: 0 } }, convertAmount(Number(tx.net_amount || 0), tx.currency).toLocaleString("fr-FR", { maximumFractionDigits: 0 }) + " " + currencySymbol)
-                );
-              }),
-              searchResults.txs.length === 8 && React.createElement("div", { style: { padding: "8px 16px", fontSize: 10, color: "var(--dim-ds)", textAlign: "center" } }, fr ? "Afficher plus dans Mes Transactions →" : "See more in My Transactions →")
-            )
-          )
-    )
-  );
+      {/* 2. KPI STRIP — Click = filter + toggle graph */}
+      {(()=>{
+        return (
+          <div className={_isMobile ? "kpi-row cols-2" : "kpi-row cols-4"} style={{ marginBottom: 18 }}>
+            {CHATTER_DASHBOARD_METRICS.map(m => {
+              const val = m.calc(kpiData);
+              const delta = kpiData[_deltaKeys[m.id]];
+              const colorClass = _metricColorMap[m.id] || "white";
+              const filterStatus = _kpiToStatus[m.id];
+              const handleClick = () => {
+                if (filterStatus) handleStatusFilter(dashStatusFilter === filterStatus ? "" : filterStatus);
+                if (m.inGraph) toggleMetric(m.id);
+                if (m.id === "tx_pending") setPopup("pending_list");
+              };
+              const isFilterActive = filterStatus && dashStatusFilter === filterStatus;
+              const isGraphActive = m.inGraph && activeMetrics.has(m.id);
+              return (
+                <div key={m.id} onClick={handleClick}
+                  className={`kpi-card ${colorClass}`}
+                  style={{
+                    cursor: "pointer",
+                    boxShadow: isFilterActive ? `0 0 0 2px ${m.color}, 0 0 20px ${m.color}15` : isGraphActive ? `0 0 0 2px ${m.color}` : undefined,
+                    transition: "all 0.2s",
+                  }}>
+                  <div className="kpi-card-label">{m.label}</div>
+                  <div className={`kpi-card-value ${colorClass}`}>{fmtVal(m.id, val)}</div>
+                  {delta != null && !isNaN(delta) && (
+                    <div className={`kpi-card-delta ${delta >= 0 ? "up" : "down"}`}>{delta >= 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>
+                  )}
+                  {isFilterActive && <div className="kpi-card-hint" style={{ color: m.color }}>Filtre actif</div>}
+                  {!isFilterActive && m.inGraph && <div className="kpi-card-hint">Cliquer pour filtrer</div>}
+                </div>
+              );
+            })}
+            {/* SOLDE CHATTER card */}
+            <div className="kpi-card green" style={{ cursor: "default" }}>
+              <div className="kpi-card-label">SOLDE CHATTER</div>
+              <div className="kpi-card-value green">{soldeChatter ? fmtAmount(soldeChatter.solde) : "..."}</div>
+              {soldeChatter && (
+                <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 4 }}>
+                  Comm. {fmtAmount(soldeChatter.commission_brute)} — Payé {fmtAmount(soldeChatter.deja_verse)}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
-  const filterEl = React.createElement("div", { className: "toolbar", style: { marginBottom: 16 } },
-    React.createElement("div", { className: "period-filters" },
-      ["24h", "7j", "30j", "90j", "all"].map(p => React.createElement("div", {
-        key: p,
-        className: "filter-pill" + (period === p ? " active" : ""),
-        onClick: () => { setPeriod(p); setDateStart(""); setDateEnd(""); },
-      }, p === "all" ? "All time" : p))
-    ),
-    React.createElement("div", { className: "filter-sep" }),
-    React.createElement(DateRangePicker, { key: "drp", startDate: dateStart, endDate: dateEnd, onChange: ({ start, end }) => { setDateStart(start || ""); setDateEnd(end || ""); setPeriod("custom"); }, placeholder: "Période personnalisée" }),
-    React.createElement("div", { className: "filter-sep" }),
-    React.createElement("select", {
-      key: "model",
-      value: modelFilter,
-      onChange: e => setModelFilter(e.target.value),
-      className: "f-select",
-    }, React.createElement("option", { value: "all" }, fr ? "Tous mes modèles" : "All my models"), modelOptions.map(m => React.createElement("option", { key: m.id, value: m.id }, m.name)))
-  );
-
-  // Map metric id → kpi-card color class
-  const _metricColorClass = { ca_brut: "green", ma_commission: "amber", tx_mois: "indigo", spenders_actifs: "white", tx_pending: "amber" };
-  const kpiCardsEl = React.createElement("div", { className: _isMobile ? "kpi-row cols-2" : "kpi-row cols-6", style: { marginBottom: 18 } },
-    [...CHATTER_DASHBOARD_METRICS.map(m => {
-      const kd = kpiData || {};
-      const val = m.calc(kd);
-      const deltaKey = { ca_brut: "deltaCaBrut", ma_commission: "deltaCommission", tx_pending: "deltaTxPending" }[m.id];
-      const delta = kd[deltaKey];
-      const isPendingListCard = m.id === "tx_pending";
-      const colorClass = _metricColorClass[m.id] || "white";
-      const handleClick = m.inGraph ? () => toggleMetric(m.id) : isPendingListCard ? () => setPopup("pending_list") : undefined;
-      let deltaEl = null;
-      if (delta != null && !isNaN(delta)) {
-        const deltaStr = (delta >= 0 ? "↑" : "↓") + " " + Math.abs(delta).toFixed(1) + "% vs préc.";
-        deltaEl = React.createElement("div", { className: "kpi-card-delta " + (delta >= 0 ? "up" : "down") }, deltaStr);
-      }
-      let hintEl = null;
-      if (m.inGraph) hintEl = React.createElement("div", { className: "kpi-card-hint" }, "Cliquer → graphe");
-      else if (isPendingListCard) hintEl = React.createElement("div", { className: "kpi-card-hint" }, "Cliquer → liste");
-      return React.createElement("div", { key: m.id, onClick: handleClick, className: "kpi-card " + colorClass, style: handleClick ? { cursor: "pointer" } : {} },
-        React.createElement("div", { className: "kpi-card-label" }, m.label),
-        React.createElement("div", { className: "kpi-card-value " + colorClass }, fmtVal(m.id, val)),
-        deltaEl,
-        hintEl
-      );
-    }),
-    React.createElement(SoldeWidget, { key: "solde-chatter", role: "chatter", soldeData: soldeChatter })]
-  );
-
-  const chartPillsEl = React.createElement("div", { className: "period-filters", style: { marginBottom: 14 } },
-    CHATTER_DASHBOARD_METRICS.filter(m => m.inGraph).map(m => React.createElement("div", {
-      key: m.id,
-      onClick: () => toggleMetric(m.id),
-      className: "filter-pill" + (activeMetrics.has(m.id) ? " active" : ""),
-      style: activeMetrics.has(m.id) ? { background: m.color + "22", borderColor: m.color, color: m.color } : {},
-    }, React.createElement("span", { style: { width: 7, height: 7, borderRadius: "50%", background: activeMetrics.has(m.id) ? m.color : "var(--muted-ds)", display: "inline-block", flexShrink: 0 } }), " " + m.label))
-  );
-
-  const chartViewBtnsEl = React.createElement("div", { style: { display: "flex", gap: 6 } },
-    [["curve", "📈 Courbe"], ["bar", "📊 Barres"], ["table", "🗒️ Tableau"]].map(([v, lbl]) => React.createElement("button", {
-      key: v,
-      onClick: () => setChartView(v),
-      style: {
-        padding: "5px 11px", borderRadius: 8, border: "1px solid " + (chartView === v ? "#8b5cf6" : "var(--border)"),
-        background: chartView === v ? "rgba(139,92,246,0.15)" : "var(--surface2)", color: chartView === v ? "#c4b5fd" : "var(--text)", fontSize: 11, cursor: "pointer",
-      }
-    }, lbl))
-  );
-
-  const showChartCurve = chartView === "curve" && _ensureRecharts() && chartData.length > 0;
-  const showChartCurveEmpty = chartView === "curve" && (!_ensureRecharts() || !chartData.length);
-  const showChartBar = chartView === "bar" && _ensureRecharts() && chartData.length > 0;
-  const showChartBarEmpty = chartView === "bar" && (!_ensureRecharts() || !chartData.length);
-  const showChartTable = chartView === "table";
-
-  const chartCurveEl = showChartCurve ? React.createElement(ResponsiveContainer, { width: "100%", height: 240 },
-    React.createElement(LineChart, { data: chartData, margin: { top: 5, right: 10, bottom: 0, left: -10 } },
-      React.createElement(CartesianGrid, { stroke: "rgba(255,255,255,0.04)", vertical: false }),
-      React.createElement(XAxis, { dataKey: period === "24h" ? "time" : "label", interval: period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd", tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false }),
-      React.createElement(YAxis, { tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false, width: 52, tickFormatter: v => v >= 1000 ? (v/1000).toFixed(0) + "k" : String(v) }),
-      React.createElement(RechartsTooltip, {
-        content: ({ active, payload, label }) => {
-          if (!active || !payload || !payload.length) return null;
-          return React.createElement("div", { style: { background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" } },
-            React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 6 } }, period === "24h" ? label + " – " + String(parseInt(label)).padStart(2,"0") + ":59" : label),
-            payload.map((p, i) => React.createElement("div", { key: i, style: { fontSize: 12, fontWeight: 600, color: p.stroke } }, p.name + ": " + fmtVal(p.dataKey, p.value)))
+      {/* 3. GRAPHE MULTI-SMOOTH */}
+      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 18 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>Évolution des métriques</div>
+            <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 2 }}>Cliquer sur un KPI pour ajouter/retirer</div>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["curve", "Courbe"], ["bar", "Barres"], ["table", "Tableau"]].map(([v, lbl]) => (
+              <button key={v} onClick={() => setChartView(v)} style={{
+                padding: "5px 11px", borderRadius: 8, border: `1px solid ${chartView === v ? "#8b5cf6" : "var(--border)"}`,
+                background: chartView === v ? "rgba(139,92,246,0.15)" : "var(--surface2)", color: chartView === v ? "#c4b5fd" : "var(--text)", fontSize: 11, cursor: "pointer",
+              }}>{lbl}</button>
+            ))}
+          </div>
+        </div>
+        {/* Metric pills */}
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 12 }}>
+          {CHATTER_DASHBOARD_METRICS.filter(m => m.inGraph).map(m => (
+            <button key={m.id} onClick={() => toggleMetric(m.id)} style={{
+              display: "flex", alignItems: "center", gap: 5,
+              background: activeMetrics.has(m.id) ? m.color + "20" : "transparent",
+              border: `1.5px solid ${activeMetrics.has(m.id) ? m.color : "var(--border)"}`,
+              borderRadius: 20, padding: "4px 12px", fontSize: 11, cursor: "pointer",
+              color: activeMetrics.has(m.id) ? m.color : "var(--muted)", fontWeight: activeMetrics.has(m.id) ? 700 : 400,
+            }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: m.color, opacity: activeMetrics.has(m.id) ? 1 : 0.3 }} />
+              {m.label}
+            </button>
+          ))}
+        </div>
+        {/* Chart render */}
+        {chartData.length > 0 && _ensureRecharts() && (() => {
+          const visibleMetrics = CHATTER_DASHBOARD_METRICS.filter(m => m.inGraph && activeMetrics.has(m.id));
+          if (chartView === "table") {
+            return (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                  <thead><tr style={{ borderBottom: "1px solid var(--border)" }}>
+                    <th style={{ textAlign: "left", padding: "6px 8px", color: "var(--text-tertiary)" }}>Date</th>
+                    {visibleMetrics.map(m => <th key={m.id} style={{ textAlign: "right", padding: "6px 8px", color: m.color }}>{m.label}</th>)}
+                  </tr></thead>
+                  <tbody>{chartData.map(row => (
+                    <tr key={row.date} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <td style={{ padding: "6px 8px", color: "var(--text)" }}>{row.label}</td>
+                      {visibleMetrics.map(m => <td key={m.id} style={{ textAlign: "right", padding: "6px 8px", color: "var(--text)" }}>{fmtVal(m.id, row[m.id] || 0)}</td>)}
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            );
+          }
+          const ChartType = chartView === "bar" ? Recharts.BarChart : Recharts.LineChart;
+          const DataEl = chartView === "bar" ? Recharts.Bar : Recharts.Line;
+          return (
+            <Recharts.ResponsiveContainer width="100%" height={260}>
+              <ChartType data={chartData} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+                <Recharts.CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <Recharts.XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted2)" }} />
+                <Recharts.YAxis tick={{ fontSize: 10, fill: "var(--muted2)" }} />
+                <Recharts.Tooltip contentStyle={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 11 }} formatter={(v, name) => [fmtVal(name, v), CHATTER_DASHBOARD_METRICS.find(m => m.id === name)?.label || name]} />
+                {visibleMetrics.map(m => chartView === "bar"
+                  ? <Recharts.Bar key={m.id} dataKey={m.id} fill={m.color} radius={[4, 4, 0, 0]} />
+                  : <Recharts.Line key={m.id} type="monotone" dataKey={m.id} stroke={m.color} strokeWidth={2} dot={false} />
+                )}
+              </ChartType>
+            </Recharts.ResponsiveContainer>
           );
-        }
-      }),
-      CHATTER_DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement(Line, { key: m.id, type: "monotone", dataKey: m.id, name: m.label, stroke: m.color, strokeWidth: 2, dot: false, activeDot: { r: 5, fill: m.color, stroke: "#1a2035", strokeWidth: 2 } }))
-    )
-  ) : null;
+        })()}
+        {chartData.length === 0 && <div style={{ textAlign: "center", padding: 40, color: "var(--muted2)", fontSize: 12 }}>Aucune donnée pour la période</div>}
+      </div>
 
-  const chartCurveEmptyEl = showChartCurveEmpty ? React.createElement("div", { style: { height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" } }, "Aucune donnée") : null;
+      {/* V2 — Bottom grid removed → page Gestion */}
 
-  const chartBarEl = showChartBar ? React.createElement(ResponsiveContainer, { width: "100%", height: 240 },
-    React.createElement(BarChart, { data: chartData, margin: { top: 5, right: 10, bottom: 0, left: -10 } },
-      React.createElement(CartesianGrid, { stroke: "rgba(255,255,255,0.04)", vertical: false }),
-      React.createElement(XAxis, { dataKey: period === "24h" ? "time" : "label", interval: period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd", tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false }),
-      React.createElement(YAxis, { tick: { fill: "#64748b", fontSize: 10 }, tickLine: false, axisLine: false, width: 52, tickFormatter: v => v >= 1000 ? (v/1000).toFixed(0) + "k" : String(v) }),
-      React.createElement(RechartsTooltip, {
-        content: ({ active, payload, label }) => {
-          if (!active || !payload || !payload.length) return null;
-          return React.createElement("div", { style: { background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" } },
-            React.createElement("div", { style: { fontSize: 11, color: "#64748b", marginBottom: 6 } }, period === "24h" ? label + " – " + String(parseInt(label)).padStart(2,"0") + ":59" : label),
-            payload.map((p, i) => React.createElement("div", { key: i, style: { fontSize: 12, fontWeight: 600, color: p.fill } }, p.name + ": " + fmtVal(p.dataKey, p.value)))
-          );
-        }
-      }),
-      CHATTER_DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement(Bar, { key: m.id, dataKey: m.id, name: m.label, fill: m.color, radius: [3,3,0,0], opacity: 0.85 }))
-    )
-  ) : null;
-
-  const chartBarEmptyEl = showChartBarEmpty ? React.createElement("div", { style: { height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)" } }, "Aucune donnée") : null;
-
-  const chartTableEl = showChartTable ? React.createElement("div", { style: { overflowX: "auto" } },
-    React.createElement("table", { style: { width: "100%", fontSize: 12, borderCollapse: "collapse" } },
-      React.createElement("thead", null, React.createElement("tr", { style: { borderBottom: "1px solid var(--border)" } },
-        React.createElement("th", { style: { padding: "8px 12px", textAlign: "left", color: "var(--muted)", fontWeight: 600 } }, "Date"),
-        CHATTER_DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement("th", { key: m.id, style: { padding: "8px 12px", textAlign: "right", color: m.color, fontWeight: 700 } }, m.label))
-      )),
-      React.createElement("tbody", null,
-        chartData.map((row, i) => React.createElement("tr", { key: i, style: { borderBottom: "1px solid rgba(255,255,255,0.04)" } },
-          React.createElement("td", { style: { padding: "7px 12px", color: "var(--text)" } }, row.label),
-          CHATTER_DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement("td", { key: m.id, style: { padding: "7px 12px", textAlign: "right", color: m.color, fontWeight: 600 } }, fmtVal(m.id, row[m.id] || 0)))
-        ))
-      )
-    )
-  ) : null;
-
-  const chartLegendEl = chartView !== "table" ? React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 14, marginTop: 14, paddingTop: 14, borderTop: "1px solid rgba(255,255,255,0.04)" } },
-    CHATTER_DASHBOARD_METRICS.filter(m => activeMetrics.has(m.id)).map(m => React.createElement("div", { key: m.id, style: { display: "flex", alignItems: "center", gap: 6 } },
-      React.createElement("div", { style: { width: 16, height: 2, background: m.color, borderRadius: 1 } }),
-      React.createElement("span", { style: { fontSize: 11, color: "var(--text)" } }, m.label)
-    ))
-  ) : null;
-
-  const chartPanelEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 18 } },
-    React.createElement("div", { style: { display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 } },
-      React.createElement("div", null,
-        React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "Évolution des métriques"),
-        React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)", marginTop: 2 } }, "Cliquer sur un KPI ou une pill pour ajouter/retirer")
-      ),
-      chartViewBtnsEl
-    ),
-    chartPillsEl,
-    chartCurveEl,
-    chartCurveEmptyEl,
-    chartBarEl,
-    chartBarEmptyEl,
-    chartTableEl,
-    chartLegendEl
-  );
-
-  const openModelsModal = () => { if (cardModal) cardModal.openCardModal({ title: "🔥 Modèles actives", data: modelStats, entityType: "chatter_models", meta: { currencySymbol } }); };
-  const modelsCardEl = React.createElement("div", {
-    style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" },
-    onClick: openModelsModal,
-    onMouseOver: e => { e.currentTarget.style.borderColor = "#8b5cf6"; },
-    onMouseOut: e => { e.currentTarget.style.borderColor = "var(--border)"; }
-  },
-    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
-      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "🔥 Modèles actives"),
-      React.createElement("span", { style: { fontSize: 10, color: "#8b5cf6" } }, "Détails →")
-    ),
-    modelStats.length > 0 ? modelStats.map(m => {
-      const avatarEl = m.photo
-        ? React.createElement("img", { src: m.photo, alt: m.name, style: { width: 34, height: 34, borderRadius: 10, objectFit: "cover", flexShrink: 0 } })
-        : React.createElement("div", { style: { width: 34, height: 34, borderRadius: 10, background: (modelColors[m.name] || "#8b5cf6") + "33", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 14, color: modelColors[m.name] || "#8b5cf6", flexShrink: 0 } }, (m.name || "?")[0]);
-      return React.createElement("div", { key: m.name, style: { marginBottom: 14 } },
-        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 5 } },
-          avatarEl,
-          React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-            React.createElement("div", { style: { fontSize: 13, fontWeight: 700, color: "var(--text)" } }, m.name),
-            React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, m.nbTxMois + " TX ce mois")
-          ),
-          React.createElement("div", { style: { fontSize: 14, fontWeight: 800, color: "var(--text)", flexShrink: 0 } }, m.caMois.toLocaleString("fr-FR") + " " + currencySymbol)
-        ),
-        React.createElement("div", { style: { height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" } },
-          React.createElement("div", { style: { height: "100%", width: m.barPct + "%", background: modelColors[m.name] || "#8b5cf6", borderRadius: 3, transition: "width 0.3s" } })
-        )
-      );
-    }) : React.createElement("div", { style: { textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 } }, "Aucune donnée modèle")
-  );
-
-  const chattersCardEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 } },
-    React.createElement("div", { style: { fontSize: 15, fontWeight: 800, marginBottom: 14, color: "var(--text)" } }, "👥 Chatters en shift"),
-    chatterProfilesForCard.length > 0 ? chatterProfilesForCard.map(ch => React.createElement("div", { key: ch.id, style: { display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" } },
-      React.createElement("div", { style: { width: 32, height: 32, borderRadius: 10, background: "rgba(99,102,241,0.2)", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 13, color: "#818cf8", flexShrink: 0 } }, (ch.name || "?")[0]),
-      React.createElement("div", { style: { flex: 1 } },
-        React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--text)" } }, ch.name),
-        React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, ch.assigned_models && ch.assigned_models.length ? ch.assigned_models.length + " modèle(s)" : (fr ? "Non assigné" : "Not assigned"))
-      ),
-      React.createElement("span", { style: { fontSize: 9, fontWeight: 700, padding: "2px 7px", borderRadius: 8, background: "rgba(52,211,153,0.15)", color: "#34d399" } }, "SHIFT")
-    )) : React.createElement("div", { style: { textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 } }, "—")
-  );
-
-  const openTxModal = () => { if (cardModal) cardModal.openCardModal({ title: "🕐 TX récentes", data: recentAllTxs.slice(0, 20), entityType: "tx", meta: { currencySymbol, convertAmount } }); };
-  const txRecentEl = React.createElement("div", {
-    style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20, cursor: "pointer", transition: "border-color 0.2s" },
-    onClick: openTxModal,
-    onMouseOver: e => { e.currentTarget.style.borderColor = "#f59e0b"; },
-    onMouseOut: e => { e.currentTarget.style.borderColor = "var(--border)"; }
-  },
-    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
-      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "🕐 TX récentes"),
-      React.createElement("span", { style: { fontSize: 10, color: "#f59e0b" } }, "Voir tout →")
-    ),
-    recentAllTxs.length > 0 ? recentAllTxs.slice(0, 5).map((tx, i) => {
-      const m = allModels.find(x => x.id === tx.model_id);
-      const sc = sColor(tx.status);
-      return React.createElement("div", { key: tx.id || i, style: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" } },
-        React.createElement("div", { style: { flex: 1, minWidth: 0 } },
-          React.createElement("div", { style: { fontSize: 12, fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, "@" + (tx.spender_handle || "?") + " · " + (m ? m.name : "?")),
-          React.createElement("div", { style: { fontSize: 10, color: "var(--muted2)" } }, new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" }))
-        ),
-        React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0, marginLeft: 8 } },
-          React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color: sc } }, "+" + convertAmount(Number(tx.net_amount || 0), tx.currency).toFixed(0) + " " + (tx.currency || currencySymbol)),
-          React.createElement("span", { style: { fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 6, background: sc + "22", color: sc } }, sLabel(tx.status))
-        )
-      );
-    }) : React.createElement("div", { style: { textAlign: "center", padding: 16, color: "var(--muted)", fontSize: 12 } }, "Aucune TX")
-  );
-
-  const botsCardEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 } },
-    React.createElement("div", { style: { fontSize: 15, fontWeight: 800, marginBottom: 14, color: "var(--text)" } }, "📡 Bots Status"),
-    React.createElement("div", { style: { textAlign: "center", padding: 12, color: "var(--muted)", fontSize: 12 } }, "—")
-  );
-
-  const alertsCardEl = dashboardAlerts.length > 0
-    ? React.createElement(React.Fragment, null, dashboardAlerts.map((a, i) => React.createElement(NotificationBarAccordion, { key: i, severity: a.severity === "red" ? "danger" : "warning", title: a.msg + (a.ongoing ? " · ongoing" : ""), icon: a.icon })))
-    : null;
-
-  const todoItems = todos.filter(t => !t.done).slice(0, 4);
-  const todoCardContent = todoItems.length > 0
-    ? React.createElement(React.Fragment, null,
-        todoItems.map(t => React.createElement("div", { key: t.id, style: { display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" } },
-          React.createElement("input", { type: "checkbox", checked: false, onChange: () => toggleTodo(t.id), style: { accentColor: "#8b5cf6", cursor: "pointer", flexShrink: 0 } }),
-          React.createElement("span", { style: { fontSize: 12, color: "var(--text)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, t.text)
-        )),
-        React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 10 } },
-          React.createElement("input", { value: newTodoText, onChange: e => setNewTodoText(e.target.value), onKeyDown: e => e.key === "Enter" && addTodo(), placeholder: "+ Ajouter une tâche...", style: { flex: 1, padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text)", fontSize: 11 } }),
-          React.createElement("button", { onClick: addTodo, disabled: !newTodoText.trim(), style: { padding: "6px 10px", borderRadius: 8, border: "none", background: newTodoText.trim() ? "#8b5cf6" : "var(--surface2)", color: newTodoText.trim() ? "#fff" : "var(--muted)", fontSize: 11, cursor: newTodoText.trim() ? "pointer" : "default" } }, "+")
-        )
-      )
-    : React.createElement(React.Fragment, null,
-        React.createElement("div", { style: { fontSize: 11, color: "var(--muted)", textAlign: "center", padding: "8px 0" } }, "Aucune tâche en attente"),
-        React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 10 } },
-          React.createElement("input", { value: newTodoText, onChange: e => setNewTodoText(e.target.value), onKeyDown: e => e.key === "Enter" && addTodo(), placeholder: "+ Ajouter une tâche...", style: { flex: 1, padding: "6px 10px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface2)", color: "var(--text)", fontSize: 11 } }),
-          React.createElement("button", { onClick: addTodo, disabled: !newTodoText.trim(), style: { padding: "6px 10px", borderRadius: 8, border: "none", background: newTodoText.trim() ? "#8b5cf6" : "var(--surface2)", color: newTodoText.trim() ? "#fff" : "var(--muted)", fontSize: 11, cursor: newTodoText.trim() ? "pointer" : "default" } }, "+")
-        )
-      );
-
-  const todoCardEl = React.createElement("div", { style: { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 } },
-    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 } },
-      React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)" } }, "✅ To-Do"),
-      null
-    ),
-    todoCardContent
-  );
-
-  const col1El = React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, modelsCardEl, chattersCardEl);
-  const col2El = React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, txRecentEl, botsCardEl);
-  const col3El = React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } }, alertsCardEl, todoCardEl);
-
-  const bottomGridEl = React.createElement("div", { style: { display: "grid", gridTemplateColumns: _isMobile ? "1fr" : "1fr 1fr 340px", gap: 14, marginBottom: 20 } }, col1El, col2El, col3El);
-
-  const noAssignBanner = myModelIds.length === 0 ? React.createElement("div", {
-    style: { background: "var(--warning-muted)", border: "1px solid var(--warning)", borderRadius: 14, padding: 48, textAlign: "center", marginBottom: 18 }
-  }, React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "var(--text)", marginBottom: 4 } }, fr ? "Aucune assignation trouvée" : "No assignments found"), React.createElement("div", { style: { fontSize: 13, color: "var(--muted2)" } }, fr ? "Contacte ton gérant." : "Contact your manager.")) : null;
-
-  const pendingListModal = popup === "pending_list" ? React.createElement(DashModal, { key: "pm", open: true, onClose: () => setPopup(null), title: "TX en attente", maxWidth: 600 }, React.createElement("div", { style: { maxHeight: 400, overflowY: "auto" } }, recentAllTxs.filter(tx => isPendingTx(tx.status)).map((tx, i) => React.createElement("div", { key: tx.id || i, style: { padding: "8px 0", borderBottom: "1px solid var(--border-subtle)", display: "flex", justifyContent: "space-between" } }, React.createElement("span", null, "@" + (tx.spender_handle || "?")), React.createElement("span", { style: { fontWeight: 600 } }, convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0) + " " + currencySymbol))))) : null;
-  const alertsModalContent = dashboardAlerts.length === 0
-    ? React.createElement("div", { style: { textAlign: "center", padding: 40, color: "var(--muted)" } }, "✅ Aucune alerte")
-    : React.createElement("div", null, dashboardAlerts.map((a, i) => React.createElement("div", { key: i, style: { display: "flex", alignItems: "flex-start", gap: 14, padding: "14px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" } }, React.createElement("span", { style: { fontSize: 20, flexShrink: 0 } }, a.icon), React.createElement("span", { style: { flex: 1, fontSize: 13, color: a.severity === "red" ? "#f87171" : "#fbbf24", lineHeight: 1.4 } }, a.msg))));
-  const alertsModal = popup === "alerts" ? React.createElement(DashModal, { key: "al", open: true, onClose: () => setPopup(null), title: "🔔 Alertes", maxWidth: 500 }, alertsModalContent) : null;
-
-  const popupsEl = React.createElement(React.Fragment, null, pendingListModal, alertsModal);
-
-  // PR1: "My data only" badge for chatter isolation
-  const scopeBadge = React.createElement("div", { style: { display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 14px", borderRadius: 20, background: "rgba(139,92,246,0.15)", border: "1px solid rgba(139,92,246,0.3)", color: "#c4b5fd", fontSize: 11, fontWeight: 700, marginBottom: 14, letterSpacing: 0.3 } },
-    React.createElement("span", null, "\uD83D\uDD12"),
-    fr ? "Mes données uniquement" : "My data only"
-  );
-
-
-
-  return React.createElement("div", { style: { padding: _isMobile ? "0 12px" : 0 } },
-    scopeBadge,
-    searchBarEl,
-    noAssignBanner,
-    filterEl,
-    kpiCardsEl,
-    chartPanelEl,
-    bottomGridEl,
-    popupsEl
+      {/* Popup: TX en attente */}
+      {popup === "pending_list" && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setPopup(null)}>
+          <div style={{ background: "var(--surface)", borderRadius: 16, padding: 24, maxWidth: 600, width: "90%", maxHeight: "70vh", overflow: "auto" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)" }}>TX en attente ({pendingTxs.length})</div>
+              <button onClick={() => setPopup(null)} style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "var(--text)" }}>✕</button>
+            </div>
+            {pendingTxs.length === 0 && <div style={{ color: "var(--muted2)", fontSize: 12 }}>Aucune TX en attente</div>}
+            {pendingTxs.map(tx => (
+              <div key={tx.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{tx.spender_handle || "—"}</div>
+                  <div style={{ fontSize: 10, color: "var(--muted2)" }}>{(models || []).find(m => m.id === tx.model_id)?.name || "—"} · {new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH")}</div>
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#f97316" }}>{fmtAmount(Number(tx.amount || 0))}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
   );
 });
+
 
 // =============================================
 // CHATTER ROLE — DASHBOARD (EC3) — Wrapper PR1A
 // =============================================
-const ChatterDashboardTab = ({user, lang, txs, spenders, models, profiles}) => {
-  return React.createElement(ChatterDashboardRedesign, { user, lang, txs, spenders, models, profiles: profiles || (user ? [user] : []) });
+const ChatterDashboardTab = ({user, lang, txs, spenders, models, profiles, onStatusFilterChange, onPeriodChange, onModelFilterChange, onDateRangeChange}) => {
+  return React.createElement(ChatterDashboardRedesign, { user, lang, txs, spenders, models, profiles: profiles || (user ? [user] : []), onStatusFilterChange, onPeriodChange, onModelFilterChange, onDateRangeChange });
 };
 
 // =============================================
 // CHATTER ROLE — TRANSACTIONS (EC4)
 // =============================================
-const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, profiles, onRefresh, onNotify, providerPaymentMethods, setTxSummary}) => {
+const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, productTags, profiles, onRefresh, onNotify, providerPaymentMethods, setTxSummary, dashboardMode, dashboardPeriod, dashboardModel, dashboardDateStart, dashboardDateEnd, dashboardStatus}) => {
   const addToast = useToast();
   const setProofLightboxUrl = useProofLightbox();
   const { fmtAmount, currencySymbol, exchangeRate } = useCurrency();
@@ -29692,6 +29383,15 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
   const [spSearch, setSpSearch] = useState("");
   const [showSpDrop, setShowSpDrop] = useState(false);
   const spDropRef = React.useRef(null);
+
+  // ── V2 dashboardMode sync ──
+  useEffect(() => {
+    if (!dashboardMode) return;
+    if (dashboardStatus === "validated") setTxCardFilter("validated");
+    else if (dashboardStatus === "pending") setTxCardFilter("pending");
+    else if (dashboardStatus === "refused") setTxCardFilter("refused");
+    else setTxCardFilter(null);
+  }, [dashboardStatus, dashboardMode]);
 
   useEffect(()=>{
     if(!showSpDrop) return;
@@ -29860,7 +29560,14 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
 
       {myModelIds.length > 0 && (
         <>
-          {(()=>{
+          {/* V2: hide KPI cards + chart in dashboardMode (shown in dashboard above) */}
+          {dashboardMode && (
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,fontSize:12,color:"var(--text-tertiary)"}}>
+              <span>{filtered.length} TX affichées</span>
+              {txCardFilter && <span style={{padding:"2px 8px",borderRadius:10,background:"rgba(139,92,246,0.15)",color:"#c4b5fd",fontSize:11}}>Filtre: {txCardFilter==="validated"?"validées":txCardFilter==="pending"?"en attente":"refusées"}</span>}
+            </div>
+          )}
+          {!dashboardMode && (()=>{
             const vTx = myTxs.filter(tx=>isValidTx(tx.status));
             const pTx = myTxs.filter(tx=>isPendingTx(tx.status));
             const caNet = vTx.reduce((s,tx)=>s+txNetAmount(tx),0);
@@ -29884,7 +29591,7 @@ const ChatterTransactionsTab = ({user, lang, txs, spenders, models, products, pr
               </div>
             );
           })()}
-          {_ensureRecharts()&&(
+          {!dashboardMode && _ensureRecharts()&&(
             <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px 8px",marginBottom:16}}>
               <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:10}}>
                 {[{v:"ca",l:"CA"},{v:"nb",l:"NB TX"}].map(m=>(
@@ -60697,6 +60404,13 @@ const App = () => {
   const [dashStatusFilter, setDashStatusFilter] = useState("");
   const [dashProviderFilter, setDashProviderFilter] = useState("");
   const [dashChatterFilter, setDashChatterFilter] = useState("");
+  // V2 chatter dashboard filters
+  const [chatterDashPeriod, setChatterDashPeriod] = useState("30j");
+  const [chatterDashModelFilter, setChatterDashModelFilter] = useState("");
+  const [chatterDashDateStart, setChatterDashDateStart] = useState("");
+  const [chatterDashDateEnd, setChatterDashDateEnd] = useState("");
+  const handleChatterDashDateRange = useCallback((s, e) => { setChatterDashDateStart(s || ""); setChatterDashDateEnd(e || ""); }, []);
+  const [chatterDashStatusFilter, setChatterDashStatusFilter] = useState("");
   const [fabOpen, setFabOpen] = useState(false);
   const [fabSpenderModal, setFabSpenderModal] = useState(false);
   const [fabTodoModal, setFabTodoModal] = useState(false);
@@ -62989,7 +62703,7 @@ const App = () => {
             <ChatterDebugDump user={user} models={models} txs={txSummary} spenders={spenders} lang={lang} />
           )}
           {/* ── Chatter-only pages — UNCHANGED ── */}
-          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ErrorBoundary name="ChatterPage"><ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} /></ErrorBoundary>}
+          {tab==="chatter_dashboard"&&user.role==="chatter"&&<ErrorBoundary name="ChatterPage"><><ChatterDashboardTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} profiles={profiles} onStatusFilterChange={setChatterDashStatusFilter} onPeriodChange={setChatterDashPeriod} onModelFilterChange={setChatterDashModelFilter} onDateRangeChange={handleChatterDashDateRange} /><ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setTxSummary={setTxSummary} dashboardMode={true} dashboardPeriod={chatterDashPeriod} dashboardModel={chatterDashModelFilter} dashboardDateStart={chatterDashDateStart} dashboardDateEnd={chatterDashDateEnd} dashboardStatus={chatterDashStatusFilter} /></></ErrorBoundary>}
           {tab==="chatter_transactions"&&user.role==="chatter"&&<ChatterTransactionsTab user={user} lang={lang} txs={txSummary} spenders={spenders} models={models} products={products} productTags={productTags} profiles={profiles} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} setTxSummary={setTxSummary} />}
           {tab==="chatter_spenders"&&user.role==="chatter"&&<ChatterSpendersTab user={user} lang={lang} spenders={spenders} txs={txSummary} models={models} profiles={profiles} selectedSpenderKey={selectedSpenderKey} setSelectedSpenderKey={setSelectedSpenderKey} onRefresh={onRefresh} onNotify={createNotification} providerPaymentMethods={providerPaymentMethods} products={products} productTags={productTags} setTxSummary={setTxSummary} />}
           {tab==="chatter_messagerie"&&user.role==="chatter"&&(<>
