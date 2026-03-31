@@ -59772,9 +59772,7 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
   );
 });
 
-
-
-const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, setMcTxs, setMcPendingTxCount, mcTxFilter, setMcTxFilter, mcTxChatterFilter, setMcTxChatterFilter, mcTxPeriod, setMcTxPeriod, dashboardMode, dashboardStatus, dashboardChatter }) => {
+const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, mcTxFilter, setMcTxFilter, mcTxChatterFilter, setMcTxChatterFilter, mcTxPeriod, setMcTxPeriod, dashboardMode, dashboardStatus, dashboardChatter }) => {
   const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
   const setProofLightboxUrl = useProofLightbox();
   const addToast = useToast();
@@ -59792,20 +59790,7 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
     setMcTxChatterFilter(dashboardChatter || "all");
   }, [dashboardChatter, dashboardMode]);
 
-  const handleMcValidate = async (txId) => {
-    const {error} = await sb.from("transactions").update({status:"validated",validated_by:user.id,validated_at:new Date().toISOString()}).eq("id",txId);
-    if (error) { addToast("Erreur: "+error.message,"error"); return; }
-    setMcTxs(prev=>prev.map(tx=>tx.id===txId?{...tx,status:"validated",validated_at:new Date().toISOString()}:tx));
-    setMcPendingTxCount(prev=>Math.max(0,prev-1));
-    addToast(lang==="fr"?"TX validée ✅":"TX validated ✅","success");
-  };
-  const handleMcRefuse = async (txId) => {
-    const {error} = await sb.from("transactions").update({status:"refused",validated_by:user.id,validated_at:new Date().toISOString()}).eq("id",txId);
-    if (error) { addToast("Erreur: "+error.message,"error"); return; }
-    setMcTxs(prev=>prev.map(tx=>tx.id===txId?{...tx,status:"refused"}:tx));
-    setMcPendingTxCount(prev=>Math.max(0,prev-1));
-    addToast(lang==="fr"?"TX refusée ❌":"TX refused ❌","error");
-  };
+  /* MC cannot validate/refuse — read-only view (same table as gérant, actions removed) */
   const now = new Date();
   const weekAgo = new Date(now.getTime()-7*86400000);
   const monthStart = new Date(now.getFullYear(),now.getMonth(),1);
@@ -59880,7 +59865,6 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
                 {filtered.map(tx=>{
                   const chName = mcChatters.find(c=>c.id===tx.chatter_id)?.name||"—";
                   const mName = (models||[]).find(m=>m.id===tx.model_id)?.name||"—";
-                  const isPending = isPendingTx(tx.status);
                   return (
                     <tr key={tx.id}>
                       <td>{new Date(tx.created_at||tx.date).toLocaleDateString("fr-FR")}</td>
@@ -59891,12 +59875,7 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
                       <td>{mName}</td>
                       <td>{statusBadge(tx.status)}</td>
                       <td style={{textAlign:'center',padding:'4px 6px'}}>{tx.proof_url?(<button onClick={()=>setProofLightboxUrl(tx.proof_url)} style={{background:'none',border:'none',cursor:'pointer',fontSize:16,padding:2}} title="Voir la preuve">🖼️</button>):(<span style={{color:'#475569',fontSize:12}}>—</span>)}</td>
-                      <td>{isPending&&(
-                        <div style={{display:"flex",gap:4}}>
-                          <button onClick={()=>handleMcValidate(tx.id)} style={{padding:"4px 10px",borderRadius:8,border:"none",background:"rgba(16,185,129,0.15)",color:"var(--success)",fontSize:12,fontWeight:700,cursor:"pointer"}}>✅</button>
-                          <button onClick={()=>handleMcRefuse(tx.id)} style={{padding:"4px 10px",borderRadius:8,border:"none",background:"rgba(239,68,68,0.15)",color:"var(--danger)",fontSize:12,fontWeight:700,cursor:"pointer"}}>❌</button>
-                        </div>
-                      )}</td>
+                      <td style={{textAlign:"center",color:"var(--text-tertiary)",fontSize:12}}>—</td>
                     </tr>
                   );
                 })}
@@ -60268,8 +60247,54 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
           setMcChatters(prev=>prev.map(c=>c.id===chatterId?{...c,assigned_models:updated}:c));
           addToast(lang==="fr"?"Modèles mis à jour \u2713":"Models updated \u2713","success");
         };
+        const _initial = (name) => (name || "?").trim()[0].toUpperCase();
+        /* ── compute enriched stats per chatter (aligned with gérant renderChatterCard) ── */
+        const enrichedChatters = mcChatters.map(ch => {
+          const chTx = mcTxs.filter(tx=>tx.chatter_id===ch.id);
+          const validTx = chTx.filter(tx=>isValidTx(tx.status));
+          const pendingTx = chTx.filter(tx=>isPendingTx(tx.status));
+          const rejectedTx = chTx.filter(tx=>tx.status==="refused");
+          const validCA = validTx.reduce((s,tx)=>s+txNetAmountCHF(tx),0);
+          const caBrut = validTx.reduce((s,tx)=>s+txAmountCHF(tx),0);
+          const convRate = chTx.length>0?Math.round((validTx.length/chTx.length)*100):0;
+          const commPct = ch.commission_pct||20;
+          const commission = validCA * (commPct/100);
+          const assignedModels = (ch.assigned_models||[]).map(mid=>(models||[]).find(m=>m.id===mid)).filter(Boolean);
+          const isOnShift = ch.on_shift===true;
+          return {...ch, chTx, validTx, pendingTx, rejectedTx, validCA, caBrut, convRate, commPct, commission, assignedModels, isOnShift};
+        }).sort((a,b)=>b.validCA-a.validCA);
+
+        /* ── KPI bar ── */
+        const kpiCA = enrichedChatters.reduce((s,c)=>s+c.validCA,0);
+        const kpiTxValid = enrichedChatters.reduce((s,c)=>s+c.validTx.length,0);
+        const kpiConvRate = enrichedChatters.length>0?Math.round(enrichedChatters.reduce((s,c)=>s+c.convRate,0)/enrichedChatters.length):0;
+        const kpiOnShift = enrichedChatters.filter(c=>c.isOnShift).length;
+
         return (
           <div style={{padding:0}}>
+            {/* ── KPI BAR (aligned gérant) ── */}
+            <div className={_isMobile?"kpi-row cols-2":"kpi-row cols-4"} style={{marginBottom:14,gridTemplateColumns:_isMobile?"1fr 1fr":undefined}}>
+              <div className="kpi-card green">
+                <div className="kpi-card-label">CA ÉQUIPE</div>
+                <div className="kpi-card-value green">{fmtAmount(kpiCA)}</div>
+                <div className="kpi-card-delta up">↑ {kpiTxValid} TX validées</div>
+              </div>
+              <div className="kpi-card indigo">
+                <div className="kpi-card-label">TX VALIDÉES</div>
+                <div className="kpi-card-value indigo">{kpiTxValid}</div>
+              </div>
+              <div className="kpi-card white">
+                <div className="kpi-card-label">CONV. RATE MOY.</div>
+                <div className="kpi-card-value white">{kpiConvRate}%</div>
+                <div className={`kpi-card-delta ${kpiConvRate>=50?"up":"warn"}`}>{kpiConvRate>=50?"✓ bon taux":"↗ à améliorer"}</div>
+              </div>
+              <div className="kpi-card green">
+                <div className="kpi-card-label">CHATTERS ACTIFS</div>
+                <div className="kpi-card-value green">{enrichedChatters.length}</div>
+                <div className="kpi-card-delta dim">{kpiOnShift} en shift</div>
+              </div>
+            </div>
+
             <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>👥 {lang==="fr"?"Mes Chatters":"My Chatters"} ({mcChatters.length})</h2>
             {mcChatters.length===0?(
               <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
@@ -60278,48 +60303,56 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
                 <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Demande au gérant de t'assigner des chatters.":"Ask the manager to assign you chatters."}</div>
               </div>
             ):(
-              <div style={{display:"flex",flexDirection:"column",gap:16}}>
-                {mcChatters.map(ch=>{
-                  const chTxs = mcTxs.filter(tx=>tx.chatter_id===ch.id);
-                  const validTxs = chTxs.filter(tx=>isValidTx(tx.status));
-                  const chCA = validTxs.reduce((s,tx)=>s+txNetAmountCHF(tx),0);
-                  const lastTx = chTxs.length>0 ? chTxs.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at))[0] : null;
-                  const lastTxDate = lastTx ? new Date(lastTx.created_at) : null;
-                  const timeAgo = lastTxDate ? (()=>{const diff=Date.now()-lastTxDate.getTime();const mins=Math.floor(diff/60000);if(mins<60)return mins+"min";const hrs=Math.floor(mins/60);if(hrs<24)return hrs+"h";const days=Math.floor(hrs/24);return days+"j";})() : null;
+              <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"repeat(auto-fill,minmax(340px,1fr))",gap:12}}>
+                {enrichedChatters.map(ch=>{
                   const chModels = ch.assigned_models||[];
                   return (
-                    <div key={ch.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-                      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:14,flexWrap:"wrap",gap:8}}>
-                        <div>
-                          <div style={{fontSize:15,fontWeight:700,color:"var(--text)"}}>{ch.name||ch.email||"Chatter"}</div>
-                          <div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>{ch.email||""}</div>
-                        </div>
-                        <div style={{display:"flex",gap:16,alignItems:"center",flexWrap:"wrap"}}>
-                          <div style={{textAlign:"center"}}>
-                            <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600}}>TX</div>
-                            <div style={{fontSize:16,fontWeight:800,color:"var(--text)"}}>{validTxs.length}</div>
+                    <div key={ch.id} style={{background:"#141e2b",border:"1px solid #1e2d3d",borderRadius:10,padding:"14px 16px",cursor:"pointer",transition:"all 0.2s"}}
+                      onMouseEnter={e=>{e.currentTarget.style.background="#1a2836";e.currentTarget.style.borderColor="#4fc3f7";}}
+                      onMouseLeave={e=>{e.currentTarget.style.background="#141e2b";e.currentTarget.style.borderColor="#1e2d3d";}}>
+                      {/* Header */}
+                      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+                        <div style={{display:"flex",alignItems:"center",gap:10}}>
+                          <div style={{width:36,height:36,borderRadius:"50%",background:"#6366f1",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,fontWeight:800,color:"#fff"}}>
+                            {_initial(ch.name)}
                           </div>
-                          <div style={{textAlign:"center"}}>
-                            <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600}}>CA</div>
-                            <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(chCA)}</div>
+                          <div>
+                            <div style={{fontSize:14,fontWeight:700,color:"#e2e8f0"}}>{ch.name||ch.email||"Chatter"}</div>
+                            <div style={{fontSize:11,color:"#94a3b8"}}>{ch.assignedModels.length} modèle{ch.assignedModels.length!==1?"s":""} · {ch.chTx.length} TX · {ch.isOnShift ? <span style={{color:"#4caf50"}}>🟢 EN SHIFT</span> : <span style={{color:"#e53935"}}>🔴 OFF</span>}</div>
                           </div>
-                          {lastTxDate&&(
-                            <div style={{textAlign:"center"}}>
-                              <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600}}>{lang==="fr"?"Dernière TX":"Last TX"}</div>
-                              <div style={{fontSize:13,fontWeight:600,color:"var(--success)"}}>{timeAgo}</div>
-                            </div>
-                          )}
                         </div>
                       </div>
-                      <div>
-                        <div style={{fontSize:11,fontWeight:600,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:6,letterSpacing:"0.8px"}}>{lang==="fr"?"Modèles assignés":"Assigned models"}</div>
+                      {/* Stats grid — CA, Taux conv, Commission */}
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+                        <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>CA généré</div>
+                          <div style={{fontSize:16,fontWeight:800,color:"#4caf50"}}>{fmtAmount(ch.validCA)}</div>
+                        </div>
+                        <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Taux conv.</div>
+                          <div style={{fontSize:16,fontWeight:800,color:ch.convRate>=50?"#4caf50":"#ff9800"}}>{ch.convRate}%</div>
+                        </div>
+                        <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Commission ({ch.commPct}%)</div>
+                          <div style={{fontSize:16,fontWeight:800,color:"#ff9800"}}>{fmtAmount(ch.commission)}</div>
+                        </div>
+                      </div>
+                      {/* TX bar */}
+                      <div style={{display:"flex",gap:10,fontSize:11,marginBottom:8}}>
+                        <span style={{color:"#4caf50"}}>✅ {ch.validTx.length}</span>
+                        <span style={{color:"#ff9800"}}>⏳ {ch.pendingTx.length}</span>
+                        <span style={{color:"#e53935"}}>❌ {ch.rejectedTx.length}</span>
+                      </div>
+                      {/* Modèles assignés */}
+                      <div style={{paddingTop:8,borderTop:"1px solid #1e2d3d"}}>
+                        <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",marginBottom:6,letterSpacing:"0.8px"}}>{lang==="fr"?"Modèles assignés":"Assigned models"}</div>
                         {managerModels.length===0?(
-                          <div style={{fontSize:12,color:"var(--text-tertiary)",fontStyle:"italic"}}>{lang==="fr"?"Aucun modèle disponible":"No models available"}</div>
+                          <div style={{fontSize:12,color:"#64748b",fontStyle:"italic"}}>{lang==="fr"?"Aucun modèle disponible":"No models available"}</div>
                         ):(
-                          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+                          <div style={{display:"flex",flexWrap:"wrap",gap:6}} onClick={e=>e.stopPropagation()}>
                             {managerModels.map(m=>(
-                              <label key={m.id} style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,padding:"5px 10px",borderRadius:8,border:"1px solid "+(chModels.includes(m.id)?"var(--accent)":"var(--border)"),background:chModels.includes(m.id)?"rgba(139,92,246,0.1)":"transparent",color:"var(--text)"}}>
-                                <input type="checkbox" checked={chModels.includes(m.id)} onChange={()=>toggleChatterModel(ch.id,m.id)} style={{accentColor:"var(--accent)"}} />{m.name}
+                              <label key={m.id} style={{display:"flex",alignItems:"center",gap:5,cursor:"pointer",fontSize:11,padding:"4px 8px",borderRadius:6,border:"1px solid "+((ch.assigned_models||[]).includes(m.id)?"#6366f1":"#1e2d3d"),background:(ch.assigned_models||[]).includes(m.id)?"rgba(99,102,241,0.1)":"transparent",color:"#e2e8f0"}}>
+                                <input type="checkbox" checked={(ch.assigned_models||[]).includes(m.id)} onChange={()=>toggleChatterModel(ch.id,m.id)} style={{accentColor:"#6366f1"}} />{m.name}
                               </label>
                             ))}
                           </div>
@@ -62880,7 +62913,7 @@ const App = () => {
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Manager Chatter pages ── */}
           {tab==="mc_dashboard"&&user.role==="manager_chatter"&&(
-            <><MCDashboardRedesign user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcSpenders={mcSpenders} mcPendingTxCount={mcPendingTxCount} models={models} onStatusFilterChange={setMcDashStatusFilter} onChatterFilterChange={setMcDashChatterFilter} onPeriodChange={setMcDashPeriod} onModelFilterChange={setMcDashModelFilter} onDateRangeChange={handleMcDashDateRange} /><MCTransactionsTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} models={models} setMcTxs={setMcTxs} setMcPendingTxCount={setMcPendingTxCount} mcTxFilter={mcTxFilter} setMcTxFilter={setMcTxFilter} mcTxChatterFilter={mcTxChatterFilter} setMcTxChatterFilter={setMcTxChatterFilter} mcTxPeriod={mcTxPeriod} setMcTxPeriod={setMcTxPeriod} dashboardMode={true} dashboardStatus={mcDashStatusFilter} dashboardChatter={mcDashChatterFilter} /></>
+            <><MCDashboardRedesign user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcSpenders={mcSpenders} mcPendingTxCount={mcPendingTxCount} models={models} onStatusFilterChange={setMcDashStatusFilter} onChatterFilterChange={setMcDashChatterFilter} onPeriodChange={setMcDashPeriod} onModelFilterChange={setMcDashModelFilter} onDateRangeChange={handleMcDashDateRange} /><MCTransactionsTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} models={models} mcTxFilter={mcTxFilter} setMcTxFilter={setMcTxFilter} mcTxChatterFilter={mcTxChatterFilter} setMcTxChatterFilter={setMcTxChatterFilter} mcTxPeriod={mcTxPeriod} setMcTxPeriod={setMcTxPeriod} dashboardMode={true} dashboardStatus={mcDashStatusFilter} dashboardChatter={mcDashChatterFilter} /></>
           )}
           {tab==="mc_chatters"&&user.role==="manager_chatter"&&(
             <MCEquipeTab user={user} lang={lang} mcChatters={mcChatters} mcTxs={mcTxs} mcConvs={mcConvs}
@@ -62894,7 +62927,7 @@ const App = () => {
               setMcConvChatterFilter={setMcConvChatterFilter} />
           )}
           {tab==="mc_transactions"&&user.role==="manager_chatter"&&(
-            <MCTransactionsTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} models={models} setMcTxs={setMcTxs} setMcPendingTxCount={setMcPendingTxCount} mcTxFilter={mcTxFilter} setMcTxFilter={setMcTxFilter} mcTxChatterFilter={mcTxChatterFilter} setMcTxChatterFilter={setMcTxChatterFilter} mcTxPeriod={mcTxPeriod} setMcTxPeriod={setMcTxPeriod} />
+            <MCTransactionsTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} models={models} mcTxFilter={mcTxFilter} setMcTxFilter={setMcTxFilter} mcTxChatterFilter={mcTxChatterFilter} setMcTxChatterFilter={setMcTxChatterFilter} mcTxPeriod={mcTxPeriod} setMcTxPeriod={setMcTxPeriod} />
           )}
           {tab==="mc_solde"&&user.role==="manager_chatter"&&(
             <MCCommissionTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcCommissions={mcCommissions} models={models} />
