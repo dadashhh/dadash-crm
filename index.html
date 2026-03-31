@@ -59337,330 +59337,461 @@ const MultiTabMessagerieApp = ({ user, lang, spenders, models, profiles, txs }) 
 };
 
 // =============================================
-// MC EXTRACTED COMPONENTS
+// MC EXTRACTED COMPONENTS — V2
 // =============================================
 
-const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpenders, mcPendingTxCount, models }) => {
-  const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
-  const [period, setPeriod] = useState("30j");
-  const [dateStart, setDateStart] = useState("");
-  const [dateEnd, setDateEnd] = useState("");
-  const [chatterFilter, setChatterFilter] = useState("all");
-  const [soldeManager, setSoldeManager] = useState(null);
-  const [chartMode, setChartMode] = useState("line");
+// MC DASHBOARD V2 — Aligned with DashboardRedesign gérant
+// Model pills, DashFilterPill (status+chatter), KPI click-to-filter, graph, TX table direct
+// =============================================
+const MC_DASHBOARD_METRICS = [
+  { id: "ca_brut",         label: "CA BRUT ÉQUIPE",    color: "#8b5cf6", calc: d => d?.caBrut ?? 0,         fmt: "currency", inGraph: true  },
+  { id: "ca_net",          label: "CA NET ÉQUIPE",     color: "#10b981", calc: d => d?.caNet ?? 0,          fmt: "currency", inGraph: true  },
+  { id: "ma_commission",   label: "MA COMMISSION",     color: "#f59e0b", calc: d => d?.maComm ?? 0,         fmt: "currency", inGraph: true  },
+  { id: "tx_pending",      label: "TX EN COURS",       color: "#f97316", calc: d => d?.txPending ?? 0,      fmt: "number",   inGraph: false },
+  { id: "tx_valid",        label: "TX VALIDÉES",       color: "#22c55e", calc: d => d?.txValid ?? 0,        fmt: "number",   inGraph: false },
+  { id: "spenders_actifs", label: "SPENDERS ACTIFS",   color: "#06b6d4", calc: d => d?.spendersActifs ?? 0, fmt: "number",   inGraph: true  },
+  { id: "chatters_actifs", label: "CHATTERS ACTIFS",   color: "#ec4899", calc: d => d?.chattersActifs ?? 0, fmt: "number",   inGraph: true  },
+  { id: "tx_cancelled",    label: "TX ANNULÉES",       color: "#ef4444", calc: d => d?.txCancelled ?? 0,    fmt: "number",   inGraph: false },
+];
 
-  // Period date ranges (copied from ChatterDashboardRedesign)
+const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpenders, mcPendingTxCount, models, onStatusFilterChange, onChatterFilterChange, onPeriodChange, onModelFilterChange, onDateRangeChange }) => {
+  const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
+  const timezone = useTimezone();
+  const addToast = useToast();
+  const fr = lang === "fr";
+  const sb = window.sb;
+  const _isMobile = window.innerWidth < 768;
+
+  // ── States ──
+  const [period, _setPeriod] = useState("30j");
+  const setPeriod = (p) => { _setPeriod(p); onPeriodChange && onPeriodChange(p); };
+  const [dateStart, _setDateStart] = useState("");
+  const [dateEnd, _setDateEnd] = useState("");
+  const setDateStart = (v) => { _setDateStart(v); };
+  const setDateEnd = (v) => { _setDateEnd(v); };
+  useEffect(() => { onDateRangeChange && onDateRangeChange(dateStart, dateEnd); }, [dateStart, dateEnd]);
+  const [modelFilter, _setModelFilter] = useState("all");
+  const setModelFilter = (m) => { _setModelFilter(m); onModelFilterChange && onModelFilterChange(m === "all" ? "" : m); };
+  const [activeMetrics, setActiveMetrics] = useState(() => new Set(["ca_brut", "ca_net"]));
+  const [chartView, setChartView] = useState("curve");
+  const [popup, setPopup] = useState(null);
+  const [soldeManager, setSoldeManager] = useState(null);
+
+  // ── V2 Dashboard Filters ──
+  const [dashStatusFilter, setDashStatusFilter] = useState("");
+  const [dashChatterFilter, setDashChatterFilter] = useState("");
+  const handleStatusFilter = (v) => { setDashStatusFilter(v); onStatusFilterChange && onStatusFilterChange(v); };
+  const handleChatterFilter = (v) => { setDashChatterFilter(v); onChatterFilterChange && onChatterFilterChange(v); };
+
+  const toggleMetric = (id) => setActiveMetrics(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+
+  // ── Model options (models accessible via chatters) ──
+  const mcModels = useMemo(() => {
+    const modelIds = new Set();
+    (mcTxs || []).forEach(tx => { if (tx.model_id) modelIds.add(tx.model_id); });
+    return (models || []).filter(m => modelIds.has(m.id)).map(m => ({ id: m.id, name: m.name || "—" })).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  }, [mcTxs, models]);
+
+  // ── All MC TX (includes MC's own TX — Zoo Agency edge case) ──
+  const allMcTxs = useMemo(() => mcTxs || [], [mcTxs]);
+
+  // ── Period bounds ──
   const { dateDebut, dateFin, prevDateDebut, prevDateFin } = useMemo(() => {
     const now = new Date();
-    let start, end, prevStart, prevEnd;
+    let end = new Date(now);
+    let start;
     if (period === "custom" && dateStart && dateEnd) {
-      start = new Date(dateStart); end = new Date(dateEnd);
-      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-        start = new Date(now); start.setDate(start.getDate() - 30); start.setHours(0,0,0,0);
-        end = new Date(now); end.setHours(23,59,59,999);
-      }
-      const diff = end.getTime() - start.getTime();
-      prevEnd = new Date(start.getTime()); prevStart = new Date(start.getTime() - diff);
+      start = new Date(dateStart + "T00:00:00");
+      end = new Date(dateEnd + "T23:59:59");
+    } else if (period === "today") {
+      start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    } else if (period === "24h") {
+      start = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    } else if (period === "all") {
+      start = new Date(2020, 0, 1);
     } else {
-      const days = period==="24h"?1:period==="7j"?7:period==="30j"?30:period==="90j"?90:99999;
-      end = new Date(now); end.setHours(23,59,59,999);
-      start = new Date(now); start.setDate(start.getDate()-days); start.setHours(0,0,0,0);
-      prevEnd = new Date(start.getTime()); prevEnd.setMilliseconds(-1);
-      prevStart = new Date(prevEnd.getTime()); prevStart.setDate(prevStart.getDate()-days);
+      const daysMap = { "7j": 7, "30j": 30, "90j": 90 };
+      const days = daysMap[period] || 30;
+      start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
     }
-    return { dateDebut: start, dateFin: end, prevDateDebut: prevStart, prevDateFin: prevEnd };
+    const diff = end.getTime() - start.getTime();
+    return { dateDebut: start, dateFin: end, prevDateDebut: new Date(start.getTime() - diff), prevDateFin: new Date(start.getTime() - 1) };
   }, [period, dateStart, dateEnd]);
 
-  // Filtered TX by period + chatter
+  // ── Filtered TX ──
   const filteredTxs = useMemo(() => {
-    return mcTxs.filter(tx => {
-      if (!isValidTx(tx.status) && !isPendingTx(tx.status)) return false;
+    const dStart = dateDebut.getTime();
+    const dFin = dateFin.getTime();
+    if (isNaN(dStart) || isNaN(dFin)) return [];
+    return safeArr(allMcTxs).filter(tx => {
       const d = new Date(tx.created_at || tx.date || 0).getTime();
-      if (d < dateDebut.getTime() || d > dateFin.getTime()) return false;
-      if (chatterFilter !== "all" && tx.chatter_id !== chatterFilter) return false;
+      if (isNaN(d) || d < dStart || d > dFin) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      if (dashChatterFilter && tx.chatter_id !== dashChatterFilter) return false;
+      if (dashStatusFilter) {
+        if (dashStatusFilter === "validated" && !isValidTx(tx.status)) return false;
+        if (dashStatusFilter === "pending" && !isPendingTx(tx.status)) return false;
+        if (dashStatusFilter === "refused" && !isRefusedTx(tx.status)) return false;
+      }
       return true;
     });
-  }, [mcTxs, dateDebut, dateFin, chatterFilter]);
+  }, [allMcTxs, dateDebut, dateFin, modelFilter, dashChatterFilter, dashStatusFilter]);
 
   const prevFilteredTxs = useMemo(() => {
-    return mcTxs.filter(tx => {
-      if (!isValidTx(tx.status) && !isPendingTx(tx.status)) return false;
+    const dStart = prevDateDebut.getTime();
+    const dFin = prevDateFin.getTime();
+    if (isNaN(dStart) || isNaN(dFin)) return [];
+    return safeArr(allMcTxs).filter(tx => {
       const d = new Date(tx.created_at || tx.date || 0).getTime();
-      if (d < prevDateDebut.getTime() || d > prevDateFin.getTime()) return false;
-      if (chatterFilter !== "all" && tx.chatter_id !== chatterFilter) return false;
+      if (isNaN(d) || d < dStart || d > dFin) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      if (dashChatterFilter && tx.chatter_id !== dashChatterFilter) return false;
       return true;
     });
-  }, [mcTxs, prevDateDebut, prevDateFin, chatterFilter]);
+  }, [allMcTxs, prevDateDebut, prevDateFin, modelFilter, dashChatterFilter]);
 
-  // 6 KPIs with deltas
+  // ── KPI Data ──
   const kpiData = useMemo(() => {
     const valid = filteredTxs.filter(tx => isValidTx(tx.status));
     const pending = filteredTxs.filter(tx => isPendingTx(tx.status));
+    const refused = filteredTxs.filter(tx => isRefusedTx(tx.status));
     const pValid = prevFilteredTxs.filter(tx => isValidTx(tx.status));
-    const caBrut = valid.reduce((s,tx) => s+txAmountCHF(tx),0);
-    const caNet = valid.reduce((s,tx) => s+txNetAmountCHF(tx),0);
-    const pCaNet = pValid.reduce((s,tx) => s+txNetAmountCHF(tx),0);
+
+    const caBrut = valid.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    const caNet = valid.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
+    const pCaNet = pValid.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
+
     const commRate = getCommissionRate(user, "manager_chatter");
     const maComm = caNet * commRate;
     const pMaComm = pCaNet * commRate;
+
     const txPending = pending.length;
     const txValid = valid.length;
     const pTxValid = pValid.length;
-    const spendersActifs = new Set(valid.map(tx=>tx.spender_handle).filter(Boolean)).size;
-    const chattersActifs = new Set(valid.map(tx=>tx.chatter_id).filter(Boolean)).size;
-    const delta = (curr, prev) => prev > 0 ? ((curr-prev)/prev*100) : (curr > 0 ? 100 : 0);
-    return { caBrut, caNet, maComm, txPending, txValid, spendersActifs, chattersActifs,
-      totalChatters: mcChatters.length, commPct: Number(user.manager_commission_pct||25),
-      deltaCaNet: delta(caNet,pCaNet), deltaComm: delta(maComm,pMaComm), deltaTx: delta(txValid,pTxValid) };
-  }, [filteredTxs, prevFilteredTxs, convertAmount, user, mcChatters]);
+    const txCancelled = refused.length;
+    const spendersActifs = new Set(valid.map(tx => tx.spender_handle).filter(Boolean)).size;
+    const chattersActifs = new Set(valid.map(tx => tx.chatter_id).filter(Boolean)).size;
 
-  // Chart data
+    const delta = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
+
+    return {
+      caBrut, caNet, maComm, txPending, txValid, txCancelled, spendersActifs, chattersActifs,
+      totalChatters: mcChatters.length, commPct: Number(user.manager_commission_pct || 25),
+      deltaCaNet: delta(caNet, pCaNet), deltaComm: delta(maComm, pMaComm), deltaTx: delta(txValid, pTxValid),
+    };
+  }, [filteredTxs, prevFilteredTxs, user, mcChatters]);
+
+  // ── Chart Data ──
   const chartData = useMemo(() => {
     const byDay = {};
-    filteredTxs.filter(tx => isValidTx(tx.status)).forEach(tx => {
-      const key = (tx.date||tx.created_at||"").toString().slice(0,10);
+    const commRate = getCommissionRate(user, "manager_chatter");
+    filteredTxs.forEach(tx => {
+      const raw = tx.created_at || tx.date || "";
+      if (!raw) return;
+      const key = new Date(raw).toLocaleDateString('fr-CA');
       if (!key || key.length < 10) return;
-      if (!byDay[key]) byDay[key] = { caNet:0, commission:0, txCount:0 };
-      byDay[key].caNet += txNetAmountCHF(tx);
-      byDay[key].commission += txNetAmountCHF(tx) * getCommissionRate(user, "manager_chatter");
-      byDay[key].txCount += 1;
+      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, ma_commission: 0, spenders: new Set(), chatters: new Set() };
+      const isVal = isValidTx(tx.status);
+      if (isVal) {
+        byDay[key].ca_brut += txAmountCHF(tx);
+        byDay[key].ca_net += txNetAmountCHF(tx);
+        byDay[key].ma_commission += txNetAmountCHF(tx) * commRate;
+        if (tx.spender_handle) byDay[key].spenders.add(tx.spender_handle);
+        if (tx.chatter_id) byDay[key].chatters.add(tx.chatter_id);
+      }
     });
-    return Object.entries(byDay).sort((a,b)=>a[0].localeCompare(b[0])).map(([date,d]) => ({
-      date, label: new Date(date+"T12:00:00").toLocaleDateString("fr-CH",{day:"2-digit",month:"short"}),
-      ca_net: Math.round(d.caNet), commission: Math.round(d.commission), transactions: d.txCount,
+    return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
+      date, label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
+      ca_brut: Math.round(d.ca_brut), ca_net: Math.round(d.ca_net), ma_commission: Math.round(d.ma_commission),
+      spenders_actifs: d.spenders.size, chatters_actifs: d.chatters.size,
     }));
-  }, [filteredTxs, convertAmount, user]);
+  }, [filteredTxs, user]);
 
-  // Chatter performance stats
-  const chatterStats = useMemo(() => {
-    const valid = filteredTxs.filter(tx => isValidTx(tx.status));
-    const result = mcChatters.map(ch => {
-      const chTxs = valid.filter(tx => tx.chatter_id === ch.id);
-      const caNet = chTxs.reduce((s,tx) => s+txNetAmountCHF(tx),0);
-      return { name: ch.name||ch.email||"Chatter", id: ch.id, caNet, nbTx: chTxs.length };
-    });
-    const topCa = Math.max(...result.map(x=>x.caNet),1);
-    return result.map(x => ({...x, barPct: (x.caNet/topCa)*100 })).sort((a,b) => b.caNet-a.caNet);
-  }, [filteredTxs, mcChatters, convertAmount]);
-
-  // Recent TX
-  const recentTxs = useMemo(() => {
-    const list = mcTxs.slice().sort((a,b) => new Date(b.date||b.created_at||0).getTime() - new Date(a.date||a.created_at||0).getTime());
-    return list.slice(0,10);
-  }, [mcTxs]);
-
-  // Solde manager widget
+  // ── Solde Manager (commissions - payé) ──
   const refreshSoldeManager = useCallback(async () => {
     try {
-      const chatterIds = [...new Set([...mcChatters.map(c=>c.id), user.id])];
-      if (!chatterIds.length) { setSoldeManager({ solde:0, commission_brute:0, deja_verse:0 }); return; }
+      const chatterIds = [...new Set([...mcChatters.map(c => c.id), user.id])];
+      if (!chatterIds.length) { setSoldeManager({ solde: 0, commission_brute: 0, deja_verse: 0 }); return; }
       const [txRes, piRes] = await Promise.allSettled([
-        sb.from('transactions').select('net_amount, amount, currency').in('chatter_id', chatterIds).in('status', ['validated','confirmee','payee','validé']),
-        sb.from('paiements_internes').select('montant, statut').eq('destinataire_id', user.id),
+        sb.from('transactions')
+          .select('net_amount, amount, currency')
+          .in('chatter_id', chatterIds)
+          .in('status', ['validated', 'confirmee', 'payee', 'validé']),
+        sb.from('paiements_internes')
+          .select('montant, statut')
+          .eq('destinataire_id', user.id),
       ]);
-      const txData = txRes.status==='fulfilled' ? (txRes.value.data||[]) : [];
-      const piData = piRes.status==='fulfilled' ? (piRes.value.data||[]) : [];
+      const txData = txRes.status === 'fulfilled' ? (txRes.value.data || []) : [];
+      const piData = piRes.status === 'fulfilled' ? (piRes.value.data || []) : [];
       const commRate = getCommissionRate(user, "manager_chatter");
-      const commBrute = txData.reduce((s,t) => s + convertAmountSimple(txNetAmount(t), t.currency) * commRate, 0);
-      const dejaVerse = piData.filter(p=>p.statut==='validated').reduce((s,p) => s+Number(p.montant||0), 0);
-      setSoldeManager({ solde: Math.max(0, commBrute-dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
-    } catch(e) { console.warn('[SoldeManager]', e?.message); }
+      const commBrute = txData.reduce((s, t) => s + convertAmountSimple(txNetAmount(t), t.currency) * commRate, 0);
+      const dejaVerse = piData.filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
+      setSoldeManager({ solde: Math.max(0, commBrute - dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
+    } catch (e) { console.warn('[SoldeManager]', e?.message); }
   }, [user?.id, mcChatters]);
-
   useEffect(() => { refreshSoldeManager(); }, [refreshSoldeManager]);
 
-  const sColor = s => s==="validated"||s==="validé"||s==="confirmee"||s==="payee" ? "#10b981" : s==="pending"||s==="en_attente" ? "#f59e0b" : "#ef4444";
-  const sLabel = s => ({validated:"Validée",confirmee:"Confirmée",payee:"Payée",pending:"En attente",en_attente:"En attente",refused:"Refusée"})[s]||s;
-  const DeltaBadge = ({val}) => val===0 ? null : React.createElement("div",{className:"kpi-card-delta "+(val>=0?"up":"down")},(val>=0?"↑":"↓")+" "+Math.abs(val).toFixed(1)+"% vs préc.");
-  const cardS = {background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"};
+  // ── Helpers ──
+  const fmtVal = (id, v) => {
+    const m = MC_DASHBOARD_METRICS.find(x => x.id === id);
+    if (!m) return v;
+    if (m.fmt === "currency") return fmtAmount(v);
+    return String(Math.round(v));
+  };
 
-  // Chart rendering
-  const MC_METRICS = [{id:"ca_net",label:"CA Net",color:"#8b5cf6"},{id:"commission",label:"Commission",color:"#10b981"},{id:"transactions",label:"TX",color:"#f59e0b"}];
-  const fmtVal = (key, v) => key==="transactions" ? v : fmtAmount(v);
-  const chartEl = chartData.length > 1 && rechartsReady ? (() => {
-    _ensureRecharts();
-    const ChartComp = chartMode==="bar" ? BarChart : LineChart;
-    return React.createElement(ResponsiveContainer, {width:"100%",height:240},
-      React.createElement(ChartComp, {data:chartData,margin:{top:5,right:10,bottom:0,left:-10}},
-        React.createElement(CartesianGrid, {stroke:"rgba(255,255,255,0.04)",vertical:false}),
-        React.createElement(XAxis, {dataKey:"label",interval:"preserveStartEnd",tick:{fill:"#64748b",fontSize:10},tickLine:false,axisLine:false}),
-        React.createElement(YAxis, {tick:{fill:"#64748b",fontSize:10},tickLine:false,axisLine:false,width:52,tickFormatter:v=>v>=1000?(v/1000).toFixed(0)+"k":String(v)}),
-        React.createElement(RechartsTooltip, {content:({active,payload,label})=>{
-          if(!active||!payload||!payload.length)return null;
-          return React.createElement("div",{style:{background:"#1a2035",border:"1px solid rgba(139,92,246,0.3)",borderRadius:10,padding:"10px 14px",boxShadow:"0 8px 24px rgba(0,0,0,0.5)"}},
-            React.createElement("div",{style:{fontSize:11,color:"#64748b",marginBottom:6}},label),
-            payload.map((p,i)=>React.createElement("div",{key:i,style:{fontSize:12,fontWeight:600,color:p.stroke||p.fill}},p.name+": "+fmtVal(p.dataKey,p.value)))
-          );
-        }}),
-        ...MC_METRICS.map(m => chartMode==="bar"
-          ? React.createElement(Bar, {key:m.id,dataKey:m.id,name:m.label,fill:m.color,radius:[3,3,0,0],opacity:0.85})
-          : React.createElement(Line, {key:m.id,type:"monotone",dataKey:m.id,name:m.label,stroke:m.color,strokeWidth:2,dot:false,activeDot:{r:5,fill:m.color,stroke:"#1a2035",strokeWidth:2}})
-        )
-      )
-    );
-  })() : null;
+  // ── Chatter filter options (includes MC himself for Zoo Agency) ──
+  const chatterOptions = useMemo(() => [
+    { value: "", label: fr ? "Tous les chatters" : "All chatters" },
+    { value: user.id, label: `${user.display_name || user.name || user.username || "Moi"} (moi)` },
+    ...(mcChatters || []).filter(c => c.id !== user.id).map(c => ({ value: c.id, label: c.display_name || c.name || c.username || "—" })),
+  ], [mcChatters, user, fr]);
+
+  // ── KPI mappings ──
+  const _kpiToStatus = { ca_brut: "validated", ca_net: "validated", ma_commission: "validated", tx_pending: "pending", tx_valid: "validated", spenders_actifs: null, chatters_actifs: null, tx_cancelled: "refused" };
+  const _deltaKeys = { ca_net: "deltaCaNet", ma_commission: "deltaComm", tx_valid: "deltaTx" };
+  const _metricColorMap = { ca_brut: "indigo", ca_net: "green", ma_commission: "amber", tx_pending: "amber", tx_valid: "green", spenders_actifs: "white", chatters_actifs: "white", tx_cancelled: "red" };
+
+  // ── Pending TX list for popup ──
+  const pendingTxs = useMemo(() => safeArr(allMcTxs).filter(tx => isPendingTx(tx.status)).sort((a, b) => new Date(b.created_at || b.date) - new Date(a.created_at || a.date)).slice(0, 30), [allMcTxs]);
 
   return (
-    <div style={{padding:0}}>
-      <h2 style={{fontSize:22,fontWeight:800,marginBottom:16,color:"var(--text)"}}>📊 Dashboard Manager</h2>
+    <div style={{ padding: _isMobile ? "0 12px" : 0 }}>
 
-      {/* Period selector + chatter filter */}
-      <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16,alignItems:"center"}}>
-        {["24h","7j","30j","90j","all"].map(p => (
-          <button key={p} onClick={()=>setPeriod(p)}
-            style={{padding:"6px 14px",borderRadius:16,fontSize:12,fontWeight:600,
-              background: period===p ? "var(--accent)" : "var(--surface)",
-              color: period===p ? "#fff" : "var(--text-secondary)",
-              border: period===p ? "none" : "1px solid var(--border)",cursor:"pointer"}}>
-            {p==="all"?"All time":p.toUpperCase()}
-          </button>
-        ))}
-        <select value={chatterFilter} onChange={e=>setChatterFilter(e.target.value)}
-          style={{padding:"6px 12px",borderRadius:16,border:"1px solid var(--border)",background:"var(--surface)",color:"var(--text)",fontSize:12,marginLeft:4}}>
-          <option value="all">{lang==="fr"?"Tous les chatters":"All chatters"}</option>
-          {mcChatters.map(ch=><option key={ch.id} value={ch.id}>{ch.name||ch.email}</option>)}
-        </select>
-      </div>
-
-      {/* 6 KPI cards */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(170px,1fr))",gap:12,marginBottom:20}}>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>CA Brut Équipe</div>
-          <div style={{fontSize:24,fontWeight:800,color:"#8b5cf6"}}>{fmtAmount(kpiData.caBrut)}</div>
-        </div>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>CA Net Équipe</div>
-          <div style={{fontSize:24,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(kpiData.caNet)}</div>
-          <DeltaBadge val={kpiData.deltaCaNet}/>
-        </div>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>Ma Commission ({kpiData.commPct}%)</div>
-          <div style={{fontSize:24,fontWeight:800,color:"#10b981"}}>{fmtAmount(kpiData.maComm)}</div>
-          <DeltaBadge val={kpiData.deltaComm}/>
-        </div>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>TX en attente</div>
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <span style={{fontSize:24,fontWeight:800,color:"var(--warning)"}}>{kpiData.txPending}</span>
-            {kpiData.txPending>0&&<span style={{background:"var(--danger)",color:"#fff",fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10}}>{kpiData.txPending}</span>}
-          </div>
-        </div>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>TX Validées</div>
-          <div style={{fontSize:24,fontWeight:800,color:"var(--text)"}}>{kpiData.txValid}</div>
-          <DeltaBadge val={kpiData.deltaTx}/>
-        </div>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>Spenders Actifs</div>
-          <div style={{fontSize:24,fontWeight:800,color:"var(--text)"}}>{kpiData.spendersActifs}</div>
-        </div>
-        <div style={cardS}>
-          <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4,textTransform:"uppercase"}}>Chatters Actifs</div>
-          <div style={{fontSize:24,fontWeight:800,color:"var(--text)"}}>{kpiData.chattersActifs}<span style={{fontSize:14,color:"var(--text-tertiary)",fontWeight:600}}>/{kpiData.totalChatters}</span></div>
-        </div>
-      </div>
-
-      {/* Chart */}
-      {chartData.length > 1 && (
-        <div style={{...cardS,marginBottom:20}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-            <div style={{fontSize:15,fontWeight:800,color:"var(--text)"}}>📈 {lang==="fr"?"Évolution":"Trend"}</div>
-            <div style={{display:"flex",gap:4}}>
-              {["line","bar"].map(m=>(
-                <button key={m} onClick={()=>setChartMode(m)} style={{padding:"4px 10px",borderRadius:8,fontSize:11,fontWeight:600,border:"none",cursor:"pointer",
-                  background:chartMode===m?"var(--accent)":"var(--surface)",color:chartMode===m?"#fff":"var(--text-secondary)"}}>{m==="line"?"📈":"📊"}</button>
-              ))}
-            </div>
-          </div>
-          <div style={{display:"flex",gap:12,marginBottom:10,flexWrap:"wrap"}}>
-            {MC_METRICS.map(m=>(
-              <span key={m.id} style={{fontSize:10,fontWeight:600,display:"flex",alignItems:"center",gap:4}}>
-                <span style={{width:8,height:8,borderRadius:4,background:m.color,display:"inline-block"}}/>{m.label}
-              </span>
-            ))}
-          </div>
-          {chartEl}
-        </div>
-      )}
-
-      {/* Bottom grid: chatter perf + recent TX + solde */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(280px,1fr))",gap:16}}>
-        {/* Chatter performance */}
-        <div style={cardS}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>👥 {lang==="fr"?"Performance chatters":"Chatter performance"}</div>
-          {chatterStats.length===0?(
-            <div style={{fontSize:13,color:"var(--text-tertiary)"}}>{lang==="fr"?"Aucun chatter":"No chatters"}</div>
-          ):chatterStats.map(ch=>(
-            <div key={ch.id} style={{marginBottom:12}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:4}}>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:13,fontWeight:700,color:"var(--text)"}}>{ch.name}</div>
-                  <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{ch.nbTx} TX</div>
-                </div>
-                <div style={{fontSize:14,fontWeight:800,color:"var(--text)",flexShrink:0}}>{fmtAmount(ch.caNet)}</div>
-              </div>
-              <div style={{height:5,borderRadius:3,background:"rgba(255,255,255,0.06)",overflow:"hidden"}}>
-                <div style={{height:"100%",width:ch.barPct+"%",background:"#8b5cf6",borderRadius:3,transition:"width 0.3s"}}/>
-              </div>
+      {/* 1. FILTRE GLOBAL — Period + Model pills */}
+      <div className="toolbar" style={{ marginBottom: 16 }}>
+        <div className="period-filters">
+          {[{id:"today",label:"Aujourd'hui"},{id:"24h",label:"24h"},{id:"7j",label:"7j"},{id:"30j",label:"30j"},{id:"90j",label:"90j"},{id:"all",label:"All time"}].map(p => (
+            <div key={p.id} className={`filter-pill${period === p.id ? " active" : ""}`}
+              onClick={() => { setPeriod(p.id); setDateStart(""); setDateEnd(""); }}>
+              {p.label}
             </div>
           ))}
         </div>
-
-        {/* Recent TX */}
-        <div style={cardS}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>🕐 {lang==="fr"?"TX récentes":"Recent TX"}</div>
-          {recentTxs.length===0?(
-            <div style={{textAlign:"center",padding:16,color:"var(--text-tertiary)",fontSize:12}}>{lang==="fr"?"Aucune TX":"No TX"}</div>
-          ):recentTxs.slice(0,8).map((tx,i)=>{
-            const chName = mcChatters.find(c=>c.id===tx.chatter_id)?.name||"—";
-            const mName = (models||[]).find(m=>m.id===tx.model_id)?.name||"";
-            const sc = sColor(tx.status);
+        <div className="filter-sep"/>
+        <DateRangePicker
+          startDate={dateStart} endDate={dateEnd}
+          onChange={({ start, end }) => { setDateStart(start || ""); setDateEnd(end || ""); setPeriod("custom"); }}
+          placeholder="Période personnalisée"
+        />
+        <div className="filter-sep"/>
+        {/* Model pills V2 */}
+        <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
+          <button onClick={() => setModelFilter("all")} style={{
+            background: modelFilter === "all" ? "var(--surface)" : "transparent",
+            border: `1.5px solid ${modelFilter === "all" ? "#818cf8" : "var(--border)"}`,
+            borderRadius: 20, padding: "5px 14px", fontSize: 12, cursor: "pointer",
+            color: modelFilter === "all" ? "var(--text)" : "var(--muted)", fontWeight: modelFilter === "all" ? 600 : 400,
+          }}>Tous les modèles</button>
+          {mcModels.map(m => {
+            const isAct = modelFilter === m.id;
+            const mColor = ["#f97316","#a855f7","#06b6d4","#ef4444","#eab308","#22c55e"][mcModels.indexOf(m) % 6];
             return (
-              <div key={tx.id||i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:12,fontWeight:600,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>@{tx.spender_handle||"?"} · {mName||"?"}</div>
-                  <div style={{fontSize:10,color:"var(--text-tertiary)"}}>{chName} · {new Date(tx.created_at||tx.date).toLocaleDateString("fr-CH",{day:"2-digit",month:"short"})}</div>
-                </div>
-                <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:2,flexShrink:0,marginLeft:8}}>
-                  <span style={{fontSize:13,fontWeight:700,color:sc}}>+{fmtAmount(Number(tx.net_amount||0),tx.currency)}</span>
-                  <span style={{fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:6,background:sc+"22",color:sc}}>{sLabel(tx.status)}</span>
-                </div>
-              </div>
+              <button key={m.id} onClick={() => setModelFilter(isAct ? "all" : m.id)} style={{
+                background: isAct ? mColor + "20" : "transparent",
+                border: `1.5px solid ${isAct ? mColor : "var(--border)"}`,
+                borderRadius: 20, padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                color: isAct ? mColor : "var(--muted)", fontWeight: isAct ? 700 : 400,
+                display: "flex", alignItems: "center", gap: 5,
+              }}>
+                <span style={{ width: 16, height: 16, borderRadius: "50%", background: mColor + "30", color: mColor, fontSize: 10, fontWeight: 800, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>{(m.name || "?")[0]}</span>
+                {m.name}
+              </button>
             );
           })}
         </div>
-
-        {/* Solde Manager widget */}
-        <div style={cardS}>
-          <div style={{fontSize:15,fontWeight:800,color:"var(--text)",marginBottom:14}}>💰 {lang==="fr"?"Mon Solde":"My Balance"}</div>
-          {soldeManager ? (<>
-            <div style={{textAlign:"center",marginBottom:16}}>
-              <div style={{fontSize:11,color:"var(--text-tertiary)",fontWeight:600,marginBottom:4}}>{lang==="fr"?"SOLDE DISPONIBLE":"AVAILABLE BALANCE"}</div>
-              <div style={{fontSize:32,fontWeight:800,color:soldeManager.solde>0?"#10b981":"var(--text)"}}>{fmtAmount(soldeManager.solde)}</div>
-            </div>
-            <div style={{display:"flex",justifyContent:"space-around",borderTop:"1px solid var(--border-subtle)",paddingTop:12}}>
-              <div style={{textAlign:"center"}}>
-                <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600}}>{lang==="fr"?"COMM. BRUTE":"GROSS COMM."}</div>
-                <div style={{fontSize:16,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(soldeManager.commission_brute)}</div>
-              </div>
-              <div style={{textAlign:"center"}}>
-                <div style={{fontSize:10,color:"var(--text-tertiary)",fontWeight:600}}>{lang==="fr"?"DÉJÀ VERSÉ":"ALREADY PAID"}</div>
-                <div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(soldeManager.deja_verse)}</div>
-              </div>
-            </div>
-          </>):(
-            <div style={{textAlign:"center",padding:20,color:"var(--text-tertiary)",fontSize:12}}>{lang==="fr"?"Chargement…":"Loading…"}</div>
-          )}
-        </div>
       </div>
+
+      {/* V2 — Status + Chatter filter pills */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
+        <DashFilterPill label="Tous les statuts" value={dashStatusFilter} onChange={handleStatusFilter}
+          color={dashStatusFilter === "validated" ? "#34d399" : dashStatusFilter === "pending" ? "#fb923c" : dashStatusFilter === "refused" ? "#f87171" : undefined}
+          options={[
+            { value: "", label: "Tous les statuts" },
+            { value: "validated", label: "Validée" },
+            { value: "pending", label: "En attente" },
+            { value: "refused", label: "Refusée / Annulée" },
+          ]} />
+        <DashFilterPill label="Tous les chatters" value={dashChatterFilter} onChange={handleChatterFilter} color="#a78bfa"
+          options={chatterOptions} />
+        {(dashStatusFilter || dashChatterFilter || modelFilter !== "all") && (
+          <button onClick={() => { handleStatusFilter(""); handleChatterFilter(""); setModelFilter("all"); }} style={{
+            display: "flex", alignItems: "center", gap: 4, background: "#f8717115", border: "1px solid #f8717140",
+            borderRadius: 20, padding: "5px 12px", fontSize: 11, cursor: "pointer", color: "#f87171", fontWeight: 600,
+          }}>✕ Reset filtres</button>
+        )}
+      </div>
+
+      {/* 2. KPI STRIP */}
+      {(()=>{
+        return (
+          <div className={_isMobile ? "kpi-row cols-2" : "kpi-row cols-4"} style={{ marginBottom: 18 }}>
+            {MC_DASHBOARD_METRICS.map(m => {
+              const val = m.calc(kpiData);
+              const delta = kpiData[_deltaKeys[m.id]];
+              const colorClass = _metricColorMap[m.id] || "white";
+              const filterStatus = _kpiToStatus[m.id];
+              const handleClick = () => {
+                if (filterStatus) handleStatusFilter(dashStatusFilter === filterStatus ? "" : filterStatus);
+                if (m.inGraph) toggleMetric(m.id);
+                if (m.id === "tx_pending") setPopup("pending_list");
+              };
+              const isFilterActive = filterStatus && dashStatusFilter === filterStatus;
+              const isGraphActive = m.inGraph && activeMetrics.has(m.id);
+              return (
+                <div key={m.id} onClick={handleClick}
+                  className={`kpi-card ${colorClass}`}
+                  style={{
+                    cursor: "pointer",
+                    boxShadow: isFilterActive ? `0 0 0 2px ${m.color}, 0 0 20px ${m.color}15` : isGraphActive ? `0 0 0 2px ${m.color}` : undefined,
+                    transition: "all 0.2s",
+                  }}>
+                  <div className="kpi-card-label">{m.label}</div>
+                  <div className={`kpi-card-value ${colorClass}`}>{fmtVal(m.id, val)}</div>
+                  {m.id === "chatters_actifs" && <div style={{fontSize:10,color:"var(--muted2)",marginTop:2}}>sur {kpiData.totalChatters} total</div>}
+                  {delta != null && !isNaN(delta) && (
+                    <div className={`kpi-card-delta ${delta >= 0 ? "up" : "down"}`}>{delta >= 0 ? "↑" : "↓"} {Math.abs(delta).toFixed(1)}% vs préc.</div>
+                  )}
+                  {isFilterActive && <div className="kpi-card-hint" style={{ color: m.color }}>Filtre actif</div>}
+                  {!isFilterActive && m.inGraph && <div className="kpi-card-hint">Cliquer pour filtrer</div>}
+                </div>
+              );
+            })}
+            {/* SOLDE MC card */}
+            <div className="kpi-card green" style={{ cursor: "default" }}>
+              <div className="kpi-card-label">SOLDE MC</div>
+              <div className="kpi-card-value green">{soldeManager ? fmtAmount(soldeManager.solde) : "..."}</div>
+              {soldeManager && (
+                <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 4 }}>
+                  Comm. {fmtAmount(soldeManager.commission_brute)} — Payé {fmtAmount(soldeManager.deja_verse)}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* 3. GRAPHE MULTI-SMOOTH */}
+      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: "16px 20px", marginBottom: 18 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text)" }}>Évolution des métriques</div>
+            <div style={{ fontSize: 10, color: "var(--muted2)", marginTop: 2 }}>Cliquer sur un KPI pour ajouter/retirer</div>
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["curve", "Courbe"], ["bar", "Barres"], ["table", "Tableau"]].map(([v, lbl]) => (
+              <button key={v} onClick={() => setChartView(v)} style={{
+                padding: "5px 11px", borderRadius: 8, border: `1px solid ${chartView === v ? "#8b5cf6" : "var(--border)"}`,
+                background: chartView === v ? "rgba(139,92,246,0.15)" : "var(--surface2)", color: chartView === v ? "#c4b5fd" : "var(--text)", fontSize: 11, cursor: "pointer",
+              }}>{lbl}</button>
+            ))}
+          </div>
+        </div>
+        {/* Metric pills */}
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginBottom: 12 }}>
+          {MC_DASHBOARD_METRICS.filter(m => m.inGraph).map(m => (
+            <button key={m.id} onClick={() => toggleMetric(m.id)} style={{
+              display: "flex", alignItems: "center", gap: 5,
+              background: activeMetrics.has(m.id) ? m.color + "20" : "transparent",
+              border: `1.5px solid ${activeMetrics.has(m.id) ? m.color : "var(--border)"}`,
+              borderRadius: 20, padding: "4px 12px", fontSize: 11, cursor: "pointer",
+              color: activeMetrics.has(m.id) ? m.color : "var(--muted)", fontWeight: activeMetrics.has(m.id) ? 700 : 400,
+            }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: m.color, opacity: activeMetrics.has(m.id) ? 1 : 0.3 }} />
+              {m.label}
+            </button>
+          ))}
+        </div>
+        {/* Chart render */}
+        {chartData.length > 0 && _ensureRecharts() && (() => {
+          const visibleMetrics = MC_DASHBOARD_METRICS.filter(m => m.inGraph && activeMetrics.has(m.id));
+          if (chartView === "table") {
+            return (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+                  <thead><tr style={{ borderBottom: "1px solid var(--border)" }}>
+                    <th style={{ textAlign: "left", padding: "6px 8px", color: "var(--text-tertiary)" }}>Date</th>
+                    {visibleMetrics.map(m => <th key={m.id} style={{ textAlign: "right", padding: "6px 8px", color: m.color }}>{m.label}</th>)}
+                  </tr></thead>
+                  <tbody>{chartData.map(row => (
+                    <tr key={row.date} style={{ borderBottom: "1px solid var(--border)" }}>
+                      <td style={{ padding: "6px 8px", color: "var(--text)" }}>{row.label}</td>
+                      {visibleMetrics.map(m => <td key={m.id} style={{ textAlign: "right", padding: "6px 8px", color: "var(--text)" }}>{fmtVal(m.id, row[m.id] || 0)}</td>)}
+                    </tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            );
+          }
+          const ChartType = chartView === "bar" ? Recharts.BarChart : Recharts.LineChart;
+          const DataEl = chartView === "bar" ? Recharts.Bar : Recharts.Line;
+          return (
+            <Recharts.ResponsiveContainer width="100%" height={260}>
+              <ChartType data={chartData} margin={{ top: 5, right: 10, bottom: 5, left: 0 }}>
+                <Recharts.CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+                <Recharts.XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted2)" }} />
+                <Recharts.YAxis tick={{ fontSize: 10, fill: "var(--muted2)" }} />
+                <Recharts.Tooltip contentStyle={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 8, fontSize: 11 }} formatter={(v, name) => [fmtVal(name, v), MC_DASHBOARD_METRICS.find(m => m.id === name)?.label || name]} />
+                {visibleMetrics.map(m => chartView === "bar"
+                  ? <Recharts.Bar key={m.id} dataKey={m.id} fill={m.color} radius={[4, 4, 0, 0]} />
+                  : <Recharts.Line key={m.id} type="monotone" dataKey={m.id} stroke={m.color} strokeWidth={2} dot={false} />
+                )}
+              </ChartType>
+            </Recharts.ResponsiveContainer>
+          );
+        })()}
+        {chartData.length === 0 && <div style={{ textAlign: "center", padding: 40, color: "var(--muted2)", fontSize: 12 }}>Aucune donnée pour la période</div>}
+      </div>
+
+      {/* V2 — Bottom grid removed → page Gestion */}
+
+      {/* Popup: TX en attente */}
+      {popup === "pending_list" && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center" }} onClick={() => setPopup(null)}>
+          <div style={{ background: "var(--surface)", borderRadius: 16, padding: 24, maxWidth: 600, width: "90%", maxHeight: "70vh", overflow: "auto" }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text)" }}>TX en attente ({pendingTxs.length})</div>
+              <button onClick={() => setPopup(null)} style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "var(--text)" }}>✕</button>
+            </div>
+            {pendingTxs.length === 0 && <div style={{ color: "var(--muted2)", fontSize: 12 }}>Aucune TX en attente</div>}
+            {pendingTxs.map(tx => {
+              const chatter = (mcChatters || []).find(c => c.id === tx.chatter_id);
+              return (
+                <div key={tx.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>{tx.spender_handle || "—"}</div>
+                    <div style={{ fontSize: 10, color: "var(--muted2)" }}>{(models || []).find(m => m.id === tx.model_id)?.name || "—"} · {chatter?.name || chatter?.username || "—"} · {new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH")}</div>
+                  </div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "#f97316" }}>{fmtAmount(Number(tx.amount || 0))}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 });
 
-const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, setMcTxs, setMcPendingTxCount, mcTxFilter, setMcTxFilter, mcTxChatterFilter, setMcTxChatterFilter, mcTxPeriod, setMcTxPeriod }) => {
+
+
+const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, setMcTxs, setMcPendingTxCount, mcTxFilter, setMcTxFilter, mcTxChatterFilter, setMcTxChatterFilter, mcTxPeriod, setMcTxPeriod, dashboardMode, dashboardStatus, dashboardChatter }) => {
   const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
   const setProofLightboxUrl = useProofLightbox();
   const addToast = useToast();
+
+  // ── V2 dashboardMode sync ──
+  useEffect(() => {
+    if (!dashboardMode) return;
+    if (dashboardStatus === "validated") setMcTxFilter("validated");
+    else if (dashboardStatus === "pending") setMcTxFilter("pending");
+    else if (dashboardStatus === "refused") setMcTxFilter("refused");
+    else setMcTxFilter("all");
+  }, [dashboardStatus, dashboardMode]);
+  useEffect(() => {
+    if (!dashboardMode) return;
+    setMcTxChatterFilter(dashboardChatter || "all");
+  }, [dashboardChatter, dashboardMode]);
+
   const handleMcValidate = async (txId) => {
     const {error} = await sb.from("transactions").update({status:"validated",validated_by:user.id,validated_at:new Date().toISOString()}).eq("id",txId);
     if (error) { addToast("Erreur: "+error.message,"error"); return; }
@@ -59695,6 +59826,15 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
   };
   return (
     <div style={{padding:0}}>
+      {/* V2: dashboardMode → hide KPI cards and filters (shown in dashboard above) */}
+      {dashboardMode && (
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,marginTop:8,fontSize:12,color:"var(--text-tertiary)"}}>
+          <span>{filtered.length} TX affichées</span>
+          {mcTxFilter && mcTxFilter !== "all" && <span style={{padding:"2px 8px",borderRadius:10,background:"rgba(139,92,246,0.15)",color:"#c4b5fd",fontSize:11}}>Filtre: {mcTxFilter==="validated"?"validées":mcTxFilter==="pending"?"en attente":"refusées"}</span>}
+          {mcTxChatterFilter && mcTxChatterFilter !== "all" && <span style={{padding:"2px 8px",borderRadius:10,background:"rgba(168,139,250,0.15)",color:"#a78bfa",fontSize:11}}>Chatter: {(mcChatters||[]).find(c=>c.id===mcTxChatterFilter)?.name || "—"}</span>}
+        </div>
+      )}
+      {!dashboardMode && (<>
       <h2 style={{fontSize:22,fontWeight:800,marginBottom:20,color:"var(--text)"}}>💰 {lang==="fr"?"Transactions":"Transactions"}</h2>
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:16,marginBottom:20}}>
         <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
@@ -59702,11 +59842,11 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
           <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:28,fontWeight:800,color:"var(--warning)"}}>{pendingCount}</span>{pendingCount>0&&<span style={{background:"var(--danger)",color:"#fff",fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10}}>{pendingCount}</span>}</div>
         </div>
         <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA NET</div>
+          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA NET VALIDÉ</div>
           <div style={{fontSize:28,fontWeight:800,color:"var(--success)"}}>{fmtAmount(caValidated)}</div>
         </div>
         <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"}}>
-          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA NET</div>
+          <div style={{fontSize:12,color:"var(--text-tertiary)",fontWeight:600,marginBottom:6}}>CA NET PENDING</div>
           <div style={{fontSize:28,fontWeight:800,color:"var(--warning)"}}>{fmtAmount(caPending)}</div>
         </div>
       </div>
@@ -59724,6 +59864,7 @@ const MCTransactionsTab = React.memo(({ user, lang, mcTxs, mcChatters, models, s
           <option value="month">{lang==="fr"?"Ce mois":"This month"}</option>
         </select>
       </div>
+      </>)}
       {filtered.length===0?(
         <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"32px 24px",textAlign:"center"}}>
           <div style={{fontSize:48,marginBottom:12}}>💰</div>
@@ -60411,6 +60552,14 @@ const App = () => {
   const [chatterDashDateEnd, setChatterDashDateEnd] = useState("");
   const handleChatterDashDateRange = useCallback((s, e) => { setChatterDashDateStart(s || ""); setChatterDashDateEnd(e || ""); }, []);
   const [chatterDashStatusFilter, setChatterDashStatusFilter] = useState("");
+  // V2 MC dashboard filters
+  const [mcDashPeriod, setMcDashPeriod] = useState("30j");
+  const [mcDashModelFilter, setMcDashModelFilter] = useState("");
+  const [mcDashDateStart, setMcDashDateStart] = useState("");
+  const [mcDashDateEnd, setMcDashDateEnd] = useState("");
+  const handleMcDashDateRange = useCallback((s, e) => { setMcDashDateStart(s || ""); setMcDashDateEnd(e || ""); }, []);
+  const [mcDashStatusFilter, setMcDashStatusFilter] = useState("");
+  const [mcDashChatterFilter, setMcDashChatterFilter] = useState("");
   const [fabOpen, setFabOpen] = useState(false);
   const [fabSpenderModal, setFabSpenderModal] = useState(false);
   const [fabTodoModal, setFabTodoModal] = useState(false);
@@ -62724,7 +62873,7 @@ const App = () => {
           {tab==="chatter_scan"&&user.role==="chatter"&&<ScanChecker user={user} lang={lang} screenshotChecks={screenshotChecks} onRefresh={onRefresh} />}
           {/* ── Manager Chatter pages ── */}
           {tab==="mc_dashboard"&&user.role==="manager_chatter"&&(
-            <MCDashboardRedesign user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcSpenders={mcSpenders} mcPendingTxCount={mcPendingTxCount} models={models} />
+            <><MCDashboardRedesign user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} mcSpenders={mcSpenders} mcPendingTxCount={mcPendingTxCount} models={models} onStatusFilterChange={setMcDashStatusFilter} onChatterFilterChange={setMcDashChatterFilter} onPeriodChange={setMcDashPeriod} onModelFilterChange={setMcDashModelFilter} onDateRangeChange={handleMcDashDateRange} /><MCTransactionsTab user={user} lang={lang} mcTxs={mcTxs} mcChatters={mcChatters} models={models} setMcTxs={setMcTxs} setMcPendingTxCount={setMcPendingTxCount} mcTxFilter={mcTxFilter} setMcTxFilter={setMcTxFilter} mcTxChatterFilter={mcTxChatterFilter} setMcTxChatterFilter={setMcTxChatterFilter} mcTxPeriod={mcTxPeriod} setMcTxPeriod={setMcTxPeriod} dashboardMode={true} dashboardStatus={mcDashStatusFilter} dashboardChatter={mcDashChatterFilter} /></>
           )}
           {tab==="mc_chatters"&&user.role==="manager_chatter"&&(
             <MCEquipeTab user={user} lang={lang} mcChatters={mcChatters} mcTxs={mcTxs} mcConvs={mcConvs}
