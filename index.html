@@ -32422,7 +32422,7 @@ const detectPaymentIA = async (spenderId, modelId, mediaUrl) => {
  * Returns { sentMediaIds: Set<string>, sentMediaUrls: Set<string> }
  */
 const fetchSentMedias = async (spenderId) => {
-  if (!spenderId) return { sentMediaIds: new Set(), sentMediaUrls: new Set() };
+  if (!spenderId) return { sentMediaIds: [], sentMediaUrls: [] };
   try {
     const { data, error } = await window.sb
       .from('sent_medias')
@@ -32430,15 +32430,15 @@ const fetchSentMedias = async (spenderId) => {
       .eq('spender_id', spenderId);
     if (error) {
       console.error('[SENT_MEDIAS] fetch error:', error);
-      return { sentMediaIds: new Set(), sentMediaUrls: new Set() };
+      return { sentMediaIds: [], sentMediaUrls: [] };
     }
-    const sentMediaIds = new Set((data || []).map(d => d.media_id).filter(Boolean));
-    const sentMediaUrls = new Set((data || []).map(d => d.media_url).filter(Boolean));
-    console.log(`[SENT_MEDIAS] spender=${spenderId} — ${sentMediaIds.size} ids, ${sentMediaUrls.size} urls (cross-model)`);
+    const sentMediaIds = [...new Set((data || []).map(d => d.media_id).filter(Boolean))];
+    const sentMediaUrls = [...new Set((data || []).map(d => d.media_url).filter(Boolean))];
+    console.log(`[SENT_MEDIAS] spender=${spenderId} — ${sentMediaIds.length} ids, ${sentMediaUrls.length} urls (cross-model)`);
     return { sentMediaIds, sentMediaUrls };
   } catch (err) {
     console.error('[SENT_MEDIAS] fetch exception:', err);
-    return { sentMediaIds: new Set(), sentMediaUrls: new Set() };
+    return { sentMediaIds: [], sentMediaUrls: [] };
   }
 };
 
@@ -32474,6 +32474,76 @@ window._markMediaAsSent = markMediaAsSent;
 window._getSentMediaUrls = async (spenderId) => {
   const { sentMediaUrls } = await fetchSentMedias(spenderId);
   return [...sentMediaUrls];
+};
+
+/**
+ * BACKFILL: populate sent_medias from tg_messages (outgoing + media_url).
+ * Runs once per session for gérant. Idempotent via upsert.
+ */
+const _backfillSentMediasKey = '__dadash_backfill_sent_medias_done';
+window._backfillSentMedias = async () => {
+  if (sessionStorage.getItem(_backfillSentMediasKey)) { console.log('[BACKFILL] Already ran this session'); return; }
+  sessionStorage.setItem(_backfillSentMediasKey, '1');
+  console.log('[BACKFILL] Starting sent_medias backfill from tg_messages...');
+  try {
+    // Fetch outgoing messages with media_url (limit 5000 most recent)
+    const { data: msgs, error } = await window.sb
+      .from('tg_messages')
+      .select('tg_chat_id, media_url, media_type, model_id, created_at')
+      .eq('is_outgoing', true)
+      .not('media_url', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(5000);
+    if (error) { console.error('[BACKFILL] fetch tg_messages error:', error); return; }
+    if (!msgs || msgs.length === 0) { console.log('[BACKFILL] No outgoing media messages found'); return; }
+    console.log(`[BACKFILL] Found ${msgs.length} outgoing media messages to check`);
+
+    // Build spender lookup from tg_chat_id
+    const spendersCache = {};
+    const { data: allSpenders } = await window.sb
+      .from('spenders')
+      .select('id, tg_user_id, telegram_id');
+    (allSpenders || []).forEach(s => {
+      if (s.tg_user_id) spendersCache[String(s.tg_user_id)] = s.id;
+      if (s.telegram_id) spendersCache[String(s.telegram_id)] = s.id;
+    });
+
+    // Batch upsert — group by unique (media_url, spender_id, model_id)
+    const seen = new Set();
+    const rows = [];
+    for (const msg of msgs) {
+      const tgId = String(msg.tg_chat_id || "");
+      const spId = spendersCache[tgId];
+      if (!spId || !msg.media_url) continue;
+      const key = `${msg.media_url}|${spId}|${msg.model_id || ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({
+        media_url: msg.media_url,
+        spender_id: spId,
+        model_id: msg.model_id || null,
+        sent_via: 'backfill',
+        sent_at: msg.created_at || new Date().toISOString()
+      });
+    }
+    console.log(`[BACKFILL] ${rows.length} unique media-spender pairs to upsert`);
+    if (rows.length === 0) return;
+
+    // Upsert in batches of 200
+    const BATCH = 200;
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += BATCH) {
+      const batch = rows.slice(i, i + BATCH);
+      const { error: upErr } = await window.sb
+        .from('sent_medias')
+        .upsert(batch, { onConflict: 'media_url,spender_id,model_id', ignoreDuplicates: true });
+      if (upErr) console.warn(`[BACKFILL] batch ${i}-${i+batch.length} error:`, upErr);
+      else inserted += batch.length;
+    }
+    console.log(`[BACKFILL] Done — ${inserted} rows upserted into sent_medias`);
+  } catch (err) {
+    console.error('[BACKFILL] exception:', err);
+  }
 };
 
 // Helper pour extraire metadata vidéo (width, height, duration)
@@ -33236,15 +33306,29 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
   const [loading, setLoading] = React.useState(true);
   const [confirmMedia, setConfirmMedia] = React.useState(null);
   const [sentMediaIds, setSentMediaIds] = React.useState([]);
+  const [localSentUrls, setLocalSentUrls] = React.useState([]);
+  const [sentMediasLoaded, setSentMediasLoaded] = React.useState(false);
   const [customAlbums, setCustomAlbums] = React.useState([]);
   const [visibleCount, setVisibleCount] = React.useState(LIBRARY_BATCH_SIZE);
   const loadMoreRef = React.useRef(null);
 
-  // Load sent media IDs+URLs for this spender (cross-model)
+  // Fix 5: Load both sent media IDs AND URLs locally (don't rely on stale parent prop)
   React.useEffect(() => {
-    if (!spenderId) { setSentMediaIds([]); return; }
-    window._fetchSentMedias(spenderId).then(({ sentMediaIds: ids }) => setSentMediaIds([...ids])).catch(() => {});
+    setSentMediasLoaded(false);
+    if (!spenderId) { setSentMediaIds([]); setLocalSentUrls([]); setSentMediasLoaded(true); return; }
+    window._fetchSentMedias(spenderId).then(({ sentMediaIds: ids, sentMediaUrls: urls }) => {
+      setSentMediaIds([...ids]);
+      setLocalSentUrls([...urls]);
+      console.log(`[LibraryModal] Loaded ${ids.length} sent IDs + ${urls.length} sent URLs for spender=${spenderId}`);
+      setSentMediasLoaded(true);
+    }).catch(() => { setSentMediasLoaded(true); });
   }, [spenderId]);
+
+  // Merge parent prop sentMediaUrls with locally loaded ones (Fix 5)
+  const allSentUrls = React.useMemo(() => {
+    const merged = new Set([...sentMediaUrls, ...localSentUrls]);
+    return [...merged];
+  }, [sentMediaUrls, localSentUrls]);
 
   React.useEffect(() => {
     const loadMedias = async () => {
@@ -33297,7 +33381,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
     else if (activeTab === 'lingerie') result = result.filter(m => m.category === 'lingerie_bikini');
     else if (activeTab === 'sextape') result = result.filter(m => m.category === 'sextape');
     else if (activeTab === 'videos_solo') result = result.filter(m => m.category === 'videos_solo');
-    else if (activeTab === 'sent') result = result.filter(m => sentMediaIds.includes(m.id) || sentMediaUrls.includes(m.url));
+    else if (activeTab === 'sent') result = result.filter(m => sentMediaIds.includes(m.id) || allSentUrls.includes(m.url));
     else if (activeTab.startsWith('album_')) {
       const albumId = activeTab.replace('album_', '');
       result = result.filter(m => m.album_id === albumId);
@@ -33310,7 +33394,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
       );
     }
     return result;
-  }, [medias, activeTab, searchQuery, sentMediaIds, sentMediaUrls]);
+  }, [medias, activeTab, searchQuery, sentMediaIds, allSentUrls]);
 
   // Reset pagination when filter/search changes
   React.useEffect(() => {
@@ -33333,7 +33417,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
   }, [visibleCount, filteredMedias.length]);
 
   const handleSelectMedia = (media) => {
-    if (sentMediaIds.includes(media.id) || sentMediaUrls.includes(media.url)) return;
+    if (sentMediaIds.includes(media.id) || allSentUrls.includes(media.url)) return;
     setConfirmMedia(media);
   };
 
@@ -33396,8 +33480,11 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
               <span>Total:</span><span style={{ color: '#fbbf24', fontWeight: 700 }}>{filteredMedias.length}</span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <span>Envoyés:</span><span style={{ color: '#10b981', fontWeight: 700 }}>{sentMediaIds.length}</span>
+              <span>Envoyés:</span><span style={{ color: '#10b981', fontWeight: 700 }}>{sentMediasLoaded ? sentMediaIds.length : '…'}</span>
             </div>
+            {!sentMediasLoaded && (
+              <div style={{ color: '#f59e0b', fontSize: 9, marginTop: 4 }}>Chargement grisage…</div>
+            )}
           </div>
         </div>
 
@@ -33425,7 +33512,7 @@ const LibraryModal = ({ modelId, spenderId, onClose, onSelectMedia, sentMediaUrl
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 }}>
                 {visibleMedias.map((media, idx) => {
-                  const isSent = sentMediaIds.includes(media.id) || sentMediaUrls.includes(media.url);
+                  const isSent = sentMediaIds.includes(media.id) || allSentUrls.includes(media.url);
                   return (
                     <MediaCard
                       key={media.id || idx}
@@ -34012,9 +34099,13 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
     setGalleryFilter('all');
     setGalleryLightbox(null);
     // Charger URLs envoyées cross-model pour cette cellule
+    // Fix 3: fallback via tg_chat_id → spenders lookup
     const conv = gpSlots[cellIndex];
-    if (conv?.spender_id) {
-      window._fetchSentMedias(conv.spender_id)
+    const _tgId = String(conv?.tg_chat_id || conv?.chat_id || "");
+    const _spFromTg = _tgId ? (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === _tgId) : null;
+    const _spId = conv?.spender_id || _spFromTg?.id;
+    if (_spId) {
+      window._fetchSentMedias(_spId)
         .then(({ sentMediaUrls }) => setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: [...sentMediaUrls] })))
         .catch(() => {});
     }
@@ -36634,8 +36725,11 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
   }, [getCurrentSpenderMedias, galleryFilter]);
 
   // Charger les URLs envoyées cross-model pour le spender courant
+  // Fix 3: fallback via tg_chat_id → spenders lookup
   useEffect(() => {
-    const spId = currentConv?.spender_id;
+    const tgId = String(currentConv?.tg_chat_id || currentConv?.chat_id || "");
+    const spFromTg = tgId ? (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === tgId) : null;
+    const spId = currentConv?.spender_id || spFromTg?.id;
     if (spId) {
       window._fetchSentMedias(spId).then(({ sentMediaUrls }) => setSentMediaUrls([...sentMediaUrls])).catch(() => {});
     } else {
@@ -37463,11 +37557,14 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   }, [txModalSlot]);
 
   // Load sent medias (unified cross-model) when media library opens for a slot
+  // Fix 3: fallback via tg_chat_id → spenders lookup
   React.useEffect(() => {
     if (mediaLibSlot === null) { setMediaLibSentIds([]); setMediaLibSentUrls([]); return; }
     const convRef = window._tlgProSlotsRef?.[mediaLibSlot];
     if (!convRef) return;
-    const spId = convRef.spender_id;
+    const _tgId = String(convRef.tg_chat_id || convRef.chat_id || "");
+    const _spFromTg = _tgId ? (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === _tgId) : null;
+    const spId = convRef.spender_id || _spFromTg?.id;
     if (spId) {
       window._fetchSentMedias(spId).then(({ sentMediaIds, sentMediaUrls }) => {
         setMediaLibSentIds([...sentMediaIds]);
@@ -41715,13 +41812,18 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       })
       .catch(() => setMediaLoading(false));
     // Unified sent medias fetch — cross-model by spender_id
-    const spId = selectedConv?.spender_id || activeSpender?.id;
+    // Fix 3: fallback resolution via tg_chat_id → spenders lookup
+    const tgId = String(_dmsgChatId(selectedConv) || "");
+    const spFromTg = tgId ? (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === tgId) : null;
+    const spId = selectedConv?.spender_id || activeSpender?.id || spFromTg?.id;
     if (spId) {
+      console.log(`[GRAYING] Fetching sent medias for spender=${spId} (source: ${selectedConv?.spender_id ? 'conv' : activeSpender?.id ? 'activeSpender' : 'tg_lookup'})`);
       window._fetchSentMedias(spId).then(({ sentMediaIds, sentMediaUrls }) => {
         setSentMediaIds([...sentMediaIds]);
         setSentMediaUrls([...sentMediaUrls]);
       }).catch(() => {});
     } else {
+      console.warn(`[GRAYING] No spender_id found for conv chatId=${tgId} — graying disabled`);
       setSentMediaIds([]);
       setSentMediaUrls([]);
     }
@@ -63296,6 +63398,10 @@ const App = () => {
       } catch(e) { console.warn("[DATA] loadData Wave2 failed (non-critical):", e.message || e); }
 
       // ── POST-WAVE2: escalation, MC data, notifications ──
+      // Backfill sent_medias from tg_messages (once per session, fire-and-forget)
+      if (currentUser && (currentUser.role === "gerant" || currentUser.role === "manager_chatter")) {
+        window._backfillSentMedias?.().catch(() => {});
+      }
       // Load escalation count for messagerie badge
       if (currentUser && currentUser.role === "gerant") {
         try {
