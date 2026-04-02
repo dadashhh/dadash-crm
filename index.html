@@ -7501,6 +7501,8 @@ const Skeleton = ({width="100%",height=20,borderRadius=8}) => (
 const SUPABASE_URL = window.SUPABASE_URL;
 const SUPABASE_ANON_KEY = window.SUPABASE_ANON_KEY;
 const sb = window.sb;
+// FIX: Alias for code that references window.__supabaseClient (voice notes, sender patching)
+window.__supabaseClient = window.sb;
 
 // =============================================
 // DATA ACCESS LAYER — DADASH compat (VIEW/RPC stables, pas de colonnes fragiles)
@@ -40757,6 +40759,7 @@ const _DADASH_DEBUG = window.location.search.includes('debug=true');
 // ── normalizeMessage : standardise TOUT message (Carlos API / Supabase / optimistic) ──
 // Un seul format canonical + champs compat pour mergeMessages, _msgKey, _shouldShowDateSep.
 function normalizeMessage(raw) {
+  try {
   if (!raw) return null;
   if (raw._normalized) return raw;
 
@@ -40826,6 +40829,10 @@ function normalizeMessage(raw) {
     _chatId: raw._chatId || null,
     _modelId: raw._modelId || null,
   };
+  } catch (normalizeErr) {
+    console.error('[NORMALIZE] Failed to normalize message:', normalizeErr.message, raw?.id || 'no-id');
+    return null;
+  }
 }
 
 const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, initialChatId }) => {
@@ -41455,14 +41462,37 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         firstMsg: raw[0]?.id || 'none',
         queryParams: { table: 'carlos_api', filterColumn: 'chat_id', filterValue: cid }
       });
-      if (raw.length === 0) {
-        if (_DADASH_DEBUG) console.warn('⚠️ [MSG-DIAG] EMPTY RESULT — Possible bug:', {
-          functionName: 'loadMessagesById',
-          subpage: 'DadashMessagerieTab',
-          chatId: cid,
-          isInitial,
-          hint: 'Vérifier si chat_id match dans la DB'
-        });
+      // ── FIX: Supabase fallback quand Carlos retourne 0 messages ──
+      if (raw.length === 0 && isInitial) {
+        console.warn('[MSG-LOAD] Carlos returned 0 messages for', cid, '— trying Supabase fallback');
+        try {
+          const { data: convRow } = await sb
+            .from("tg_conversations").select("id")
+            .eq("tg_chat_id", cid).maybeSingle();
+          if (convRow?.id) {
+            const { data: sbMsgs } = await sb.from("tg_messages").select("*")
+              .eq("conversation_id", convRow.id)
+              .order("created_at", { ascending: false })
+              .limit(50);
+            const sbList = _normalizeMsgMedia((sbMsgs || []).reverse());
+            if (sbList.length > 0) {
+              console.log('[MSG-LOAD] Supabase fallback found', sbList.length, 'messages');
+              const sbNorm = sbList.map(normalizeMessage).filter(Boolean);
+              if (sbNorm.length > 0) {
+                _DMSG_MSG_CACHE[convKey] = { data: sbNorm, ts: Date.now() };
+                if (String(chatIdRef.current) === cid) {
+                  setMessages(sbNorm);
+                  setMsgOffset(0);
+                  setHasMoreMsgs(sbNorm.length >= 50);
+                  setTimeout(() => scrollToBottom('instant'), 100);
+                }
+                return;
+              }
+            }
+          }
+        } catch (sbErr) {
+          console.warn('[MSG-LOAD] Supabase fallback failed:', sbErr.message);
+        }
       }
       const nList = list.map(normalizeMessage).filter(Boolean);
       if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] Setting messages:', {
@@ -41506,6 +41536,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       }
     } catch (e) {
       if (e.name === "AbortError") return;
+      // FIX: Always log errors (console.error is NOT silenced in prod)
+      console.error('[MSG-LOAD] ❌ Error loading messages for chat', cid, ':', e.message || e);
       if (isInitial && !_DMSG_MSG_CACHE[convKey]?.data?.length) {
         try {
           if (_DADASH_DEBUG) console.log('[DEBUG-LOAD] FALLBACK Supabase used:', {
@@ -41679,7 +41711,21 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
 
     chatIdRef.current = chatId;
     // Notify global realtime channel of conversation change
-    window.dispatchEvent(new CustomEvent('conversationChanged', { detail: { id: conv?.id || null } }));
+    // FIX: resolve Supabase UUID for realtime subscription (Carlos convs lack .id)
+    const _rtConvId = conv?.id || null;
+    if (_rtConvId) {
+      window.dispatchEvent(new CustomEvent('conversationChanged', { detail: { id: _rtConvId } }));
+    } else {
+      // Carlos conv — resolve UUID from Supabase asynchronously for realtime
+      const _rtCid = String(chatId);
+      sb.from("tg_conversations").select("id").eq("tg_chat_id", _rtCid).maybeSingle()
+        .then(({ data }) => {
+          if (data?.id && String(chatIdRef.current) === _rtCid) {
+            conv.id = data.id;
+            window.dispatchEvent(new CustomEvent('conversationChanged', { detail: { id: data.id } }));
+          }
+        }).catch(() => {});
+    }
     // Lock the selection — polling is NEVER allowed to change selectedConv
     selectedConvRef.current = conv;
     setSelectedConv(conv);
@@ -41698,9 +41744,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     if (cached && cached.data.length > 0) {
       // Stale-while-revalidate : afficher le cache même expiré, le poll mergera les nouveaux
       setMessages(cached.data.map(normalizeMessage).filter(Boolean));
+    } else {
+      // FIX: Clear stale messages from previous conv + show loading spinner
+      setMessages([]);
+      setMsgLoading(true);
     }
-    // Pas de setMessages([]) — le fetch asynchrone (loadMessagesById) prendra le relais
-    // Si aucun cache : messages reste [] depuis le useState initial ou le load précédent
     msgInputRef.current = "";
     setMsgInput("");
     setShowScripts(false);
