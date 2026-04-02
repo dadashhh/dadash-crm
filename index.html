@@ -33071,6 +33071,37 @@ const _escapeHtml = (text) => {
   return d.innerHTML;
 };
 
+// ── Patch sender identity on the most recent outbound message after Carlos send ──
+// Carlos API inserts tg_messages WITHOUT sender_profile_id, so CRM patches it after.
+const _patchSenderOnLastOutbound = async (convId, user) => {
+  if (!convId || !user?.id) return;
+  try {
+    const sb = window.__supabaseClient;
+    if (!sb) return;
+    const senderName = user.name || user.email || 'Agent';
+    const senderRole = user.role || 'chatter';
+    // Find the latest outbound message for this conversation (just inserted by Carlos)
+    const { data: msgs } = await sb.from('tg_messages')
+      .select('id, meta')
+      .eq('conversation_id', convId)
+      .eq('direction', 'out')
+      .is('sender_profile_id', null)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (!msgs || msgs.length === 0) return;
+    const msg = msgs[0];
+    const existingMeta = (msg.meta && typeof msg.meta === 'object') ? msg.meta : {};
+    await sb.from('tg_messages')
+      .update({
+        sender_profile_id: user.id,
+        meta: { ...existingMeta, sender_name: senderName, sender_role: senderRole }
+      })
+      .eq('id', msg.id);
+  } catch (e) {
+    console.warn('[SENDER-PATCH] Failed to patch sender on outbound msg:', e);
+  }
+};
+
 // =====================================================================
 // GRID CONSTANTS (shared by Grid Premium + TLG Pro)
 // =====================================================================
@@ -40772,8 +40803,8 @@ function normalizeMessage(raw) {
     pending,
     sent,
     error,
-    sender: raw.sender || raw.sent_by_name || meta.sent_by_name || null,
-    sentByName: raw.sent_by_name || meta.sent_by_name || null,
+    sender: raw.sender || raw.sent_by_name || meta.sent_by_name || meta.sender_name || null,
+    sentByName: raw.sent_by_name || meta.sent_by_name || meta.sender_name || null,
     sentBy: raw.sent_by || meta.sent_by || null,
     sender_type: raw.sender_type || (isOutgoing ? (raw.from_bot ? 'bot' : 'chatter') : 'spender'),
     sender_profile_id: raw.sender_profile_id || raw.sender_id || null,
@@ -42520,14 +42551,16 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         method: "POST",
         body: JSON.stringify(
           modelId
-            ? { chat_id: chatId, text, model_id: modelId }
-            : { chat_id: chatId, text }
+            ? { chat_id: chatId, text, model_id: modelId, sender_id: user?.id, sender_name: user?.name }
+            : { chat_id: chatId, text, sender_id: user?.id, sender_name: user?.name }
         ),
         timeout: 15000,
       });
       setMessages(prev => prev.map(m =>
         m.id === localId ? { ...m, _sent: true, sent: true } : m
       ));
+      // Patch sender identity on the message Carlos just inserted
+      setTimeout(() => _patchSenderOnLastOutbound(selectedConv.id, user), 500);
       // Remonter la conv en haut de liste — delayed to avoid left panel flash
       setTimeout(() => loadConversations(true), 3000);
       // Si un script texte est actif sur cette conv, avancer à l'étape suivante
@@ -44133,27 +44166,29 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
                     <div className="conv-sender-label" style={{ fontSize: 11, color: convTheme === 'light' ? "#a855f7" : "#a5b4fc", fontWeight: 700, marginBottom: 2, textAlign: "right" }}>
                       {msg.sentByName || (msg.sender ? _senderLabel(msg.sender) : null)
                         || (() => {
-                          // Resolve name from profiles if we have sender_profile_id
+                          // 1) Resolve name from profiles if we have sender_profile_id
                           if (msg.sender_profile_id && profiles) {
                             const p = profiles.find(x => x.id === msg.sender_profile_id);
-                            if (p) return (p.prenom || p.first_name || p.name || p.email || '').trim() || null;
+                            if (p) return (p.name || p.email || '').trim() || null;
                           }
-                          // Fallback: resolve from conversation chatter_id
+                          // 2) Check meta.sender_name (set by _patchSenderOnLastOutbound)
+                          if (msg.meta?.sender_name) return msg.meta.sender_name;
+                          // 3) Fallback: resolve from conversation chatter_id
                           if (selectedConv?.chatter_id && profiles) {
                             const cp = profiles.find(x => x.id === selectedConv.chatter_id);
-                            if (cp) return (cp.prenom || cp.first_name || cp.name || '').trim() || null;
+                            if (cp) return (cp.name || '').trim() || null;
                           }
-                          // Fallback: resolve from conversation assigned_chatter or mc
+                          // 4) Fallback: resolve from conversation assigned_chatter
                           if (selectedConv?.assigned_chatter_id && profiles) {
                             const ac = profiles.find(x => x.id === selectedConv.assigned_chatter_id);
-                            if (ac) return (ac.prenom || ac.first_name || ac.name || '').trim() || null;
+                            if (ac) return (ac.name || '').trim() || null;
                           }
-                          // Fallback: msg.from_name or msg.sender_name (bot fields)
+                          // 5) msg.from_name or msg.sender_name
                           if (msg.from_name) return msg.from_name;
                           if (msg.sender_name) return msg.sender_name;
                           return null;
                         })()
-                        || (msg.sender_type === 'bot' ? '🤖 Bot' : msg.sender_type === 'gerant' ? '👑 Gérant' : msg.sender_type === 'chatter' ? '💬 Chatter' : '📤')}
+                        || (msg.sender_type === 'bot' ? '🤖 Bot' : msg.sender_type === 'gerant' ? '👑 Gérant' : '📤 Agent')}
                     </div>
                   )}
                   <div className={isOut ? "conv-bubble-outgoing" : "conv-bubble-incoming"} style={{
