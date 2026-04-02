@@ -35023,6 +35023,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
   const [galleryFilter, setGalleryFilter]     = React.useState('all');
   const [galleryLightbox, setGalleryLightbox] = React.useState(null);
   const [sentMediaUrlsMap, setSentMediaUrlsMap] = React.useState({}); // { cellIndex: string[] }
+  const [sentMediaIdsMap, setSentMediaIdsMap] = React.useState({}); // { cellIndex: string[] }
   const [activeLibraryCell, setActiveLibraryCell] = React.useState(null);
   const tSlotScrollRefs  = React.useRef({});
   const tTopSentinelRefs = React.useRef({});
@@ -35639,7 +35640,10 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
     const conv = tSlots[cellIndex];
     if (conv?.spender_id) {
       window._fetchSentMedias(conv.spender_id)
-        .then(({ sentMediaUrls }) => setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: [...sentMediaUrls] })))
+        .then(({ sentMediaIds, sentMediaUrls }) => {
+          setSentMediaUrlsMap(prev => ({ ...prev, [cellIndex]: [...sentMediaUrls] }));
+          setSentMediaIdsMap(prev => ({ ...prev, [cellIndex]: [...sentMediaIds] }));
+        })
         .catch(() => {});
     }
   };
@@ -36253,7 +36257,8 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 }}>
                   {filteredCellMedias.map((media, idx) => {
-                    const isSent = (sentMediaUrlsMap[showCellGallery] || []).includes(media.url);
+                    const isSent = (sentMediaUrlsMap[showCellGallery] || []).includes(media.url)
+                                || (sentMediaIdsMap[showCellGallery] || []).includes(media.id);
                     return (
                       <MediaCard
                         key={media.id || idx}
@@ -36399,6 +36404,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
   const [galleryLightbox, setGalleryLightbox] = React.useState(null);
   const [tindadaLightbox, setTindadaLightbox] = React.useState(null);
   const [sentMediaUrls, setSentMediaUrls] = React.useState([]); // cross-pages sync
+  const [sentMediaIds, setSentMediaIds] = React.useState([]); // cross-pages sync by ID
   // TX modal
   const [showTxModal, setShowTxModal] = React.useState(false);
   const [txForm, setTxForm] = React.useState({ amount: "", currency: "CHF", product: "", product_id: "", provider_id: "", payment_method: "", note: "" });
@@ -36741,7 +36747,10 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
     const spFromTg = tgId ? (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === tgId) : null;
     const spId = currentConv?.spender_id || spFromTg?.id;
     if (spId) {
-      window._fetchSentMedias(spId).then(({ sentMediaUrls }) => setSentMediaUrls([...sentMediaUrls])).catch(() => {});
+      window._fetchSentMedias(spId).then(({ sentMediaIds: ids, sentMediaUrls: urls }) => {
+        setSentMediaUrls([...urls]);
+        setSentMediaIds([...ids]);
+      }).catch(() => {});
     } else {
       setSentMediaUrls([]);
     }
@@ -37263,7 +37272,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12 }}>
                   {filteredMedias.map((media, idx) => {
-                    const isSent = sentMediaUrls.includes(media.url);
+                    const isSent = sentMediaUrls.includes(media.url) || sentMediaIds.includes(media.id);
                     return (
                       <MediaCard
                         key={media.id || idx}
@@ -40896,6 +40905,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const [inlineIALoading, setInlineIALoading] = useState(false);
   const [inlineIAError, setInlineIAError] = useState(null);
 
+  // Voice recording state
+  const [isRecording, setIsRecording] = React.useState(false);
+  const [recordingTime, setRecordingTime] = React.useState(0);
+  const mediaRecorderRef = React.useRef(null);
+  const audioChunksRef = React.useRef([]);
+  const recordingTimerRef = React.useRef(null);
+
   // ── Socket.IO enriched listeners (Carlos PR #1-3) ──
   useEffect(() => {
     const socket = window.__dadashSocket;
@@ -42296,6 +42312,123 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     return result;
   }, [conversations, searchQuery, filterSpender, filterModels, filterTier, filterLang, spenders, convTotalsMap, showUnreadOnly, _modelIdToName, _modelNameToIds]);
 
+  // ── Voice recording functions ─────────────────────
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 }
+      });
+      const mimeType = MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+        ? 'audio/ogg;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus' : 'audio/webm';
+      const recorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach(t => t.stop());
+        clearInterval(recordingTimerRef.current);
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        if (blob.size < 1000) { addToast && addToast(fr ? "Enregistrement trop court" : "Recording too short", "warning"); return; }
+        await sendVoiceNote(blob, mimeType);
+      };
+      recorder.start(250);
+      setIsRecording(true);
+      setRecordingTime(0);
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime(prev => { if (prev >= 300) { stopRecording(); return prev; } return prev + 1; });
+      }, 1000);
+    } catch (err) {
+      console.error('Erreur micro:', err);
+      addToast && addToast(fr ? "Impossible d'accéder au micro" : "Unable to access microphone", "error");
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    setIsRecording(false);
+    setRecordingTime(0);
+  };
+
+  const sendVoiceNote = async (blob, mimeType) => {
+    if (!selectedConv?.id) {
+      addToast && addToast(fr ? "Sélectionnez une conversation" : "Select a conversation", "error");
+      return;
+    }
+    try {
+      addToast && addToast(fr ? "Envoi du message vocal..." : "Sending voice message...", "info");
+
+      // Upload to Supabase Storage
+      const ext = mimeType.includes('ogg') ? 'ogg' : 'webm';
+      const fileName = 'voice_' + Date.now() + '.' + ext;
+      const modelName = selectedConv.model_name || selectedConv.model_id || 'unknown';
+      const storagePath = 'voice-notes/' + modelName + '/' + fileName;
+
+      const { data: uploadData, error: uploadError } = await window.__supabaseClient.storage
+        .from('media').upload(storagePath, blob, { contentType: mimeType, upsert: false });
+      if (uploadError) throw uploadError;
+
+      const { data: urlData } = window.__supabaseClient.storage.from('media').getPublicUrl(storagePath);
+      const audioUrl = urlData.publicUrl;
+
+      // Send via bot /send-voice
+      const chatId = chatIdRef.current || _dmsgChatId(selectedConv);
+      const modelId = selectedConv.model_id || selectedModelId || chatterCtx.assignedModelIds?.[0];
+
+      const res = await fetch(_DMSG_API + '/send-voice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': window.CRM_API_KEY },
+        body: JSON.stringify({
+          chat_id: chatId,
+          audio_url: audioUrl,
+          model_id: modelId,
+          caption: ''
+        }),
+        signal: AbortSignal.timeout(120000)
+      });
+      if (!res.ok) throw new Error('Bot error: ' + res.status);
+
+      // Persist in tg_messages
+      await window.__supabaseClient.from('tg_messages').insert({
+        conversation_id: selectedConv.id,
+        chat_id: chatId,
+        model_id: modelId,
+        direction: 'outgoing',
+        media_type: 'voice_note',
+        media_url: audioUrl,
+        text: fr ? '[Message vocal]' : '[Voice note]',
+        sender_profile_id: user?.id,
+        sent_by_name: user?.name || user?.email || 'Gerant',
+        sent_at: new Date().toISOString()
+      });
+
+      // Optimistic message in UI
+      const localId = "pending-voice-" + Date.now();
+      const optimistic = normalizeMessage({
+        id: localId,
+        text: fr ? '[Message vocal]' : '[Voice note]',
+        direction: "out",
+        is_outgoing: true,
+        media_type: 'voice_note',
+        media_url: audioUrl,
+        sender_type: "chatter",
+        created_at: new Date().toISOString(),
+        _pending: false,
+      });
+      setMessages(prev => [...prev, optimistic]);
+      isUserScrollRef.current = false;
+      scrollToBottom('smooth');
+
+      addToast && addToast(fr ? "Message vocal envoyé ✅" : "Voice message sent ✅", "success");
+    } catch (err) {
+      console.error('Erreur envoi vocal:', err);
+      addToast && addToast((fr ? "Erreur envoi vocal: " : "Voice send error: ") + err.message, "error");
+    }
+  };
+
   // ── Send message ─────────────────────────────────
   const sendMessage = useCallback(async () => {
     if (!selectedConv || !msgInputRef.current.trim()) return;
@@ -42575,6 +42708,11 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           const mediaTimeout = step.type === 'video' ? 600000 : step.type === 'audio' ? 120000 : 30000;
           await _dmsgFetch(endpoint, { method: 'POST', body: JSON.stringify(body), timeout: mediaTimeout });
           console.log(`[SCRIPT] ✅ ${step.type} envoyé`);
+          // Mark media as sent for cross-page graying
+          const spId = selectedConv?.spender_id || (spenders || []).find(s => String(s.tg_user_id || s.telegram_id || "") === String(chatId))?.id;
+          if (spId && step.media_url && window._markMediaAsSent) {
+            window._markMediaAsSent(step.media_url, spId, modelId, 'script', null);
+          }
         } else {
           const text = msgInputRef.current.trim() || scriptStepCaption || _replaceVars(step.content) || '';
           if (text) {
