@@ -62156,6 +62156,51 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
   const { convertAmount, currencySymbol, fmtAmount } = useCurrency();
   const addToast = useToast();
 
+  // --- PR4: Fetch paiements_internes for MC's chatters ---
+  const [mcPaiements, setMcPaiements] = useState([]);
+  const [payingChatter, setPayingChatter] = useState(null);
+  const [payAmount, setPayAmount] = useState("");
+  const [payDesc, setPayDesc] = useState("");
+  const [paySaving, setPaySaving] = useState(false);
+  const [expandedPayHistory, setExpandedPayHistory] = useState(null);
+
+  const fetchMcPaiements = React.useCallback(async () => {
+    try {
+      const chatterIds = mcChatters.map(ch => ch.id);
+      if (chatterIds.length === 0) return;
+      const { data } = await sb.from("paiements_internes")
+        .select("id,montant,devise,statut,type,description,created_at,destinataire_id,createur_id")
+        .in("destinataire_id", chatterIds)
+        .in("type", ["chatter_payment", "commission"])
+        .eq("statut", "validated");
+      setMcPaiements(data || []);
+    } catch(e) { console.error("fetchMcPaiements error", e); }
+  }, [mcChatters]);
+
+  React.useEffect(() => { fetchMcPaiements(); }, [fetchMcPaiements]);
+
+  const payChatter = async (chatterId, montant, description) => {
+    if (!montant || montant <= 0) { addToast("Montant invalide", "error"); return; }
+    setPaySaving(true);
+    try {
+      const { error } = await sb.from("paiements_internes").insert({
+        type: "chatter_payment",
+        montant: montant,
+        devise: "CHF",
+        statut: "validated",
+        createur_id: user.id,
+        createur_role: "manager_chatter",
+        destinataire_id: chatterId,
+        destinataire_type: "chatter",
+        description: description || ("Paiement commission " + new Date().toLocaleDateString()),
+        created_at: new Date().toISOString()
+      });
+      if (error) { addToast("Erreur: " + error.message, "error"); }
+      else { addToast("Paiement enregistr\u00e9 \u2705", "success"); setPayingChatter(null); setPayAmount(""); setPayDesc(""); await fetchMcPaiements(); }
+    } catch(e) { addToast("Erreur r\u00e9seau", "error"); }
+    setPaySaving(false);
+  };
+
   return (
     <div style={{padding:0}}>
       <div style={{display:"flex",gap:8,marginBottom:20}}>
@@ -62200,7 +62245,10 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
           const commission = validCA * (commPct/100);
           const assignedModels = (ch.assigned_models||[]).map(mid=>(models||[]).find(m=>m.id===mid)).filter(Boolean);
           const isOnShift = ch.on_shift===true;
-          return {...ch, chTx, validTx, pendingTx, rejectedTx, validCA, caBrut, convRate, commPct, commission, assignedModels, isOnShift};
+          const chPaiements = (mcPaiements || []).filter(p => p.destinataire_id === ch.id);
+          const dejaVerse = chPaiements.reduce((s, p) => s + Number(p.montant || 0), 0);
+          const soldeDu = Math.max(0, commission - dejaVerse);
+          return {...ch, chTx, validTx, pendingTx, rejectedTx, validCA, caBrut, convRate, commPct, commission, dejaVerse, soldeDu, chPaiements, assignedModels, isOnShift};
         }).sort((a,b)=>b.validCA-a.validCA);
 
         /* ── KPI bar ── */
@@ -62261,21 +62309,51 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
                           </div>
                         </div>
                       </div>
-                      {/* Stats grid — CA, Taux conv, Commission */}
-                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:10}}>
+                      {/* Stats grid — CA, Taux conv, Commission, Solde dû */}
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,marginBottom:10}}>
                         <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
-                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>CA généré</div>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>CA NET</div>
                           <div style={{fontSize:16,fontWeight:800,color:"#4caf50"}}>{fmtAmount(ch.validCA)}</div>
                         </div>
                         <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
-                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Taux conv.</div>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>Taux conv.</div>
                           <div style={{fontSize:16,fontWeight:800,color:ch.convRate>=50?"#4caf50":"#ff9800"}}>{ch.convRate}%</div>
                         </div>
                         <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
-                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Commission ({ch.commPct}%)</div>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>Commission</div>
                           <div style={{fontSize:16,fontWeight:800,color:"#ff9800"}}>{fmtAmount(ch.commission)}</div>
                         </div>
+                        <div style={{padding:"8px 10px",borderRadius:8,background:"#0f1923",border:"1px solid #1e2d3d"}}>
+                          <div style={{fontSize:9,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:4}}>Solde d\u00fb</div>
+                          <div style={{fontSize:16,fontWeight:800,color:ch.soldeDu>0?"#e53935":"#4caf50"}}>{fmtAmount(ch.soldeDu)}</div>
+                        </div>
                       </div>
+                      {/* Pay button + History */}
+                      <div style={{display:"flex",gap:8,marginBottom:8,alignItems:"center"}}>
+                        {payingChatter===ch.id ? (
+                          <div style={{display:"flex",gap:6,alignItems:"center",flex:1}}>
+                            <input type="number" value={payAmount} onChange={e=>setPayAmount(e.target.value)} placeholder="Montant CHF" style={{width:100,padding:"6px 8px",borderRadius:6,border:"1px solid #1e2d3d",background:"#0f1923",color:"#e2e8f0",fontSize:12}} />
+                            <input type="text" value={payDesc} onChange={e=>setPayDesc(e.target.value)} placeholder="Description" style={{flex:1,padding:"6px 8px",borderRadius:6,border:"1px solid #1e2d3d",background:"#0f1923",color:"#e2e8f0",fontSize:12}} />
+                            <button onClick={()=>{payChatter(ch.id,Number(payAmount),payDesc)}} disabled={paySaving||!payAmount} style={{padding:"6px 12px",borderRadius:6,background:paySaving?"#334155":"#4caf50",color:"#fff",border:"none",cursor:paySaving?"wait":"pointer",fontSize:12,fontWeight:600}}>{paySaving?"...":"Confirmer"}</button>
+                            <button onClick={()=>{setPayingChatter(null);setPayAmount("");setPayDesc("")}} style={{padding:"6px 8px",borderRadius:6,background:"transparent",color:"#94a3b8",border:"1px solid #334155",cursor:"pointer",fontSize:12}}>\u2715</button>
+                          </div>
+                        ) : (
+                          <button onClick={()=>{setPayingChatter(ch.id);setPayAmount(String(Math.round(ch.soldeDu*100)/100))}} style={{padding:"6px 14px",borderRadius:8,background:"linear-gradient(135deg,#1e3a5f,#0f2744)",border:"1px solid #2d4a6f",color:"#e2e8f0",cursor:"pointer",fontSize:12,fontWeight:600,display:"flex",alignItems:"center",gap:6}}>\ud83d\udcb8 Payer</button>
+                        )}
+                        <button onClick={()=>setExpandedPayHistory(expandedPayHistory===ch.id?null:ch.id)} style={{padding:"6px 10px",borderRadius:8,background:"transparent",border:"1px solid #1e2d3d",color:"#94a3b8",cursor:"pointer",fontSize:11}}>\ud83d\udccb {(ch.chPaiements||[]).length} paiement{(ch.chPaiements||[]).length!==1?"s":""}</button>
+                      </div>
+                      {expandedPayHistory===ch.id && (ch.chPaiements||[]).length > 0 && (
+                        <div style={{background:"#0a1219",borderRadius:8,padding:10,marginBottom:8,border:"1px solid #1e2d3d"}}>
+                          <div style={{fontSize:10,fontWeight:600,color:"#64748b",textTransform:"uppercase",marginBottom:8}}>Historique paiements</div>
+                          {(ch.chPaiements||[]).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at)).map(p=>(
+                            <div key={p.id} style={{display:"flex",justifyContent:"space-between",padding:"4px 0",borderBottom:"1px solid #1e2d3d",fontSize:11}}>
+                              <span style={{color:"#94a3b8"}}>{new Date(p.created_at).toLocaleDateString()}</span>
+                              <span style={{color:"#e2e8f0",fontWeight:600}}>{Number(p.montant).toFixed(0)} CHF</span>
+                              <span style={{color:"#64748b",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.description||"-"}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       {/* TX bar */}
                       <div style={{display:"flex",gap:10,fontSize:11,marginBottom:8}}>
                         <span style={{color:"#4caf50"}}>✅ {ch.validTx.length}</span>
