@@ -20647,9 +20647,17 @@ const UnifiedChattingPage = ({user, lang, txs, profiles, models, chatterLogs, on
   const allChatters = profiles.filter(p => _roleIs(p, "chatter"));
   const directChatters = allChatters.filter(ch => !allAssignedChatterIds.includes(ch.id));
 
-  // Helper: compute chatter stats
-  const computeChatterStats = (ch) => {
-    const chTx = txs.filter(tx => tx.chatter_id === ch.id);
+  // Helper: compute chatter stats (assignedAt = optional timestamp, skip TX before this date)
+  const computeChatterStats = (ch, assignedAt) => {
+    let chTx = txs.filter(tx => tx.chatter_id === ch.id);
+    // If assignedAt provided, only count TX after assignment date
+    if (assignedAt) {
+      const assignedTs = new Date(assignedAt).getTime();
+      chTx = chTx.filter(tx => {
+        const txDate = new Date(tx.created_at || tx.date || 0).getTime();
+        return txDate >= assignedTs;
+      });
+    }
     const validTx = chTx.filter(tx => isValidTx(tx.status));
     const pendingTx = chTx.filter(tx => isPendingTx(tx.status));
     const rejectedTx = chTx.filter(tx => tx.status === "refused" || tx.status === "rejected");
@@ -20668,11 +20676,18 @@ const UnifiedChattingPage = ({user, lang, txs, profiles, models, chatterLogs, on
     return { ...ch, chTx, validTx, pendingTx, rejectedTx, validCA, convRate, commPct, commission, dejaVerse, soldeDu, isOnShift, assignedModels, rank };
   };
 
-  // Helper: compute MC stats
+  // Helper: compute MC stats (filters chatter TX by assigned_at — aligned with page Gestion L22508)
   const computeMCStats = (mc) => {
-    const assignedIds = mcLinks.filter(l => l.manager_id === mc.id).map(l => l.chatter_id);
-    const assignedChatters = allChatters.filter(ch => assignedIds.includes(ch.id)).map(computeChatterStats);
-    const caNet = assignedChatters.reduce((s, ch) => s + ch.validCA, 0);
+    const mcAssignedLinks = mcLinks.filter(l => l.manager_id === mc.id);
+    const assignedIds = mcAssignedLinks.map(l => l.chatter_id);
+    // Build assigned_at map: chatter_id → assigned_at timestamp
+    const assignedAtMap = {};
+    mcAssignedLinks.forEach(l => { if (l.chatter_id && l.assigned_at) assignedAtMap[l.chatter_id] = l.assigned_at; });
+    const assignedChatters = allChatters.filter(ch => assignedIds.includes(ch.id)).map(ch => computeChatterStats(ch, assignedAtMap[ch.id]));
+    // MC own TX (when MC also chatters): always included without assigned_at filter
+    const mcOwnTx = txs.filter(tx => tx.chatter_id === mc.id && isValidTx(tx.status));
+    const mcOwnCA = mcOwnTx.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
+    const caNet = assignedChatters.reduce((s, ch) => s + ch.validCA, 0) + mcOwnCA;
     const commRate = getCommissionRate(mc, "manager_chatter");
     const allocation = caNet * commRate;
     const dejaVerse = paiementsPI.filter(p => p.destinataire_id === mc.id && (p.type === "mc_payment" || p.type === "commission") && p.statut === "validated").reduce((s, p) => s + Number(p.montant || 0), 0);
