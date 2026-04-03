@@ -30988,6 +30988,15 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
   const fr = lang === "fr";
   const [conversations, setConversations] = useState([]);
   const [messages, setMessages] = useState([]);
+
+  // ── MIKE-A: Sync unread badge to nav ──
+  React.useEffect(() => {
+    if (window.__updateUnreadMsgBadge) {
+      const total = conversations.reduce((sum, c) => sum + ((c.unread_count || 0) > 0 ? (c.unread_count || 0) : 0), 0);
+      window.__updateUnreadMsgBadge(total);
+    }
+  }, [conversations]);
+
   const [selectedConv, setSelectedConv] = useState(null);
   const [msgInput, setMsgInput] = useState("");
   const [loading, setLoading] = useState(true);
@@ -31466,6 +31475,15 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
 
   const [conversations, setConversations] = useState([]);
   const [messages, setMessages] = useState([]);
+
+  // ── MIKE-A: Sync unread badge to nav ──
+  React.useEffect(() => {
+    if (window.__updateUnreadMsgBadge) {
+      const total = conversations.reduce((sum, c) => sum + ((c.unread_count || 0) > 0 ? (c.unread_count || 0) : 0), 0);
+      window.__updateUnreadMsgBadge(total);
+    }
+  }, [conversations]);
+
   const [selectedConv, setSelectedConv] = useState(null);
   const [msgInput, setMsgInput] = useState("");
   const [loading, setLoading] = useState(true);
@@ -40756,6 +40774,146 @@ const MessagerieHubPage = ({ user, lang, models = [], setTab }) => {
   );
 };
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIKE-A: CONVERSATION RECAP MODAL (AI Summary)
+// ═══════════════════════════════════════════════════════════════════════════════
+const ConversationRecapModal = ({ isOpen, onClose, conversationId, conversationName }) => {
+  const [loading, setLoading] = useState(false);
+  const [recap, setRecap] = useState(null);
+  const [error, setError] = useState(null);
+
+  React.useEffect(() => {
+    if (!isOpen || !conversationId) return;
+    setRecap(null); setError(null); setLoading(true);
+    (async () => {
+      try {
+        const { data: msgs, error: msgErr } = await sb.from("tg_messages")
+          .select("text, direction, created_at, meta")
+          .eq("conversation_id", conversationId)
+          .order("created_at", { ascending: true });
+        if (msgErr) throw msgErr;
+        if (!msgs || msgs.length < 5) { setError("Pas assez de messages pour un récap (minimum 5)."); setLoading(false); return; }
+
+        const apiKey = localStorage.getItem("dadash-anthropic-key") || localStorage.getItem("dadash_claude_key");
+        if (!apiKey) { setError("Configure ta clé Anthropic dans les paramètres (Admin \u2192 Clé API)."); setLoading(false); return; }
+
+        const h24ago = new Date(Date.now() - 86400000);
+        const fmtMsgs = msgs.map(m => {
+          const dir = m.direction === "in" ? "CLIENT" : "MODÈLE";
+          const ts = new Date(m.created_at).toLocaleString("fr-CH");
+          return "[" + ts + "] " + dir + ": " + (m.text || "(média)");
+        }).join("\n");
+        const recentCount = msgs.filter(m => new Date(m.created_at) >= h24ago).length;
+
+        const prompt = "Tu es un assistant d\'agence de modèles. Analyse cette conversation Telegram et produis un récap structuré en français.\n\nCONVERSATION (" + msgs.length + " messages) :\n" + fmtMsgs + "\n\nProduis EXACTEMENT ce format :\n\n## \ud83d\udccb Récap global\n- Résumé en 3-5 lignes : qui est le client, ce qu\'il veut, l\'état de la relation\n- Montant total dépensé si mentionné\n- Niveau d\'engagement (nouveau / régulier / VIP / froid)\n\n## \ud83d\udd50 Dernière session (24h)\n" + (recentCount > 0 ? "- " + recentCount + " messages dans les dernières 24h" : "- Aucun message dans les dernières 24h") + "\n- Dernier sujet abordé\n- Action requise (relance / réponse attendue / rien)\n\nSois concis et actionnable.";
+
+        const resp = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+          body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1024, messages: [{ role: "user", content: prompt }] })
+        });
+        if (!resp.ok) { const errBody = await resp.text(); throw new Error("API " + resp.status + ": " + errBody.slice(0, 200)); }
+        const result = await resp.json();
+        setRecap(result.content && result.content[0] ? result.content[0].text : "Aucune réponse.");
+      } catch (e) { console.error("[RECAP-IA]", e); setError("Erreur : " + e.message); }
+      finally { setLoading(false); }
+    })();
+  }, [isOpen, conversationId]);
+
+  if (!isOpen) return null;
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, zIndex:99999, background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center", backdropFilter:"blur(4px)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:"var(--bg-card,#1a1a2e)", borderRadius:16, padding:24, maxWidth:600, width:"90%", maxHeight:"80vh", overflow:"auto", border:"1px solid rgba(139,92,246,0.2)", boxShadow:"0 20px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+          <h3 style={{ margin:0, fontSize:18, fontWeight:700, color:"var(--text-primary,#fff)" }}>\ud83e\udd16 Récap IA — {conversationName || "Conversation"}</h3>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:"var(--text-secondary,#aaa)", fontSize:20, cursor:"pointer" }}>\u2715</button>
+        </div>
+        {loading && <div style={{ textAlign:"center", padding:"40px 0" }}><div style={{ fontSize:32, marginBottom:12 }}>\ud83e\udd16</div><div style={{ color:"var(--text-secondary,#aaa)", fontSize:14 }}>Analyse en cours...</div></div>}
+        {error && <div style={{ padding:16, background:"rgba(239,68,68,0.1)", borderRadius:10, color:"#f87171", fontSize:14 }}>{error}</div>}
+        {recap && <div style={{ fontSize:14, lineHeight:1.7, color:"var(--text-primary,#fff)", whiteSpace:"pre-wrap" }}>{recap}</div>}
+      </div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MIKE-A: CONVERSATION READER MODAL (Full History — Fullscreen)
+// ═══════════════════════════════════════════════════════════════════════════════
+const ConversationReaderModal = ({ isOpen, onClose, conversationId, conversationName }) => {
+  const [loading, setLoading] = useState(false);
+  const [allMessages, setAllMessages] = useState([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const scrollRef = React.useRef(null);
+
+  React.useEffect(() => {
+    if (!isOpen || !conversationId) return;
+    setAllMessages([]); setSearchQuery(""); setLoading(true);
+    (async () => {
+      try {
+        const { data, error } = await sb.from("tg_messages")
+          .select("id, text, direction, created_at, meta, media_url, media_type")
+          .eq("conversation_id", conversationId)
+          .order("created_at", { ascending: true });
+        if (error) throw error;
+        setAllMessages(data || []);
+      } catch (e) { console.error("[READER]", e); }
+      finally { setLoading(false); }
+    })();
+  }, [isOpen, conversationId]);
+
+  React.useEffect(() => {
+    if (!loading && allMessages.length > 0 && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [loading, allMessages.length]);
+
+  const filtered = React.useMemo(() => {
+    if (!searchQuery.trim()) return allMessages;
+    const q = searchQuery.toLowerCase();
+    return allMessages.filter(m => (m.text || "").toLowerCase().includes(q));
+  }, [allMessages, searchQuery]);
+
+  if (!isOpen) return null;
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, zIndex:99999, background:"rgba(0,0,0,0.85)", display:"flex", flexDirection:"column", backdropFilter:"blur(4px)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ display:"flex", flexDirection:"column", height:"100%", maxWidth:800, width:"100%", margin:"0 auto", background:"var(--bg-card,#1a1a2e)" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"16px 20px", borderBottom:"1px solid rgba(139,92,246,0.15)", flexShrink:0 }}>
+          <h3 style={{ margin:0, fontSize:18, fontWeight:700, color:"var(--text-primary,#fff)" }}>\ud83d\udcd6 Tout lire — {conversationName || "Conversation"}</h3>
+          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+            <span style={{ fontSize:12, color:"var(--text-secondary,#aaa)" }}>{filtered.length}/{allMessages.length} msgs</span>
+            <button onClick={onClose} style={{ background:"none", border:"none", color:"var(--text-secondary,#aaa)", fontSize:20, cursor:"pointer" }}>\u2715</button>
+          </div>
+        </div>
+        <div style={{ padding:"12px 20px", borderBottom:"1px solid rgba(139,92,246,0.08)", flexShrink:0 }}>
+          <input type="text" placeholder="\ud83d\udd0d Rechercher dans la conversation..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+            style={{ width:"100%", padding:"10px 14px", borderRadius:10, border:"1px solid rgba(139,92,246,0.15)", background:"rgba(255,255,255,0.03)", color:"var(--text-primary,#fff)", fontSize:14, outline:"none", boxSizing:"border-box" }} />
+        </div>
+        <div ref={scrollRef} style={{ flex:1, overflow:"auto", padding:"16px 20px" }}>
+          {loading && <div style={{ textAlign:"center", padding:"40px 0", color:"var(--text-secondary,#aaa)" }}>Chargement...</div>}
+          {!loading && filtered.length === 0 && <div style={{ textAlign:"center", padding:"40px 0", color:"var(--text-secondary,#aaa)" }}>{searchQuery ? "Aucun message trouvé" : "Aucun message"}</div>}
+          {filtered.map((msg, i) => {
+            const isIn = msg.direction === "in";
+            const ts = new Date(msg.created_at);
+            const showDateSep = i === 0 || new Date(filtered[i - 1].created_at).toDateString() !== ts.toDateString();
+            return (
+              <React.Fragment key={msg.id || i}>
+                {showDateSep && <div style={{ textAlign:"center", margin:"16px 0 8px", fontSize:11, color:"var(--text-secondary,#888)", fontWeight:600 }}>{ts.toLocaleDateString("fr-CH", { weekday:"long", day:"numeric", month:"long", year:"numeric" })}</div>}
+                <div style={{ display:"flex", justifyContent:isIn ? "flex-start" : "flex-end", marginBottom:6 }}>
+                  <div style={{ maxWidth:"75%", padding:"10px 14px", borderRadius:isIn ? "4px 14px 14px 14px" : "14px 4px 14px 14px", background:isIn ? "rgba(255,255,255,0.06)" : "rgba(139,92,246,0.15)", color:"var(--text-primary,#fff)", fontSize:14, lineHeight:1.5, wordBreak:"break-word" }}>
+                    <div style={{ fontSize:10, color:"var(--text-secondary,#888)", marginBottom:4 }}>{isIn ? "\ud83d\udce5 Client" : "\ud83d\udce4 Modèle"} \u00b7 {ts.toLocaleTimeString("fr-CH", { hour:"2-digit", minute:"2-digit" })}</div>
+                    {msg.text || (msg.media_url ? "[" + (msg.media_type || "média") + "]" : "(vide)")}
+                  </div>
+                </div>
+              </React.Fragment>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ── Feature flags — DadashMessagerieTab ──────────────────────────────────────
 // Active la virtualisation DOM (react-window) pour les conversations > 200 messages.
 // Passer à true uniquement après avoir chargé react-window via CDN et testé le scroll infini.
@@ -40962,6 +41120,31 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   const [galleryLightbox, setGalleryLightbox] = React.useState(null);
   const [showLibrary, setShowLibrary] = React.useState(false);
   const [msgPassportModel, setMsgPassportModel] = React.useState(null);
+
+  // ── MIKE-A: modal states ──
+  const [showRecapIA, setShowRecapIA] = useState(false);
+  const [showReaderModal, setShowReaderModal] = useState(false);
+
+  // ── MIKE-A: Sync unread badge to nav ──
+  React.useEffect(() => {
+    if (window.__updateUnreadMsgBadge) {
+      const total = conversations.reduce((sum, c) => sum + ((c.unread_count || 0) > 0 ? (c.unread_count || 0) : 0), 0);
+      window.__updateUnreadMsgBadge(total);
+    }
+  }, [conversations]);
+
+  // ── MIKE-A: Escape key handler for modals ──
+  React.useEffect(() => {
+    const handleEsc = (e) => {
+      if (e.key === "Escape") {
+        if (showRecapIA) setShowRecapIA(false);
+        if (showReaderModal) setShowReaderModal(false);
+      }
+    };
+    window.addEventListener("keydown", handleEsc);
+    return () => window.removeEventListener("keydown", handleEsc);
+  }, [showRecapIA, showReaderModal]);
+
   const [showScammerList, setShowScammerList] = React.useState(false);
 
   // IA Semi-Auto state (classic messagerie)
@@ -44073,6 +44256,20 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               <span>{sc}</span>
             </button>
             ) : null; })()}
+            {/* ── MIKE-A: Récap IA ── */}
+            {selectedConv && <button onClick={() => setShowRecapIA(true)} title="Récap IA"
+              style={{ background:"rgba(139,92,246,0.12)", border:"1px solid rgba(139,92,246,0.2)", borderRadius:6, padding:"7px 14px", cursor:"pointer", color:"#a78bfa", fontSize:13, fontWeight:600, display:"flex", alignItems:"center", gap:4, transition:"all 0.2s", flexShrink:0 }}
+              onMouseEnter={e => { e.currentTarget.style.background = "rgba(139,92,246,0.25)"; }}
+              onMouseLeave={e => { e.currentTarget.style.background = "rgba(139,92,246,0.12)"; }}>
+              <span style={{ fontSize:15 }}>\ud83e\udd16</span><span>Récap</span>
+            </button>}
+            {/* ── MIKE-A: Tout Lire ── */}
+            {selectedConv && <button onClick={() => setShowReaderModal(true)} title="Tout lire"
+              style={{ background:"rgba(59,130,246,0.12)", border:"1px solid rgba(59,130,246,0.2)", borderRadius:6, padding:"7px 14px", cursor:"pointer", color:"#60a5fa", fontSize:13, fontWeight:600, display:"flex", alignItems:"center", gap:4, transition:"all 0.2s", flexShrink:0 }}
+              onMouseEnter={e => { e.currentTarget.style.background = "rgba(59,130,246,0.25)"; }}
+              onMouseLeave={e => { e.currentTarget.style.background = "rgba(59,130,246,0.12)"; }}>
+              <span style={{ fontSize:15 }}>\ud83d\udcd6</span><span>Lire</span>
+            </button>}
             <button className="conv-hdr-tx-btn" onClick={() => { setShowTxModal(true); setTxForm({ amount: "", type: "tip", note: "" }); }}
               style={{ padding: "5px 10px", borderRadius: 8, border: "1px solid var(--accent)", background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
               + TX
@@ -45567,6 +45764,13 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             onSave={(updated) => { setMsgPassportModel(updated); }}
           />
         )}
+      {/* ── MIKE-A: Recap IA Modal ── */}
+      {showRecapIA && <ConversationRecapModal isOpen={showRecapIA} onClose={() => setShowRecapIA(false)}
+        conversationId={selectedConv?.id} conversationName={selectedConv?.spender_name || selectedConv?.username || selectedConv?.tg_username || "Conv"} />}
+      {/* ── MIKE-A: Reader Modal ── */}
+      {showReaderModal && <ConversationReaderModal isOpen={showReaderModal} onClose={() => setShowReaderModal(false)}
+        conversationId={selectedConv?.id} conversationName={selectedConv?.spender_name || selectedConv?.username || selectedConv?.tg_username || "Conv"} />}
+
         {showScammerList && (
           <ScammerListPanel
             spenders={spenders}
@@ -48357,6 +48561,15 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
   const effectiveUser = simuActive ? { ...simuOverride.profile, role: "chatter", id: simuOverride.profile?.id } : user;
   const [conversations, setConversations] = useState([]);
   const [messages, setMessages] = useState([]);
+
+  // ── MIKE-A: Sync unread badge to nav ──
+  React.useEffect(() => {
+    if (window.__updateUnreadMsgBadge) {
+      const total = conversations.reduce((sum, c) => sum + ((c.unread_count || 0) > 0 ? (c.unread_count || 0) : 0), 0);
+      window.__updateUnreadMsgBadge(total);
+    }
+  }, [conversations]);
+
   const [selectedConv, setSelectedConv] = useState(null);
   const [loading, setLoading] = useState(true);
   const [msgLoading, setMsgLoading] = useState(false);
@@ -63265,8 +63478,15 @@ const App = () => {
   const [mcSpenders, setMcSpenders] = useState([]);
   const [mcPendingTxCount, setMcPendingTxCount] = useState(0);
   const [mcUnreadConvCount, setMcUnreadConvCount] = useState(0);
+  const [unreadMsgTotal, setUnreadMsgTotal] = useState(0); // MIKE-A: nav badge
   const [mcConvs, setMcConvs] = useState([]);
   const [mcConvsLoading, setMcConvsLoading] = useState(true);
+
+  // ── MIKE-A: Global callback for messagerie tabs to update nav badge ──
+  React.useEffect(() => {
+    window.__updateUnreadMsgBadge = (total) => setUnreadMsgTotal(total);
+    return () => { delete window.__updateUnreadMsgBadge; };
+  }, []);
   const [mcSelectedConv, setMcSelectedConv] = useState(null);
   const [mcMessages, setMcMessages] = useState([]);
   const [mcMsgLoading, setMcMsgLoading] = useState(false);
@@ -63804,6 +64024,20 @@ const App = () => {
           setEscalationCount(escCount||0);
         } catch(e) { /* escalation count fetch failed */ }
       }
+      // ── MIKE-A: UNREAD MESSAGES BADGE (all roles) ──
+      try {
+        if (currentUser.role === "gerant") {
+          const { count: _umCount } = await sb.from("tg_conversations").select("id", { count: "exact", head: true }).gt("unread_count", 0);
+          setUnreadMsgTotal(_umCount || 0);
+        } else if (currentUser.role === "chatter") {
+          const _assignedM = currentUser.assigned_models || [];
+          if (_assignedM.length > 0) {
+            const { data: _uData } = await sb.from("tg_conversations").select("unread_count").in("model_id", _assignedM).gt("unread_count", 0);
+            setUnreadMsgTotal((_uData || []).reduce((sum, c) => sum + (c.unread_count || 0), 0));
+          }
+        }
+      } catch(e) { /* unread msg badge fetch failed */ }
+
       // ── MANAGER CHATTER DATA LOADING ──
       if (currentUser && _roleIs(currentUser, "manager_chatter")) {
         try {
@@ -65136,6 +65370,7 @@ const App = () => {
               <button key={item.id} className={`mobile-bottom-btn${tab===item.id&&!drillDown?" active":""}`} onClick={()=>{closeDrill();setTab(item.id);}} style={{flexShrink:0,minWidth:56}}>
                 <span className="mobile-bottom-icon">{item.icon}</span>
                 <span className="mobile-bottom-label">{item.label}</span>
+                {item.id==="messagerie"&&unreadMsgTotal>0&&<span className="mobile-bottom-badge" style={{background:"#3b82f6",color:"#fff"}}>{unreadMsgTotal>99?"99+":unreadMsgTotal}</span>}
                 {(item.id==="chatter_notif"||item.id==="model_notif"||item.id==="provider_notif")&&unreadCount>0&&<span className="mobile-bottom-badge" style={{background:"#EF4444",color:"#fff"}}>{unreadCount>9?"9+":unreadCount}</span>}
               </button>
             ));
@@ -65164,6 +65399,7 @@ const App = () => {
                   <span style={{fontSize:20}}>{n.icon}</span>
                   <span>{n.label}</span>
                   {n.id==="business"&&pendingTxCount>0&&<span style={{marginLeft:"auto",background:"var(--warning)",color:"#000",fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:10}}>{pendingTxCount}</span>}
+                  {n.id==="messagerie"&&unreadMsgTotal>0&&<span style={{marginLeft:escalationCount>0?4:"auto",background:"#3b82f6",color:"#fff",fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:10}}>{unreadMsgTotal>99?"99+":unreadMsgTotal}</span>}
                   {n.id==="messagerie"&&escalationCount>0&&<span style={{marginLeft:"auto",background:"var(--danger)",color:"#fff",fontSize:11,fontWeight:700,padding:"2px 7px",borderRadius:10}}>{escalationCount}</span>}
                 </button>
               )) : otherTabs.filter(x=>x.show&&canSeeWithPerms(user.role,x.id,myPerms)).map(x=>(
