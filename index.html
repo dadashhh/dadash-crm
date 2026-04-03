@@ -61646,7 +61646,8 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
       const {data: _mcLinksForSolde} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", user.id);
       const _soldeAssignedMap = {};
       (_mcLinksForSolde||[]).forEach(l => { if (l.chatter_id && l.assigned_at) _soldeAssignedMap[l.chatter_id] = new Date(l.assigned_at).getTime(); });
-      const [txRes, piRes] = await Promise.allSettled([
+      const chatterIdsOnly = chatterIds.filter(id => id !== user.id);
+      const [txRes, piMcRes, piChatterRes] = await Promise.allSettled([
         sb.from('transactions')
           .select('net_amount, amount, currency, chatter_id, created_at, date')
           .in('chatter_id', chatterIds)
@@ -61655,9 +61656,18 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
           .select('montant, statut')
           .eq('destinataire_id', user.id)
           .eq('type', 'mc_payment'),
+        // Paiements gérant→chatters du MC (réduisent le solde dû au MC, exclure paiements MC→chatters)
+        chatterIdsOnly.length > 0
+          ? sb.from('paiements_internes')
+              .select('montant, statut, destinataire_id, createur_id')
+              .in('destinataire_id', chatterIdsOnly)
+              .in('type', ['chatter_payment', 'commission'])
+              .neq('createur_id', user.id)
+          : Promise.resolve({ data: [] }),
       ]);
       const txDataAll = txRes.status === 'fulfilled' ? (txRes.value.data || []) : [];
-      const piData = piRes.status === 'fulfilled' ? (piRes.value.data || []) : [];
+      const piMcData = piMcRes.status === 'fulfilled' ? (piMcRes.value.data || []) : [];
+      const piChatterData = piChatterRes.status === 'fulfilled' ? (piChatterRes.value.data || []) : [];
       const commRate = getCommissionRate(user, "manager_chatter");
       // SOLDE = commission on post-assigned_at TX only (MC own TX always included)
       const commBrute = txDataAll.reduce((s, t) => {
@@ -61669,7 +61679,9 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
         }
         return s + convertAmountSimple(txNetAmount(t), t.currency) * commRate;
       }, 0);
-      const dejaVerse = piData.filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
+      const dejaVerseAuMC = piMcData.filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
+      const dejaVerseAuxChatters = piChatterData.filter(p => p.statut === 'validated').reduce((s, p) => s + Number(p.montant || 0), 0);
+      const dejaVerse = dejaVerseAuMC + dejaVerseAuxChatters;
       setSoldeManager({ solde: Math.max(0, commBrute - dejaVerse), commission_brute: commBrute, deja_verse: dejaVerse });
     } catch (e) { console.warn('[SoldeManager]', e?.message); }
   }, [user?.id, mcChatters]);
@@ -62064,20 +62076,27 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
   const commRate = getCommissionRate(user, "manager_chatter");
   const cardS = {background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:"20px 24px"};
 
-  // Load MC payments (sent to chatters + received from gérant)
+  const [gerantChatterPayments, setGerantChatterPayments] = useState([]); // paiements gérant→chatters du MC
+  // Load MC payments (sent to chatters + received from gérant + gérant→chatters du MC)
   const refreshMcPayments = React.useCallback(async () => {
     try {
-      const [sent, received] = await Promise.all([
+      const chatterIds = mcChatters.map(c => c.id);
+      const [sent, received, gerantToChat] = await Promise.all([
         sb.from("paiements_internes").select("*").eq("createur_id",user.id).eq("type","chatter_payment").order("created_at",{ascending:false}),
         sb.from("paiements_internes").select("*").eq("destinataire_id",user.id).eq("type","mc_payment").order("created_at",{ascending:false}),
+        // Paiements gérant→chatters du MC (pas créés par le MC)
+        chatterIds.length > 0
+          ? sb.from("paiements_internes").select("*").in("destinataire_id",chatterIds).in("type",["chatter_payment","commission"]).neq("createur_id",user.id).order("created_at",{ascending:false})
+          : Promise.resolve({ data: [] }),
       ]);
       setMcPaymentsSent(sent.data||[]);
       setMcPaymentsReceived(received.data||[]);
+      setGerantChatterPayments(gerantToChat.data||[]);
     } catch(_){}
-  }, [user.id]);
+  }, [user.id, mcChatters]);
   React.useEffect(() => { refreshMcPayments(); }, [refreshMcPayments]);
 
-  // Per-chatter solde calculation
+  // Per-chatter solde calculation (includes gérant→chatter payments)
   const chatterSoldes = useMemo(() => {
     const allValid = mcTxs.filter(tx => isValidTx(tx.status));
     return mcChatters.map(ch => {
@@ -62085,19 +62104,23 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
       const caNet = chTxs.reduce((s,tx) => s + txNetAmountCHF(tx), 0);
       const chatterRate = getCommissionRate(ch, "chatter");
       const du = caNet * chatterRate;
-      const dejaVerse = mcPaymentsSent.filter(p => p.destinataire_id === ch.id && p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
-      return { id: ch.id, name: ch.name||ch.email||"Chatter", caNet, rate: chatterRate, du, dejaVerse, solde: Math.max(0, du - dejaVerse), txCount: chTxs.length };
+      const mcPaid = mcPaymentsSent.filter(p => p.destinataire_id === ch.id && p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+      const gerantPaid = gerantChatterPayments.filter(p => p.destinataire_id === ch.id && p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+      const dejaVerse = mcPaid + gerantPaid;
+      return { id: ch.id, name: ch.name||ch.email||"Chatter", caNet, rate: chatterRate, du, dejaVerse, mcPaid, gerantPaid, solde: Math.max(0, du - dejaVerse), txCount: chTxs.length };
     }).sort((a,b) => b.solde - a.solde);
-  }, [mcTxs, mcChatters, mcPaymentsSent]);
+  }, [mcTxs, mcChatters, mcPaymentsSent, gerantChatterPayments]);
 
-  // MC's own solde (received from gérant)
+  // MC's own solde (received from gérant + gérant→chatters déduit)
   const mcSolde = useMemo(() => {
     const allValid = mcTxs.filter(tx => isValidTx(tx.status));
     const caNet = allValid.reduce((s,tx) => s + txNetAmountCHF(tx), 0);
     const allocation = caNet * commRate;
-    const received = mcPaymentsReceived.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
-    return { allocation, received, solde: Math.max(0, allocation - received) };
-  }, [mcTxs, mcPaymentsReceived, commRate]);
+    const receivedDirect = mcPaymentsReceived.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    const gerantPaidChatters = gerantChatterPayments.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    const totalReceived = receivedDirect + gerantPaidChatters;
+    return { allocation, received: totalReceived, receivedDirect, gerantPaidChatters, solde: Math.max(0, allocation - totalReceived) };
+  }, [mcTxs, mcPaymentsReceived, gerantChatterPayments, commRate]);
 
   // ── BÉNÉFICE NET MC ──
   // Gérant doit au MC (allocation) — MC doit aux chatters = bénéfice net
@@ -62120,10 +62143,13 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
       return { id: ch.id, name: ch.name||ch.email||"Chatter", caNet, rate: chatterRate, du: caNet * chatterRate, txCount: chTxs.length };
     });
     const mcDoitChatters = detailChatters.reduce((s,ch) => s + ch.du, 0);
-    // Déjà versé aux chatters
-    const dejaVerseChatters = mcPaymentsSent.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
-    // Déjà reçu du gérant
-    const dejaRecuGerant = mcPaymentsReceived.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    // Déjà versé aux chatters (MC + gérant directement)
+    const dejaVerseChattersParMC = mcPaymentsSent.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    const dejaVerseChattersParGerant = gerantChatterPayments.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    const dejaVerseChatters = dejaVerseChattersParMC + dejaVerseChattersParGerant;
+    // Déjà reçu du gérant (direct mc_payment + gérant→chatters compte comme reçu)
+    const dejaRecuGerantDirect = mcPaymentsReceived.filter(p => p.statut === "validated").reduce((s,p) => s + Number(p.montant||0), 0);
+    const dejaRecuGerant = dejaRecuGerantDirect + dejaVerseChattersParGerant;
     // Bénéfice net = ce qu'il gagne - ce qu'il doit
     const benefBrut = gerantDoitMC - mcDoitChatters;
     // Solde réel = (reçu du gérant - versé aux chatters)
@@ -62135,7 +62161,7 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
       ownTxCount: ownTxs.length, teamTxCount: teamTxs.length,
       detailChatters,
     };
-  }, [mcTxs, mcChatters, mcPaymentsSent, mcPaymentsReceived, commRate, user.id, mcChatterIds]);
+  }, [mcTxs, mcChatters, mcPaymentsSent, mcPaymentsReceived, gerantChatterPayments, commRate, user.id, mcChatterIds]);
 
   const handlePayChatter = async () => {
     if (!payModal || !payAmount) return;
