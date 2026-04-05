@@ -41289,11 +41289,86 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       });
     };
 
+    const onNewMessage = (data) => {
+      if (!data || !data.chat_id) return;
+      // Update sidebar: patch last_message, last_message_at, unread_count
+      const chatId = String(data.chat_id);
+      const msg = data.message || {};
+      const isIncoming = msg.direction === 'in';
+
+      setConversations(prev => {
+        let found = false;
+        const updated = prev.map(c => {
+          const cChatId = String(_dmsgChatId(c));
+          const cModelId = String(c.model_id || '');
+          if (cChatId === chatId && (!data.model_id || cModelId === String(data.model_id))) {
+            found = true;
+            return {
+              ...c,
+              last_message: msg.text || msg.content || c.last_message,
+              last_message_text: msg.text || msg.content || c.last_message_text,
+              last_message_at: msg.created_at || new Date().toISOString(),
+              last_message_direction: msg.direction || c.last_message_direction,
+              unread_count: isIncoming && String(_dmsgChatId(selectedConvRef.current)) !== chatId
+                ? (parseInt(c.unread_count || 0) + 1)
+                : c.unread_count,
+            };
+          }
+          return c;
+        });
+        if (!found) return prev; // Unknown conversation — don't touch
+        // Re-sort: most recent first
+        return updated.sort((a, b) =>
+          new Date(b.last_message_at || b.updated_at || 0).getTime() -
+          new Date(a.last_message_at || a.updated_at || 0).getTime()
+        );
+      });
+
+      // Also update the global cache so loadConversations() doesn't overwrite with stale data
+      _DMSG_CONV_CACHE.ts = 0; // Invalidate cache to force fresh fetch on next load
+    };
+
+    const onConvUpdated = (data) => {
+      if (!data || !data.chat_id) return;
+      const chatId = String(data.chat_id);
+
+      setConversations(prev => {
+        let found = false;
+        const updated = prev.map(c => {
+          const cChatId = String(_dmsgChatId(c));
+          if (cChatId === chatId && (!data.model_id || String(c.model_id || '') === String(data.model_id))) {
+            found = true;
+            return {
+              ...c,
+              last_message: data.last_message || c.last_message,
+              last_message_text: data.last_message || c.last_message_text,
+              last_message_at: data.last_message_at || c.last_message_at,
+              unread_count: data.unread_count_delta
+                ? (parseInt(c.unread_count || 0) + parseInt(data.unread_count_delta))
+                : (data.unread_count != null ? data.unread_count : c.unread_count),
+            };
+          }
+          return c;
+        });
+        if (!found) return prev;
+        return updated.sort((a, b) =>
+          new Date(b.last_message_at || b.updated_at || 0).getTime() -
+          new Date(a.last_message_at || a.updated_at || 0).getTime()
+        );
+      });
+
+      _DMSG_CONV_CACHE.ts = 0;
+    };
+
     socket.on('message_read', onMessageRead);
     socket.on('user_typing', onUserTyping);
+    socket.on('new_message', onNewMessage);
+    socket.on('conv_updated', onConvUpdated);
     return () => {
       socket.off('message_read', onMessageRead);
       socket.off('user_typing', onUserTyping);
+      socket.off('new_message', onNewMessage);
+      socket.off('conv_updated', onConvUpdated);
     };
   }, []);
 
@@ -41315,6 +41390,19 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       });
     }, 1000);
     return () => clearInterval(interval);
+  }, []);
+
+  // Catch-up on tab visibility change — re-fetch conversations when tab becomes visible
+  useEffect(() => {
+    const onVisible = () => {
+      if (!document.hidden) {
+        convsCache.current.lastFetch = 0;
+        _DMSG_CONV_CACHE.ts = 0;
+        loadConversationsRef.current(true);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
   }, []);
 
   // État courant du script = scriptStates[chatId] ou null
@@ -42403,7 +42491,9 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         if (now - lastConvRefreshRef.current > 5000) {
           lastConvRefreshRef.current = now;
           React.startTransition(() => {
-            loadConversationsRef.current();
+            convsCache.current.lastFetch = 0;
+            _DMSG_CONV_CACHE.ts = 0;
+            loadConversationsRef.current(true);
           });
         }
       }
@@ -63808,6 +63898,10 @@ const App = () => {
       });
       socket.on('reconnect', (attempt) => {
         console.log('[SOCKET] Reconnected after', attempt, 'attempts');
+        // Re-fetch conversations to catch messages during disconnect
+        if (window.__dadashConvCacheInvalidate) {
+          window.__dadashConvCacheInvalidate();
+        }
       });
       // Catch upgrade errors (when polling→websocket upgrade fails in Safari)
       socket.io.on('error', (error) => {
