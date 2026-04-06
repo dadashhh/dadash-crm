@@ -6795,31 +6795,43 @@ function getChartData(rawData, dateField, valueFields, activePeriod) {
 
   if (isHourly) {
     const now = new Date();
-    const currentHour = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Zurich", hour: "numeric", hour12: false }).format(now));
-    const todayStr = now.toLocaleDateString("en-CA", { timeZone: "Europe/Zurich" });
+    const tz = "Europe/Zurich";
+    const currentHour = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false }).format(now));
+    const todayStr = now.toLocaleDateString("en-CA", { timeZone: tz });
     const slots = [];
 
-    for (let h = 0; h <= currentHour; h++) {
-      const label = String(h).padStart(2, '0') + 'h';
-      // Use created_at (full ISO timestamp) — tx.date is DATE-only and parses as UTC midnight
+    // FIX 06/04/2026: "24h" = rolling 24 slots from (now-24h) to now
+    // "today" = slots from 00h to current hour (today only)
+    const is24hRolling = activePeriod === "24h";
+    const slotCount = is24hRolling ? 24 : (currentHour + 1);
+
+    for (let i = 0; i < slotCount; i++) {
+      let slotHour, slotLabel, slotDateStr;
+      if (is24hRolling) {
+        // Rolling: slot 0 = (currentHour - 23), slot 23 = currentHour
+        const slotTime = new Date(now.getTime() - (23 - i) * 3600000);
+        slotHour = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false }).format(slotTime));
+        slotDateStr = slotTime.toLocaleDateString("en-CA", { timeZone: tz });
+        const isYesterday = slotDateStr !== todayStr;
+        slotLabel = (isYesterday ? "J-1 " : "") + String(slotHour).padStart(2, '0') + 'h';
+      } else {
+        slotHour = i;
+        slotDateStr = todayStr;
+        slotLabel = String(slotHour).padStart(2, '0') + 'h';
+      }
+
       const hourTxs = rawData.filter(item => {
         const d = new Date(item[dateField] || item.created_at || item.date);
         if (isNaN(d.getTime())) return false;
-        // For "today": only show today's hours
-        // For "24h": show all filtered TX bucketed by hour (filteredTxs already date-filtered)
-        if (activePeriod === "today" || activePeriod === "Aujourd'hui") {
-          const dH = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Zurich", hour: "numeric", hour12: false }).format(d));
-          const dDay = d.toLocaleDateString("en-CA", { timeZone: "Europe/Zurich" });
-          return dH === h && dDay === todayStr;
-        }
-        // "24h": just bucket by hour — filteredTxs already contains only last-24h TX
-        return parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Zurich", hour: "numeric", hour12: false }).format(d)) === h;
+        const dH = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false }).format(d));
+        const dDay = d.toLocaleDateString("en-CA", { timeZone: tz });
+        return dH === slotHour && dDay === slotDateStr;
       });
       const validHour = hourTxs.filter(tx => isValidTx(tx.status));
       const pendingHour = hourTxs.filter(tx => isPendingTx(tx.status));
       const refusedHour = hourTxs.filter(tx => isRefusedTx(tx.status));
       slots.push({
-        time: label,
+        time: slotLabel,
         ca_brut: Math.round(validHour.reduce((s, tx) => s + txAmountCHF(tx), 0)),
         ca_net: Math.round(validHour.reduce((s, tx) => s + txNetAmountCHF(tx), 0)),
         total: hourTxs.length,
@@ -10428,6 +10440,9 @@ const useDateRange = (defaultPreset="30d") => {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [activePreset, setActivePreset] = useState(defaultPreset);
+  // FIX 06/04/2026: ISO overrides for rolling 24h (sub-day precision)
+  const [isoOverrideStart, setIsoOverrideStart] = useState(null);
+  const [isoOverrideEnd, setIsoOverrideEnd] = useState(null);
   useEffect(()=>{
     const now = new Date();
     const tz = getUserTimezone();
@@ -10454,11 +10469,24 @@ const useDateRange = (defaultPreset="30d") => {
       return `${sign}${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;
     } catch (_) { return '+02:00'; }
   };
-  const startISO = startDate ? new Date(startDate + 'T00:00:00' + _crmTzOffset(startDate)).toISOString() : null;
-  const endISO = endDate ? new Date(endDate + 'T23:59:59' + _crmTzOffset(endDate)).toISOString() : null;
+  // Use ISO overrides when set (rolling 24h), else compute from date strings
+  const startISO = isoOverrideStart || (startDate ? new Date(startDate + 'T00:00:00' + _crmTzOffset(startDate)).toISOString() : null);
+  const endISO = isoOverrideEnd || (endDate ? new Date(endDate + 'T23:59:59' + _crmTzOffset(endDate)).toISOString() : null);
   // TZ2 — Compare les dates en fuseau Europe/Zurich — préfère created_at sur le champ date
+  // FIX 06/04/2026: supports ISO overrides for sub-day precision (rolling 24h)
   const filterByDate = (data, dateField="date") => {
-    if(activePreset==="all"&&!startDate&&!endDate) return data;
+    if(activePreset==="all"&&!startDate&&!endDate&&!isoOverrideStart) return data;
+    // When ISO overrides are set, filter by exact timestamp (rolling 24h)
+    if (isoOverrideStart || isoOverrideEnd) {
+      const isoStartMs = isoOverrideStart ? new Date(isoOverrideStart).getTime() : 0;
+      const isoEndMs = isoOverrideEnd ? new Date(isoOverrideEnd).getTime() : Infinity;
+      return data.filter(item => {
+        const fieldVal = item['created_at'] || item[dateField];
+        if (!fieldVal) return false;
+        const ms = new Date(fieldVal).getTime();
+        return !isNaN(ms) && ms >= isoStartMs && ms <= isoEndMs;
+      });
+    }
     return data.filter(item=>{
       const fieldVal = item['created_at'] || item[dateField];
       if(!fieldVal) return false;
@@ -10470,7 +10498,7 @@ const useDateRange = (defaultPreset="30d") => {
       return true;
     });
   };
-  return {startDate, endDate, startISO, endISO, setStartDate, setEndDate, activePreset, setActivePreset, filterByDate};
+  return {startDate, endDate, startISO, endISO, setStartDate, setEndDate, activePreset, setActivePreset, filterByDate, setIsoOverrideStart, setIsoOverrideEnd};
 };
 
 // Centralized filter helpers
@@ -11805,13 +11833,13 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
           <ResponsiveContainer width="100%" height={240}>
             <LineChart data={chartData} margin={{ top: 5, right: 10, bottom: 0, left: -10 }}>
               <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
-              <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd"} tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} />
+              <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? 3 : "preserveStartEnd"} tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} />
               <YAxis tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} width={52} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : String(v)} />
               <RechartsTooltip content={({ active, payload, label }) => {
                 if (!active || !payload || !payload.length) return null;
                 return (
                   <div style={{ background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}>
-                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>{period === "24h" ? label + " – " + String(parseInt(label)).padStart(2,"0") + ":59" : label}</div>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>{period === "24h" ? label + " – " + label.replace(/.*?(\d+)h/, "$1").padStart(2,"0") + ":59" : label}</div>
                     {payload.map((p, i) => <div key={i} style={{ fontSize: 12, fontWeight: 600, color: p.stroke }}>{p.name}: {fmtVal(p.dataKey, p.value)}</div>)}
                   </div>
                 );
@@ -11829,13 +11857,13 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
           <ResponsiveContainer width="100%" height={240}>
             <BarChart data={chartData} margin={{ top: 5, right: 10, bottom: 0, left: -10 }}>
               <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
-              <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd"} tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} />
+              <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? 3 : "preserveStartEnd"} tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} />
               <YAxis tick={{ fill: "#64748b", fontSize: 10 }} tickLine={false} axisLine={false} width={52} tickFormatter={v => v >= 1000 ? `${(v/1000).toFixed(0)}k` : String(v)} />
               <RechartsTooltip content={({ active, payload, label }) => {
                 if (!active || !payload || !payload.length) return null;
                 return (
                   <div style={{ background: "#1a2035", border: "1px solid rgba(139,92,246,0.3)", borderRadius: 10, padding: "10px 14px", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}>
-                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>{period === "24h" ? label + " – " + String(parseInt(label)).padStart(2,"0") + ":59" : label}</div>
+                    <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>{period === "24h" ? label + " – " + label.replace(/.*?(\d+)h/, "$1").padStart(2,"0") + ":59" : label}</div>
                     {payload.map((p, i) => <div key={i} style={{ fontSize: 12, fontWeight: 600, color: p.fill }}>{p.name}: {fmtVal(p.dataKey, p.value)}</div>)}
                   </div>
                 );
@@ -15060,6 +15088,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
     const now = new Date();
     const tz = getUserTimezone ? getUserTimezone() : 'Europe/Zurich';
     const todayStr = now.toLocaleDateString('fr-CA', { timeZone: tz });
+    // FIX 06/04/2026: clear ISO overrides for all presets except "24h"
+    if (dashboardPeriod !== "24h") { dr.setIsoOverrideStart(null); dr.setIsoOverrideEnd(null); }
     if (dashboardPeriod === "all") { dr.setActivePreset("all"); dr.setStartDate(""); dr.setEndDate(""); return; }
     if (dashboardPeriod === "custom" && dashboardDateStart && dashboardDateEnd) {
       dr.setStartDate(dashboardDateStart); dr.setEndDate(dashboardDateEnd); dr.setActivePreset("custom"); return;
@@ -15068,7 +15098,12 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
       dr.setStartDate(todayStr); dr.setEndDate(todayStr); dr.setActivePreset("custom"); return;
     }
     if (dashboardPeriod === "24h") {
-      const yesterdayStr = new Date(now.getTime() - 24 * 60 * 60 * 1000).toLocaleDateString('fr-CA', { timeZone: tz });
+      // FIX 06/04/2026: vrai rolling 24h — bornes ISO exactes (now-24h → now)
+      const start24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      dr.setIsoOverrideStart(start24h.toISOString());
+      dr.setIsoOverrideEnd(now.toISOString());
+      // Date strings as fallback for display
+      const yesterdayStr = start24h.toLocaleDateString('fr-CA', { timeZone: tz });
       dr.setStartDate(yesterdayStr); dr.setEndDate(todayStr); dr.setActivePreset("custom"); return;
     }
     const daysMap = { "7j": 7, "30j": 30, "90j": 90 };
@@ -23057,7 +23092,7 @@ const ProviderDashboardTab = React.memo(({ user, lang, txs, txsPaginated, provid
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.04)" vertical={false}/>
-                <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? (chartData.length > 12 ? 2 : 1) : "preserveStartEnd"} tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false}/>
+                <XAxis dataKey={period === "24h" ? "time" : "label"} interval={period === "24h" ? 3 : "preserveStartEnd"} tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false}/>
                 <YAxis tick={{ fontSize: 10, fill: '#6b7280' }} axisLine={false} tickLine={false} width={48}/>
                 <Tooltip contentStyle={{ background: '#0b1020', border: '1px solid rgba(99,102,241,0.2)', borderRadius: 10, fontSize: 12 }}
                   formatter={(v, n) => [`${Math.round(v).toLocaleString()} CHF`, n === 'ca' ? (fr?'CA NET':'Net Revenue') : (fr?'En attente':'Pending')]}/>
