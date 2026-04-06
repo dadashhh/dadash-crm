@@ -6795,8 +6795,8 @@ function getChartData(rawData, dateField, valueFields, activePeriod) {
 
   if (isHourly) {
     const now = new Date();
-    const currentHour = now.getHours();
-    const todayStr = now.toDateString();
+    const currentHour = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Zurich", hour: "numeric", hour12: false }).format(now));
+    const todayStr = now.toLocaleDateString("en-CA", { timeZone: "Europe/Zurich" });
     const slots = [];
 
     for (let h = 0; h <= currentHour; h++) {
@@ -6808,13 +6808,16 @@ function getChartData(rawData, dateField, valueFields, activePeriod) {
         // For "today": only show today's hours
         // For "24h": show all filtered TX bucketed by hour (filteredTxs already date-filtered)
         if (activePeriod === "today" || activePeriod === "Aujourd'hui") {
-          return d.getHours() === h && d.toDateString() === todayStr;
+          const dH = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Zurich", hour: "numeric", hour12: false }).format(d));
+          const dDay = d.toLocaleDateString("en-CA", { timeZone: "Europe/Zurich" });
+          return dH === h && dDay === todayStr;
         }
         // "24h": just bucket by hour — filteredTxs already contains only last-24h TX
-        return d.getHours() === h;
+        return parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Zurich", hour: "numeric", hour12: false }).format(d)) === h;
       });
       const validHour = hourTxs.filter(tx => isValidTx(tx.status));
       const pendingHour = hourTxs.filter(tx => isPendingTx(tx.status));
+      const refusedHour = hourTxs.filter(tx => isRefusedTx(tx.status));
       slots.push({
         time: label,
         ca_brut: Math.round(validHour.reduce((s, tx) => s + txAmountCHF(tx), 0)),
@@ -6825,7 +6828,7 @@ function getChartData(rawData, dateField, valueFields, activePeriod) {
         ma_commission: Math.round(validHour.reduce((s, tx) => s + txConvertCHF(Number(tx.chatter_commission || 0), tx), 0)),
         transactions: Math.round(pendingHour.reduce((s, tx) => s + txAmountCHF(tx), 0)),
         panier_moyen: validHour.length > 0 ? Math.round(validHour.reduce((s, tx) => s + txAmountCHF(tx), 0) / validHour.length) : 0,
-        taux_validation: (validHour.length + pendingHour.length) > 0 ? Math.round((validHour.length / (validHour.length + pendingHour.length)) * 100) : 0,
+        taux_validation: (validHour.length + refusedHour.length) > 0 ? Math.round((validHour.length / (validHour.length + refusedHour.length)) * 100) : 0,
       });
     }
     return slots;
@@ -11114,7 +11117,7 @@ const GestionPage = React.memo(({ user, lang, txs, models, profiles, alerts, onD
                   React.createElement("span", { style: { width: 8, height: 8, borderRadius: "50%", background: c, marginTop: 5, flexShrink: 0, boxShadow: `0 0 6px ${c}55` } }),
                   React.createElement("div", { style: { flex: 1 } },
                     React.createElement("div", { style: { fontSize: 12, color: "var(--text)", lineHeight: 1.4 } }, a.message || a.text || "—"),
-                    React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 3 } }, a.created_at ? new Date(a.created_at).toLocaleString("fr-CH", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "")
+                    React.createElement("div", { style: { fontSize: 10, color: "var(--muted)", marginTop: 3 } }, a.created_at ? new Date(a.created_at).toLocaleString("fr-CH", { timeZone: "Europe/Zurich", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "")
                   ),
                   React.createElement("div", { style: { display: "flex", gap: 4, flexShrink: 0 } },
                     onToggleAlertRead && React.createElement("button", { onClick: () => onToggleAlertRead(a.id), style: { background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "var(--muted)", padding: 4 } }, isRead ? "👁️" : "✓"),
@@ -11422,6 +11425,22 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     });
   }, [allTxs, dateDebut, dateFin, modelFilter, dashStatusFilter, dashProviderFilter, dashChatterFilter]);
 
+  // TX filtered by date+model+provider+chatter ONLY (no status filter) — for "fixed" KPI indicators
+  const dateOnlyFilteredTxs = useMemo(() => {
+    const dStart = dateDebut.getTime();
+    const dFin = dateFin.getTime();
+    if (isNaN(dStart) || isNaN(dFin)) return [];
+    return allTxs.filter(tx => {
+      const d = new Date(tx.created_at || tx.date || 0).getTime();
+      if (isNaN(d)) return false;
+      if (d < dStart || d > dFin) return false;
+      if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      if (dashProviderFilter && tx.provider_id !== dashProviderFilter) return false;
+      if (dashChatterFilter && tx.chatter_id !== dashChatterFilter) return false;
+      return true;
+    });
+  }, [allTxs, dateDebut, dateFin, modelFilter, dashProviderFilter, dashChatterFilter]);
+
   const prevFilteredTxs = useMemo(() => {
     const pStart = prevDateDebut.getTime();
     const pFin = prevDateFin.getTime();
@@ -11431,42 +11450,52 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       if (isNaN(d)) return false;
       if (d < pStart || d > pFin) return false;
       if (modelFilter !== "all" && tx.model_id !== modelFilter) return false;
+      if (dashProviderFilter && tx.provider_id !== dashProviderFilter) return false;
+      if (dashChatterFilter && tx.chatter_id !== dashChatterFilter) return false;
       return true;
     });
-  }, [allTxs, prevDateDebut, prevDateFin, modelFilter]);
+  }, [allTxs, prevDateDebut, prevDateFin, modelFilter, dashProviderFilter, dashChatterFilter]);
 
   const kpiData = useMemo(() => {
-    const valid   = filteredTxs.filter(tx => isValidTx(tx.status));
-    const pending = filteredTxs.filter(tx => isPendingTx(tx.status));
-    const cancelled = filteredTxs.filter(tx => isRefusedTx(tx.status));
-    const caBrut       = valid.reduce((s, tx) => s + txAmountCHF(tx), 0);
-    const caNet        = valid.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
-    const txCount      = valid.length;
-    const txPending    = pending.length;
-    const txCancelled  = cancelled.length;
-    const caCancelled  = cancelled.reduce((s, tx) => s + txAmountCHF(tx), 0);
-    const caBrutPending = pending.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    // ── Filtered KPIs (follow ALL filters incl. status) ──
+    const caBrut       = filteredTxs.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    const caNet        = filteredTxs.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
+    const txCount      = filteredTxs.length;
     const panierMoyen  = txCount > 0 ? caBrut / txCount : 0;
-    const tauxValidation = (txCount + txPending) > 0 ? (txCount / (txCount + txPending)) * 100 : 0;
 
-    const pValid   = prevFilteredTxs.filter(tx => isValidTx(tx.status));
-    const pPending = prevFilteredTxs.filter(tx => isPendingTx(tx.status));
-    const pCaBrut      = pValid.reduce((s, tx) => s + txAmountCHF(tx), 0);
-    const pCaNet       = pValid.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
-    const pTxCount     = pValid.length;
-    const pTxPending   = pPending.length;
-    const pCaBrutPending = pPending.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    // ── Fixed KPIs (ignore status filter, use dateOnlyFilteredTxs) ──
+    const doValid     = dateOnlyFilteredTxs.filter(tx => isValidTx(tx.status));
+    const doPending   = dateOnlyFilteredTxs.filter(tx => isPendingTx(tx.status));
+    const doCancelled = dateOnlyFilteredTxs.filter(tx => isRefusedTx(tx.status));
+    const txPending    = doPending.length;
+    const txCancelled  = doCancelled.length;
+    const caCancelled  = doCancelled.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    const caBrutPending = doPending.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    // TAUX VALIDATION = validated / (validated + refused + cancelled) — pending EXCLU du dénominateur
+    const valCount = doValid.length;
+    const denomTaux = valCount + doCancelled.length;
+    const tauxValidation = denomTaux > 0 ? (valCount / denomTaux) * 100 : 0;
+
+    // ── Previous period (for "vs préc." deltas) ──
+    const pCaBrut      = prevFilteredTxs.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    const pCaNet       = prevFilteredTxs.reduce((s, tx) => s + txNetAmountCHF(tx), 0);
+    const pTxCount     = prevFilteredTxs.length;
     const pPanierMoyen = pTxCount > 0 ? pCaBrut / pTxCount : 0;
-    const pTauxVal     = (pTxCount + pTxPending) > 0 ? (pTxCount / (pTxCount + pTxPending)) * 100 : 0;
+    const pValid       = prevFilteredTxs.filter(tx => isValidTx(tx.status));
+    const pCancelled   = prevFilteredTxs.filter(tx => isRefusedTx(tx.status));
+    const pPending     = prevFilteredTxs.filter(tx => isPendingTx(tx.status));
+    const pCaBrutPending = pPending.reduce((s, tx) => s + txAmountCHF(tx), 0);
+    const pDenomTaux   = pValid.length + pCancelled.length;
+    const pTauxVal     = pDenomTaux > 0 ? (pValid.length / pDenomTaux) * 100 : 0;
 
     const delta = (curr, prev) => prev > 0 ? ((curr - prev) / prev * 100) : (curr > 0 ? 100 : 0);
     return {
       caBrut, caNet, txCount, txPending, txCancelled, caCancelled, caBrutPending, panierMoyen, tauxValidation,
       deltaCaBrut: delta(caBrut, pCaBrut), deltaCaNet: delta(caNet, pCaNet), deltaTx: delta(txCount, pTxCount),
-      deltaTxPending: delta(txPending, pTxPending), deltaCaBrutPending: delta(caBrutPending, pCaBrutPending),
+      deltaTxPending: delta(txPending, pPending.length), deltaCaBrutPending: delta(caBrutPending, pCaBrutPending),
       deltaPanier: delta(panierMoyen, pPanierMoyen), deltaTaux: tauxValidation - pTauxVal,
     };
-  }, [filteredTxs, prevFilteredTxs, convertAmount]);
+  }, [filteredTxs, dateOnlyFilteredTxs, prevFilteredTxs, convertAmount]);
 
   const toggleMetric = (id) => {
     setActiveMetrics(prev => {
@@ -11485,9 +11514,9 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
     filteredTxs.forEach(tx => {
       const raw = tx.created_at || tx.date || "";
       if (!raw) return;
-      const key = new Date(raw).toLocaleDateString('fr-CA');
+      const key = new Date(raw).toLocaleDateString('fr-CA', { timeZone: timezone });
       if (!key || key.length < 10) return;
-      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, ca_brut_pending: 0, commission: 0 };
+      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, refused: 0, ca_brut_pending: 0, commission: 0 };
       const amt = txAmountCHF(tx);
       const isVal = isValidTx(tx.status);
       const isPend = isPendingTx(tx.status);
@@ -11495,18 +11524,19 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       byDay[key].total += 1;
       if (isVal) byDay[key].valid += 1;
       if (isPend) { byDay[key].pending += 1; byDay[key].ca_brut_pending += amt; }
+      if (isRefusedTx(tx.status)) byDay[key].refused += 1;
     });
     return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
       date,
-      label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { day: "2-digit", month: "short" }),
+      label: new Date(date + "T12:00:00").toLocaleDateString("fr-CH", { timeZone: timezone, day: "2-digit", month: "short" }),
       ca_brut: Math.round(d.ca_brut),
       ca_net: Math.round(d.ca_net),
       ma_commission: Math.round(d.commission),
       transactions: Math.round(d.ca_brut_pending),
       panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
-      taux_validation: (d.valid + d.pending) > 0 ? Math.round((d.valid / (d.valid + d.pending)) * 100) : 0,
+      taux_validation: (d.valid + d.refused) > 0 ? Math.round((d.valid / (d.valid + d.refused)) * 100) : 0,
     }));
-  }, [filteredTxs, convertAmount, period]);
+  }, [filteredTxs, convertAmount, period, timezone]);
 
   const modelStats = useMemo(() => {
     const validFilteredTxs = filteredTxs.filter(tx => isValidTx(tx.status));
@@ -11523,8 +11553,11 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       const actives = filteredTxs.filter(tx => tx.model_id === m.id && isPendingTx(tx.status)).length;
       const weeklyCA = [];
       for (let w = 7; w >= 0; w--) {
-        const ws = new Date(); ws.setDate(ws.getDate() - (w + 1) * 7); ws.setHours(0, 0, 0, 0);
-        const we = new Date(); we.setDate(we.getDate() - w * 7); we.setHours(23, 59, 59, 999);
+        const wsNow = new Date(); const wsZurich = new Date(wsNow.toLocaleString("en-US", { timeZone: timezone }));
+        wsZurich.setDate(wsZurich.getDate() - (w + 1) * 7); wsZurich.setHours(0, 0, 0, 0);
+        const weZurich = new Date(wsNow.toLocaleString("en-US", { timeZone: timezone }));
+        weZurich.setDate(weZurich.getDate() - w * 7); weZurich.setHours(23, 59, 59, 999);
+        const ws = wsZurich; const we = weZurich;
         const wc = allMTxs.filter(tx => { const d = new Date(tx.created_at || tx.date); return d >= ws && d <= we; }).reduce((s, tx) => s + txAmountCHF(tx), 0);
         weeklyCA.push({ label: `S${8 - w}`, ca: Math.round(wc) });
       }
@@ -11558,7 +11591,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       const convs = new Set(last24h.map(x => x.conversation_id || x.spender_id).filter(Boolean)).size;
       const escalations = last24h.reduce((s, x) => s + (x.escalations || 0), 0);
       const uptime = last24h.length > 0 ? Math.round(((last24h.length - last24h.filter(x => (x.errors || 0) > 0).length) / last24h.length) * 100) : 0;
-      const logs = last24h.slice(0, 20).map(s => ({ time: new Date(s.timestamp).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }), type: (s.errors || 0) > 0 ? "error" : (s.escalations || 0) > 0 ? "esc" : "info", text: (s.errors || 0) > 0 ? `${s.errors} erreur(s)` : (s.escalations || 0) > 0 ? `Escalade (${s.escalations})` : `${(s.messages_sent || 0) + (s.messages_received || 0)} messages` }));
+      const logs = last24h.slice(0, 20).map(s => ({ time: new Date(s.timestamp).toLocaleTimeString("fr-FR", { timeZone: "Europe/Zurich", hour: "2-digit", minute: "2-digit" }), type: (s.errors || 0) > 0 ? "error" : (s.escalations || 0) > 0 ? "esc" : "info", text: (s.errors || 0) > 0 ? `${s.errors} erreur(s)` : (s.escalations || 0) > 0 ? `Escalade (${s.escalations})` : `${(s.messages_sent || 0) + (s.messages_received || 0)} messages` }));
       return { ...b, status, msgs, convs, escalations, errors, uptime, logs };
     });
   }, [botStats]);
@@ -12234,7 +12267,11 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
     let cancelled = false;
     const fetchWa = async () => {
       try {
-        const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+        // Midnight Zurich → UTC for Supabase query
+        const _zurichNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Europe/Zurich" }));
+        const _zurichMidnight = new Date(_zurichNow.getFullYear(), _zurichNow.getMonth(), _zurichNow.getDate());
+        const _tzOffsetMs = _zurichMidnight.getTime() - new Date(_zurichMidnight.toLocaleString("en-US", { timeZone: "UTC" })).getTime();
+        const todayStart = new Date(_zurichMidnight.getTime() - _tzOffsetMs);
         const [countRes, sentRes, convertedRes, rowsRes] = await Promise.all([
           sb.from("wa_redirects").select("*", {count:"exact", head:true}).gte("created_at", todayStart.toISOString()),
           sb.from("wa_redirects").select("*", {count:"exact", head:true}).not("redirect_sent_at", "is", null),
@@ -12529,7 +12566,7 @@ const DashboardTab = React.memo(({user, lang, txs, models, profiles, onRefresh, 
                         }}, row.status || "—"),
                       ),
                       React.createElement("td", {style:{padding:"10px 6px",color:"var(--text-secondary)",fontSize:11}},
-                        row.redirect_sent_at ? new Date(row.redirect_sent_at).toLocaleString("fr-FR", {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—"
+                        row.redirect_sent_at ? new Date(row.redirect_sent_at).toLocaleString("fr-FR", {timeZone:"Europe/Zurich",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—"
                       ),
                       React.createElement("td", {style:{padding:"10px 6px",textAlign:"center",fontSize:14}},
                         row.redirect_done ? "\u{2705}" : "\u{2796}"
