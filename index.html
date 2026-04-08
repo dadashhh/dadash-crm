@@ -8471,8 +8471,8 @@ const resolveModelFromId = (id, fallbackModels) => {
 
 // ═══ TX STATUS CONSTANTS ═══
 const TX_VALID_STATUSES = ["validated"];
-const TX_PENDING_STATUSES = ["pending", "en_attente"];
-const TX_REFUSED_STATUSES = ["refused", "cancelled", "rejected"];
+const TX_PENDING_STATUSES = ["pending"];
+const TX_REFUSED_STATUSES = ["refused", "cancelled"];
 const isValidTx = (status) => TX_VALID_STATUSES.includes(status);
 const isPendingTx = (status) => TX_PENDING_STATUSES.includes(status);
 const isRefusedTx = (status) => TX_REFUSED_STATUSES.includes(status);
@@ -11272,7 +11272,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
 
       const [txRes, piRes] = await Promise.allSettled([
         sb.from('transactions')
-          .select('net_amount, amount, currency, chatter_id, chatter_commission, created_at, date')
+          .select('net_amount, net_amount_chf, amount, amount_chf, currency, exchange_rate_used, chatter_id, chatter_commission, created_at, date')
           .in('status', ['validated']),
         sb.from('paiements_internes')
           .select('destinataire_id, montant, statut')
@@ -11291,7 +11291,8 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
         const chTx = allTx.filter(t => t.chatter_id === ch.id);
         const commDue = chTx.reduce((s, t) => {
           const explicit = Number(t.chatter_commission || 0);
-          return s + (explicit > 0 ? explicit : convertAmountSimple(txNetAmount(t), t.currency) * rate);
+          // FIX 08/04/2026: use txNetAmountCHF (frozen rate) instead of convertAmountSimple (current rate)
+          return s + (explicit > 0 ? txConvertCHF(explicit, t) : txNetAmountCHF(t) * rate);
         }, 0);
         const paid = allPi.filter(p => p.destinataire_id === ch.id).reduce((s, p) => s + Number(p.montant || 0), 0);
         totalOwed += Math.max(0, commDue - paid);
@@ -11306,16 +11307,17 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
         assignments.forEach(a => { if (a.assigned_at) assignedAtMap[a.chatter_id] = new Date(a.assigned_at).getTime(); });
 
         let commDue = 0;
+        // FIX 08/04/2026: use txNetAmountCHF (frozen rate) instead of convertAmountSimple
         allTx.forEach(tx => {
           if (tx.chatter_id === mc.id) {
-            commDue += convertAmountSimple(txNetAmount(tx), tx.currency) * rate;
+            commDue += txNetAmountCHF(tx) * rate;
           } else if (assignedChatterIds.includes(tx.chatter_id)) {
             const assignedAt = assignedAtMap[tx.chatter_id];
             if (assignedAt) {
               const txDate = new Date(tx.created_at || tx.date || 0).getTime();
               if (txDate < assignedAt) return;
             }
-            commDue += convertAmountSimple(txNetAmount(tx), tx.currency) * rate;
+            commDue += txNetAmountCHF(tx) * rate;
           }
         });
         const paid = allPi.filter(p => p.destinataire_id === mc.id).reduce((s, p) => s + Number(p.montant || 0), 0);
@@ -11557,9 +11559,16 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
 
   const chartData = useMemo(() => {
     if (period === "24h" || period === "today") return getChartData(filteredTxs, "created_at", ["ca_brut", "ca_net", "total", "valid", "pending", "ma_commission", "panier_moyen", "taux_validation"], period);
-    // Build map directly from transactions — O(n) instead of O(days + n)
-    // Group by LOCAL date (not UTC) so timezone-aware
+    // FIX 08/04/2026: pre-fill ALL days in [dateDebut, dateFin] so chart keeps full period axis
+    // even when status filter reduces filteredTxs to a few days (e.g. pending on 2/7 days)
     const byDay = {};
+    if (dateDebut && dateFin && !isNaN(dateDebut.getTime()) && !isNaN(dateFin.getTime())) {
+      for (let d = new Date(dateDebut); d <= dateFin; d = new Date(d.getTime() + 86400000)) {
+        const key = d.toLocaleDateString('fr-CA', { timeZone: timezone });
+        if (key && key.length >= 10) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, refused: 0, ca_brut_pending: 0, commission: 0 };
+      }
+    }
+    // Group by LOCAL date (not UTC) so timezone-aware
     filteredTxs.forEach(tx => {
       const raw = tx.created_at || tx.date || "";
       if (!raw) return;
@@ -11585,7 +11594,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
       taux_validation: (d.valid + d.refused) > 0 ? Math.round((d.valid / (d.valid + d.refused)) * 100) : 0,
     }));
-  }, [filteredTxs, convertAmount, period, timezone]);
+  }, [filteredTxs, convertAmount, period, timezone, dateDebut, dateFin]);
 
   const modelStats = useMemo(() => {
     const validFilteredTxs = filteredTxs.filter(tx => isValidTx(tx.status));
@@ -11924,7 +11933,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
                   <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {currencySymbol}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>+{Math.round(txAmountCHF(tx))} {currencySymbol}</div>
                     <div style={{ fontSize: 10, color: "#64748b" }}>{new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" })}</div>
                   </div>
                   <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: "#f59e0b22", color: "#f59e0b", minWidth: 50, textAlign: "center" }}>PEND.</span>
@@ -15177,7 +15186,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
       .filter(tx => !model || tx.model_id === model)
       .filter(tx => !chatter || tx.chatter_id === chatter)
       .filter(tx => !txProvider || tx.provider_id === txProvider)
-      .filter(tx => !status || tx.status === status);
+      .filter(tx => !status || (status === "refused" ? isRefusedTx(tx.status) : status === "pending" ? isPendingTx(tx.status) : status === "validated" ? isValidTx(tx.status) : tx.status === status));
   }, [txSummaryProp, txs, dr.startDate, dr.endDate, model, chatter, txProvider, status, user.role, user.id]);
   const { validate, refuse, cancel, processingIds } = useTransactionActions({
     txs, setTxs, setTxSummary, setSrvData, srvData, onNotify, addToast, currencySymbol, models, profiles, lang, t, convertAmount, user
@@ -15222,7 +15231,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
     setSrvLoading(true);
     try {
       const f = {};
-      if (status) f.status = status;
+      // FIX 08/04/2026: "refused" filter must include both refused AND cancelled (matches isRefusedTx)
+      if (status && status !== "refused") f.status = status;
       if (model) f.model_id = model;
       if (chatter) f.chatter_id = chatter;
       // Provider voit uniquement ses propres TX — filtre forcé (défense en profondeur)
@@ -15234,6 +15244,8 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
       const qm = (q) => {
         if (dr.startISO) q = q.gte("created_at", dr.startISO);
         if (dr.endISO) q = q.lte("created_at", dr.endISO);
+        // FIX 08/04/2026: "refused" = refused + cancelled (consistent with dashboard isRefusedTx)
+        if (status === "refused") q = q.in("status", ["refused", "cancelled"]);
         return q;
       };
       const result = await loadPage("transactions", p, TX_PAGE_SIZE, f, "date", qm);
