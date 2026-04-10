@@ -7799,16 +7799,17 @@ const _fetchSpendersGlobal = async () => {
   const _doFetch = async () => {
     console.log('[SPENDERS_QUERY]', 'parallel pagination', { filters: 'NONE — no model_id filter on query' });
     // Parallel pagination: count first, then all pages in Promise.all
-    const _fetchAllParallel = async (table, mapper, label) => {
+    const _fetchAllParallel = async (table, mapper, label, cols = "*") => {
       const PAGE = 1000;
-      // 1. Count query (fast, head-only)
-      const { count, error: cErr } = await sb.from(table).select("id", { count: "exact", head: true });
+      // 1. Count query (fast, head-only) — v_spenders_canon uses spender_id not id
+      const countCol = table === "v_spenders_canon" ? "spender_id" : "id";
+      const { count, error: cErr } = await sb.from(table).select(countCol, { count: "exact", head: true });
       if (cErr || !count || count === 0) return null;
       // 2. Fire all pages in parallel
       const nPages = Math.ceil(count / PAGE);
       const pagePromises = [];
       for (let i = 0; i < nPages; i++) {
-        pagePromises.push(sb.from(table).select("*").order("updated_at", { ascending: false }).range(i * PAGE, (i + 1) * PAGE - 1));
+        pagePromises.push(sb.from(table).select(cols).order("updated_at", { ascending: false }).range(i * PAGE, (i + 1) * PAGE - 1));
       }
       const results = await Promise.all(pagePromises);
       const all = results.flatMap(r => r.data || []);
@@ -7816,14 +7817,14 @@ const _fetchSpendersGlobal = async () => {
       return null;
     };
     try {
-      const result = await _fetchAllParallel("spenders", mapUiToSpender, "spenders");
+      const result = await _fetchAllParallel("spenders", mapUiToSpender, "spenders", SPENDER_COLS);
       if (result) return result;
     } catch (e) { console.warn("[SPENDERS] spenders fallback:", e?.message || e); }
     try {
       const result = await _fetchAllParallel("v_spenders_canon", mapCanonToSpender, "v_spenders_canon");
       if (result) return result;
     } catch (e) { console.warn("[SPENDERS] v_spenders_canon fallback:", e?.message || e); }
-    const { data, error } = await sb.from("spenders").select("*").limit(3000);
+    const { data, error } = await sb.from("spenders").select(SPENDER_COLS).limit(3000);
     if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
     console.log("[SPENDERS] spenders n=" + (data?.length || 0));
     return data || [];
@@ -7842,6 +7843,10 @@ const _fetchSpendersGlobal = async () => {
 
 // ── TX column projection — no SELECT * (CLAUDE.md rule #3) ──
 const TX_COLS = "id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used";
+
+// ── SPENDER column projection — SELECT * on 77 cols × 2500 rows = 29s timeout ──
+// Only fetch columns needed for list rendering. Detail modal uses v_spenders_ui on-demand.
+const SPENDER_COLS = "id,handle,name,first_name,last_name,display_name,telegram_id,telegram_username,tg_user_id,username,model_id,segment,status,source,total_spent,tags,notes,risk_level,risk_score,is_scammer,scammer_reason,created_at,updated_at,last_active,last_seen_at,age,city,country,job,language,langue,meta,channel,classification,is_active,merged_into_id,deleted_at,profile_updated_at,contact_id,phone";
 
 const apiFetchTransactions = async ({ scope, filters } = {}) => {
   const s = scope || { type: 'global' };
@@ -35582,7 +35587,7 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
   const loadAnalytics = async () => {
     setAnalyticsLoading(true);
     try {
-      let q = sb.from("broadcast_history").select("id, model_id, message, media_url, sent_at, recipients_count, status").order("sent_at", { ascending: false }).limit(1000);
+      let q = sb.from("broadcast_history").select("id, model_id, message, has_media, media_type, sent_at, total_recipients, sent_count, failed_count").order("sent_at", { ascending: false }).limit(1000);
       if (filterModel !== "all") q = q.eq("model_id", filterModel);
       if (filterDateRange !== "all") {
         const d = new Date();
@@ -35882,8 +35887,7 @@ const DadacastSubpage = ({ conversations = [], convTotalsMap = {}, models = [], 
         has_media: !!broadcastMedia, media_type: broadcastMedia?.type || null,
         total_recipients: chatIds.length, sent_count: ok, failed_count: fail,
         read_count: 0, reply_count: 0, revenue_generated: 0,
-        recipient_chat_ids: chatIds,
-        metadata: { tier: selectedTier, spacing: scheduleSpacing, variants_count: variantsToSend.length, used_variants: hasVariants },
+        metadata: { tier: selectedTier, spacing: scheduleSpacing, variants_count: variantsToSend.length, used_variants: hasVariants, chat_ids: chatIds },
       }).catch(() => {});
       addToast(`✅ ${ok}/${chatIds.length} envoyés${hasVariants ? ` (${variantsToSend.length} variantes)` : ""}${fail > 0 ? ` · ❌ ${fail} erreurs` : ""}`, ok > 0 ? "success" : "error");
       setBroadcastMessage(""); setBroadcastMedia(null); setSelectedTier("all");
@@ -43454,7 +43458,7 @@ const ScriptBuilder = ({ script, onSave, onClose }) => {
 
   const loadPickerData = async (modelName) => {
     const [{ data: albums }, { data: medias }] = await Promise.all([
-      sb.from('media_albums').select('id, name, model_id, created_at, description').order('created_at').limit(1000),
+      sb.from('media_albums').select('id, name, model, cover_url, created_at, emoji, is_default').order('created_at').limit(1000),
       sb.from('media_library').select('id, url, name, type, filename, model, created_at, size, category, tags, album_id').order('created_at').limit(5000),
     ]);
     setPickerAlbums(albums || []);
@@ -44766,7 +44770,7 @@ const MediaLibraryPage = ({ user }) => {
   useEffect(() => { loadMedia(); loadAlbums('all'); }, []);
 
   const loadAlbums = async (modelFilter) => {
-    let query = sb.from('media_albums').select('id, name, model_id, created_at, description').order('created_at').limit(1000);
+    let query = sb.from('media_albums').select('id, name, model, cover_url, created_at, emoji, is_default').order('created_at').limit(1000);
     if (modelFilter && modelFilter !== 'all') query = query.eq('model', modelFilter);
     const { data } = await query;
     setAlbums(data || []);
@@ -56295,29 +56299,29 @@ const App = () => {
       try {
         const _w2Timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: données secondaires non chargées en 15s")), 15000));
         const [_paR, _exR, _ppR, _prodR, _ptagR, _mpR, _mtR, _clR, _ctplR, _ciR, _alR, _bsR, _invR, _mvR, _vsR, _ppmR, _chLogR, _scR, _bcR, _psR, _txSumR, _ecR, _peR] = await Promise.race([Promise.all([
-          (isChatter || isProvider) ? safe(sb.from("payouts").select("id,user_id,amount,date,status,method,currency,payment_method,notes,created_at,receipt_url,declared_by").eq("user_id", currentUser.id).order("date",{ascending:false}).limit(1000), "payouts") : (isMC || isModele) ? SKIP : safe(sb.from("payouts").select("id,user_id,amount,date,status,method,currency,payment_method,notes,created_at,receipt_url,declared_by").order("date",{ascending:false}).limit(1000), "payouts"),
-          (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("id,amount,category,description,date,model_id,created_at,type,paid,currency,assigned_to_id,assigned_to_type").limit(500), "expenses"),
-          isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("id,provider_id,amount,date,status,method,notes,created_at,declared_by").eq("provider_id", currentUser.id).order("created_at",{ascending:false}).limit(500), "provider_payouts") : (isMC || isModele) ? SKIP : safe(sb.from("provider_payouts").select("id,provider_id,amount,date,status,method,notes,created_at,declared_by").order("created_at",{ascending:false}).limit(500), "provider_payouts"),
+          (isChatter || isProvider) ? safe(sb.from("payouts").select("id,user_id,amount,date,status,method,notes,created_at,type,model_id,beneficiary_type").eq("user_id", currentUser.id).order("date",{ascending:false}).limit(1000), "payouts") : (isMC || isModele) ? SKIP : safe(sb.from("payouts").select("id,user_id,amount,date,status,method,notes,created_at,type,model_id,beneficiary_type").order("date",{ascending:false}).limit(1000), "payouts"),
+          (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("id,name,amount,category,date,model_id,created_at,type,paid,paid_at,currency,assigned_to_id,assigned_to_type,recurring").limit(500), "expenses"),
+          isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("id,provider_id,amount,currency,status,payment_method,reference,proof_url,notes,created_at,declared_by,validated_by,validated_at,period_from,period_to").eq("provider_id", currentUser.id).order("created_at",{ascending:false}).limit(500), "provider_payouts") : (isMC || isModele) ? SKIP : safe(sb.from("provider_payouts").select("id,provider_id,amount,currency,status,payment_method,reference,proof_url,notes,created_at,declared_by,validated_by,validated_at,period_from,period_to").order("created_at",{ascending:false}).limit(500), "provider_payouts"),
           (isGerant || isChatter || isMC) ? safe(sb.from("products").select("id,model_id,name,icon,category,price_chf,duration_minutes,description,details,active,sort_order").order("sort_order").limit(200), "products") : SKIP,
-          (isGerant) ? safe(sb.from("product_tags").select("id,label,sort_order").order("sort_order").limit(100), "product_tags") : SKIP,
-          (isGerant) ? safe(sb.from("model_prices").select("id,model_id,price_level,price_chf,created_at,updated_at").limit(200), "model_prices") : SKIP,
-          (isGerant) ? safe(sb.from("model_tasks").select("id,model_id,task,status,due_date,created_at,updated_at,assigned_to,priority").order("created_at",{ascending:false}).limit(500), "model_tasks") : SKIP,
-          (isGerant) ? safe(sb.from("content_list").select("id,model_id,title,type,status,url,created_at,updated_at,notes").order("created_at",{ascending:false}).limit(500), "content_list") : SKIP,
-          (isGerant) ? safe(sb.from("checklist_templates").select("id,name,description,tasks,created_at,updated_at").order("created_at").limit(100), "checklist_templates") : SKIP,
-          (isGerant) ? safe(sb.from("checklist_instances").select("id,model_id,date,items,created_at,status").order("date",{ascending:false}).limit(200), "checklist_instances") : SKIP,
-          (isGerant) ? safe(sb.from("alerts").select("id,type,message,model_id,created_at,read,severity,data").order("created_at",{ascending:false}).limit(100), "alerts") : SKIP,
-          (isGerant) ? safe(sb.from("bot_stats").select("id,model_id,timestamp,messages_in,messages_out,active_convs,new_spenders").order("timestamp",{ascending:false}).limit(200), "bot_stats") : SKIP,
-          (isGerant) ? safe(sb.from("invoices").select("id,transaction_id,spender_id,model_id,amount,currency,status,invoice_url,created_at").order("created_at",{ascending:false}).limit(200), "invoices") : SKIP,
-          (isGerant) ? safe(sb.from("model_videos").select("id,model_id,title,url,duration,status,created_at,thumbnail_url").order("created_at",{ascending:false}).limit(100), "model_videos") : SKIP,
-          (isGerant) ? safe(sb.from("video_sessions").select("id,model_id,spender_id,start_time,end_time,duration,status,amount,created_at").order("created_at",{ascending:false}).limit(100), "video_sessions") : SKIP,
-          (isGerant || isProvider) ? safe(sb.from("provider_payment_methods").select("id,provider_id,name,method_type,account_details,is_primary,active,sort_order").order("sort_order",{ascending:true}).limit(100), "provider_payment_methods") : SKIP,
-          (isGerant || isChatter) ? safe(sb.from("chatter_logs").select("id,chatter_id,model_id,action,details,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "chatter_logs") : SKIP,
-          (isGerant || isChatter) ? safe(sb.from("screenshot_checks").select("id,chatter_id,model_id,screenshot_url,status,checked_by,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "screenshot_checks") : SKIP,
-          (isGerant) ? safe(sb.from("broadcasts").select("id,model_id,message,media_url,audience_id,status,sent_at,created_at,recipients_count").order("created_at",{ascending:false}).limit(200), "broadcasts") : SKIP,
-          (isGerant || isChatter || isMC) ? safe(sb.from("payslips").select("id,user_id,month,amount,currency,status,pdf_url,created_at,notes").order("created_at",{ascending:false}).limit(200), "payslips") : SKIP,
+          (isGerant) ? safe(sb.from("product_tags").select("id,name,color,sort_order").order("sort_order").limit(100), "product_tags") : SKIP,
+          (isGerant) ? safe(sb.from("model_prices").select("id,model_id,product_id,price,currency,created_at").limit(200), "model_prices") : SKIP,
+          (isGerant) ? safe(sb.from("model_tasks").select("id,model_id,title,description,due_date,status,created_by,created_at,updated_at").order("created_at",{ascending:false}).limit(500), "model_tasks") : SKIP,
+          (isGerant) ? safe(sb.from("content_list").select("id,model_id,title,type,status,due_date,notes,created_by,created_at").order("created_at",{ascending:false}).limit(500), "content_list") : SKIP,
+          (isGerant) ? safe(sb.from("checklist_templates").select("id,title,items,created_by,created_at").order("created_at").limit(100), "checklist_templates") : SKIP,
+          (isGerant) ? safe(sb.from("checklist_instances").select("id,template_id,model_id,date,items,completed,created_at").order("date",{ascending:false}).limit(200), "checklist_instances") : SKIP,
+          (isGerant) ? safe(sb.from("alerts").select("id,type,title,message,severity,read,is_read,user_id,created_at,level,is_done").order("created_at",{ascending:false}).limit(100), "alerts") : SKIP,
+          (isGerant) ? safe(sb.from("bot_stats").select("id,bot_type,model_id,status,uptime_seconds,messages_today,active_conversations,pending_escalations,last_error,timestamp").order("timestamp",{ascending:false}).limit(200), "bot_stats") : SKIP,
+          (isGerant) ? safe(sb.from("invoices").select("id,invoice_number,type,from_name,to_name,subtotal,tax_rate,tax_amount,total,currency,status,payout_id,profile_id,provider_id,pdf_url,notes,created_by,created_at,due_date,payment_method").order("created_at",{ascending:false}).limit(200), "invoices") : SKIP,
+          (isGerant) ? safe(sb.from("model_videos").select("id,model_id,filename,storage_url,content_type,duration_seconds,tags,mood,description,has_audio,quality,play_count,active,created_at").order("created_at",{ascending:false}).limit(100), "model_videos") : SKIP,
+          (isGerant) ? safe(sb.from("video_sessions").select("id,model_id,contact_id,video_id,content_type,duration_paid,duration_actual,amount,currency,tx_id,status,metadata,created_at").order("created_at",{ascending:false}).limit(100), "video_sessions") : SKIP,
+          (isGerant || isProvider) ? safe(sb.from("provider_payment_methods").select("id,provider_id,type,label,detail,currency,is_primary,active,sort_order,created_at,updated_at").order("sort_order",{ascending:true}).limit(100), "provider_payment_methods") : SKIP,
+          (isGerant || isChatter) ? safe(sb.from("chatter_logs").select("id,chatter_id,conversation_id,message,blocked,block_reason,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "chatter_logs") : SKIP,
+          (isGerant || isChatter) ? safe(sb.from("screenshot_checks").select("id,checked_by,checked_by_role,spender_id,model_id,provider_id,image_data,claimed_amount,claimed_currency,status,transaction_id,notes,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "screenshot_checks") : SKIP,
+          (isGerant) ? safe(sb.from("broadcasts").select("id,model_id,segment,message,scheduled_at,sent_at,status,total_sent,total_delivered,total_replies,created_by,created_at").order("created_at",{ascending:false}).limit(200), "broadcasts") : SKIP,
+          (isGerant || isChatter || isMC) ? safe(sb.from("payslips").select("id,user_id,user_role,period_start,period_end,base_amount,bonus_amount,total_amount,currency,status,paid_at,notes,created_by,created_at,period").order("created_at",{ascending:false}).limit(200), "payslips") : SKIP,
           safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_reuse"),
           (isGerant) ? safe(sb.from("expense_categories").select("code,label").eq("is_active",true).order("sort_order",{ascending:true}), "expense_categories") : SKIP,
-          (isGerant) ? safe(sb.from("payment_events").select("id,transaction_id,type,amount,currency,status,method,created_at,notes").order("created_at",{ascending:false}).limit(200), "payment_events") : SKIP,
+          (isGerant) ? safe(sb.from("payment_events").select("id,payment_id,event_type,created_at,created_by,metadata").order("created_at",{ascending:false}).limit(200), "payment_events") : SKIP,
         ]), _w2Timeout]);
         if (window.PERF) { window.PERF.mark('loadData_wave2_done'); window.PERF.measure('loadData Wave2 (secondary)', 'loadData_wave1_setState'); }
         if (thisVersion !== _loadVersion.current) return;
