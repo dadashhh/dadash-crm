@@ -169,6 +169,18 @@
   <!-- ═══ SCRIPTS NON-CRITIQUES — chargement différé ═══ -->
   <!-- PropTypes retiré : inutile en prod, économise 8KB réseau -->
   <script src="https://cdn.jsdelivr.net/npm/recharts@2.1.16/umd/Recharts.js"></script>
+  <script>
+    // Recharts CDN fallback — if jsdelivr blocked/failed, retry from unpkg after 2s
+    setTimeout(function() {
+      if (window.Recharts) return;
+      console.warn("[CDN] Recharts not loaded from jsdelivr — trying unpkg fallback");
+      var s = document.createElement("script");
+      s.src = "https://unpkg.com/recharts@2.1.16/umd/Recharts.js";
+      s.onload = function() { console.log("[CDN] Recharts loaded from unpkg fallback:", !!window.Recharts); };
+      s.onerror = function() { console.error("[CDN] Recharts fallback also failed"); };
+      document.head.appendChild(s);
+    }, 2000);
+  </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.8/purify.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js" defer></script>
@@ -7797,37 +7809,29 @@ const _fetchSpendersGlobal = async () => {
     return _spenderCache.promise;
   }
   const _doFetch = async () => {
-    console.log('[SPENDERS_QUERY]', 'parallel pagination', { filters: 'NONE — no model_id filter on query' });
-    // Parallel pagination: count first, then all pages in Promise.all
-    const _fetchAllParallel = async (table, mapper, label, cols = "*") => {
-      const PAGE = 1000;
-      // 1. Count query (fast, head-only) — v_spenders_canon uses spender_id not id
-      const countCol = table === "v_spenders_canon" ? "spender_id" : "id";
-      const { count, error: cErr } = await sb.from(table).select(countCol, { count: "exact", head: true });
-      if (cErr || !count || count === 0) return null;
-      // 2. Fire all pages in parallel
-      const nPages = Math.ceil(count / PAGE);
+    console.log('[SPENDERS_QUERY]', 'direct parallel pages (no count)', { filters: 'NONE' });
+    // ── Direct parallel pages — NO count query (saves 8s on cold start) ──
+    // PostgREST max 1000 rows/page. Fire 3 pages blindly (covers up to 3000 spenders).
+    // Empty pages return [] harmlessly. Eliminates the count round-trip.
+    const PAGE = 1000, MAX_PAGES = 3;
+    try {
       const pagePromises = [];
-      for (let i = 0; i < nPages; i++) {
-        pagePromises.push(sb.from(table).select(cols).order("updated_at", { ascending: false }).range(i * PAGE, (i + 1) * PAGE - 1));
+      for (let i = 0; i < MAX_PAGES; i++) {
+        pagePromises.push(sb.from("spenders").select(SPENDER_COLS).order("updated_at", { ascending: false }).range(i * PAGE, (i + 1) * PAGE - 1));
       }
       const results = await Promise.all(pagePromises);
       const all = results.flatMap(r => r.data || []);
-      if (all.length > 0) { console.log("[SPENDERS] " + label + " n=" + all.length + " pages=" + nPages + " (parallel)"); return all.map(mapper); }
-      return null;
-    };
+      if (all.length > 0) {
+        console.log("[SPENDERS] spenders n=" + all.length + " pages=" + MAX_PAGES + " (direct parallel)");
+        return all.map(mapUiToSpender);
+      }
+    } catch (e) { console.warn("[SPENDERS] spenders parallel fallback:", e?.message || e); }
+    // Fallback: single query (PostgREST caps at 1000 but better than nothing)
     try {
-      const result = await _fetchAllParallel("spenders", mapUiToSpender, "spenders", SPENDER_COLS);
-      if (result) return result;
-    } catch (e) { console.warn("[SPENDERS] spenders fallback:", e?.message || e); }
-    try {
-      const result = await _fetchAllParallel("v_spenders_canon", mapCanonToSpender, "v_spenders_canon");
-      if (result) return result;
-    } catch (e) { console.warn("[SPENDERS] v_spenders_canon fallback:", e?.message || e); }
-    const { data, error } = await sb.from("spenders").select(SPENDER_COLS).limit(3000);
-    if (error) { console.warn("[SPENDERS] fetch error:", error.message); return []; }
-    console.log("[SPENDERS] spenders n=" + (data?.length || 0));
-    return data || [];
+      const { data, error } = await sb.from("spenders").select(SPENDER_COLS).order("updated_at", { ascending: false }).limit(1000);
+      if (!error && data?.length > 0) { console.log("[SPENDERS] fallback n=" + data.length); return data.map(mapUiToSpender); }
+    } catch (e) { console.warn("[SPENDERS] single fallback:", e?.message || e); }
+    return [];
   };
   // Set promise to dedup concurrent calls
   _spenderCache.promise = _doFetch();
