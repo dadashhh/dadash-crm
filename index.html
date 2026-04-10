@@ -7840,12 +7840,15 @@ const _fetchSpendersGlobal = async () => {
   }
 };
 
+// ── TX column projection — no SELECT * (CLAUDE.md rule #3) ──
+const TX_COLS = "id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used";
+
 const apiFetchTransactions = async ({ scope, filters } = {}) => {
   const s = scope || { type: 'global' };
   console.log("[API_TX] scope=" + s.type);
   if (s.type === 'chatter') {
     const modelIds = s._allowedModelIds || [];
-    let q = sb.from("transactions").select("id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used,idempotency_key").order("date", { ascending: false }).limit(5000);
+    let q = sb.from("transactions").select(TX_COLS).order("date", { ascending: false }).limit(5000);
     if (modelIds.length > 0) {
       // Toutes les TX sur les modèles assignés (tous chatters confondus)
       q = q.in("model_id", modelIds);
@@ -7864,7 +7867,7 @@ const apiFetchTransactions = async ({ scope, filters } = {}) => {
   // ── RBAC: Provider — server-side filter by provider_id ──
   if (s.type === 'provider') {
     let q = sb.from("transactions")
-      .select("*")
+      .select(TX_COLS)
       .order("date", { ascending: false })
       .eq("provider_id", s.provider_user_id);
     if (filters?.startISO) q = q.gte("created_at", filters.startISO);
@@ -7876,7 +7879,7 @@ const apiFetchTransactions = async ({ scope, filters } = {}) => {
     return { data: rows, count: rows.length };
   }
   // Single fetch with count (dataSummary was never read — killed double fetch)
-  const { data, error, count } = await sb.from("transactions").select("id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used,idempotency_key", { count: "exact" }).order("date", { ascending: false }).limit(5000);
+  const { data, error, count } = await sb.from("transactions").select(TX_COLS, { count: "exact" }).order("date", { ascending: false }).limit(5000);
   if (error) { console.warn("[API_TX] global fetch error:", error.message); return { data: [], count: 0 }; }
   return { data: data || [], count: count || 0 }; // count = total in DB, data = last 500
 };
@@ -26133,7 +26136,7 @@ const TransactionSuggestionsTab = React.memo(({lang, user, profiles, spenders, o
     if (s.suggestion_type === "update" && s.transaction_id) {
       setLoadingTx(true);
       try {
-        const {data} = await sb.from("transactions").select("id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used,idempotency_key").eq("id", s.transaction_id).single();
+        const {data} = await sb.from("transactions").select(TX_COLS).eq("id", s.transaction_id).single();
         setCurrentTx(data);
       } catch (e) { console.warn("[SUGGESTIONS] Load tx:", e.message); }
       setLoadingTx(false);
@@ -29483,8 +29486,30 @@ const _dmsgFetch = async (path, opts = {}) => {
   try { return JSON.parse(text); } catch (_) { return {}; }
 };
 
+// Track recently-read conversations so polling doesn't overwrite unread_count=0
+const _DMSG_READ_SET = {}; // { chatId: timestamp } — TTL 5min
+const _DMSG_READ_TTL = 300000; // 5 minutes
+const _dmsgMarkReadLocal = (chatId) => {
+  if (!chatId) return;
+  _DMSG_READ_SET[String(chatId)] = Date.now();
+  // Also patch global cache inline
+  const list = _DMSG_CONV_CACHE.list;
+  for (let i = 0; i < list.length; i++) {
+    if (String(list[i].chat_id || list[i].tg_chat_id) === String(chatId)) {
+      list[i] = { ...list[i], unread_count: 0 };
+    }
+  }
+};
+const _dmsgIsRecentlyRead = (chatId) => {
+  const ts = _DMSG_READ_SET[String(chatId)];
+  if (!ts) return false;
+  if (Date.now() - ts > _DMSG_READ_TTL) { delete _DMSG_READ_SET[String(chatId)]; return false; }
+  return true;
+};
+
 const markConversationAsRead = async (chatId, modelId) => {
   if (!chatId) return;
+  _dmsgMarkReadLocal(chatId); // Immediately mark in local cache
   try {
     await _dmsgFetch('/mark-read', {
       method: 'POST',
@@ -38316,7 +38341,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     let apiOk_ = false;
 
     // ── 0.4 Promise.allSettled : Carlos + Supabase en parallèle ─────────────
-    let _convSbQuery = sb.from("tg_conversations").select("*");
+    let _convSbQuery = sb.from("tg_conversations").select("id,tg_chat_id,tg_peer_id,tg_user_id,spender_id,model_id,assigned_chatter_id,status,last_message_at,display_name,username,tg_username,tg_first_name,tg_display_name,unread_count,updated_at");
     if (_roleIs(userProfile, "chatter")) {
       const _assigned = userProfile.assigned_models || [];
       if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
@@ -38442,12 +38467,33 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       return db - da;
     });
 
+    // Limit to unread + 500 most recent to avoid rendering 2000+ convs
+    if (list.length > 600) {
+      const unreadConvs = list.filter(c => (c.unread_count || 0) > 0);
+      const recentConvs = list.slice(0, 500);
+      const unreadIds = new Set(unreadConvs.map(c => String(c.chat_id || c.tg_chat_id)));
+      const combined = [...recentConvs];
+      for (const uc of unreadConvs) {
+        const ucId = String(uc.chat_id || uc.tg_chat_id);
+        if (!combined.some(c => String(c.chat_id || c.tg_chat_id) === ucId)) combined.push(uc);
+      }
+      console.log(`[CONV] Trimmed ${list.length} → ${combined.length} (500 recent + ${unreadConvs.length} unread)`);
+      list = combined;
+    }
+
     const prevCacheLen = _DMSG_CONV_CACHE.list.length;
     if (list.length < prevCacheLen * 0.5 && prevCacheLen > 10) {
       console.warn(`[CONV] Fetch returned ${list.length} convs vs ${prevCacheLen} cached — keeping cache (probable partial fetch)`);
       setConvLoading(false);
       convLoadedRef.current = true;
       return;
+    }
+    // Preserve unread_count=0 for recently-read conversations
+    for (let i = 0; i < list.length; i++) {
+      const cid = String(list[i].chat_id || list[i].tg_chat_id || '');
+      if (cid && _dmsgIsRecentlyRead(cid) && (list[i].unread_count || 0) > 0) {
+        list[i] = { ...list[i], unread_count: 0 };
+      }
     }
     convsCache.current = { data: list, lastFetch: now };
     _DMSG_CONV_CACHE.list = list;
@@ -43459,7 +43505,7 @@ const ScriptBuilder = ({ script, onSave, onClose }) => {
   };
 
   const saveScript = async () => {
-    if (!(localScript.title || '').trim()) { alert('⚠️ Donne un nom au script'); return; }
+    if (!localScript.name.trim()) { alert('⚠️ Donne un nom au script'); return; }
     if (localScript.sequence.length === 0) { alert('⚠️ Ajoute au moins une étape'); return; }
     setIsSaving(true);
     const MODEL_NAME_TO_ID = {};
@@ -44531,7 +44577,7 @@ const ScriptsPage = ({ user, lang }) => {
     const { id, created_at, updated_at, ...rest } = script;
     const { error } = await sb.from('scripts').insert({
       ...rest,
-      title: script.title + ' (copie)',
+      name: script.name + ' (copie)',
       stats: { total_sent: 0, success_rate: 0, avg_revenue: 0 },
     });
     if (!error) { addToast('✅ Script dupliqué', 'success'); loadScripts(); }
@@ -44613,7 +44659,7 @@ const ScriptsPage = ({ user, lang }) => {
               {/* Card header */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '12px' }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <h3 style={{ margin: '0 0 7px', fontSize: '16px', fontWeight: '700', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{script.title}</h3>
+                  <h3 style={{ margin: '0 0 7px', fontSize: '16px', fontWeight: '700', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{script.name}</h3>
                   <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
                     <span style={{ background: '#6366f1', padding: '3px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: '600' }}>{script.category}</span>
                     <span style={{ background: modelColor(script.model_id), padding: '3px 8px', borderRadius: '5px', fontSize: '11px', fontWeight: '600' }}>{script.model_id}</span>
@@ -56133,7 +56179,7 @@ const App = () => {
         ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_chatter")
         : isProvider
         ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_provider")
-        : safe(sb.from("transactions").select("id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used,idempotency_key",{count:"exact"}).order("date",{ascending:false}).limit(5000), "transactions");
+        : safe(sb.from("transactions").select(TX_COLS,{count:"exact"}).order("date",{ascending:false}).limit(5000), "transactions");
       // Spenders: deferred for chatter (needs TX first) — providers never see spenders
       const spPromise = isChatter
         ? safe((async () => ({ data: [], error: null }))(), "spenders_chatter_deferred")
@@ -56239,29 +56285,29 @@ const App = () => {
       try {
         const _w2Timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: données secondaires non chargées en 15s")), 15000));
         const [_paR, _exR, _ppR, _prodR, _ptagR, _mpR, _mtR, _clR, _ctplR, _ciR, _alR, _bsR, _invR, _mvR, _vsR, _ppmR, _chLogR, _scR, _bcR, _psR, _txSumR, _ecR, _peR] = await Promise.race([Promise.all([
-          (isChatter || isProvider) ? safe(sb.from("payouts").select("id,user_id,amount,date,status,method,notes,created_at,type,model_id,beneficiary_type").eq("user_id", currentUser.id).order("date",{ascending:false}).limit(1000), "payouts") : (isMC || isModele) ? SKIP : safe(sb.from("payouts").select("id,user_id,amount,date,status,method,notes,created_at,type,model_id,beneficiary_type").order("date",{ascending:false}).limit(1000), "payouts"),
-          (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("id,name,amount,category,date,model_id,created_at,type,paid,paid_at,currency,assigned_to_id,assigned_to_type,recurring").limit(500), "expenses"),
-          isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("id,provider_id,amount,currency,period_from,period_to,payment_method,reference,proof_url,status,validated_by,validated_at,notes,created_at,declared_by").eq("provider_id", currentUser.id).order("created_at",{ascending:false}).limit(500), "provider_payouts") : (isMC || isModele) ? SKIP : safe(sb.from("provider_payouts").select("id,provider_id,amount,currency,period_from,period_to,payment_method,reference,proof_url,status,validated_by,validated_at,notes,created_at,declared_by").order("created_at",{ascending:false}).limit(500), "provider_payouts"),
+          (isChatter || isProvider) ? safe(sb.from("payouts").select("id,user_id,amount,date,status,method,currency,payment_method,notes,created_at,receipt_url,declared_by").eq("user_id", currentUser.id).order("date",{ascending:false}).limit(1000), "payouts") : (isMC || isModele) ? SKIP : safe(sb.from("payouts").select("id,user_id,amount,date,status,method,currency,payment_method,notes,created_at,receipt_url,declared_by").order("date",{ascending:false}).limit(1000), "payouts"),
+          (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("id,amount,category,description,date,model_id,created_at,type,paid,currency,assigned_to_id,assigned_to_type").limit(500), "expenses"),
+          isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("id,provider_id,amount,date,status,method,notes,created_at,declared_by").eq("provider_id", currentUser.id).order("created_at",{ascending:false}).limit(500), "provider_payouts") : (isMC || isModele) ? SKIP : safe(sb.from("provider_payouts").select("id,provider_id,amount,date,status,method,notes,created_at,declared_by").order("created_at",{ascending:false}).limit(500), "provider_payouts"),
           (isGerant || isChatter || isMC) ? safe(sb.from("products").select("id,model_id,name,icon,category,price_chf,duration_minutes,description,details,active,sort_order").order("sort_order").limit(200), "products") : SKIP,
           (isGerant) ? safe(sb.from("product_tags").select("id,label,sort_order").order("sort_order").limit(100), "product_tags") : SKIP,
-          (isGerant) ? safe(sb.from("model_prices").select("id,model_id,product_id,price,currency,created_at").limit(200), "model_prices") : SKIP,
-          (isGerant) ? safe(sb.from("model_tasks").select("id,model_id,title,description,due_date,status,created_by,created_at,updated_at").order("created_at",{ascending:false}).limit(500), "model_tasks") : SKIP,
-          (isGerant) ? safe(sb.from("content_list").select("id,model_id,title,type,status,due_date,notes,created_by,created_at").order("created_at",{ascending:false}).limit(500), "content_list") : SKIP,
-          (isGerant) ? safe(sb.from("checklist_templates").select("id,title,items,created_by,created_at").order("created_at").limit(100), "checklist_templates") : SKIP,
-          (isGerant) ? safe(sb.from("checklist_instances").select("id,template_id,model_id,date,items,completed,created_at").order("date",{ascending:false}).limit(200), "checklist_instances") : SKIP,
-          (isGerant) ? safe(sb.from("alerts").select("id,type,title,message,severity,read,user_id,created_at,is_read,level,is_done").order("created_at",{ascending:false}).limit(100), "alerts") : SKIP,
-          (isGerant) ? safe(sb.from("bot_stats").select("id,bot_type,model_id,status,uptime_seconds,messages_today,active_conversations,pending_escalations,last_error,timestamp").order("timestamp",{ascending:false}).limit(200), "bot_stats") : SKIP,
-          (isGerant) ? safe(sb.from("invoices").select("id,invoice_number,type,from_name,to_name,subtotal,tax_rate,tax_amount,total,currency,status,payout_id,profile_id,provider_id,pdf_url,notes,created_by,created_at,due_date,period_from,period_to").order("created_at",{ascending:false}).limit(200), "invoices") : SKIP,
-          (isGerant) ? safe(sb.from("model_videos").select("id,model_id,filename,storage_url,content_type,duration_seconds,tags,mood,description,has_audio,quality,play_count,active,created_at").order("created_at",{ascending:false}).limit(100), "model_videos") : SKIP,
-          (isGerant) ? safe(sb.from("video_sessions").select("id,model_id,contact_id,video_id,content_type,duration_paid,duration_actual,amount,currency,tx_id,status,metadata,created_at").order("created_at",{ascending:false}).limit(100), "video_sessions") : SKIP,
-          (isGerant || isProvider) ? safe(sb.from("provider_payment_methods").select("id,provider_id,type,label,detail,currency,is_primary,active,sort_order,created_at,updated_at").order("sort_order",{ascending:true}).limit(100), "provider_payment_methods") : SKIP,
-          (isGerant || isChatter) ? safe(sb.from("chatter_logs").select("id,chatter_id,conversation_id,message,blocked,block_reason,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "chatter_logs") : SKIP,
-          (isGerant || isChatter) ? safe(sb.from("screenshot_checks").select("id,checked_by,checked_by_role,spender_id,model_id,provider_id,status,claimed_amount,claimed_currency,risk_score,notes,created_at,transaction_id",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "screenshot_checks") : SKIP,
-          (isGerant) ? safe(sb.from("broadcasts").select("id,model_id,segment,message,scheduled_at,sent_at,status,total_sent,total_delivered,total_replies,created_by,created_at").order("created_at",{ascending:false}).limit(200), "broadcasts") : SKIP,
-          (isGerant || isChatter || isMC) ? safe(sb.from("payslips").select("id,user_id,user_role,period_start,period_end,base_amount,bonus_amount,total_amount,currency,status,paid_at,notes,created_by,created_at,period").order("created_at",{ascending:false}).limit(200), "payslips") : SKIP,
+          (isGerant) ? safe(sb.from("model_prices").select("id,model_id,price_level,price_chf,created_at,updated_at").limit(200), "model_prices") : SKIP,
+          (isGerant) ? safe(sb.from("model_tasks").select("id,model_id,task,status,due_date,created_at,updated_at,assigned_to,priority").order("created_at",{ascending:false}).limit(500), "model_tasks") : SKIP,
+          (isGerant) ? safe(sb.from("content_list").select("id,model_id,title,type,status,url,created_at,updated_at,notes").order("created_at",{ascending:false}).limit(500), "content_list") : SKIP,
+          (isGerant) ? safe(sb.from("checklist_templates").select("id,name,description,tasks,created_at,updated_at").order("created_at").limit(100), "checklist_templates") : SKIP,
+          (isGerant) ? safe(sb.from("checklist_instances").select("id,model_id,date,items,created_at,status").order("date",{ascending:false}).limit(200), "checklist_instances") : SKIP,
+          (isGerant) ? safe(sb.from("alerts").select("id,type,message,model_id,created_at,read,severity,data").order("created_at",{ascending:false}).limit(100), "alerts") : SKIP,
+          (isGerant) ? safe(sb.from("bot_stats").select("id,model_id,timestamp,messages_in,messages_out,active_convs,new_spenders").order("timestamp",{ascending:false}).limit(200), "bot_stats") : SKIP,
+          (isGerant) ? safe(sb.from("invoices").select("id,transaction_id,spender_id,model_id,amount,currency,status,invoice_url,created_at").order("created_at",{ascending:false}).limit(200), "invoices") : SKIP,
+          (isGerant) ? safe(sb.from("model_videos").select("id,model_id,title,url,duration,status,created_at,thumbnail_url").order("created_at",{ascending:false}).limit(100), "model_videos") : SKIP,
+          (isGerant) ? safe(sb.from("video_sessions").select("id,model_id,spender_id,start_time,end_time,duration,status,amount,created_at").order("created_at",{ascending:false}).limit(100), "video_sessions") : SKIP,
+          (isGerant || isProvider) ? safe(sb.from("provider_payment_methods").select("id,provider_id,name,method_type,account_details,is_primary,active,sort_order").order("sort_order",{ascending:true}).limit(100), "provider_payment_methods") : SKIP,
+          (isGerant || isChatter) ? safe(sb.from("chatter_logs").select("id,chatter_id,model_id,action,details,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "chatter_logs") : SKIP,
+          (isGerant || isChatter) ? safe(sb.from("screenshot_checks").select("id,chatter_id,model_id,screenshot_url,status,checked_by,created_at",{count:"exact"}).order("created_at",{ascending:false}).range(0,99), "screenshot_checks") : SKIP,
+          (isGerant) ? safe(sb.from("broadcasts").select("id,model_id,message,media_url,audience_id,status,sent_at,created_at,recipients_count").order("created_at",{ascending:false}).limit(200), "broadcasts") : SKIP,
+          (isGerant || isChatter || isMC) ? safe(sb.from("payslips").select("id,user_id,month,amount,currency,status,pdf_url,created_at,notes").order("created_at",{ascending:false}).limit(200), "payslips") : SKIP,
           safe((async () => ({ data: "USE_TX", error: null }))(), "tx_summary_reuse"),
           (isGerant) ? safe(sb.from("expense_categories").select("code,label").eq("is_active",true).order("sort_order",{ascending:true}), "expense_categories") : SKIP,
-          (isGerant) ? safe(sb.from("payment_events").select("id,payment_id,event_type,created_at,created_by,metadata").order("created_at",{ascending:false}).limit(200), "payment_events") : SKIP,
+          (isGerant) ? safe(sb.from("payment_events").select("id,transaction_id,type,amount,currency,status,method,created_at,notes").order("created_at",{ascending:false}).limit(200), "payment_events") : SKIP,
         ]), _w2Timeout]);
         if (window.PERF) { window.PERF.mark('loadData_wave2_done'); window.PERF.measure('loadData Wave2 (secondary)', 'loadData_wave1_setState'); }
         if (thisVersion !== _loadVersion.current) return;
@@ -56329,9 +56375,19 @@ const App = () => {
           setEscalationCount(escCount||0);
         } catch(e) { /* escalation count fetch failed */ }
       }
-      // ── MIKE-A: UNREAD MESSAGES BADGE (disabled — tg_conversations.unread_count column does not exist) ──
-      // TODO: re-enable when unread_count column is added to tg_conversations
-      setUnreadMsgTotal(0);
+      // ── MIKE-A: UNREAD MESSAGES BADGE (all roles) ──
+      try {
+        if (currentUser.role === "gerant") {
+          const { count: _umCount } = await sb.from("tg_conversations").select("id", { count: "exact", head: true }).gt("unread_count", 0);
+          setUnreadMsgTotal(_umCount || 0);
+        } else if (currentUser.role === "chatter") {
+          const _assignedM = currentUser.assigned_models || [];
+          if (_assignedM.length > 0) {
+            const { data: _uData } = await sb.from("tg_conversations").select("unread_count").in("model_id", _assignedM).gt("unread_count", 0).limit(500);
+            setUnreadMsgTotal((_uData || []).reduce((sum, c) => sum + (c.unread_count || 0), 0));
+          }
+        }
+      } catch(e) { /* unread msg badge fetch failed */ }
 
       // ── MANAGER CHATTER DATA LOADING ──
       if (currentUser && _roleIs(currentUser, "manager_chatter")) {
@@ -56345,7 +56401,7 @@ const App = () => {
             // Stagger Wave 2 queries to avoid Supabase saturation
             const [_mcProfilesR, mcTxR, shiftR, commR] = await Promise.all([
               sb.from("profiles").select("*").in("id", _mcIds),
-              new Promise(async r => { await new Promise(s => setTimeout(s, 500)); r(await sb.from("transactions").select("id,date,chatter_id,model_id,provider_id,spender_id,spender_handle,amount,currency,product,tag,status,notes,provider_fee,dada_fee,net_amount,chatter_commission,margin,created_at,updated_at,payment_method,channel,provider_payment_method_id,product_id,product_contents,product_tag_id,amount_original,currency_original,telegram_id,validated_at,invoice_url,auto_detected,invoice_has_fallback,cancellation_reason,cancelled_at,cancelled_by,proof_url,validated_by,amount_chf,net_amount_chf,exchange_rate_used,idempotency_key").in("chatter_id", _allIds).order("date", {ascending: false}).limit(5000)); }),
+              new Promise(async r => { await new Promise(s => setTimeout(s, 500)); r(await sb.from("transactions").select(TX_COLS).in("chatter_id", _allIds).order("date", {ascending: false}).limit(5000)); }),
               new Promise(async r => { await new Promise(s => setTimeout(s, 1000)); r(await sb.from("chatter_shifts").select("*").eq("manager_id", currentUser.id).order("date", {ascending: false}).limit(500)); }),
               new Promise(async r => { await new Promise(s => setTimeout(s, 1500)); r(await sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false}).limit(500)); }),
             ]);
