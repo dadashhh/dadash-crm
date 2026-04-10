@@ -28386,12 +28386,25 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
     return filtered;
   };
 
-  const sortedConvs = getFilteredConversations().sort((a,b)=>{
-    const aEsc = getConvStatus(a)==="escalade" ? 0 : 1;
-    const bEsc = getConvStatus(b)==="escalade" ? 0 : 1;
-    if(aEsc!==bEsc) return aEsc-bEsc;
-    return new Date(b.updated_at||0)-new Date(a.updated_at||0);
-  });
+  const sortedConvs = (() => {
+    let list = getFilteredConversations().sort((a,b)=>{
+      const aEsc = getConvStatus(a)==="escalade" ? 0 : 1;
+      const bEsc = getConvStatus(b)==="escalade" ? 0 : 1;
+      if(aEsc!==bEsc) return aEsc-bEsc;
+      return new Date(b.updated_at||0)-new Date(a.updated_at||0);
+    });
+    // Sidebar trim: keep unread + 500 most recent (full list stays in conversations for Dadacast)
+    if (list.length > 500) {
+      const unread = [];
+      const rest = [];
+      for (let i = 0; i < list.length; i++) {
+        if ((list[i].unread_count || 0) > 0) unread.push(list[i]);
+        else rest.push(list[i]);
+      }
+      list = unread.concat(rest.slice(0, 500));
+    }
+    return list;
+  })();
 
   // Selected spender enrichment
   const selectedSpender = selectedConv ? getSpender(selectedConv) : null;
@@ -38341,7 +38354,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     let apiOk_ = false;
 
     // ── 0.4 Promise.allSettled : Carlos + Supabase en parallèle ─────────────
-    let _convSbQuery = sb.from("tg_conversations").select("id,tg_chat_id,tg_peer_id,tg_user_id,spender_id,model_id,assigned_chatter_id,status,last_message_at,display_name,username,tg_username,tg_first_name,tg_display_name,updated_at");
+    let _convSbQuery = sb.from("tg_conversations").select("id,tg_chat_id,tg_peer_id,tg_user_id,spender_id,model_id,assigned_chatter_id,status,last_message_at,display_name,username,tg_username,tg_first_name,tg_display_name,unread_count,updated_at");
     if (_roleIs(userProfile, "chatter")) {
       const _assigned = userProfile.assigned_models || [];
       if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
@@ -38466,20 +38479,6 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       const db = new Date(b.last_message_at || 0).getTime();
       return db - da;
     });
-
-    // Limit to unread + 500 most recent to avoid rendering 2000+ convs
-    if (list.length > 600) {
-      const unreadConvs = list.filter(c => (c.unread_count || 0) > 0);
-      const recentConvs = list.slice(0, 500);
-      const unreadIds = new Set(unreadConvs.map(c => String(c.chat_id || c.tg_chat_id)));
-      const combined = [...recentConvs];
-      for (const uc of unreadConvs) {
-        const ucId = String(uc.chat_id || uc.tg_chat_id);
-        if (!combined.some(c => String(c.chat_id || c.tg_chat_id) === ucId)) combined.push(uc);
-      }
-      console.log(`[CONV] Trimmed ${list.length} → ${combined.length} (500 recent + ${unreadConvs.length} unread)`);
-      list = combined;
-    }
 
     const prevCacheLen = _DMSG_CONV_CACHE.list.length;
     if (list.length < prevCacheLen * 0.5 && prevCacheLen > 10) {
@@ -45620,6 +45619,17 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
 
         return false;
       });
+    }
+    // Sidebar trim: keep unread + 500 most recent (full list stays in conversations for Dadacast/search)
+    if (list.length > 500) {
+      const unread = [];
+      const rest = [];
+      for (let i = 0; i < list.length; i++) {
+        if ((list[i].unread_count || 0) > 0) unread.push(list[i]);
+        else rest.push(list[i]);
+      }
+      rest.sort((a, b) => new Date(b.last_message_at || b.updated_at || 0) - new Date(a.last_message_at || a.updated_at || 0));
+      list = unread.concat(rest.slice(0, 500));
     }
     return list;
   }, [conversations, debouncedSearch, spenders, getConvName]);
@@ -56375,9 +56385,19 @@ const App = () => {
           setEscalationCount(escCount||0);
         } catch(e) { /* escalation count fetch failed */ }
       }
-      // ── MIKE-A: UNREAD MESSAGES BADGE (disabled — unread_count column does NOT exist on tg_conversations) ──
-      // TODO: re-enable when unread_count column is added to tg_conversations
-      setUnreadMsgTotal(0);
+      // ── MIKE-A: UNREAD MESSAGES BADGE (all roles) ──
+      try {
+        if (currentUser.role === "gerant") {
+          const { count: _umCount } = await sb.from("tg_conversations").select("id", { count: "exact", head: true }).gt("unread_count", 0);
+          setUnreadMsgTotal(_umCount || 0);
+        } else if (currentUser.role === "chatter") {
+          const _assignedM = currentUser.assigned_models || [];
+          if (_assignedM.length > 0) {
+            const { data: _uData } = await sb.from("tg_conversations").select("unread_count").in("model_id", _assignedM).gt("unread_count", 0).limit(500);
+            setUnreadMsgTotal((_uData || []).reduce((sum, c) => sum + (c.unread_count || 0), 0));
+          }
+        }
+      } catch(e) { /* unread msg badge fetch failed */ }
 
       // ── MANAGER CHATTER DATA LOADING ──
       if (currentUser && _roleIs(currentUser, "manager_chatter")) {
