@@ -167,7 +167,7 @@
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1"></script>
 
   <!-- ═══ SCRIPTS NON-CRITIQUES — chargement différé ═══ -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+  <!-- PropTypes retiré : inutile en prod, économise 8KB réseau -->
   <script src="https://cdn.jsdelivr.net/npm/recharts@2.1.16/umd/Recharts.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.8/purify.min.js" defer></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
@@ -7869,6 +7869,7 @@ const apiFetchTransactions = async ({ scope, filters } = {}) => {
       .eq("provider_id", s.provider_user_id);
     if (filters?.startISO) q = q.gte("created_at", filters.startISO);
     if (filters?.endISO) q = q.lte("created_at", filters.endISO);
+    q = q.limit(5000);
     const { data, error } = await q;
     if (error) { console.warn("[API_TX] provider fetch error:", error.message); return { data: [], count: 0 }; }
     const rows = (data || []).filter(tx => tx.provider_id === s.provider_user_id);
@@ -7922,9 +7923,9 @@ const apiFetchActivityScoped = async ({ scope, tab = "all", limit = 30, offset =
       console.warn("[ACTIVITY_SCOPED] chatter has 0 allowed spenders — returning empty");
       return [];
     }
-    const items = await apiFetchActivityTab(tab, limit, offset);
     const spenderIdSet = new Set(allowedSpenderIds);
-    const tgIdSet = new Set(allowedTgIds.map(String));
+    const tgIdSet = new Set(allowedTgIds);
+    const items = await apiFetchActivityTab(tab, limit, offset);
     const filtered = items.filter(item => {
       if (item.spender_id && spenderIdSet.has(item.spender_id)) return true;
       const tg = item.tg_user_id || item.tg_user_id_text;
@@ -7939,11 +7940,11 @@ const apiFetchActivityScoped = async ({ scope, tab = "all", limit = 30, offset =
 const apiFetchPayoutRequests = async (scope) => {
   const s = scope || { type: 'global' };
   if (s.type === 'chatter') {
-    const { data, error } = await sb.from("payout_requests").select("*").eq("chatter_user_id", s.chatter_user_id).order("created_at", { ascending: false });
+    const { data, error } = await sb.from("payout_requests").select("*").eq("chatter_user_id", s.chatter_user_id).order("created_at", { ascending: false }).limit(500);
     if (error) { console.warn("[PAYOUT_REQ] chatter fetch error:", error.message); return []; }
     return data || [];
   }
-  const { data, error } = await sb.from("payout_requests").select("*").order("created_at", { ascending: false });
+  const { data, error } = await sb.from("payout_requests").select("*").order("created_at", { ascending: false }).limit(500);
   if (error) { console.warn("[PAYOUT_REQ] global fetch error:", error.message); return []; }
   return data || [];
 };
@@ -7964,7 +7965,7 @@ const apiCreatePayoutRequest = async ({ chatter_user_id, amount, currency, perio
 // Sync TG — v_tg_conversations expose tg_username (compat layer), fn_upsert_spender_from_tg attend TEXT
 const apiSyncTG = async () => {
   const safeCols = "id,tg_chat_id,tg_peer_id,tg_user_id,spender_id,tg_username,username,display_name";
-  const { data: convs, error: convErr } = await sb.from("v_tg_conversations").select(safeCols);
+  const { data: convs, error: convErr } = await sb.from("v_tg_conversations").select(safeCols).limit(500);
   if (convErr) throw new Error("v_tg_conversations: " + convErr.message);
   let total = 0, synced = 0;
   for (const conv of convs || []) {
@@ -8474,8 +8475,8 @@ const resolveModelFromId = (id, fallbackModels) => {
 
 // ═══ TX STATUS CONSTANTS ═══
 const TX_VALID_STATUSES = ["validated"];
-const TX_PENDING_STATUSES = ["pending"];
-const TX_REFUSED_STATUSES = ["refused", "cancelled"];
+const TX_PENDING_STATUSES = ["pending", "en_attente"];
+const TX_REFUSED_STATUSES = ["refused", "cancelled", "rejected"];
 const isValidTx = (status) => TX_VALID_STATUSES.includes(status);
 const isPendingTx = (status) => TX_PENDING_STATUSES.includes(status);
 const isRefusedTx = (status) => TX_REFUSED_STATUSES.includes(status);
@@ -11030,7 +11031,7 @@ const GestionPage = React.memo(({ user, lang, txs, models, profiles, alerts, onD
     (async () => {
       try {
         const today = new Date().toISOString().slice(0, 10);
-        const { data } = await sb.from("shifts").select("*").gte("date", today).lte("date", today).order("start_time", { ascending: true });
+        const { data } = await sb.from("shifts").select("*").gte("date", today).lte("date", today).order("start_time", { ascending: true }).limit(200);
         if (data && data.length > 0) {
           setAgenda(data.map(s => ({
             id: s.id, time: `${s.start_time || "?"} – ${s.end_time || "?"}`,
@@ -11269,13 +11270,13 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       const mcProfiles = (teamProfiles||[]).filter(p => _roleIs(p, 'manager_chatter'));
       const mcAssignmentMap = {};
       for (const mc of mcProfiles) {
-        const {data: links} = await sb.from('manager_chatters').select('chatter_id, assigned_at').eq('manager_id', mc.id);
+        const {data: links} = await sb.from('manager_chatters').select('chatter_id, assigned_at').eq('manager_id', mc.id).limit(500);
         mcAssignmentMap[mc.id] = links || [];
       }
 
       const [txRes, piRes] = await Promise.allSettled([
         sb.from('transactions')
-          .select('net_amount, net_amount_chf, amount, amount_chf, currency, exchange_rate_used, chatter_id, chatter_commission, created_at, date')
+          .select('net_amount, amount, currency, chatter_id, chatter_commission, created_at, date')
           .in('status', ['validated']),
         sb.from('paiements_internes')
           .select('destinataire_id, montant, statut')
@@ -11294,8 +11295,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
         const chTx = allTx.filter(t => t.chatter_id === ch.id);
         const commDue = chTx.reduce((s, t) => {
           const explicit = Number(t.chatter_commission || 0);
-          // FIX 08/04/2026: use txNetAmountCHF (frozen rate) instead of convertAmountSimple (current rate)
-          return s + (explicit > 0 ? txConvertCHF(explicit, t) : txNetAmountCHF(t) * rate);
+          return s + (explicit > 0 ? explicit : convertAmountSimple(txNetAmount(t), t.currency) * rate);
         }, 0);
         const paid = allPi.filter(p => p.destinataire_id === ch.id).reduce((s, p) => s + Number(p.montant || 0), 0);
         totalOwed += Math.max(0, commDue - paid);
@@ -11310,17 +11310,16 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
         assignments.forEach(a => { if (a.assigned_at) assignedAtMap[a.chatter_id] = new Date(a.assigned_at).getTime(); });
 
         let commDue = 0;
-        // FIX 08/04/2026: use txNetAmountCHF (frozen rate) instead of convertAmountSimple
         allTx.forEach(tx => {
           if (tx.chatter_id === mc.id) {
-            commDue += txNetAmountCHF(tx) * rate;
+            commDue += convertAmountSimple(txNetAmount(tx), tx.currency) * rate;
           } else if (assignedChatterIds.includes(tx.chatter_id)) {
             const assignedAt = assignedAtMap[tx.chatter_id];
             if (assignedAt) {
               const txDate = new Date(tx.created_at || tx.date || 0).getTime();
               if (txDate < assignedAt) return;
             }
-            commDue += txNetAmountCHF(tx) * rate;
+            commDue += convertAmountSimple(txNetAmount(tx), tx.currency) * rate;
           }
         });
         const paid = allPi.filter(p => p.destinataire_id === mc.id).reduce((s, p) => s + Number(p.montant || 0), 0);
@@ -11562,27 +11561,23 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
 
   const chartData = useMemo(() => {
     if (period === "24h" || period === "today") return getChartData(filteredTxs, "created_at", ["ca_brut", "ca_net", "total", "valid", "pending", "ma_commission", "panier_moyen", "taux_validation"], period);
-    // FIX 08/04/2026: pre-fill ALL days in [dateDebut, dateFin] so chart keeps full period axis
-    // even when status filter reduces filteredTxs to a few days (e.g. pending on 2/7 days)
+    // Build map directly from transactions — O(n) instead of O(days + n)
+    // Group by LOCAL date (not UTC) so timezone-aware
     const byDay = {};
-    if (dateDebut && dateFin && !isNaN(dateDebut.getTime()) && !isNaN(dateFin.getTime())) {
-      for (let d = new Date(dateDebut); d <= dateFin; d = new Date(d.getTime() + 86400000)) {
-        const key = d.toLocaleDateString('fr-CA', { timeZone: timezone });
-        if (key && key.length >= 10) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, refused: 0, ca_brut_pending: 0, commission: 0 };
-      }
-    }
-    // Helper: TX → local date key
-    const txToDay = (tx) => { const r = tx.created_at || tx.date || ""; if (!r) return null; const k = new Date(r).toLocaleDateString('fr-CA', { timeZone: timezone }); return (k && k.length >= 10) ? k : null; };
-    const ensureDay = (k) => { if (!byDay[k]) byDay[k] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, refused: 0, ca_brut_pending: 0, commission: 0 }; };
-    // Pass 1: CA BRUT / NET / valid / commission from dateOnlyFilteredTxs (NO status filter)
-    // so CA BRUT/NET curves always show validated amounts, matching KPI cards behavior
-    dateOnlyFilteredTxs.forEach(tx => {
-      const key = txToDay(tx); if (!key) return; ensureDay(key);
+    filteredTxs.forEach(tx => {
+      const raw = tx.created_at || tx.date || "";
+      if (!raw) return;
+      const key = new Date(raw).toLocaleDateString('fr-CA', { timeZone: timezone });
+      if (!key || key.length < 10) return;
+      if (!byDay[key]) byDay[key] = { ca_brut: 0, ca_net: 0, total: 0, valid: 0, pending: 0, refused: 0, ca_brut_pending: 0, commission: 0 };
+      const amt = txAmountCHF(tx);
       const isVal = isValidTx(tx.status);
-      if (isVal) { byDay[key].ca_brut += txAmountCHF(tx); byDay[key].ca_net += txNetAmountCHF(tx); byDay[key].commission += txConvertCHF(Number(tx.chatter_commission || 0), tx); byDay[key].valid += 1; }
-      if (isPendingTx(tx.status)) { byDay[key].ca_brut_pending += txAmountCHF(tx); byDay[key].pending += 1; }
-      if (isRefusedTx(tx.status)) byDay[key].refused += 1;
+      const isPend = isPendingTx(tx.status);
+      if (isVal) { byDay[key].ca_brut += amt; byDay[key].ca_net += txNetAmountCHF(tx); byDay[key].commission += txConvertCHF(Number(tx.chatter_commission || 0), tx); }
       byDay[key].total += 1;
+      if (isVal) byDay[key].valid += 1;
+      if (isPend) { byDay[key].pending += 1; byDay[key].ca_brut_pending += amt; }
+      if (isRefusedTx(tx.status)) byDay[key].refused += 1;
     });
     return Object.entries(byDay).sort((a, b) => a[0].localeCompare(b[0])).map(([date, d]) => ({
       date,
@@ -11594,7 +11589,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
       panier_moyen: d.valid > 0 ? Math.round(d.ca_brut / d.valid) : 0,
       taux_validation: (d.valid + d.refused) > 0 ? Math.round((d.valid / (d.valid + d.refused)) * 100) : 0,
     }));
-  }, [dateOnlyFilteredTxs, convertAmount, period, timezone, dateDebut, dateFin]);
+  }, [filteredTxs, convertAmount, period, timezone]);
 
   const modelStats = useMemo(() => {
     const validFilteredTxs = filteredTxs.filter(tx => isValidTx(tx.status));
@@ -11629,7 +11624,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
   // ── Platform accounts for widget ──
   const [dashPlatformAccounts, setDashPlatformAccounts] = useState([]);
   useEffect(() => {
-    sb.from("platform_accounts").select("id,platform,account_name,status").order("platform")
+    sb.from("platform_accounts").select("id,platform,account_name,status").order("platform").limit(200)
       .then(({ data, error }) => { if (error) { console.warn("[SB_ERR] platform_accounts:", error.message||error); } setDashPlatformAccounts(data || []); })
       .catch(e => { console.warn("[SB_ERR] platform_accounts (catch):", e.message||e); });
   }, []);
@@ -11933,7 +11928,7 @@ const DashboardRedesign = React.memo(({ user, lang, txs, models, profiles, spend
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 12, flexShrink: 0 }}>
                   <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>+{Math.round(txAmountCHF(tx))} {currencySymbol}</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#f8fafc" }}>+{convertAmount(Number(tx.amount || 0), tx.currency).toFixed(0)} {currencySymbol}</div>
                     <div style={{ fontSize: 10, color: "#64748b" }}>{new Date(tx.created_at || tx.date).toLocaleDateString("fr-CH", { timeZone: _tz.current, day: "2-digit", month: "short" })}</div>
                   </div>
                   <span style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 6, background: "#f59e0b22", color: "#f59e0b", minWidth: 50, textAlign: "center" }}>PEND.</span>
@@ -12712,8 +12707,8 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
   const refreshPIM = React.useCallback(async () => {
     try {
       const [{ data: soldes }, { data: piData }] = await Promise.all([
-        sb.from("vue_soldes_modeles").select("*"),
-        sb.from("paiements_internes").select("*").limit(500).eq("destinataire_type","modele").order("created_at",{ascending:false}),
+        sb.from("vue_soldes_modeles").select("*").limit(200),
+        sb.from("paiements_internes").select("*").eq("destinataire_type","modele").order("created_at",{ascending:false}).limit(1000),
       ]);
       if (soldes) { const m={}; soldes.forEach(r=>{m[r.modele_id]=r;}); setSoldesMapM(m); }
       if (piData) setPaiementsM(piData);
@@ -12779,7 +12774,7 @@ const ModelesTab = React.memo(({user, lang, txs, models, profiles, expenses, exp
     setPiSavingM(true);
     try {
       const yr = new Date().getFullYear();
-      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").limit(500).like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
       const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
       const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
       const { error } = await sb.from("paiements_internes").update({statut:"validated",validated_by:user.id,validated_at:new Date().toISOString(),facture_numero:facNum,facture_generated:true}).eq("id",piId);
@@ -13955,8 +13950,8 @@ const SpenderEditModal = ({ spender, onClose, onSaved, dbSpenders, user }) => {
     // Union badges (no duplicates)
     try {
       const [{ data: kb }, { data: ob }] = await Promise.all([
-        sb.from('spender_badges').select('badge').eq('spender_id', keepId),
-        sb.from('spender_badges').select('badge').eq('spender_id', otherId),
+        sb.from('spender_badges').select('badge').eq('spender_id', keepId).limit(1000),
+        sb.from('spender_badges').select('badge').eq('spender_id', otherId).limit(1000),
       ]);
       const keepSet = new Set((kb || []).map(b => b.badge));
       const toAdd = (ob || []).filter(b => !keepSet.has(b.badge)).map(b => ({ spender_id: keepId, badge: b.badge }));
@@ -14144,7 +14139,7 @@ const UnifiedSpenderModal = React.memo(({
   const [dbBadges, setDbBadges] = React.useState({});
   const loadBadges = React.useCallback(async () => {
     try {
-      const { data } = await sb.from("spender_badges").select("spender_id,badge");
+      const { data } = await sb.from("spender_badges").select("spender_id,badge").limit(1000);
       const map = {};
       (data || []).forEach(r => { if (!map[r.spender_id]) map[r.spender_id] = []; map[r.spender_id].push(r.badge); });
       setDbBadges(map);
@@ -15186,7 +15181,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
       .filter(tx => !model || tx.model_id === model)
       .filter(tx => !chatter || tx.chatter_id === chatter)
       .filter(tx => !txProvider || tx.provider_id === txProvider)
-      .filter(tx => !status || (status === "refused" ? isRefusedTx(tx.status) : status === "pending" ? isPendingTx(tx.status) : status === "validated" ? isValidTx(tx.status) : tx.status === status));
+      .filter(tx => !status || tx.status === status);
   }, [txSummaryProp, txs, dr.startDate, dr.endDate, model, chatter, txProvider, status, user.role, user.id]);
   const { validate, refuse, cancel, processingIds } = useTransactionActions({
     txs, setTxs, setTxSummary, setSrvData, srvData, onNotify, addToast, currencySymbol, models, profiles, lang, t, convertAmount, user
@@ -15231,8 +15226,7 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
     setSrvLoading(true);
     try {
       const f = {};
-      // FIX 08/04/2026: "refused" filter must include both refused AND cancelled (matches isRefusedTx)
-      if (status && status !== "refused") f.status = status;
+      if (status) f.status = status;
       if (model) f.model_id = model;
       if (chatter) f.chatter_id = chatter;
       // Provider voit uniquement ses propres TX — filtre forcé (défense en profondeur)
@@ -15244,8 +15238,6 @@ const TransactionsTab = React.memo(({user, lang, txs, txSummary: txSummaryProp, 
       const qm = (q) => {
         if (dr.startISO) q = q.gte("created_at", dr.startISO);
         if (dr.endISO) q = q.lte("created_at", dr.endISO);
-        // FIX 08/04/2026: "refused" = refused + cancelled (consistent with dashboard isRefusedTx)
-        if (status === "refused") q = q.in("status", ["refused", "cancelled"]);
         return q;
       };
       const result = await loadPage("transactions", p, TX_PAGE_SIZE, f, "date", qm);
@@ -16197,7 +16189,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   // Platform presence lookup: handle → Set<platform>
   const [spenderPlatforms, setSpenderPlatforms] = useState({});
   useEffect(() => {
-    sb.from("platform_fans").select("username,platform").then(({ data }) => {
+    sb.from("platform_fans").select("username,platform").limit(500).then(({ data }) => {
       if (!data) return;
       const map = {};
       data.forEach(row => {
@@ -16213,7 +16205,7 @@ const SpendersTab = React.memo(({user, lang, txs, models, profiles, dbSpenders, 
   const [dbBadgeList, setDbBadgeList] = useState([]);
   const loadBadges = React.useCallback(async () => {
     try {
-      const { data, error } = await sb.from("spender_badges").select("spender_id,badge");
+      const { data, error } = await sb.from("spender_badges").select("spender_id,badge").limit(1000);
       if (error) { console.warn("[BADGES] load error:", error.message); return; }
       const map = {};
       const allBadges = new Set();
@@ -18983,8 +18975,8 @@ const ChattersTab = React.memo(({user, lang, txs, profiles, models, chatterLogs,
   const refreshPI = React.useCallback(async () => {
     try {
       const [{ data: soldes }, { data: piData }] = await Promise.all([
-        sb.from("vue_soldes_chatters").select("*"),
-        sb.from("paiements_internes").select("*").limit(500).in("destinataire_type",["chatter","mc","manager_chatter"]).order("created_at",{ascending:false}),
+        sb.from("vue_soldes_chatters").select("*").limit(200),
+        sb.from("paiements_internes").select("*").in("destinataire_type",["chatter","mc","manager_chatter"]).order("created_at",{ascending:false}).limit(1000),
       ]);
       if (soldes) { const m={}; soldes.forEach(r=>{m[r.chatter_id]=r;}); setSoldesMap(m); }
       if (piData) setPaiementsPI(piData);
@@ -19056,7 +19048,7 @@ const ChattersTab = React.memo(({user, lang, txs, profiles, models, chatterLogs,
     setPiSaving(true);
     try {
       const yr = new Date().getFullYear();
-      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").limit(500).like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
       const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
       const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
       const { error } = await sb.from("paiements_internes").update({statut:"validated",validated_by:user.id,validated_at:new Date().toISOString(),facture_numero:facNum,facture_generated:true}).eq("id",piId);
@@ -20458,9 +20450,9 @@ const PaiementsHubTab = React.memo(({user, lang, profiles, onRefresh}) => {
     setLoading(true);
     try {
       const [{ data }, sc, sm] = await Promise.all([
-        sb.from("paiements_internes").select("*").limit(500).order("created_at",{ascending:false}),
-        sb.from("vue_soldes_chatters").select("chatter_id,name,solde_du,commission_brute,deja_verse"),
-        sb.from("vue_soldes_modeles").select("modele_id,name,solde_du,commission_brute,deja_verse"),
+        sb.from("paiements_internes").select("*").order("created_at",{ascending:false}).limit(1000),
+        sb.from("vue_soldes_chatters").select("chatter_id,name,solde_du,commission_brute,deja_verse").limit(200),
+        sb.from("vue_soldes_modeles").select("modele_id,name,solde_du,commission_brute,deja_verse").limit(200),
       ]);
       setPiList(data||[]);
       if (sc.data) { const m={}; sc.data.forEach(r=>{m[r.chatter_id]=r;}); setSoldesC(m); }
@@ -20471,7 +20463,7 @@ const PaiementsHubTab = React.memo(({user, lang, profiles, onRefresh}) => {
         const mcSoldes = {};
         for (const mc of mcProfiles) {
           const mcRate = getCommissionRate(mc, "manager_chatter");
-          const {data:mcLinks} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id",mc.id);
+          const {data:mcLinks} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id",mc.id).limit(500);
           const chIds = (mcLinks||[]).map(l=>l.chatter_id);
           // Build assigned_at map for solde filtering
           const _mcAssignedMap = {};
@@ -20480,7 +20472,7 @@ const PaiementsHubTab = React.memo(({user, lang, profiles, onRefresh}) => {
           const allIds = [...new Set([...chIds, mc.id])];
           let caNet = 0;
           if (allIds.length > 0) {
-            const {data:txDataRaw} = await sb.from("transactions").select("net_amount,currency,chatter_id,created_at,date").in("chatter_id",allIds).in("status",["validated"]);
+            const {data:txDataRaw} = await sb.from("transactions").select("net_amount,currency,chatter_id,created_at,date").in("chatter_id",allIds).in("status",["validated"]).limit(5000);
             // SOLDE = only post-assigned_at TX (MC own TX always included)
             caNet = (txDataRaw||[]).reduce((s,t) => {
               if (t.chatter_id === mc.id) return s + Number(t.net_amount||0); // MC own TX
@@ -20534,7 +20526,7 @@ const PaiementsHubTab = React.memo(({user, lang, profiles, onRefresh}) => {
     setActionSaving(true);
     try {
       const yr = new Date().getFullYear();
-      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").limit(500).like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const { data:ex } = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
       const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
       const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
       await sb.from("paiements_internes").update({statut:"validated",validated_by:user.id,validated_at:new Date().toISOString(),facture_numero:facNum,facture_generated:true}).eq("id",pi.id);
@@ -24674,7 +24666,7 @@ const ProductCatalogTab = React.memo(({user, lang, txs, models, profiles, produc
   const loadProductMedia = React.useCallback(async () => {
     setProdMediaLoading(true);
     try {
-      const { data, error } = await sb.from("media_library").select("*").limit(1000).not("product_id","is",null).order("created_at",{ascending:false});
+      const { data, error } = await sb.from("media_library").select("*").not("product_id","is",null).order("created_at",{ascending:false}).limit(2000);
       if (!error && data) {
         const byProd = {};
         data.forEach(m => { if (!byProd[m.product_id]) byProd[m.product_id] = []; byProd[m.product_id].push(m); });
@@ -25202,7 +25194,7 @@ const AdminUsersTab = React.memo(({lang, profiles, models, onRefresh}) => {
     setEditUser(u);
     let assignedChatters = [];
     if (_roleIs(u, "manager_chatter")) {
-      const {data} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", u.id);
+      const {data} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", u.id).limit(500);
       assignedChatters = (data||[]).map(r=>r.chatter_id);
     }
     setForm({name:u.name||u.full_name||"",email:u.email||"",role:u.role||"chatter",commission_pct:u.commission_pct||u.comm_pct||10,assigned_models:u.assigned_models||[],is_active:u.is_active!==false,manager_commission_pct:u.manager_commission_pct||25,assigned_chatters:assignedChatters});
@@ -25420,7 +25412,7 @@ const AdminRolesTab = React.memo(({lang, user, profiles}) => {
     try {
       const ids = employees.map(e => e.id);
       if (ids.length === 0) { setUserPerms({}); setLoading(false); return; }
-      const {data, error} = await sb.from("user_permissions").select("*").limit(1000).in("user_id", ids);
+      const {data, error} = await sb.from("user_permissions").select("*").in("user_id", ids).limit(200);
       if (error && (error.code === "42P01" || error.code === "PGRST116")) {
         setUserPerms({});
       } else if (error) {
@@ -25730,7 +25722,7 @@ const PlatformSettingsTab = React.memo(({ lang }) => {
   const loadAccounts = async () => {
     setLoading(true);
     try {
-      const { data } = await sb.from("platform_accounts").select("id,platform,account_name,status,last_sync_at,created_at").order("created_at");
+      const { data } = await sb.from("platform_accounts").select("id,platform,account_name,status,last_sync_at,created_at").order("created_at").limit(200);
       setAccounts(data || []);
     } catch (_) { setAccounts([]); }
     setLoading(false);
@@ -25980,7 +25972,7 @@ const AdminPipelineDebugTab = ({lang}) => {
     Promise.all([
       sb.from("spender_events").select("id,event_type,tg_user_id,spender_id,data,created_at").order("created_at",{ascending:false}).limit(30),
       sb.from("v_spender_enrich_queue").select("id,conversation_id,tg_user_id,status,attempts,error,created_at").order("created_at",{ascending:false}).limit(20),
-      sb.from("tg_messages").select("id,conversation_id,direction,text,tg_message_id,meta,created_at").limit(1000).order("created_at",{ascending:false}).limit(20),
+      sb.from("tg_messages").select("id,conversation_id,direction,text,tg_message_id,meta,created_at").order("created_at",{ascending:false}).limit(20),
     ]).then(([eR, qR, mR]) => {
       if (!m) return;
       setEvents(eR.data||[]);
@@ -28222,7 +28214,7 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
     setLoadError(null);
     setLoading(true);
     try {
-      const {data} = await sb.from("conversations").select("*").limit(500).order("updated_at",{ascending:false});
+      const {data} = await sb.from("conversations").select("*").order("updated_at",{ascending:false}).limit(500);
       setConversations(data||[]);
     } catch(e) {
       setConversations([]);
@@ -28235,7 +28227,7 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
   // selectedConv n'est jamais modifié ici, seulement par un clic utilisateur
   const silentRefreshConversations = useCallback(async () => {
     try {
-      const {data} = await sb.from("conversations").select("*").limit(500).order("updated_at",{ascending:false});
+      const {data} = await sb.from("conversations").select("*").order("updated_at",{ascending:false}).limit(500);
       if (data) setConversations(data);
     } catch(_) {}
   }, []);
@@ -28269,7 +28261,7 @@ const GerantMessagerieTab = ({user, lang, spenders, profiles, models, txs, onRef
     });
     try {
       // ── 1.4 LIMIT 100 most recent messages to avoid fetching entire history ──
-      const {data} = await sb.from("tg_messages").select("*").limit(1000).eq("conversation_id",convId).order("created_at",{ascending:false}).limit(100);
+      const {data} = await sb.from("tg_messages").select("*").eq("conversation_id",convId).order("created_at",{ascending:false}).limit(100);
       console.log('📊 [MSG-DIAG] Query result:', {
         functionName: 'loadMessages',
         subpage: 'GerantMessagerieTab',
@@ -28708,13 +28700,13 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
     const isInitialLoad = !convLoadedRef.current;
     if (isInitialLoad) setLoading(true);
     try {
-      let res = await sb.from("conversations").select("*").limit(500).in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).order("updated_at", {ascending: false});
+      let res = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).order("updated_at", {ascending: false}).limit(500);
       if (res.error) throw new Error(res.error.message);
       setConversations(res.data || []);
       convLoadedRef.current = true;
     } catch (e) {
       try {
-        const fallback = await sb.from("conversations").select("*").limit(500).in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]);
+        const fallback = await sb.from("conversations").select("*").in("model_id", myModelIds.length > 0 ? myModelIds : ["__none__"]).limit(500);
         if (!fallback.error) { setConversations((fallback.data || []).sort((a,b) => new Date(b.updated_at || b.created_at || 0) - new Date(a.updated_at || a.created_at || 0))); convLoadedRef.current = true; }
         else if (isInitialLoad) { setConversations([]); setLoadError(e?.message || (fr ? "Erreur chargement" : "Load error")); }
       } catch (_) {
@@ -28852,7 +28844,7 @@ const ChatterMessagerieTab = ({user, lang, spenders, models}) => {
       setMessages([]);
       // Refresh conversations
       try {
-        const {data} = await sb.from("conversations").select("*").limit(500).in("model_id", myModelIds).order("updated_at", {ascending: false});
+        const {data} = await sb.from("conversations").select("*").in("model_id", myModelIds).order("updated_at", {ascending: false}).limit(500);
         setConversations(data || []);
       } catch(e) { /* Conversations refresh failed */ }
     } catch (e) {
@@ -29330,6 +29322,19 @@ const _DMSG_API = "https://dadash-autofill-v2-production.up.railway.app";
 // Cache global — survit aux remontages du composant (changements d'onglet)
 const _DMSG_CONV_CACHE = { list: [], ts: 0 };
 const _DMSG_MSG_CACHE  = {}; // { chatId: { data: messages[], ts: number } } — TTL 60s (L1 RAM)
+const _DMSG_MSG_CACHE_MAX = 20; // LRU: max 20 conversations en cache mémoire
+const _dmsgMsgCacheSet = (chatId, data, ts) => {
+  _DMSG_MSG_CACHE[chatId] = { data: data, ts: ts || Date.now() };
+  const keys = Object.keys(_DMSG_MSG_CACHE);
+  if (keys.length > _DMSG_MSG_CACHE_MAX) {
+    let oldest = keys[0], oldestTs = Infinity;
+    for (const k of keys) {
+      const kts = _DMSG_MSG_CACHE[k] && _DMSG_MSG_CACHE[k].ts || 0;
+      if (kts < oldestTs) { oldest = k; oldestTs = kts; }
+    }
+    delete _DMSG_MSG_CACHE[oldest];
+  }
+};
 
 /** Normalize media fields: extract from meta JSONB if flat fields are missing */
 const _normalizeMsgMedia = (msgs) => {
@@ -30602,7 +30607,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
       if (_gpIdb) {
         _DADASH_DEBUG && console.log(`[PERF] gpLoadMsgs L2-IDB-HIT — slot ${idx} chatId: ${cid}`);
         _normalizeMsgMedia(_gpIdb.data);
-        _DMSG_MSG_CACHE[String(cid)] = { data: _gpIdb.data, ts: _gpIdb.ts };
+        _dmsgMsgCacheSet(String(cid), _gpIdb.data, _gpIdb.ts);
         setGpSlotMsgs(p => ({ ...p, [idx]: _gpIdb.data }));
         return;
       }
@@ -30638,7 +30643,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
         });
       }
       // ── 0.2 + 2.3 Write L1 + L2 cache ────────────────────────────────────
-      _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+      _dmsgMsgCacheSet(String(cid), msgs);
       _idbSetMsgs(cid, msgs);
       setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setGpHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
@@ -30650,12 +30655,12 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
         _DADASH_DEBUG && console.warn(`[GP] Fallback Supabase — slot ${idx} chatId: ${cid}`);
         const { data: _gpConvRow } = await sb.from("tg_conversations").select("id").eq("tg_chat_id", String(cid)).maybeSingle();
         if (_gpConvRow?.id) {
-          const { data: _gpSbMsgs } = await sb.from("tg_messages").select("*").limit(1000)
+          const { data: _gpSbMsgs } = await sb.from("tg_messages").select("*")
             .eq("conversation_id", _gpConvRow.id)
             .order("created_at", { ascending: true })
             .limit(200);
           const msgs = _normalizeMsgMedia(_gpSbMsgs || []);
-          if (msgs.length > 0) _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+          if (msgs.length > 0) _dmsgMsgCacheSet(String(cid), msgs);
           setGpSlotMsgs(p => ({ ...p, [idx]: msgs }));
           console.log(`✅ [GP] Supabase fallback OK — slot ${idx} — ${msgs.length} msgs`);
         }
@@ -30668,9 +30673,11 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
 
   useEffect(() => {
     // ── 0.5 Stagger load : 100ms entre cellules pour éviter les rafales ──────
-    gpSlots.forEach((c, i) => { if (c) setTimeout(() => gpLoadMsgs(c, i, false), i * 100); });
+    const _gpStaggerTimers = [];
+    gpSlots.forEach((c, i) => { if (c) _gpStaggerTimers.push(setTimeout(() => gpLoadMsgs(c, i, false), i * 100)); });
     // ── 1.3 Sync ref so polling interval uses latest slots ──
     gpSlotsRef.current = gpSlots;
+    return () => { _gpStaggerTimers.forEach(t => clearTimeout(t)); };
   }, [gpSlots]);
 
   // ── 1.3 Stable gpLoadMsgs ref ──
@@ -30912,7 +30919,7 @@ const GridPremiumSubpage = ({ conversations = [], convTotalsMap = {}, models = [
   // ── TX modal ──────────────────────────────────────────────────────
   React.useEffect(() => {
     if (txCellIdx === null || txProducts.length > 0) return;
-    sb.from("products").select("*").limit(200).eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
+    sb.from("products").select("*").eq("active", true).order("category").limit(200).then(({ data }) => setTxProducts(data || []));
   }, [txCellIdx]);
 
   const openTxModal = (cellIndex) => {
@@ -32092,7 +32099,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
       if (_tIdb) {
         _DADASH_DEBUG && console.log(`[PERF] tLoadMsgs L2-IDB-HIT — slot ${idx} chatId: ${cid}`);
         _normalizeMsgMedia(_tIdb.data);
-        _DMSG_MSG_CACHE[String(cid)] = { data: _tIdb.data, ts: _tIdb.ts };
+        _dmsgMsgCacheSet(String(cid), _tIdb.data, _tIdb.ts);
         setTSlotMsgs(p => ({ ...p, [idx]: _tIdb.data }));
         return;
       }
@@ -32128,7 +32135,7 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
         });
       }
       // ── 0.2 + 2.3 Write L1 + L2 cache ────────────────────────────────────
-      _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+      _dmsgMsgCacheSet(String(cid), msgs);
       _idbSetMsgs(cid, msgs);
       setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
       setTHasMore(p => ({ ...p, [idx]: msgs.length >= 200 }));
@@ -32140,12 +32147,12 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
         _DADASH_DEBUG && console.warn(`[TLG] Fallback Supabase — slot ${idx} chatId: ${cid}`);
         const { data: _tConvRow } = await sb.from("tg_conversations").select("id").eq("tg_chat_id", String(cid)).maybeSingle();
         if (_tConvRow?.id) {
-          const { data: _tSbMsgs } = await sb.from("tg_messages").select("*").limit(1000)
+          const { data: _tSbMsgs } = await sb.from("tg_messages").select("*")
             .eq("conversation_id", _tConvRow.id)
             .order("created_at", { ascending: true })
             .limit(200);
           const msgs = _normalizeMsgMedia(_tSbMsgs || []);
-          if (msgs.length > 0) _DMSG_MSG_CACHE[String(cid)] = { data: msgs, ts: Date.now() };
+          if (msgs.length > 0) _dmsgMsgCacheSet(String(cid), msgs);
           setTSlotMsgs(p => ({ ...p, [idx]: msgs }));
           console.log(`✅ [TLG] Supabase fallback OK — slot ${idx} — ${msgs.length} msgs`);
         }
@@ -32158,14 +32165,16 @@ const TlgProSubpage = ({ conversations = [], convTotalsMap = {}, models = [], la
 
   useEffect(() => {
     // ── 0.5 Stagger load : 100ms entre cellules pour éviter les rafales ──────
+    const _tStaggerTimers = [];
     tSlots.forEach((c, i) => {
       const prevId = tPrevSlotsRef.current[i] ? _dmsgChatId(tPrevSlotsRef.current[i]) : null;
       const currId = c ? _dmsgChatId(c) : null;
-      if (c && currId !== prevId) setTimeout(() => tLoadMsgs(c, i, false), i * 100);
+      if (c && currId !== prevId) _tStaggerTimers.push(setTimeout(() => tLoadMsgs(c, i, false), i * 100));
     });
     tPrevSlotsRef.current = [...tSlots];
     // ── 1.3 Sync ref so polling interval uses latest slots ──
     tSlotsRef.current = tSlots;
+    return () => { _tStaggerTimers.forEach(t => clearTimeout(t)); };
   }, [tSlots]);
 
   // ── 1.3 Stable tLoadMsgs ref ──
@@ -33522,7 +33531,7 @@ const TindadaInboxZeroPage = ({ user, lang, spenders = [], models = [], profiles
   // Charger les produits pour le modal TX
   useEffect(() => {
     if (!showTxModal || txProducts.length > 0) return;
-    sb.from("products").select("*").limit(200).eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
+    sb.from("products").select("*").eq("active", true).order("category").limit(200).then(({ data }) => setTxProducts(data || []));
   }, [showTxModal]);
 
   const openTxModal = () => { setTxForm({ amount: "", currency: "CHF", product: "", product_id: "", provider_id: "", payment_method: "", note: "" }); setShowTxModal(true); };
@@ -34335,7 +34344,7 @@ const TlgProStandalonePage = ({ user, lang, spenders = [], models = [], profiles
   // Load products when TX modal opens
   React.useEffect(() => {
     if (txModalSlot === null || txProducts.length > 0) return;
-    sb.from("products").select("*").limit(200).eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
+    sb.from("products").select("*").eq("active", true).order("category").limit(200).then(({ data }) => setTxProducts(data || []));
   }, [txModalSlot]);
 
   // Load sent medias (unified cross-model) when media library opens for a slot
@@ -36986,7 +36995,7 @@ const _prefetchMediaLibrary = (modelName) => {
   const key = modelName || "__all__";
   ["photo", "video"].forEach(type => {
     if (_MEDIA_LIB_CACHE[type]?.[key]?.ts && Date.now() - _MEDIA_LIB_CACHE[type][key].ts < _MEDIA_LIB_TTL) return;
-    let query = sb.from("media_library").select("*").limit(1000).eq("type", type);
+    let query = sb.from("media_library").select("*").eq("type", type);
     if (modelName) query = query.eq("model", modelName);
     query.order("created_at", { ascending: false }).limit(50)
       .then(({ data }) => {
@@ -36998,7 +37007,7 @@ const _prefetchMediaLibrary = (modelName) => {
         };
       }).catch(() => {});
     if (modelName) {
-      sb.from("media_albums").select("*").eq("model", modelName).order("created_at")
+      sb.from("media_albums").select("*").eq("model", modelName).order("created_at").limit(200)
         .then(({ data }) => {
           if (_MEDIA_LIB_CACHE[type]?.[key]) {
             _MEDIA_LIB_CACHE[type][key].albums = data || [];
@@ -37045,7 +37054,7 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
     }
 
     // Fetch from Supabase
-    let query = sb.from("media_library").select("*").limit(1000).eq("type", mediaType);
+    let query = sb.from("media_library").select("*").eq("type", mediaType);
     if (modelName) query = query.eq("model", modelName);
     query
       .order("created_at", { ascending: false })
@@ -37063,7 +37072,7 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
         setMediaLoading(false);
       });
     if (modelName) {
-      sb.from("media_albums").select("*").eq("model", modelName).order("created_at")
+      sb.from("media_albums").select("*").eq("model", modelName).order("created_at").limit(200)
         .then(({ data }) => {
           const albums = data || [];
           setMsgAlbums(albums);
@@ -37077,7 +37086,7 @@ const MediaPanelGrid = ({ mediaType, onSelect, modelName, sentMediaIds = [] }) =
   const loadMore = React.useCallback(() => {
     if (loadingMore || !hasMore) return;
     setLoadingMore(true);
-    let query = sb.from("media_library").select("*").limit(1000).eq("type", mediaType);
+    let query = sb.from("media_library").select("*").eq("type", mediaType);
     if (modelName) query = query.eq("model", modelName);
     query
       .order("created_at", { ascending: false })
@@ -37995,16 +38004,37 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           }
           return c;
         });
-        if (!found) return prev; // Unknown conversation — don't touch
+        if (!found) {
+          // Nouvelle conversation détectée via Socket.IO — créer un objet minimal
+          // Sera enrichi au prochain polling 60s avec les données complètes Carlos
+          const newConv = {
+            chat_id: chatId,
+            tg_chat_id: chatId,
+            model_id: data.model_id || '',
+            model_name: data.model || data.model_name || '',
+            display_name: msg.sender_name || data.display_name || chatId,
+            username: data.username || '',
+            first_name: msg.sender_name || data.first_name || '',
+            last_message: msg.text || msg.content || '',
+            last_message_text: msg.text || msg.content || '',
+            last_message_at: msg.created_at || new Date().toISOString(),
+            last_message_direction: msg.direction || 'in',
+            unread_count: isIncoming ? 1 : 0,
+          };
+          const withNew = [newConv, ...prev];
+          _DMSG_CONV_CACHE.list = withNew;
+          _DMSG_CONV_CACHE.ts = Date.now();
+          return withNew;
+        }
         // Re-sort: most recent first
-        return updated.sort((a, b) =>
+        const sorted = updated.sort((a, b) =>
           new Date(b.last_message_at || b.updated_at || 0).getTime() -
           new Date(a.last_message_at || a.updated_at || 0).getTime()
         );
+        _DMSG_CONV_CACHE.list = sorted;
+        _DMSG_CONV_CACHE.ts = Date.now();
+        return sorted;
       });
-
-      // Also update the global cache so loadConversations() doesn't overwrite with stale data
-      _DMSG_CONV_CACHE.ts = 0; // Invalidate cache to force fresh fetch on next load
     };
 
     const onConvUpdated = (data) => {
@@ -38029,14 +38059,32 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           }
           return c;
         });
-        if (!found) return prev;
-        return updated.sort((a, b) =>
+        if (!found) {
+          // Nouvelle conversation via conv_updated — créer objet minimal
+          const newConv = {
+            chat_id: chatId,
+            tg_chat_id: chatId,
+            model_id: data.model_id || '',
+            model_name: data.model || data.model_name || '',
+            display_name: data.display_name || chatId,
+            last_message: data.last_message || '',
+            last_message_text: data.last_message || '',
+            last_message_at: data.last_message_at || new Date().toISOString(),
+            unread_count: data.unread_count || 1,
+          };
+          const withNew = [newConv, ...prev];
+          _DMSG_CONV_CACHE.list = withNew;
+          _DMSG_CONV_CACHE.ts = Date.now();
+          return withNew;
+        }
+        const sorted = updated.sort((a, b) =>
           new Date(b.last_message_at || b.updated_at || 0).getTime() -
           new Date(a.last_message_at || a.updated_at || 0).getTime()
         );
+        _DMSG_CONV_CACHE.list = sorted;
+        _DMSG_CONV_CACHE.ts = Date.now();
+        return sorted;
       });
-
-      _DMSG_CONV_CACHE.ts = 0;
     };
 
     socket.on('message_read', onMessageRead);
@@ -38280,7 +38328,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
       const _assigned = userProfile.assigned_models || [];
       if (_assigned.length > 0) _convSbQuery = _convSbQuery.in("model_id", _assigned);
     }
-    _convSbQuery = _convSbQuery.order("last_message_at", { ascending: false });
+    _convSbQuery = _convSbQuery.order("last_message_at", { ascending: false }).limit(500);
 
     const [_convApiRes, _convSbRes] = await Promise.allSettled([
       _dmsgFetch("/conversations"),
@@ -38528,7 +38576,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             .from("tg_conversations").select("id")
             .eq("tg_chat_id", cid).maybeSingle();
           if (convRow?.id) {
-            const { data: sbMsgs } = await sb.from("tg_messages").select("*").limit(1000)
+            const { data: sbMsgs } = await sb.from("tg_messages").select("*")
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: false })
               .limit(50);
@@ -38537,7 +38585,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               console.log('[MSG-LOAD] Supabase fallback found', sbList.length, 'messages');
               const sbNorm = sbList.map(normalizeMessage).filter(Boolean);
               if (sbNorm.length > 0) {
-                _DMSG_MSG_CACHE[convKey] = { data: sbNorm, ts: Date.now() };
+                _dmsgMsgCacheSet(convKey, sbNorm);
                 if (String(chatIdRef.current) === cid) {
                   setMessages(sbNorm);
                   setMsgOffset(0);
@@ -38562,7 +38610,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
         lastDate: nList[nList.length-1]?.date || nList[nList.length-1]?.created_at || 'N/A',
         lastText: nList[nList.length-1]?.text?.substring(0, 50) || 'N/A'
       });
-      if (nList.length > 0) _DMSG_MSG_CACHE[convKey] = { data: nList, ts: Date.now() };
+      if (nList.length > 0) _dmsgMsgCacheSet(convKey, nList);
       if (isInitial) {
         setMessages(nList);
         setMsgOffset(0);
@@ -38606,7 +38654,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             .from("tg_conversations").select("id")
             .eq("tg_chat_id", cid).maybeSingle();
           if (convRow?.id) {
-            const { data } = await sb.from("tg_messages").select("*").limit(1000)
+            const { data } = await sb.from("tg_messages").select("*")
               .eq("conversation_id", convRow.id)
               .order("created_at", { ascending: false })
               .limit(50);
@@ -38617,7 +38665,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
               lastText: list[list.length-1]?.text?.substring(0, 50) || 'N/A',
               lastDate: list[list.length-1]?.date || list[list.length-1]?.created_at || 'N/A'
             });
-            if (list.length > 0) _DMSG_MSG_CACHE[convKey] = { data: list, ts: Date.now() };
+            if (list.length > 0) _dmsgMsgCacheSet(convKey, list);
             // Guard: discard stale Supabase fallback if user switched conversation
             if (String(chatIdRef.current) !== cid) return;
             setMessages(list);
@@ -38989,7 +39037,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
     setPendingMedia(null);
     setSentScriptIds([]);
     setMediaLoading(true);
-    sb.from("media_library").select("*").limit(1000).order("created_at", { ascending: false }).limit(5000)
+    sb.from("media_library").select("*").order("created_at", { ascending: false }).limit(5000)
       .then(({ data, error }) => {
         if (!error) setMediaItems(data || []);
         setMediaLoading(false);
@@ -39130,6 +39178,8 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
           rtBufferRef.current.push(nMsg);
           if (rtTimerRef.current) clearTimeout(rtTimerRef.current);
           const _rtActiveCid = String(activeCid); // Capturer le chatId actuel AVANT le timeout
+          // Premier message = flush rapide (50ms). Messages suivants = batch 200ms.
+          const _rtDelay = rtBufferRef.current.length === 1 ? 50 : 200;
           rtTimerRef.current = setTimeout(() => {
             // Guard: si l'user a changé de conv pendant le debounce, ignorer le batch
             if (String(chatIdRef.current) !== _rtActiveCid) {
@@ -39162,7 +39212,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
             if (!isUserScrollRef.current) {
               setTimeout(() => scrollToBottom('smooth'), 100);
             }
-          }, 500);
+          }, _rtDelay);
         }
       }
       if (nMsg.direction === 'in' || rawMsg.sender_type === 'user') {
@@ -40103,7 +40153,7 @@ const DadashMessagerieTab = ({ user, lang, spenders, models, profiles, txs, init
   // Charger produits au premier ouverture
   React.useEffect(() => {
     if (!showTxModal || txProducts.length > 0) return;
-    sb.from("products").select("*").limit(200).eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
+    sb.from("products").select("*").eq("active", true).order("category").limit(200).then(({ data }) => setTxProducts(data || []));
   }, [showTxModal]);
 
   const txModal = showTxModal && (
@@ -43113,7 +43163,7 @@ const ScriptsAdminTab = ({ user, lang, models }) => {
 
   const loadScripts = useCallback(async () => {
     setLoading(true);
-    const { data, error } = await sb.from("scripts").select("*").limit(500).order("model_id").order("sort_order");
+    const { data, error } = await sb.from("scripts").select("*").order("model_id").order("sort_order").limit(200);
     if (error) addToast((fr ? "Erreur: " : "Error: ") + error.message, "error");
     else setScripts(data || []);
     setLoading(false);
@@ -43364,7 +43414,7 @@ const ScriptBuilder = ({ script, onSave, onClose }) => {
   useEffect(() => {
     if (script.model_id) loadPickerData(script.model_id);
     if (script.media_ids?.length > 0) {
-      sb.from('media_library').select('id, url, name, type, filename, model, created_at, size, category, tags, album_id').in('id', script.media_ids)
+      sb.from('media_library').select('id, url, name, type, filename, model, created_at, size, category, tags, album_id').in('id', script.media_ids).limit(2000)
         .then(({ data }) => setScriptMedias(data || []));
     }
   }, []);
@@ -45335,7 +45385,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
           }
         }
       }
-      q = q.order("last_message_at", { ascending: false });
+      q = q.order("last_message_at", { ascending: false }).limit(500);
       const { data, error } = await q;
       if (error) throw new Error(error.message);
       setConversations(data || []);
@@ -45361,7 +45411,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
     });
     setMsgLoading(true);
     try {
-      const { data, error } = await sb.from("tg_messages").select("*").limit(1000).eq("conversation_id", convId).order("created_at", { ascending: false }).limit(PAGE_SIZE);
+      const { data, error } = await sb.from("tg_messages").select("*").eq("conversation_id", convId).order("created_at", { ascending: false }).limit(PAGE_SIZE);
       if (error) throw new Error(error.message);
       console.log('📊 [MSG-DIAG] Query result:', {
         functionName: 'loadMessages',
@@ -45395,7 +45445,7 @@ const TgMessagerieBetaTab = ({user, lang, spenders, profiles, models, simuOverri
     setLoadingMore(true);
     try {
       const oldestCreatedAt = messages[0].created_at;
-      const { data, error } = await sb.from("tg_messages").select("*").limit(1000).eq("conversation_id", selectedConv.id).lt("created_at", oldestCreatedAt).order("created_at", { ascending: false }).limit(PAGE_SIZE);
+      const { data, error } = await sb.from("tg_messages").select("*").eq("conversation_id", selectedConv.id).lt("created_at", oldestCreatedAt).order("created_at", { ascending: false }).limit(PAGE_SIZE);
       if (error) throw new Error(error.message);
       const newBatch = (data || []).reverse();
       const seen = new Set(messages.map(m => m.id));
@@ -46065,7 +46115,7 @@ const PaiementsPI_Receiver = ({user, lang, profiles}) => {
     setSaving(true);
     try {
       const yr = new Date().getFullYear();
-      const {data:ex} = await sb.from("paiements_internes").select("facture_numero").limit(500).like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
+      const {data:ex} = await sb.from("paiements_internes").select("facture_numero").like("facture_numero",`FAC-${yr}-%`).order("facture_numero",{ascending:false}).limit(1);
       const lastN = ex&&ex.length>0 ? parseInt((ex[0].facture_numero||"").split("-")[2]||"0",10) : 0;
       const facNum = `FAC-${yr}-${String(lastN+1).padStart(4,"0")}`;
       const {error} = await sb.from("paiements_internes").update({
@@ -48392,8 +48442,8 @@ const ModelDashboardTab = ({user, lang}) => {
   useEffect(() => {
     const load = async () => {
       const [tR, pR] = await Promise.all([
-        sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false }),
-        sb.from("model_payments").select("*").eq("model_id", user.id).order("date", { ascending: false }),
+        sb.from("content_tasks").select("*").eq("model_id", user.id).order("created_at", { ascending: false }).limit(200),
+        sb.from("model_payments").select("*").eq("model_id", user.id).order("date", { ascending: false }).limit(200),
       ]);
       setTasks(tR.data || []);
       setPayments(pR.data || []);
@@ -49397,7 +49447,7 @@ const BotsManagementPage = ({ lang, user }) => {
     if (!window.sb) { setError("Supabase non connecté"); setLoading(false); return; }
     setError(null);
     try {
-      const { data, error: err } = await window.sb.from("bot_status").select("*");
+      const { data, error: err } = await window.sb.from("bot_status").select("*").limit(50);
       if (err) { setError(err.message || "Erreur chargement"); setStatusRows([]); }
       else setStatusRows(Array.isArray(data) ? data : []);
     } catch (e) { setError(String(e && e.message) || "Erreur"); setStatusRows([]); }
@@ -49470,7 +49520,7 @@ const BotsManagementPage = ({ lang, user }) => {
     if (!window.sb) { setSessionsError("Supabase non connecté"); setSessionsLoading(false); return; }
     setSessionsError(null);
     try {
-      const { data, error: err } = await window.sb.from("bot_sessions").select("*").limit(500).order("created_at", { ascending: false });
+      const { data, error: err } = await window.sb.from("bot_sessions").select("*").order("created_at", { ascending: false }).limit(200);
       if (err && (err.code === "42P01" || err.code === "PGRST116")) { setSessions([]); }
       else if (err) { setSessionsError(err.message || "Erreur"); setSessions([]); }
       else setSessions(Array.isArray(data) ? data : []);
@@ -49481,7 +49531,7 @@ const BotsManagementPage = ({ lang, user }) => {
   const fetchCamModels = useCallback(async () => {
     if (!window.sb) return;
     try {
-      const { data } = await window.sb.from("models").select("id,name").order("name");
+      const { data } = await window.sb.from("models").select("id,name").order("name").limit(200);
       if (data) setCamModels(dedupModels(data));
     } catch (_) {}
   }, []);
@@ -51207,7 +51257,7 @@ const UserSearchModal = ({open, onClose, lang, user, txs, spenders, onNavigate})
   const {fmtAmount} = useCurrency();
   const fr = lang === "fr";
   const role = user?.role || "chatter";
-  useEffect(() => { if (open && inputRef.current) setTimeout(() => inputRef.current.focus(), 50); }, [open]);
+  useEffect(() => { if (!open || !inputRef.current) return; const _t = setTimeout(() => inputRef.current?.focus(), 50); return () => clearTimeout(_t); }, [open]);
   useEffect(() => { if (!open) setQuery(""); }, [open]);
   useEffect(() => {
     if (!open) return;
@@ -51348,7 +51398,7 @@ const SearchModal = ({open, onClose, lang, user, txs, spenders, profiles, models
   const [query, setQuery] = useState("");
   const inputRef = useRef(null);
   const {fmtAmount, convertAmount} = useCurrency();
-  useEffect(() => { if (open && inputRef.current) setTimeout(() => inputRef.current.focus(), 50); }, [open]);
+  useEffect(() => { if (!open || !inputRef.current) return; const _t = setTimeout(() => inputRef.current?.focus(), 50); return () => clearTimeout(_t); }, [open]);
   useEffect(() => { if (!open) setQuery(""); }, [open]);
   // Close on Escape
   useEffect(() => {
@@ -51919,7 +51969,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
         try {
           const { data: convRow } = await sb.from("tg_conversations").select("id").eq("tg_chat_id", String(chatId)).maybeSingle();
           if (convRow?.id) {
-            const { data } = await sb.from("tg_messages").select("*").limit(1000).eq("conversation_id", convRow.id).order("created_at", { ascending: true });
+            const { data } = await sb.from("tg_messages").select("*").eq("conversation_id", convRow.id).order("created_at", { ascending: true }).limit(200);
             if (mountedRef.current) setMessages(data || []);
           }
         } catch (_) {}
@@ -52230,7 +52280,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
         const { data: lastTxData } = await sb.from("transactions").select("created_at,amount").eq("spender_handle", sp.handle || sp.name).order("created_at", { ascending: false }).limit(1);
         setSpenderLastTx(lastTxData?.[0] || null);
         // Fetch all models this spender has conversations with
-        const { data: spConvs } = await sb.from("conversations").select("model_id").limit(500).eq("spender_id", sp.id);
+        const { data: spConvs } = await sb.from("conversations").select("model_id").eq("spender_id", sp.id).limit(500);
         const uniqueModelIds = [...new Set((spConvs || []).map(c => c.model_id).filter(Boolean))];
         const resolvedModels = uniqueModelIds.map(mid => {
           const m = (models || []).find(mod => mod.id === mid);
@@ -52264,7 +52314,7 @@ const GridConversationCell = ({ chatId, convData, modelId, user, lang, spenders,
     setTxForm({ amount: "", currency: "CHF", product: "", product_id: "", provider_id: "", payment_method: "", note: "" });
     setShowTxModal(true);
     if (txProducts.length === 0) {
-      sb.from("products").select("*").limit(200).eq("active", true).order("category").then(({ data }) => setTxProducts(data || []));
+      sb.from("products").select("*").eq("active", true).order("category").limit(200).then(({ data }) => setTxProducts(data || []));
     }
     try {
       const spId = resolvedSpender?.id || spenderData?.id;
@@ -53765,7 +53815,7 @@ const MCDashboardRedesign = React.memo(({ user, lang, mcTxs, mcChatters, mcSpend
       const chatterIds = [...new Set([...mcChatters.map(c => c.id), user.id])];
       if (!chatterIds.length) { setSoldeManager({ solde: 0, commission_brute: 0, deja_verse: 0 }); return; }
       // Get assigned_at map for post-assignment filtering
-      const {data: _mcLinksForSolde} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", user.id);
+      const {data: _mcLinksForSolde} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", user.id).limit(500);
       const _soldeAssignedMap = {};
       (_mcLinksForSolde||[]).forEach(l => { if (l.chatter_id && l.assigned_at) _soldeAssignedMap[l.chatter_id] = new Date(l.assigned_at).getTime(); });
       const chatterIdsOnly = chatterIds.filter(id => id !== user.id);
@@ -54204,11 +54254,11 @@ const MCCommissionTab = React.memo(({ user, lang, mcTxs, mcChatters, mcCommissio
     try {
       const chatterIds = mcChatters.map(c => c.id);
       const [sent, received, gerantToChat] = await Promise.all([
-        sb.from("paiements_internes").select("*").limit(500).eq("createur_id",user.id).eq("type","chatter_payment").order("created_at",{ascending:false}),
-        sb.from("paiements_internes").select("*").limit(500).eq("destinataire_id",user.id).eq("type","mc_payment").order("created_at",{ascending:false}),
+        sb.from("paiements_internes").select("*").eq("createur_id",user.id).eq("type","chatter_payment").order("created_at",{ascending:false}).limit(1000),
+        sb.from("paiements_internes").select("*").eq("destinataire_id",user.id).eq("type","mc_payment").order("created_at",{ascending:false}).limit(1000),
         // Paiements gérant→chatters du MC (pas créés par le MC)
         chatterIds.length > 0
-          ? sb.from("paiements_internes").select("*").limit(500).in("destinataire_id",chatterIds).in("type",["chatter_payment","commission"]).neq("createur_id",user.id).order("created_at",{ascending:false})
+          ? sb.from("paiements_internes").select("*").in("destinataire_id",chatterIds).in("type",["chatter_payment","commission"]).neq("createur_id",user.id).order("created_at",{ascending:false}).limit(1000)
           : Promise.resolve({ data: [] }),
       ]);
       setMcPaymentsSent(sent.data||[]);
@@ -54849,7 +54899,7 @@ const MCEquipeTab = React.memo(({ user, lang, mcChatters, mcTxs, mcConvs, mcMess
         const loadMcMessages = async (convId) => {
           setMcMsgLoading(true);
           try {
-            const {data} = await sb.from("tg_messages").select("*").limit(1000).eq("conversation_id",convId).order("created_at",{ascending:false}).limit(100);
+            const {data} = await sb.from("tg_messages").select("*").eq("conversation_id",convId).order("created_at",{ascending:false}).limit(100);
             setMcMessages((data||[]).reverse());
           } catch(e) { setMcMessages([]); }
           setMcMsgLoading(false);
@@ -55547,7 +55597,7 @@ const App = () => {
   // ── Load user permissions from user_permissions table ──
   useEffect(() => {
     if (!user || _roleIs(user, "gerant")) { setMyPerms({}); return; }
-    sb.from("user_permissions").select("*").limit(1000).eq("user_id", user.id)
+    sb.from("user_permissions").select("*").eq("user_id", user.id).limit(200)
       .then(({ data }) => {
         const map = {};
         (data || []).forEach(row => {
@@ -56106,9 +56156,9 @@ const App = () => {
       [txR, spR, prR, moR, mcLinksR] = await Promise.race([Promise.all([
         txPromise,
         spPromise,
-        safe(sb.from("profiles").select("id,name,role,commission_pct,commission_rate,assigned_models,active,created_at,updated_at,goal_currency,messaging_permissions,is_active,comm_pct,daily_goal,weekly_goal,billing_company_name,billing_address,billing_siret,billing_vat_number,manager_commission_pct,manager_balance"), "profiles"),
-        safe(sb.from("models").select("id,name,platform,monthly_cost,active,created_at,color,emoji,last_activity_at,message_count_7d,account_status,bio,age,nationality,languages,specialties,avatar_url,personality,schedule,notes_internes"), "models"),
-        safe(sb.from("manager_chatters").select("id,manager_id,chatter_id,assigned_at"), "manager_chatters"),
+        safe(sb.from("profiles").select("id,name,role,commission_pct,commission_rate,assigned_models,active,created_at,updated_at,goal_currency,messaging_permissions,is_active,comm_pct,daily_goal,weekly_goal,billing_company_name,billing_address,billing_siret,billing_vat_number,manager_commission_pct,manager_balance").limit(200), "profiles"),
+        safe(sb.from("models").select("id,name,platform,monthly_cost,active,created_at,color,emoji,last_activity_at,message_count_7d,account_status,bio,age,nationality,languages,specialties,avatar_url,personality,schedule,notes_internes").limit(200), "models"),
+        safe(sb.from("manager_chatters").select("id,manager_id,chatter_id,assigned_at").limit(500), "manager_chatters"),
       ]), _w1Timeout]);
       if (window.PERF) { window.PERF.mark('loadData_wave1_done'); window.PERF.measure('loadData Wave1 (critical)', 'loadData_start'); }
     } catch(e) { console.error("[DATA] loadData Wave1 failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
@@ -56204,7 +56254,7 @@ const App = () => {
           (isChatter || isProvider) ? safe(sb.from("payouts").select("id,user_id,amount,date,status,method,currency,payment_method,notes,created_at,receipt_url,declared_by").eq("user_id", currentUser.id).order("date",{ascending:false}).limit(1000), "payouts") : (isMC || isModele) ? SKIP : safe(sb.from("payouts").select("id,user_id,amount,date,status,method,currency,payment_method,notes,created_at,receipt_url,declared_by").order("date",{ascending:false}).limit(1000), "payouts"),
           (isChatter || isProvider) ? Promise.resolve({data:[]}) : safe(sb.from("expenses").select("id,amount,category,description,date,model_id,created_at,type,paid,currency,assigned_to_id,assigned_to_type").limit(500), "expenses"),
           isChatter ? Promise.resolve({data:[]}) : isProvider ? safe(sb.from("provider_payouts").select("id,provider_id,amount,date,status,method,notes,created_at,declared_by").eq("provider_id", currentUser.id).order("created_at",{ascending:false}).limit(500), "provider_payouts") : (isMC || isModele) ? SKIP : safe(sb.from("provider_payouts").select("id,provider_id,amount,date,status,method,notes,created_at,declared_by").order("created_at",{ascending:false}).limit(500), "provider_payouts"),
-          (isGerant || isChatter || isMC) ? safe(sb.from("products").select("id,model_id,name,icon,category,price_chf,duration_minutes,description,details,active,sort_order").limit(200).order("sort_order").limit(200), "products") : SKIP,
+          (isGerant || isChatter || isMC) ? safe(sb.from("products").select("id,model_id,name,icon,category,price_chf,duration_minutes,description,details,active,sort_order").order("sort_order").limit(200), "products") : SKIP,
           (isGerant) ? safe(sb.from("product_tags").select("id,label,sort_order").order("sort_order").limit(100), "product_tags") : SKIP,
           (isGerant) ? safe(sb.from("model_prices").select("id,model_id,price_level,price_chf,created_at,updated_at").limit(200), "model_prices") : SKIP,
           (isGerant) ? safe(sb.from("model_tasks").select("id,model_id,task,status,due_date,created_at,updated_at,assigned_to,priority").order("created_at",{ascending:false}).limit(500), "model_tasks") : SKIP,
@@ -56299,7 +56349,7 @@ const App = () => {
         } else if (currentUser.role === "chatter") {
           const _assignedM = currentUser.assigned_models || [];
           if (_assignedM.length > 0) {
-            const { data: _uData } = await sb.from("tg_conversations").select("unread_count").in("model_id", _assignedM).gt("unread_count", 0);
+            const { data: _uData } = await sb.from("tg_conversations").select("unread_count").in("model_id", _assignedM).gt("unread_count", 0).limit(500);
             setUnreadMsgTotal((_uData || []).reduce((sum, c) => sum + (c.unread_count || 0), 0));
           }
         }
@@ -56308,7 +56358,7 @@ const App = () => {
       // ── MANAGER CHATTER DATA LOADING ──
       if (currentUser && _roleIs(currentUser, "manager_chatter")) {
         try {
-          const {data: mcLinks} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", currentUser.id);
+          const {data: mcLinks} = await sb.from("manager_chatters").select("chatter_id,assigned_at").eq("manager_id", currentUser.id).limit(500);
           const _mcIds = (mcLinks || []).map(r => r.chatter_id).filter(Boolean);
           setMcChatterIds(_mcIds);
           let mcProfiles = [];
@@ -56318,8 +56368,8 @@ const App = () => {
             const [_mcProfilesR, mcTxR, shiftR, commR] = await Promise.all([
               sb.from("profiles").select("*").in("id", _mcIds),
               new Promise(async r => { await new Promise(s => setTimeout(s, 500)); r(await sb.from("transactions").select("*").in("chatter_id", _allIds).order("date", {ascending: false}).limit(5000)); }),
-              new Promise(async r => { await new Promise(s => setTimeout(s, 1000)); r(await sb.from("chatter_shifts").select("*").eq("manager_id", currentUser.id).order("date", {ascending: false})); }),
-              new Promise(async r => { await new Promise(s => setTimeout(s, 1500)); r(await sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false})); }),
+              new Promise(async r => { await new Promise(s => setTimeout(s, 1000)); r(await sb.from("chatter_shifts").select("*").eq("manager_id", currentUser.id).order("date", {ascending: false}).limit(500)); }),
+              new Promise(async r => { await new Promise(s => setTimeout(s, 1500)); r(await sb.from("manager_commissions").select("*").eq("manager_id", currentUser.id).order("created_at", {ascending: false}).limit(500)); }),
             ]);
             mcProfiles = _mcProfilesR.data || [];
             setMcChatters(mcProfiles);
@@ -56353,7 +56403,7 @@ const App = () => {
             const _allModelIds2 = [...new Set((mcProfiles || []).flatMap(c => c.assigned_models || []).filter(Boolean))];
             if (_allModelIds2.length > 0) {
               try {
-                const {data: convData} = await sb.from("conversations").select("*").limit(500).in("model_id", _allModelIds2).order("updated_at", {ascending: false}).limit(200);
+                const {data: convData} = await sb.from("conversations").select("*").in("model_id", _allModelIds2).order("updated_at", {ascending: false}).limit(200);
                 setMcConvs(convData || []);
                 setMcUnreadConvCount((convData || []).filter(c => (c.unread_count || 0) > 0).length);
               } catch(e2) { setMcConvs([]); }
