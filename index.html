@@ -56788,6 +56788,16 @@ const App = () => {
       } catch (e) { console.warn("[RT] patchSpender error:", e?.message); return null; }
     };
 
+    // ── RBAC: server-side Realtime filters — reduce event noise per role ──
+    const _isGerant = _roleIs(user, "gerant");
+    const _isChatter = _roleIs(user, "chatter");
+    const _isProvider = _roleIs(user, "provider");
+    const _isMC = _roleIs(user, "manager_chatter");
+    // TX filter: gerant gets all, others get scoped
+    const _txFilter = _isChatter ? { filter: "chatter_id=eq." + user.id }
+                    : _isProvider ? { filter: "provider_id=eq." + user.id }
+                    : {};
+
     const channel = sb.channel("dadash-realtime-notifs-" + user.id)
       // Listen for new notifications inserted for this user
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "notifications", filter: "user_id=eq." + user.id }, (payload) => {
@@ -56797,7 +56807,8 @@ const App = () => {
         }
       })
       // ── Transactions INSERT: patch txs state + notification ──
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "transactions" }, (payload) => {
+      // Server-side filter: chatter_id for chatters, provider_id for providers
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "transactions", ..._txFilter }, (payload) => {
         if (!payload.new) return;
         const tx = payload.new;
         if (rtDedup("tx-ins-" + tx.id)) return;
@@ -56814,7 +56825,7 @@ const App = () => {
           setTimeout(() => { try { window.__refetchModalSpender(tx.spender_id); } catch {} }, 350);
         }
         window.__rtLastEvent = Date.now();
-        if (_roleIs(user, "gerant")) {
+        if (_isGerant) {
           const amt = txAmountCHF(tx);
           const notif = { id: "rt-tx-" + Date.now(), type: "tx_created", title: (lang === "fr" ? "Nouvelle TX" : "New TX") + " \u{1F4B0}", message: "@" + (tx.spender_handle || "?") + " — " + fmtAmount(amt), created_at: new Date().toISOString(), read: false, _local: true };
           setNotifications(prev => [notif, ...prev].slice(0, 50));
@@ -56822,7 +56833,7 @@ const App = () => {
         }
       })
       // ── Transactions UPDATE: patch txs state in-place + notification ──
-      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "transactions" }, (payload) => {
+      .on("postgres_changes", { event: "UPDATE", schema: "public", table: "transactions", ..._txFilter }, (payload) => {
         if (!payload.new) return;
         const tx = payload.new;
         if (rtDedup("tx-upd-" + tx.id + "-" + (tx.updated_at || ""))) return;
@@ -56836,7 +56847,7 @@ const App = () => {
           setTimeout(() => { try { window.__refetchModalSpender(tx.spender_id); } catch {} }, 350);
         }
         window.__rtLastEvent = Date.now();
-        if (_roleIs(user, "gerant") && payload.old && tx.status !== payload.old.status) {
+        if (_isGerant && payload.old && tx.status !== payload.old.status) {
           const amt = txAmountCHF(tx);
           const icon = tx.status === "validated" ? "✅" : tx.status === "refused" ? "❌" : "✏️";
           const notif = { id: "rt-txu-" + Date.now(), type: tx.status === "validated" ? "tx_validated" : "tx_modified", title: icon + " TX " + tx.status, message: "@" + (tx.spender_handle || "?") + " — " + fmtAmount(amt), created_at: new Date().toISOString(), read: false, _local: true };
@@ -56900,8 +56911,9 @@ const App = () => {
           setUnreadCount(prev => prev + 1);
         }
       })
-      // PAYMENT SYSTEM — realtime: payment_events UPDATE (gérant sees status changes)
+      // PAYMENT SYSTEM — realtime: payment_events UPDATE (gérant only)
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "payment_events" }, (payload) => {
+        if (!_isGerant) return; // RBAC: only gérant needs payment_events
         if (payload.new) {
           setPaymentEvents(prev => prev.map(e => e.id===payload.new.id ? payload.new : e));
           if (payload.new.status === "paid" && payload.old && payload.old.status !== "paid") {
@@ -56912,8 +56924,9 @@ const App = () => {
           }
         }
       })
-      // PAYMENT SYSTEM — realtime: payment_events INSERT (gérant sees new payments)
+      // PAYMENT SYSTEM — realtime: payment_events INSERT (gérant only)
       .on("postgres_changes", { event: "INSERT", schema: "public", table: "payment_events" }, (payload) => {
+        if (!_isGerant) return; // RBAC: only gérant needs payment_events
         if (payload.new) {
           setPaymentEvents(prev => [payload.new, ...prev].slice(0, 200));
         }
@@ -56981,7 +56994,7 @@ const App = () => {
         window.__rtChannelStatus = status;
       });
     return () => { sb.removeChannel(channel); window.__rtChannelStatus = "CLOSED"; };
-  }, [user?.id, user?.role, lang, convertAmount, fmtAmount]);
+  }, [user?.id, user?.role, lang, fmtAmount]);
 
   /* DB FIX — handleLogin with error resilience */
   /* SAFARI FIX — non-blocking: render app immediately, load data in background */
