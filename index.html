@@ -7821,9 +7821,9 @@ const _fetchSpendersGlobal = async () => {
   const _doFetch = async () => {
     console.log('[SPENDERS_QUERY]', 'direct parallel pages (no count)', { filters: 'NONE' });
     // ── Direct parallel pages — NO count query (saves 8s on cold start) ──
-    // PostgREST max 1000 rows/page. Fire 3 pages blindly (covers up to 3000 spenders).
-    // Empty pages return [] harmlessly. Eliminates the count round-trip.
-    const PAGE = 1000, MAX_PAGES = 3;
+    // PostgREST max 1000 rows/page. Fire 2 pages (covers 2000 spenders, ~79% of 2536).
+    // Reduces concurrent Supabase requests from 7 to 6 in Wave1. Oldest 536 load in Wave2.
+    const PAGE = 1000, MAX_PAGES = 2;
     try {
       const pagePromises = [];
       for (let i = 0; i < MAX_PAGES; i++) {
@@ -56204,14 +56204,24 @@ const App = () => {
       // Cold start: first REST call takes ~5-8s (TLS+auth+PostgREST init)
       // After warm-up, subsequent queries take ~0.3s each
       try { await sb.from("models").select("id").limit(1); } catch(e) { /* ignore warm-up errors */ }
-      const _w1Timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: données critiques non chargées en 30s")), 30000));
+      const _w1Timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout: données critiques non chargées en 45s")), 45000));
 
+      // ── STAGGER: fire small queries first, then heavy ones ──
+      // Reduces peak concurrent Supabase connections from 7 to max 4
+      // Batch 1: profiles + models + mc_links (~0.3s each, 3 requests)
+      [prR, moR, mcLinksR] = await Promise.all([
+        safe(sb.from("profiles").select("id,name,role,commission_pct,commission_rate,assigned_models,active,created_at,updated_at,goal_currency,messaging_permissions,is_active,comm_pct,daily_goal,weekly_goal,billing_company_name,billing_address,billing_siret,billing_vat_number,manager_commission_pct,manager_balance").limit(200), "profiles"),
+        safe(sb.from("models").select("id,name,platform,monthly_cost,active,created_at,color,emoji,last_activity_at,message_count_7d,account_status,bio,age,nationality,languages,specialties,avatar_url,personality,schedule,notes_internes").limit(200), "models"),
+        safe(sb.from("manager_chatters").select("id,manager_id,chatter_id,assigned_at").limit(500), "manager_chatters"),
+      ]);
+
+      // Batch 2: TX + spenders (heavy — 1 TX query + 2 spender pages = 3 requests)
       // RBAC: chatter/provider use scoped API — no global transaction/spender fetch
       const txPromise = isChatter
         ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_chatter")
         : isProvider
         ? safe((async () => { const r = await apiFetchTransactions({ scope }); return { data: r.data, count: r.count, error: null }; })(), "transactions_provider")
-        : safe(sb.from("transactions").select(TX_COLS,{count:"exact"}).order("date",{ascending:false}).limit(5000), "transactions");
+        : safe(sb.from("transactions").select(TX_COLS,{count:"exact"}).order("date",{ascending:false}).limit(500), "transactions");
       // Spenders: deferred for chatter (needs TX first) — providers never see spenders
       const spPromise = isChatter
         ? safe((async () => ({ data: [], error: null }))(), "spenders_chatter_deferred")
@@ -56219,12 +56229,9 @@ const App = () => {
         ? safe((async () => ({ data: [], error: null }))(), "spenders_provider_empty")
         : safe((async () => { const d = await apiFetchSpenders(); return { data: d, error: null }; })(), "spenders");
 
-      [txR, spR, prR, moR, mcLinksR] = await Promise.race([Promise.all([
+      [txR, spR] = await Promise.race([Promise.all([
         txPromise,
         spPromise,
-        safe(sb.from("profiles").select("id,name,role,commission_pct,commission_rate,assigned_models,active,created_at,updated_at,goal_currency,messaging_permissions,is_active,comm_pct,daily_goal,weekly_goal,billing_company_name,billing_address,billing_siret,billing_vat_number,manager_commission_pct,manager_balance").limit(200), "profiles"),
-        safe(sb.from("models").select("id,name,platform,monthly_cost,active,created_at,color,emoji,last_activity_at,message_count_7d,account_status,bio,age,nationality,languages,specialties,avatar_url,personality,schedule,notes_internes").limit(200), "models"),
-        safe(sb.from("manager_chatters").select("id,manager_id,chatter_id,assigned_at").limit(500), "manager_chatters"),
       ]), _w1Timeout]);
       if (window.PERF) { window.PERF.mark('loadData_wave1_done'); window.PERF.measure('loadData Wave1 (critical)', 'loadData_start'); }
     } catch(e) { console.error("[DATA] loadData Wave1 failed:", e.message || e); setLoadError(e.message || "Erreur de chargement"); return; }
@@ -56301,6 +56308,25 @@ const App = () => {
     setManagerChattersData((mcLinksR&&mcLinksR.data)||[]);
     if (window.PERF) { window.PERF.mark('loadData_wave1_setState'); window.PERF.measure('loadData Wave1→setState', 'loadData_start'); }
     console.info("[BOOT] Wave1 complete — UI can render. Launching Wave2 in background...");
+
+    // ── Wave1.5: backfill remaining spenders (page 3 = oldest 536) ──
+    // Wave1 loads 2 pages (2000), this silently loads the rest
+    if (!isChatter && !isProvider) {
+      (async () => {
+        try {
+          const { data: page3 } = await sb.from("spenders").select(SPENDER_COLS).order("updated_at", { ascending: false }).range(2000, 2999);
+          if (page3 && page3.length > 0) {
+            const mapped = page3.map(mapUiToSpender);
+            setSpenders(prev => {
+              const existing = new Map(prev.map(s => [s.id, s]));
+              mapped.forEach(s => { if (!existing.has(s.id)) existing.set(s.id, s); });
+              return Array.from(existing.values());
+            });
+            console.info("[BOOT] Wave1.5 — backfilled " + mapped.length + " older spenders");
+          }
+        } catch (e) { console.warn("[BOOT] Wave1.5 spender backfill failed:", e?.message); }
+      })();
+    }
 
     /* ══════════════════════════════════════════════════════════
      * WAVE 2 — SECONDARY DATA (fire-and-forget, non-blocking)
