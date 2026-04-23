@@ -1,45 +1,60 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
 import { Button } from '@/components/ui/Button';
-
-const ENTRIES = [
-  { d: '23/04', t: 'Réception', lib: 'TX Stripe validées', amt: '+2 840', cur: 'CHF' },
-  { d: '22/04', t: 'Salaire', lib: 'Paie chatters P2 avril', amt: '-3 890', cur: 'CHF' },
-  { d: '22/04', t: 'Marketing', lib: 'Boost Twitter 7j', amt: '-280', cur: 'CHF' },
-  { d: '21/04', t: 'Autre', lib: 'Abo Vercel Pro', amt: '-42', cur: 'CHF' },
-  { d: '20/04', t: 'Réception', lib: 'TX PayPal', amt: '+1 420', cur: 'EUR' },
-  { d: '19/04', t: 'Marketing', lib: 'Pub Reddit', amt: '-180', cur: 'CHF' },
-  { d: '18/04', t: 'Salaire', lib: 'Paie MC Alex P1', amt: '-1 240', cur: 'CHF' },
-  { d: '17/04', t: 'Autre', lib: 'Railway hosting', amt: '-28', cur: 'CHF' },
-];
-
-const CHATTERS = ['Alex', 'Jules', 'Marco', 'Yann', 'Nina', 'Kevin', 'Luca', 'Sam'];
-const FACS = [
-  { n: '2026-042', d: '22/04/2026', dest: 'Karl M.', lib: 'Programme accompagnement digital', amt: '520' },
-  { n: '2026-041', d: '21/04/2026', dest: 'Hans F.', lib: 'Programme accompagnement digital', amt: '300' },
-  { n: '2026-040', d: '20/04/2026', dest: 'Paul O.', lib: 'Services numériques', amt: '180' },
-  { n: '2026-039', d: '18/04/2026', dest: 'Dimitri V.', lib: 'Programme accompagnement digital', amt: '1 200' },
-  { n: '2026-038', d: '15/04/2026', dest: 'Luca R.', lib: 'Abonnement VIP mensuel', amt: '120' },
-];
+import { useTransactions, useTransactionStats, useChatters, useProviders, useModels } from '@/hooks/useDadashData';
 
 type Tab = 'compta' | 'paies' | 'factures' | 'legal';
 
 export function GestionPage() {
   const [tab, setTab] = useState<Tab>('compta');
+  const { data: txs } = useTransactions({ limit: 500, days: 30 });
+  const { data: stats } = useTransactionStats();
+  const { data: chatters } = useChatters();
+  const { data: providers } = useProviders();
+  const { data: models } = useModels();
+  const chatterById = Object.fromEntries((chatters ?? []).map(c => [c.id, c]));
+  const providerById = Object.fromEntries((providers ?? []).map(p => [p.id, p]));
+  const modelById = Object.fromEntries((models ?? []).map(m => [m.id, m]));
+
+  const comptaSummary = useMemo(() => {
+    const validated = (txs ?? []).filter(t => t.status === 'validated');
+    const ca = validated.reduce((a, t) => a + Number(t.amount_chf ?? t.amount ?? 0), 0);
+    const fees = validated.reduce((a, t) => a + Number(t.provider_fee ?? 0), 0);
+    const commissions = validated.reduce((a, t) => a + Number(t.chatter_commission ?? 0), 0);
+    const net = validated.reduce((a, t) => a + Number(t.net_amount_chf ?? t.net_amount ?? 0), 0);
+    return { ca, fees, commissions, net, validated: validated.length };
+  }, [txs]);
+
+  const paiesByChatter = useMemo(() => {
+    const map: Record<string, { name: string; ca: number; commission: number; tx: number; rate: number }> = {};
+    (txs ?? []).filter(t => t.status === 'validated').forEach(t => {
+      if (!t.chatter_id) return;
+      const ch = chatterById[t.chatter_id];
+      if (!ch) return;
+      if (!map[t.chatter_id]) {
+        map[t.chatter_id] = { name: ch.full_name ?? ch.email ?? '—', ca: 0, commission: 0, tx: 0, rate: ch.commission_rate ?? 10 };
+      }
+      map[t.chatter_id].ca += Number(t.amount_chf ?? t.amount ?? 0);
+      map[t.chatter_id].commission += Number(t.chatter_commission ?? 0);
+      map[t.chatter_id].tx += 1;
+    });
+    return map;
+  }, [txs, chatterById]);
+
   return (
     <div className="space-y-5">
       <div className="flex items-end justify-between">
         <div>
-          <div className="mono-tag">FINANCE OPERATIONS</div>
+          <div className="mono-tag">FINANCE OPERATIONS · LIVE DB</div>
           <div className="text-[26px] font-bold mt-1">Gestion agence</div>
-          <div className="text-[12px]" style={{ color: 'var(--color-muted)' }}>Compta 2-clics · paies auto tous les 10j · factures PDF neutres · légal</div>
+          <div className="text-[12px]" style={{ color: 'var(--color-muted)' }}>
+            Compta · paies · factures · légal · data 30 derniers jours
+          </div>
         </div>
         <div className="inline-flex gap-0.5 bg-[var(--color-card-2)] border border-[var(--color-border)] rounded-[10px] p-0.5">
           {(['compta', 'paies', 'factures', 'legal'] as Tab[]).map((t) => (
-            <button key={t} onClick={() => setTab(t)}
-                    className={`px-3 py-1.5 rounded-lg text-[12px] font-semibold ${tab === t ? 'text-white shadow-[0_2px_8px_rgba(99,102,241,0.35)]' : 'text-[var(--color-text-2)]'}`}
-                    style={tab === t ? { background: 'var(--grad-primary)' } : undefined}>
+            <button key={t} onClick={() => setTab(t)} className="px-3 py-1.5 rounded-lg text-[12px] font-semibold" style={tab === t ? { background: 'var(--grad-primary)', color: 'white', boxShadow: '0 2px 8px rgba(99,102,241,0.35)' } : { color: 'var(--color-text-2)' }}>
               {t === 'compta' ? 'Compta' : t === 'paies' ? 'Paies' : t === 'factures' ? 'Factures' : 'Légal'}
             </button>
           ))}
@@ -49,48 +64,51 @@ export function GestionPage() {
       {tab === 'compta' && (
         <>
           <div className="grid grid-cols-4 gap-3">
-            {[
-              { ico: '📢', l: 'Dépense marketing' }, { ico: '💰', l: 'Salaire payé' },
-              { ico: '📥', l: 'Réception' }, { ico: '📦', l: 'Autre' },
-            ].map((a) => (
-              <Card key={a.l} variant="premium" className="p-4 cursor-pointer hover:-translate-y-0.5 transition-transform">
-                <div className="text-[32px]">{a.ico}</div>
-                <div className="text-[14px] font-semibold mt-2">{a.l}</div>
-                <div className="mono-tag mt-1">2 clics</div>
-              </Card>
-            ))}
+            <Card variant="premium" className="p-4"><div className="mono-tag">CA 30J</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1 metallic-anim">{Math.round(comptaSummary.ca).toLocaleString('fr-CH')}</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>CHF · {comptaSummary.validated} TX</div></Card>
+            <Card variant="premium" className="p-4"><div className="mono-tag">FEES PROVIDERS</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1" style={{ color: 'var(--color-danger)' }}>-{Math.round(comptaSummary.fees).toLocaleString('fr-CH')}</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>CHF</div></Card>
+            <Card variant="premium" className="p-4"><div className="mono-tag">COMMISSIONS CHATTERS</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1" style={{ color: 'var(--color-warning)' }}>-{Math.round(comptaSummary.commissions).toLocaleString('fr-CH')}</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>CHF</div></Card>
+            <Card variant="premium" className="p-4"><div className="mono-tag">NET AGENCE</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1" style={{ color: 'var(--color-success)' }}>{Math.round(comptaSummary.net).toLocaleString('fr-CH')}</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>CHF · {comptaSummary.ca > 0 ? Math.round((comptaSummary.net / comptaSummary.ca) * 100) : 0}% marge</div></Card>
           </div>
-          <div className="grid grid-cols-3 gap-4">
-            <Card variant="premium" className="p-4"><div className="mono-tag">CA MOIS</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1 metallic-anim">34 547</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>CHF</div></Card>
-            <Card variant="premium" className="p-4"><div className="mono-tag">DÉPENSES</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1" style={{ color: 'var(--color-danger)' }}>-22 705</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>CHF</div></Card>
-            <Card variant="premium" className="p-4"><div className="mono-tag">MARGE NETTE</div><div className="text-[24px] font-bold font-[var(--font-mono)] mt-1" style={{ color: 'var(--color-success)' }}>+11 842</div><div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>34.3%</div></Card>
-          </div>
+
           <Card variant="premium" className="overflow-hidden p-0">
-            <div className="p-5 flex items-center justify-between border-b" style={{ borderColor: 'var(--color-border)' }}>
-              <div className="text-[15px] font-semibold">Écritures récentes</div>
-              <Button variant="ghost" className="!text-[11px]">⤓ Export XLSX</Button>
+            <div className="p-5 border-b" style={{ borderColor: 'var(--color-border)' }}>
+              <div className="text-[15px] font-semibold">Flux TX · 30 derniers jours</div>
             </div>
-            <table className="w-full">
-              <thead>
-                <tr className="text-left">
-                  {['Date', 'Type', 'Libellé', 'Montant', 'Devise', 'Statut'].map((h) => (
-                    <th key={h} className={`font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)] ${h === 'Montant' ? 'text-right' : ''}`}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {ENTRIES.map((e, i) => (
-                  <tr key={i} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
-                    <td className="px-4 py-[11px] font-[var(--font-mono)] text-[13px]">{e.d}</td>
-                    <td className="px-4 py-[11px] text-[13px]"><Chip tone={e.t === 'Réception' ? 'success' : e.t === 'Salaire' ? 'indigo' : 'muted'}>{e.t}</Chip></td>
-                    <td className="px-4 py-[11px] text-[13px]">{e.lib}</td>
-                    <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold text-[13px]" style={{ color: e.amt.startsWith('+') ? 'var(--color-success)' : 'var(--color-danger)' }}>{e.amt}</td>
-                    <td className="px-4 py-[11px] font-[var(--font-mono)] text-[13px]">{e.cur}</td>
-                    <td className="px-4 py-[11px]"><Chip tone="success">✓</Chip></td>
+            <div className="overflow-x-auto" style={{ maxHeight: 480 }}>
+              <table className="w-full">
+                <thead className="sticky top-0 z-10" style={{ background: 'var(--color-card)' }}>
+                  <tr className="text-left">
+                    {['Date', 'Spender', 'Modèle', 'Chatter', 'Provider', 'Montant', 'Fees', 'Commission', 'Net', 'Statut'].map((h) => (
+                      <th key={h} className={`font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)] ${['Montant', 'Fees', 'Commission', 'Net'].includes(h) ? 'text-right' : ''}`}>{h}</th>
+                    ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(txs ?? []).map((t) => {
+                    const m = t.model_id ? modelById[t.model_id] : null;
+                    const c = t.chatter_id ? chatterById[t.chatter_id] : null;
+                    const p = t.provider_id ? providerById[t.provider_id] : null;
+                    const amt = Number(t.amount_chf ?? t.amount ?? 0);
+                    return (
+                      <tr key={t.id} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
+                        <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">{t.date ? new Date(t.date).toLocaleDateString('fr-CH', { day: '2-digit', month: '2-digit' }) : '—'}</td>
+                        <td className="px-4 py-[11px] text-[13px]" style={{ color: 'var(--color-accent-l)' }}>{t.spender_handle ?? '—'}</td>
+                        <td className="px-4 py-[11px] text-[13px]">{m ? `${m.emoji ?? ''} ${m.name}` : '—'}</td>
+                        <td className="px-4 py-[11px] text-[13px]">{c?.full_name ?? '—'}</td>
+                        <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">{p?.name ?? '—'}</td>
+                        <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold metallic-text text-[13px]">{amt.toLocaleString('fr-CH')}</td>
+                        <td className="px-4 py-[11px] text-right font-[var(--font-mono)] text-[11px]" style={{ color: 'var(--color-danger)' }}>{t.provider_fee ? `-${Number(t.provider_fee).toFixed(2)}` : '—'}</td>
+                        <td className="px-4 py-[11px] text-right font-[var(--font-mono)] text-[11px]" style={{ color: 'var(--color-warning)' }}>{t.chatter_commission ? `-${Number(t.chatter_commission).toFixed(2)}` : '—'}</td>
+                        <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold text-[11px]" style={{ color: 'var(--color-success)' }}>{t.net_amount_chf ? Number(t.net_amount_chf).toFixed(2) : '—'}</td>
+                        <td className="px-4 py-[11px]">
+                          <Chip tone={t.status === 'validated' ? 'success' : t.status === 'pending' ? 'warning' : 'danger'}>{t.status ?? '—'}</Chip>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </Card>
         </>
       )}
@@ -98,56 +116,37 @@ export function GestionPage() {
       {tab === 'paies' && (
         <>
           <Card variant="premium" className="p-5">
-            <div className="mono-tag">PAYROLL SCHEDULE</div>
-            <div className="text-[16px] font-semibold mt-1 mb-3">📅 Calendrier paies · tous les 10 jours</div>
-            <div className="grid grid-cols-3 gap-4">
-              {[
-                { l: 'P1 · J1-J10', d: 'Paie le 11', amt: '4 284 CHF', st: '✓ 2026-04-11', tone: 'success' as const },
-                { l: 'P2 · J11-J20', d: 'Paie le 21', amt: '3 890 CHF', st: '✓ 2026-04-21', tone: 'success' as const },
-                { l: 'P3 · J21-J30', d: 'Paie le 1er mai', amt: '2 148 CHF', st: '⏳ 8j restants', tone: 'warning' as const, highlight: true },
-              ].map((p) => (
-                <div key={p.l} className="p-4 rounded-2xl"
-                     style={{
-                       background: p.highlight ? 'linear-gradient(135deg,rgba(129,140,248,0.08),transparent)' : 'var(--color-card-2)',
-                       border: `1px solid ${p.highlight ? 'var(--color-border-2)' : 'var(--color-border)'}`,
-                     }}>
-                  <div className="mono-tag" style={p.highlight ? { color: 'var(--color-accent-l)' } : undefined}>{p.l}</div>
-                  <div className="text-[16px] font-bold mt-1">{p.d}</div>
-                  <div className={`text-[22px] font-bold font-[var(--font-mono)] mt-2 ${p.highlight ? 'metallic-anim' : 'metallic-text'}`}>{p.amt}</div>
-                  <Chip tone={p.tone} className="mt-2 inline-block">{p.st}</Chip>
-                </div>
-              ))}
-            </div>
-          </Card>
-          <Card variant="premium" className="overflow-hidden p-0">
-            <div className="p-4 border-b" style={{ borderColor: 'var(--color-border)' }}>
-              <div className="text-[14px] font-semibold">Détail · période en cours</div>
-            </div>
+            <div className="mono-tag">PAIES CHATTERS · 30 DERNIERS JOURS</div>
+            <div className="text-[16px] font-semibold mt-1 mb-3">💰 Commissions calculées depuis TX validées</div>
             <table className="w-full">
               <thead>
                 <tr className="text-left">
-                  {['Chatter', 'MC', 'CA', 'Commission', 'Tier', 'Statut'].map((h) => (
-                    <th key={h} className="font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)]">{h}</th>
+                  {['Chatter', 'TX validées', 'CA généré', 'Taux', 'Commission à verser'].map((h) => (
+                    <th key={h} className={`font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)] ${['CA généré', 'Commission à verser'].includes(h) ? 'text-right' : ''}`}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {CHATTERS.map((c, i) => {
-                  const ca = 1400 + i * 450;
-                  const rate = [0.08, 0.12, 0.20][i % 3];
-                  return (
-                    <tr key={c} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
-                      <td className="px-4 py-[11px] text-[13px]">{c}</td>
-                      <td className="px-4 py-[11px] text-[11px]">Alex (MC)</td>
-                      <td className="px-4 py-[11px] text-right font-[var(--font-mono)] text-[13px]">{ca}</td>
-                      <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold metallic-text text-[13px]">{Math.round(ca * rate)}</td>
-                      <td className="px-4 py-[11px] text-right"><Chip tone="indigo">T{(i % 3) + 1} {Math.round(rate * 100)}%</Chip></td>
-                      <td className="px-4 py-[11px]"><Chip tone="warning">En cours</Chip></td>
-                    </tr>
-                  );
-                })}
+                {Object.entries(paiesByChatter).map(([cid, p]) => (
+                  <tr key={cid} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
+                    <td className="px-4 py-[11px] text-[13px] font-semibold">{p.name}</td>
+                    <td className="px-4 py-[11px] text-[13px]">{p.tx}</td>
+                    <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold metallic-text text-[13px]">{Math.round(p.ca).toLocaleString('fr-CH')} CHF</td>
+                    <td className="px-4 py-[11px] text-right"><Chip tone="indigo">{p.rate}%</Chip></td>
+                    <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold text-[14px]" style={{ color: 'var(--color-success)' }}>{Math.round(p.commission).toLocaleString('fr-CH')} CHF</td>
+                  </tr>
+                ))}
+                {Object.keys(paiesByChatter).length === 0 && (
+                  <tr><td colSpan={5} className="p-8 text-center text-[12px]" style={{ color: 'var(--color-muted)' }}>Aucune TX validée avec commission chatter sur 30j</td></tr>
+                )}
               </tbody>
             </table>
+            <div className="mt-4 p-3 rounded-xl flex items-center justify-between" style={{ background: 'linear-gradient(135deg,rgba(129,140,248,0.08),transparent)', border: '1px solid var(--color-border-2)' }}>
+              <span className="text-[13px] font-semibold">Total à verser</span>
+              <span className="text-[22px] font-bold font-[var(--font-mono)] metallic-anim">
+                {Math.round(Object.values(paiesByChatter).reduce((a, p) => a + p.commission, 0)).toLocaleString('fr-CH')} CHF
+              </span>
+            </div>
           </Card>
         </>
       )}
@@ -156,33 +155,35 @@ export function GestionPage() {
         <Card variant="premium" className="overflow-hidden p-0">
           <div className="p-5 flex items-center justify-between border-b" style={{ borderColor: 'var(--color-border)' }}>
             <div>
-              <div className="text-[15px] font-semibold">Factures PDF auto</div>
-              <div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>Compliance Suisse · libellés neutres · "Programme accompagnement digital"</div>
+              <div className="text-[15px] font-semibold">Factures TX validées</div>
+              <div className="text-[11px]" style={{ color: 'var(--color-muted)' }}>Auto-générées depuis les TX · libellés neutres</div>
             </div>
             <Button variant="primary">+ Générer facture</Button>
           </div>
-          <table className="w-full">
-            <thead>
-              <tr className="text-left">
-                {['N°', 'Émise', 'Destinataire', 'Libellé', 'Montant', 'Statut', ''].map((h) => (
-                  <th key={h} className={`font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)] ${h === 'Montant' ? 'text-right' : ''}`}>{h}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {FACS.map((f) => (
-                <tr key={f.n} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
-                  <td className="px-4 py-[11px] font-[var(--font-mono)] text-[13px]">#{f.n}</td>
-                  <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">{f.d}</td>
-                  <td className="px-4 py-[11px] font-semibold text-[13px]">{f.dest}</td>
-                  <td className="px-4 py-[11px] text-[11px]" style={{ color: 'var(--color-muted)' }}>{f.lib}</td>
-                  <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold metallic-text text-[13px]">{f.amt} CHF</td>
-                  <td className="px-4 py-[11px]"><Chip tone="success">Payée</Chip></td>
-                  <td className="px-4 py-[11px]"><Button variant="ghost" className="!py-1 !text-[10.5px]">⤓ PDF</Button></td>
+          <div className="overflow-x-auto" style={{ maxHeight: 480 }}>
+            <table className="w-full">
+              <thead className="sticky top-0 z-10" style={{ background: 'var(--color-card)' }}>
+                <tr className="text-left">
+                  {['N°', 'Date', 'Spender', 'Libellé', 'Montant', 'Statut', 'PDF'].map((h) => (
+                    <th key={h} className={`font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)] ${h === 'Montant' ? 'text-right' : ''}`}>{h}</th>
+                  ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {(txs ?? []).filter(t => t.status === 'validated').slice(0, 50).map((t, i) => (
+                  <tr key={t.id} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
+                    <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">#F-{String(i + 1).padStart(5, '0')}</td>
+                    <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">{t.date ? new Date(t.date).toLocaleDateString('fr-CH') : '—'}</td>
+                    <td className="px-4 py-[11px] font-semibold text-[13px]">{t.spender_handle ?? '—'}</td>
+                    <td className="px-4 py-[11px] text-[11px]" style={{ color: 'var(--color-muted)' }}>Programme accompagnement digital</td>
+                    <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold metallic-text text-[13px]">{Number(t.amount_chf ?? t.amount ?? 0).toLocaleString('fr-CH')} CHF</td>
+                    <td className="px-4 py-[11px]"><Chip tone="success">Payée</Chip></td>
+                    <td className="px-4 py-[11px]">{t.invoice_url ? <Button variant="ghost" className="!py-1 !text-[10.5px]" onClick={() => window.open(t.invoice_url!, '_blank')}>⤓ PDF</Button> : <Chip tone="muted">—</Chip>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </Card>
       )}
 
@@ -192,39 +193,29 @@ export function GestionPage() {
             <div className="mono-tag">DOCUMENTS AGENCE</div>
             <div className="text-[15px] font-semibold mt-1 mb-3">📜 Corpus juridique</div>
             <div className="space-y-2 text-[12.5px]">
-              {[
-                { l: 'Avenant chatter · screen mirror consentement', tone: 'warning' as const, st: 'Draft' },
-                { l: 'Contrat type modèle', tone: 'success' as const, st: 'Signé' },
-                { l: 'RGPD Suisse · rétention', tone: 'success' as const, st: 'Validé' },
-                { l: 'CGU SaaS multi-tenant', tone: 'muted' as const, st: 'À faire' },
-              ].map((d) => (
-                <div key={d.l} className="p-3 rounded-xl flex items-center justify-between" style={{ background: 'var(--color-card-2)' }}>
-                  <span>{d.l}</span>
-                  <Chip tone={d.tone}>{d.st}</Chip>
-                </div>
-              ))}
+              <div className="p-3 rounded-xl flex items-center justify-between" style={{ background: 'var(--color-card-2)' }}><span>Avenant chatter · screen mirror consentement</span><Chip tone="warning">Draft</Chip></div>
+              <div className="p-3 rounded-xl flex items-center justify-between" style={{ background: 'var(--color-card-2)' }}><span>Contrat type modèle</span><Chip tone="success">Signé</Chip></div>
+              <div className="p-3 rounded-xl flex items-center justify-between" style={{ background: 'var(--color-card-2)' }}><span>RGPD Suisse · rétention</span><Chip tone="success">Validé</Chip></div>
+              <div className="p-3 rounded-xl flex items-center justify-between" style={{ background: 'var(--color-card-2)' }}><span>CGU SaaS multi-tenant</span><Chip tone="muted">À faire</Chip></div>
             </div>
           </Card>
           <Card variant="premium" className="p-5">
             <div className="mono-tag">COMPLIANCE SUISSE</div>
             <div className="text-[15px] font-semibold mt-1 mb-3">🇨🇭 Conformité</div>
             <div className="space-y-2 text-[12.5px]">
-              {[
-                ['TVA enregistrement', 'success', '✓'],
-                ['Registre du commerce', 'success', '✓'],
-                ['Libellés factures neutres', 'success', '✓'],
-                ['FX CHF/EUR sync live', 'success', '✓'],
-                ['RGPD consent spender', 'warning', 'partiel'],
-              ].map(([l, tone, st]) => (
-                <div key={l} className="flex items-center justify-between p-2">
-                  <span>{l}</span>
-                  <Chip tone={tone as 'success' | 'warning'}>{st}</Chip>
-                </div>
-              ))}
+              <div className="flex items-center justify-between p-2"><span>TVA enregistrement</span><Chip tone="success">✓</Chip></div>
+              <div className="flex items-center justify-between p-2"><span>Registre du commerce</span><Chip tone="success">✓</Chip></div>
+              <div className="flex items-center justify-between p-2"><span>Libellés factures neutres</span><Chip tone="success">✓</Chip></div>
+              <div className="flex items-center justify-between p-2"><span>RLS Supabase</span><Chip tone="success">128/128</Chip></div>
+              <div className="flex items-center justify-between p-2"><span>pgcrypto tokens</span><Chip tone="success">AES-256</Chip></div>
             </div>
           </Card>
         </div>
       )}
+
+      <div className="text-[10px] text-right" style={{ color: 'var(--color-muted)' }}>
+        Total TX DB: {stats?.total ?? 0} · validées: {stats?.validated ?? 0} · pending: {stats?.pending ?? 0} · CA global: {stats ? Math.round(stats.caBrut).toLocaleString('fr-CH') : 0} CHF
+      </div>
     </div>
   );
 }
