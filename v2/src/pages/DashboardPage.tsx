@@ -1,261 +1,179 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Card } from '@/components/ui/Card';
 import { Chip } from '@/components/ui/Chip';
 import { Button } from '@/components/ui/Button';
 import { KpiCard } from '@/components/ui/KpiCard';
 import { PremiumChart } from '@/components/ui/Chart';
+import { useTransactions, useTransactionStats, useSpendersCount, useModels, useChatters, useProviders, useValidateTx, useRefuseTx } from '@/hooks/useDadashData';
 
-type KpiKey = 'ca' | 'tx' | 'spenders' | 'conv' | 'marge';
-
-const PERIODS = ['Auj', '7j', '30j', '90j', 'All', 'Custom'];
-
-const CHART_TITLES: Record<KpiKey, string> = {
-  ca: 'CA cumulé — 30 derniers jours',
-  tx: 'TX validées — 30 derniers jours',
-  spenders: 'Spenders actifs — évolution',
-  conv: 'Conversion msg→TX — 30j',
-  marge: 'Marge nette — 30j',
-};
-
-const LABELS = Array.from({ length: 30 }, (_, i) => `${String(i + 1).padStart(2, '0')}/04`);
-
-function genData(kpi: KpiKey): number[] {
-  const r = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
-  return Array.from({ length: 30 }, () => {
-    if (kpi === 'conv') return +(r(10, 20) + Math.random()).toFixed(1);
-    if (kpi === 'marge') return r(300, 900);
-    if (kpi === 'spenders') return r(1200, 1500);
-    if (kpi === 'tx') return r(10, 30);
-    return r(800, 2400);
-  });
-}
+type KpiKey = 'ca' | 'tx' | 'spenders' | 'pending' | 'aov';
 
 export function DashboardPage() {
   const [selected, setSelected] = useState<KpiKey>('ca');
-  const [data, setData] = useState<number[]>(() => genData('ca'));
-  const [chartType, setChartType] = useState<'line' | 'bar'>('line');
+  const { data: stats } = useTransactionStats();
+  const { data: spCount } = useSpendersCount();
+  const { data: recentTx } = useTransactions({ limit: 14 });
+  const { data: chartTx } = useTransactions({ days: 30 });
+  const { data: models } = useModels();
+  const { data: chatters } = useChatters();
+  const { data: providers } = useProviders();
+  const validateTx = useValidateTx();
+  const refuseTx = useRefuseTx();
 
-  const onSelect = (k: KpiKey) => {
-    setSelected(k);
-    setData(genData(k));
+  const modelById = useMemo(() => Object.fromEntries((models ?? []).map(m => [m.id, m])), [models]);
+  const chatterById = useMemo(() => Object.fromEntries((chatters ?? []).map(c => [c.id, c])), [chatters]);
+  const providerById = useMemo(() => Object.fromEntries((providers ?? []).map(p => [p.id, p])), [providers]);
+
+  const chartData = useMemo(() => {
+    const days: Record<string, number> = {};
+    const labels: string[] = [];
+    const now = new Date();
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 86400000);
+      const key = d.toISOString().slice(0, 10);
+      days[key] = 0;
+      labels.push(`${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}`);
+    }
+    (chartTx ?? []).forEach(tx => {
+      if (!tx.date) return;
+      const key = new Date(tx.date).toISOString().slice(0, 10);
+      if (key in days) {
+        if (selected === 'ca') days[key] += Number(tx.amount_chf ?? tx.amount ?? 0);
+        else if (selected === 'tx' && tx.status === 'validated') days[key] += 1;
+        else if (selected === 'pending' && tx.status === 'pending') days[key] += 1;
+        else if (selected === 'aov' && tx.status === 'validated') days[key] += Number(tx.amount_chf ?? tx.amount ?? 0);
+      }
+    });
+    return { labels, values: Object.values(days) };
+  }, [chartTx, selected]);
+
+  const chartTitle: Record<KpiKey, string> = {
+    ca: 'CA cumulé — 30 derniers jours',
+    tx: 'TX validées — 30 derniers jours',
+    spenders: 'Spenders actifs',
+    pending: 'TX en attente',
+    aov: 'AOV — 30 derniers jours',
   };
+
+  const caPct = stats && stats.caBrut > 0 ? '+' : '';
+  const pendingCount = stats?.pending ?? 0;
 
   return (
     <div className="space-y-5">
-      {/* HERO DIGEST */}
       <Card variant="hero" className="p-6">
         <div className="flex items-start justify-between mb-4">
           <div>
-            <div className="mono-tag">JEUDI 23 AVRIL 2026 · 09:42 GMT-3 · BRÉSIL</div>
+            <div className="mono-tag">DADASH · DATA LIVE SUPABASE</div>
             <h1 className="text-[26px] font-bold mt-1">
-              Bonjour <span className="metallic-anim">DADA</span>. <span className="font-[var(--font-serif)] italic font-normal text-[var(--color-text-2)]">Voici ton matin.</span>
+              Bonjour <span className="metallic-anim">DADA</span>. <span className="font-[var(--font-serif)] italic font-normal text-[var(--color-text-2)]">Ton matin.</span>
             </h1>
-          </div>
-          <div className="flex items-center gap-2 bg-[var(--color-card-2)] border border-[var(--color-border)] rounded-[10px] p-0.5">
-            {PERIODS.map((p, i) => (
-              <button
-                key={p}
-                className={`px-3 py-1.5 rounded-lg text-[12px] font-semibold ${i === 0 ? 'text-white bg-[var(--grad-primary)] shadow-[0_2px_8px_rgba(99,102,241,0.35)]' : 'text-[var(--color-text-2)] hover:bg-[rgba(129,140,248,0.06)]'}`}
-              >
-                {p}
-              </button>
-            ))}
           </div>
         </div>
         <div className="grid grid-cols-4 gap-3">
-          <DigestTile icon="🔴" label="TX à valider" value="12" tone="danger" action="Valider" />
-          <DigestTile icon="💬" label="Non répondus" value="7" tone="warning" action="Ouvrir" />
-          <DigestTile icon="🟢" label="Chatters live" value="8/15" tone="success" action="Live OPS" />
-          <DigestTile icon="📸" label="Cames live" value="3/9" tone="indigo" action="Cockpit" metallic />
+          <div className="flex items-center gap-3 p-3 rounded-2xl" style={{ background: 'rgba(251,113,133,0.06)', border: '1px solid rgba(251,113,133,0.2)' }}>
+            <div className="text-[22px]">🔴</div>
+            <div className="flex-1">
+              <div className="mono-tag">TX à valider</div>
+              <div className="text-[22px] font-bold font-[var(--font-mono)]" style={{ color: 'var(--color-danger)' }}>{pendingCount}</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 p-3 rounded-2xl" style={{ background: 'rgba(52,211,153,0.06)', border: '1px solid rgba(52,211,153,0.2)' }}>
+            <div className="text-[22px]">✓</div>
+            <div className="flex-1">
+              <div className="mono-tag">TX validées</div>
+              <div className="text-[22px] font-bold font-[var(--font-mono)]" style={{ color: 'var(--color-success)' }}>{stats?.validated ?? 0}</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 p-3 rounded-2xl" style={{ background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.18)' }}>
+            <div className="text-[22px]">✗</div>
+            <div className="flex-1">
+              <div className="mono-tag">TX refusées</div>
+              <div className="text-[22px] font-bold font-[var(--font-mono)]" style={{ color: 'var(--color-warning)' }}>{stats?.refused ?? 0}</div>
+            </div>
+          </div>
+          <div className="flex items-center gap-3 p-3 rounded-2xl" style={{ background: 'rgba(129,140,248,0.06)', border: '1px solid var(--color-border-2)' }}>
+            <div className="text-[22px]">👥</div>
+            <div className="flex-1">
+              <div className="mono-tag">Spenders</div>
+              <div className="text-[22px] font-bold font-[var(--font-mono)] metallic-anim">{spCount ?? 0}</div>
+            </div>
+          </div>
         </div>
       </Card>
 
-      {/* KPIs */}
       <div className="grid grid-cols-5 gap-3">
-        <KpiCard label="CA cumulé" value="34 547" hint="CHF · mois en cours" trend={{ value: '▲ 12.4%' }} selected={selected === 'ca'} onClick={() => onSelect('ca')} metallic />
-        <KpiCard label="TX validées" value="577" hint="AOV 59.87 CHF" trend={{ value: '▲ 8.1%' }} selected={selected === 'tx'} onClick={() => onSelect('tx')} />
-        <KpiCard label="Actifs" value="1 421" hint="🐋 52 · 🦈 8 · 🦍 201" trend={{ value: '2 733', tone: 'indigo' }} selected={selected === 'spenders'} onClick={() => onSelect('spenders')} />
-        <KpiCard label="Conv msg→TX" value="14.3%" hint="Objectif 18%" trend={{ value: '▼ 1.2%', tone: 'warning' }} selected={selected === 'conv'} onClick={() => onSelect('conv')} />
-        <KpiCard label="Marge nette" value="11 842" hint="CHF · +3.2%" trend={{ value: '34.3%' }} selected={selected === 'marge'} onClick={() => onSelect('marge')} metallic />
+        <KpiCard label="CA cumulé" value={stats ? Math.round(stats.caBrut).toLocaleString('fr-CH') : '…'} hint="CHF · total validées" trend={{ value: caPct + ((stats?.caBrut ?? 0) > 0 ? 'live' : '—') }} selected={selected === 'ca'} onClick={() => setSelected('ca')} metallic />
+        <KpiCard label="TX validées" value={stats?.validated ?? 0} hint={`AOV ${stats ? Math.round(stats.aov) : 0} CHF`} selected={selected === 'tx'} onClick={() => setSelected('tx')} />
+        <KpiCard label="Spenders" value={spCount ?? 0} hint="total DB" trend={{ value: 'live', tone: 'indigo' }} selected={selected === 'spenders'} onClick={() => setSelected('spenders')} />
+        <KpiCard label="TX pending" value={pendingCount} hint="à valider" trend={{ value: pendingCount > 0 ? 'à traiter' : 'OK', tone: pendingCount > 0 ? 'warning' : 'success' }} selected={selected === 'pending'} onClick={() => setSelected('pending')} />
+        <KpiCard label="AOV" value={stats ? Math.round(stats.aov) : 0} hint="CHF · panier moyen" selected={selected === 'aov'} onClick={() => setSelected('aov')} metallic />
       </div>
 
-      {/* CHART + INSIGHTS */}
-      <div className="grid grid-cols-[1fr_340px] gap-5">
-        <Card variant="premium" className="p-5">
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <div className="mono-tag">PERFORMANCE</div>
-              <div className="text-[16px] font-semibold mt-0.5">{CHART_TITLES[selected]}</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="inline-flex gap-0.5 bg-[var(--color-card-2)] border border-[var(--color-border)] rounded-[10px] p-0.5">
-                {(['line', 'bar'] as const).map((t) => (
-                  <button
-                    key={t}
-                    onClick={() => setChartType(t)}
-                    className={`px-3 py-1.5 rounded-lg text-[12px] font-semibold ${chartType === t ? 'text-white bg-[var(--grad-primary)]' : 'text-[var(--color-text-2)] hover:bg-[rgba(129,140,248,0.06)]'}`}
-                  >
-                    {t === 'line' ? 'Courbe' : 'Barres'}
-                  </button>
-                ))}
-              </div>
-              <Button variant="ghost" className="text-[11px]">⤓ Export</Button>
-            </div>
+      <Card variant="premium" className="p-5">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <div className="mono-tag">PERFORMANCE</div>
+            <div className="text-[16px] font-semibold mt-0.5">{chartTitle[selected]}</div>
           </div>
-          <div className="h-[280px]">
-            <PremiumChart type={chartType} labels={LABELS} data={data} unit={selected === 'conv' ? '%' : 'CHF'} />
-          </div>
-        </Card>
-
-        <div className="space-y-4">
-          <Card variant="default" className="p-4 border-[var(--color-border-2)] bg-[linear-gradient(135deg,rgba(129,140,248,0.08),rgba(99,102,241,0.02))]">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="w-6 h-6 rounded-lg flex items-center justify-center font-bold text-[11px] bg-[var(--metallic)] text-[#0a0d18]">J</div>
-              <span className="text-[12.5px] font-semibold">JIM · insight du jour</span>
-              <Chip tone="indigo" className="text-[9px]!">OPUS 4.6</Chip>
-            </div>
-            <div className="text-[12.5px] text-[var(--color-text-2)] leading-[1.55]">
-              Conv en baisse de 1.2% sur 7j. 3 chatters en dessous du seuil qualité (Marco, Kevin, Luca). Briefing équipe recommandé.
-            </div>
-          </Card>
-
-          <Card variant="premium" className="p-4">
-            <div className="mono-tag mb-2">BREAKDOWN COMMISSIONS · MOIS</div>
-            <div className="space-y-3 text-[12px]">
-              <ProgressRow label="DADASH · 12%" value="4 145 CHF" pct={12} metallic />
-              <ProgressRow label="MC · 25%" value="8 636 CHF" pct={25} />
-              <ProgressRow label="Chatters · ~11%" value="3 800 CHF" pct={11} />
-              <ProgressRow label="Modèles · reversées" value="5 295 CHF" pct={15.3} />
-              <div className="h-px my-2 bg-[var(--color-border)]" />
-              <div className="flex justify-between pt-1 text-[13px]">
-                <span className="font-semibold">Marge nette</span>
-                <span className="font-[var(--font-mono)] font-bold metallic-anim">11 842 CHF</span>
-              </div>
-            </div>
-          </Card>
         </div>
-      </div>
+        <div className="h-[280px]">
+          <PremiumChart type="line" labels={chartData.labels} data={chartData.values} unit={selected === 'tx' || selected === 'pending' ? '' : 'CHF'} />
+        </div>
+      </Card>
 
-      {/* TX RÉCENTES */}
       <Card variant="premium" className="p-0">
-        <div className="p-5 flex items-center justify-between border-b border-[var(--color-border)]">
+        <div className="p-5 flex items-center justify-between border-b" style={{ borderColor: 'var(--color-border)' }}>
           <div>
             <div className="mono-tag">TRANSACTIONS RÉCENTES</div>
-            <div className="text-[16px] font-semibold mt-0.5">Dernière heure · 14 TX</div>
+            <div className="text-[16px] font-semibold mt-0.5">{(recentTx ?? []).length} dernières TX</div>
           </div>
-          <div className="flex items-center gap-2">
-            <Chip tone="danger" className="pulse-red">12 EN ATTENTE</Chip>
-            <Button variant="primary">+ Nouvelle TX</Button>
-          </div>
+          {pendingCount > 0 && <Chip tone="danger" className="pulse-red">{pendingCount} EN ATTENTE</Chip>}
         </div>
-        <TxTable />
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr className="text-left">
+                {['Date', 'Spender', 'Modèle', 'Chatter', 'Provider', 'Montant', 'Statut', 'Actions'].map((h) => (
+                  <th key={h} className={`font-[var(--font-mono)] text-[10px] uppercase tracking-wider font-semibold px-4 py-3 border-b border-[var(--color-border)] text-[var(--color-muted)] ${h === 'Montant' ? 'text-right' : ''} ${h === 'Statut' ? 'text-center' : ''} ${h === 'Actions' ? 'text-right pr-4' : ''}`}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {(recentTx ?? []).map((tx) => {
+                const model = tx.model_id ? modelById[tx.model_id] : null;
+                const chatter = tx.chatter_id ? chatterById[tx.chatter_id] : null;
+                const provider = tx.provider_id ? providerById[tx.provider_id] : null;
+                const st = tx.status;
+                const amt = Number(tx.amount_chf ?? tx.amount ?? 0);
+                return (
+                  <tr key={tx.id} className="hover:bg-[rgba(129,140,248,0.03)] border-b" style={{ borderColor: 'rgba(129,140,248,0.06)' }}>
+                    <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">{tx.date ? new Date(tx.date).toLocaleDateString('fr-CH', { day: '2-digit', month: '2-digit' }) + ' ' + new Date(tx.date).toLocaleTimeString('fr-CH', { hour: '2-digit', minute: '2-digit' }) : '—'}</td>
+                    <td className="px-4 py-[11px] text-[13px]" style={{ color: 'var(--color-accent-l)' }}>{tx.spender_handle ?? '—'}</td>
+                    <td className="px-4 py-[11px] text-[13px]">{model ? `${model.emoji ?? '✨'} ${model.name}` : '—'}</td>
+                    <td className="px-4 py-[11px] text-[13px]">{chatter?.full_name ?? '—'}</td>
+                    <td className="px-4 py-[11px] font-[var(--font-mono)] text-[11px]">{provider?.name ?? '—'}</td>
+                    <td className="px-4 py-[11px] text-right font-[var(--font-mono)] font-bold metallic-text text-[13px]">{amt.toLocaleString('fr-CH')} {tx.currency ?? 'CHF'}</td>
+                    <td className="px-4 py-[11px] text-center">
+                      {st === 'validated' && <Chip tone="success">Validée</Chip>}
+                      {st === 'pending' && <Chip tone="warning">En attente</Chip>}
+                      {(st === 'refused' || st === 'cancelled') && <Chip tone="danger">Refusée</Chip>}
+                      {st && !['validated', 'pending', 'refused', 'cancelled'].includes(st) && <Chip tone="muted">{st}</Chip>}
+                    </td>
+                    <td className="px-4 py-[11px] text-right pr-4">
+                      {st === 'pending' ? (
+                        <>
+                          <Button variant="ghost" className="!py-1 !px-2 !text-[10px] mr-1" onClick={() => validateTx.mutate(tx.id)} disabled={validateTx.isPending}>✓ Valider</Button>
+                          <Button variant="ghost" className="!py-1 !px-2 !text-[10px]" onClick={() => refuseTx.mutate({ id: tx.id })} disabled={refuseTx.isPending}>✗ Refuser</Button>
+                        </>
+                      ) : <span className="text-[10px] text-[var(--color-muted)]">—</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </Card>
-    </div>
-  );
-}
-
-function DigestTile({ icon, label, value, tone, action, metallic }: { icon: string; label: string; value: string; tone: 'danger' | 'warning' | 'success' | 'indigo'; action: string; metallic?: boolean }) {
-  const bg: Record<typeof tone, string> = {
-    danger: 'bg-[rgba(251,113,133,0.06)] border-[rgba(251,113,133,0.2)]',
-    warning: 'bg-[rgba(251,191,36,0.06)] border-[rgba(251,191,36,0.18)]',
-    success: 'bg-[rgba(52,211,153,0.06)] border-[rgba(52,211,153,0.2)]',
-    indigo: 'bg-[rgba(129,140,248,0.06)] border-[var(--color-border-2)]',
-  };
-  const text: Record<typeof tone, string> = {
-    danger: 'text-[var(--color-danger)]',
-    warning: 'text-[var(--color-warning)]',
-    success: 'text-[var(--color-success)]',
-    indigo: 'text-[var(--color-accent-l)]',
-  };
-  return (
-    <div className={`flex items-center gap-3 p-3 rounded-2xl border ${bg[tone]}`}>
-      <div className="text-[22px]">{icon}</div>
-      <div className="flex-1">
-        <div className="mono-tag">{label}</div>
-        <div className={`text-[22px] font-bold font-[var(--font-mono)] ${metallic ? 'metallic-anim' : text[tone]}`}>{value}</div>
-      </div>
-      <Button variant="ghost" className="text-[11px]! py-1.5!">{action}</Button>
-    </div>
-  );
-}
-
-function ProgressRow({ label, value, pct, metallic }: { label: string; value: string; pct: number; metallic?: boolean }) {
-  return (
-    <div>
-      <div className="flex justify-between">
-        <span className="text-[var(--color-muted)]">{label}</span>
-        <span className={`font-[var(--font-mono)] font-bold ${metallic ? 'metallic-text' : ''}`}>{value}</span>
-      </div>
-      <div className="h-1.5 mt-1 rounded bg-[var(--color-card-2)] overflow-hidden">
-        <div className="h-full bg-[var(--grad-primary)]" style={{ width: `${pct}%` }} />
-      </div>
-    </div>
-  );
-}
-
-const TX_SAMPLE = Array.from({ length: 14 }, (_, i) => {
-  const names = ['Karl M.', 'Hans F.', 'Dimitri V.', 'Paul O.', 'Luca R.', 'Max W.', 'Antoine L.', 'Miguel S.', 'Oleg R.', 'Jamal K.', 'Franz B.', 'Sebastian Z.', 'Pierre G.', 'Tomas K.'];
-  const models = ['Sophie', 'Carla', 'Bella', 'Nadia', 'Lea', 'Alice'];
-  const chatters = ['Alex', 'Jules', 'Marco', 'Nina', 'Kevin'];
-  const providers = ['Stripe', 'PayPal', 'Revolut', 'Wise', 'Binance', 'Twint'];
-  const statuses: Array<'validated' | 'pending' | 'refused'> = ['validated', 'validated', 'pending', 'validated', 'pending'];
-  return {
-    id: 14500 - i,
-    time: `23/04 ${String(9 + Math.floor(i / 3)).padStart(2, '0')}:${String((i * 7) % 60).padStart(2, '0')}`,
-    spender: names[i % names.length],
-    model: models[i % models.length],
-    chatter: chatters[i % chatters.length],
-    provider: providers[i % providers.length],
-    amount: 50 + Math.floor(Math.random() * 1150),
-    currency: Math.random() > 0.6 ? 'EUR' : 'CHF',
-    status: statuses[i % statuses.length],
-  };
-});
-
-function TxTable() {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-[12px]">
-        <thead className="text-[var(--color-muted)] border-b border-[var(--color-border)] font-[var(--font-mono)] text-[10px] uppercase tracking-wider">
-          <tr className="text-left">
-            <th className="px-4 py-3 font-semibold">ID</th>
-            <th className="font-semibold">Date</th>
-            <th className="font-semibold">Spender</th>
-            <th className="font-semibold">Modèle</th>
-            <th className="font-semibold">Chatter</th>
-            <th className="font-semibold">Provider</th>
-            <th className="text-right font-semibold">Montant</th>
-            <th className="text-center font-semibold">Statut</th>
-            <th className="text-right font-semibold pr-4">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {TX_SAMPLE.map((t) => (
-            <tr key={t.id} className="hover:bg-[rgba(129,140,248,0.03)] border-b border-[rgba(129,140,248,0.06)]">
-              <td className="px-4 py-2.5 font-[var(--font-mono)] text-[10px] text-[var(--color-muted)]">#{t.id}</td>
-              <td className="font-[var(--font-mono)] text-[11px]">{t.time}</td>
-              <td className="text-[var(--color-accent-l)] cursor-pointer">{t.spender}</td>
-              <td>✨ {t.model}</td>
-              <td>{t.chatter}</td>
-              <td className="font-[var(--font-mono)] text-[11px]">{t.provider}</td>
-              <td className="text-right font-[var(--font-mono)] font-bold metallic-text">{t.amount} {t.currency}</td>
-              <td className="text-center">
-                {t.status === 'pending' ? <Chip tone="warning">En attente</Chip> : t.status === 'refused' ? <Chip tone="danger">Refusée</Chip> : <Chip tone="success">Validée</Chip>}
-              </td>
-              <td className="text-right pr-4">
-                {t.status === 'pending' ? (
-                  <>
-                    <button className="text-[10px] px-2 py-1 rounded bg-[rgba(52,211,153,0.08)] text-[var(--color-success)] border border-[rgba(52,211,153,0.22)] mr-1">✓</button>
-                    <button className="text-[10px] px-2 py-1 rounded bg-[rgba(251,113,133,0.08)] text-[var(--color-danger)] border border-[rgba(251,113,133,0.22)]">✗</button>
-                  </>
-                ) : (
-                  <button className="text-[10px] px-2 py-1 rounded bg-[rgba(129,140,248,0.04)] border border-[var(--color-border)] text-[var(--color-text-2)]">Détail</button>
-                )}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
     </div>
   );
 }
