@@ -1,60 +1,47 @@
 import { useEffect, useState } from 'react';
-import { supabase, isDemoMode, type DadashUser, type UserRole } from '@/lib/supabase';
+import { supabase, type DadashUser, type UserRole } from '@/lib/supabase';
 
-const DEMO_USER: DadashUser = {
-  id: 'demo-dada',
-  email: 'martin.delamare@mail.novancia.fr',
-  role: 'admin',
-  name: 'DADA',
-  tenant_id: 'dadash',
-};
+async function loadProfile(userId: string, email: string): Promise<DadashUser | null> {
+  const { data, error } = await supabase.from('profiles').select('id,name,role,active').eq('id', userId).maybeSingle();
+  if (error || !data) {
+    return { id: userId, email, role: 'admin', name: email, tenant_id: 'dadash' };
+  }
+  return {
+    id: data.id,
+    email,
+    role: (data.role ?? 'admin') as UserRole,
+    name: data.name ?? email,
+    tenant_id: 'dadash',
+  };
+}
 
 export function useAuth() {
   const [user, setUser] = useState<DadashUser | null>(null);
   const [loading, setLoading] = useState(true);
+  const [signingIn, setSigningIn] = useState(false);
+  const [signInError, setSignInError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Demo mode : bypass supabase auth entirely, bootstrap DADA admin user
-    if (isDemoMode) {
-      setUser(DEMO_USER);
-      setLoading(false);
-      return;
-    }
-
     let mounted = true;
-    supabase.auth.getSession().then(({ data }) => {
+    supabase.auth.getSession().then(async ({ data }) => {
       if (!mounted) return;
       if (data.session) {
         const u = data.session.user;
-        setUser({
-          id: u.id,
-          email: u.email ?? '',
-          role: (u.user_metadata?.role ?? 'admin') as UserRole,
-          name: u.user_metadata?.name ?? u.email ?? 'User',
-          tenant_id: u.user_metadata?.tenant_id ?? 'default',
-        });
-      } else {
-        // Auth configured but no session yet — fallback to demo user (pas de flow login formel pour l'instant)
-        setUser(DEMO_USER);
+        const profile = await loadProfile(u.id, u.email ?? '');
+        if (mounted) setUser(profile);
       }
       setLoading(false);
     }).catch(() => {
-      if (!mounted) return;
-      // Supabase injoignable → fallback demo
-      setUser(DEMO_USER);
-      setLoading(false);
+      if (mounted) setLoading(false);
     });
 
-    const { data: sub } = supabase.auth.onAuthStateChange((_evt, session) => {
-      if (!session) return; // ne pas écraser le demo user si session null
-      const u = session.user;
-      setUser({
-        id: u.id,
-        email: u.email ?? '',
-        role: (u.user_metadata?.role ?? 'admin') as UserRole,
-        name: u.user_metadata?.name ?? u.email ?? 'User',
-        tenant_id: u.user_metadata?.tenant_id ?? 'default',
-      });
+    const { data: sub } = supabase.auth.onAuthStateChange(async (evt, session) => {
+      if (evt === 'SIGNED_OUT' || !session) {
+        setUser(null);
+        return;
+      }
+      const profile = await loadProfile(session.user.id, session.user.email ?? '');
+      setUser(profile);
     });
 
     return () => {
@@ -63,7 +50,24 @@ export function useAuth() {
     };
   }, []);
 
-  return { user, loading, signOut: () => supabase.auth.signOut() };
+  const signIn = async (email: string, password: string) => {
+    setSigningIn(true);
+    setSignInError(null);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    setSigningIn(false);
+    if (error) {
+      setSignInError(error.message);
+      return false;
+    }
+    return true;
+  };
+
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+  };
+
+  return { user, loading, signIn, signOut, signingIn, signInError };
 }
 
 export function useFeatureFlag(flag: string): boolean {
