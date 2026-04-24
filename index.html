@@ -35584,6 +35584,25 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
   const [scheduledBroadcasts, setScheduledBroadcasts] = useState([]);
   const [showScheduledPanel, setShowScheduledPanel]   = useState(false);
 
+  // ── Real audience counts from tg_conversations DB ──────
+  // (includes spenders who deleted the chat — larger than live Telethon dialogs)
+  const [audienceCounts, setAudienceCounts] = useState({});
+
+  useEffect(() => {
+    const base = (window.TELEGRAM_BOT_URL || "").replace(/\/$/, "");
+    if (!base) return;
+    fetch(`${base}/api/dadacast/audience-counts`)
+      .then(r => r.json())
+      .then(data => { if (data && data.success) setAudienceCounts(data.counts_by_name || {}); })
+      .catch(err => console.warn("[DADACAST] audience-counts fetch failed", err?.message));
+  }, []);
+
+  const getAudienceCount = React.useCallback((modelName) => {
+    if (!modelName) return null;
+    const v = audienceCounts[String(modelName).toLowerCase()];
+    return typeof v === "number" ? v : null;
+  }, [audienceCounts]);
+
   useEffect(() => {
     if (!broadcastModel && models.length > 0) setBroadcastModel(models[0].id);
   }, [models]);
@@ -35747,8 +35766,10 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
 
   const tierCounts = React.useMemo(() => {
     const counts = {};
+    const selectedModelName = models.find(m => m.id === broadcastModel)?.name;
+    const dbAllCount = getAudienceCount(selectedModelName);
     TIERS.forEach(t => {
-      if (t.id === "all") { counts[t.id] = modelConvs.length; return; }
+      if (t.id === "all") { counts[t.id] = dbAllCount ?? modelConvs.length; return; }
       counts[t.id] = modelConvs.filter(c => {
         const cid = String(_dmsgChatId(c) || "");
         const total = convTotalsMap[cid] ?? Number(c.total_spent || 0);
@@ -35756,7 +35777,7 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
       }).length;
     });
     return counts;
-  }, [modelConvs, convTotalsMap]);
+  }, [modelConvs, convTotalsMap, models, broadcastModel, getAudienceCount]);
 
   useEffect(() => {
     if (!broadcastModel) return;
@@ -35976,7 +35997,11 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
   const successRate     = totalRecipients > 0 ? ((totalSent / totalRecipients) * 100).toFixed(1) : "0.0";
 
   const selectedModel = models.find(m => m.id === broadcastModel);
-  const estMinutes = Math.max(1, Math.ceil(selectedConvIds.size * 3.5 / 60));
+  const dbAudience = getAudienceCount(selectedModel?.name);
+  // Show DB audience as "Destinataires" for the "Tous" segment (real count from tg_conversations,
+  // includes spenders who deleted the chat). Sub-segments keep the live selectedConvIds count.
+  const effectiveRecipients = (selectedTier === "all" && dbAudience != null) ? dbAudience : selectedConvIds.size;
+  const estMinutes = Math.max(1, Math.ceil(effectiveRecipients * 3.5 / 60));
   const canSend = (!!broadcastMessage.trim() || !!broadcastMedia) && selectedConvIds.size > 0 && !isSending;
   const card = { background: "rgba(255,255,255,0.03)", padding: "22px 24px", borderRadius: 16, border: "1px solid rgba(255,255,255,0.07)" };
 
@@ -36069,6 +36094,7 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
                 const clr = getModelClr(m.name);
                 const active = broadcastModel === m.id;
                 const convCount = conversations.filter(c => c.model_id === m.id).length;
+                const fansCount = getAudienceCount(m.name) ?? convCount;
                 return (
                   <button key={m.id} onClick={() => { setBroadcastModel(m.id); setSelectedTier("all"); }}
                     style={{ padding: "14px 8px", borderRadius: 10, border: `2px solid ${active ? clr.bg : "rgba(255,255,255,0.07)"}`,
@@ -36080,7 +36106,7 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
                       {getModelMeta(m.name).emoji}
                     </div>
                     <div style={{ fontWeight: 800, fontSize: 13 }}>{m.name}</div>
-                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{convCount} fans</div>
+                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{fansCount} fans</div>
                     {(() => {
                       const mSt = modelsStatus[m.id] || computeLocalModelStatus(m.id);
                       const ws = WARMUP_CONFIG[mSt.status] || WARMUP_CONFIG.cold;
@@ -36140,7 +36166,7 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
             <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
               <span style={{ width: 20, height: 20, borderRadius: "50%", background: "#6366f1", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: "#fff" }}>2</span>
               <span style={{ fontSize: 14, fontWeight: 700 }}>Segmenter l'audience</span>
-              {broadcastModel && <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-tertiary)" }}>{modelConvs.length} fans · {selectedModel?.name}</span>}
+              {broadcastModel && <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-tertiary)" }}>{getAudienceCount(selectedModel?.name) ?? modelConvs.length} fans · {selectedModel?.name}</span>}
             </div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               {TIERS.map(t => {
@@ -36287,7 +36313,7 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
               <div style={{ padding: "12px 10px", background: "rgba(255,255,255,0.03)", borderRadius: 10, textAlign: "center" }}>
                 <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Destinataires</div>
-                <div style={{ fontSize: 26, fontWeight: 800, color: "#6366f1" }}>{selectedConvIds.size}</div>
+                <div style={{ fontSize: 26, fontWeight: 800, color: "#6366f1" }}>{effectiveRecipients}</div>
               </div>
               <div style={{ padding: "12px 10px", background: "rgba(255,255,255,0.03)", borderRadius: 10, textAlign: "center" }}>
                 <div style={{ fontSize: 10, color: "var(--text-tertiary)", fontWeight: 700, textTransform: "uppercase", marginBottom: 3 }}>Durée est.</div>
@@ -36335,7 +36361,7 @@ const DadacastSubpage = React.memo(({ conversations = [], convTotalsMap = {}, mo
                   fontSize: 14, fontWeight: 700, cursor: canSend && !isSending && !scheduledDate ? "pointer" : "not-allowed",
                   boxShadow: canSend && !isSending && !scheduledDate ? "0 4px 16px rgba(99,102,241,0.4)" : "none",
                   transition: "all 0.2s" }}>
-                {isSending ? `⏳ Envoi ${sendProgress?.current || 0}/${sendProgress?.total || 0}…` : `🚀 Envoyer maintenant · ${selectedConvIds.size} fans · ~${estMinutes}min`}
+                {isSending ? `⏳ Envoi ${sendProgress?.current || 0}/${sendProgress?.total || 0}…` : `🚀 Envoyer maintenant · ${effectiveRecipients} fans · ~${estMinutes}min`}
               </button>
 
               <button onClick={() => setShowScheduledPanel(!showScheduledPanel)}
