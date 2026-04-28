@@ -6699,6 +6699,36 @@
       };
     }
 
+    /* ═══ SUPABASE RETRY HELPER — 4 attempts, backoff 250/500/1000/2000ms,
+       per-attempt timeout 4s (Promise.race). Used to harden the initial
+       getSession() against Supabase cold-start latency spikes. ═══ */
+    window.__SB_RETRY_DELAYS = [250, 500, 1000, 2000];
+    window.__SB_RETRY_TIMEOUT_MS = 4000;
+    window.initSupabaseWithRetry = async function(opFactory, label) {
+      var name = label || "supabase_op";
+      var lastErr = null;
+      for (var i = 0; i < window.__SB_RETRY_DELAYS.length; i++) {
+        try {
+          var attemptPromise = Promise.resolve().then(function(){ return opFactory(); });
+          var timeoutPromise = new Promise(function(_, rej){
+            setTimeout(function(){ rej(new Error("Timeout: impossible de joindre Supabase (" + window.__SB_RETRY_TIMEOUT_MS + "ms)")); }, window.__SB_RETRY_TIMEOUT_MS);
+          });
+          var res = await Promise.race([attemptPromise, timeoutPromise]);
+          if (i > 0) console.log("[DADASH] " + name + " ok after " + (i+1) + " attempts");
+          return res;
+        } catch (e) {
+          lastErr = e;
+          var reason = (e && e.message) || String(e);
+          console.warn("[DADASH] " + name + " attempt " + (i+1) + "/" + window.__SB_RETRY_DELAYS.length + " failed: " + reason);
+          if (i < window.__SB_RETRY_DELAYS.length - 1) {
+            await new Promise(function(r){ setTimeout(r, window.__SB_RETRY_DELAYS[i]); });
+          }
+        }
+      }
+      console.error("[DADASH] " + name + " failed after " + window.__SB_RETRY_DELAYS.length + " attempts:", (lastErr && lastErr.message) || lastErr);
+      throw lastErr || new Error("Échec après plusieurs tentatives");
+    };
+
     // ═══ SERVICE WORKER — cache versionné par commit, network-first pour index.html ═══
     window.__swActive = false;
     if ('serviceWorker' in navigator) {
@@ -56833,9 +56863,13 @@ const App = () => {
       try {
         if (signal && signal.aborted) throw new Error("Auth init annulé");
         if (window.PERF) window.PERF.mark('auth_getSession_start');
-        const sessionPromise = sb.auth.getSession();
-        const sessionTimeout = new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout: impossible de joindre Supabase")), 8000));
-        const {data:{session}} = await Promise.race([sessionPromise, sessionTimeout]);
+        const sessionResult = window.initSupabaseWithRetry
+          ? await window.initSupabaseWithRetry(function(){ return sb.auth.getSession(); }, "auth.getSession")
+          : await Promise.race([
+              sb.auth.getSession(),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("Timeout: impossible de joindre Supabase")), 8000))
+            ]);
+        const {data:{session}} = sessionResult;
         if (window.PERF) window.PERF.mark('auth_getSession_done');
         if (signal && signal.aborted) throw new Error("Auth init annulé");
         if(session) {
@@ -57471,7 +57505,15 @@ const App = () => {
   }
   const hash = (typeof window !== "undefined" ? window.location.hash.replace(/^#/, "").split("/")[0] : "") || "";
   const showLoginRoute = hash === "login";
-  if (!user) return <LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} />;
+  /* SUPABASE RETRY — non-blocking top banner shown on the login screen
+     when Supabase init/getSession failed. Login form stays usable. */
+  const _supabaseTopBanner = (loadError && !user) ? (
+    <div style={{position:"fixed",top:0,left:0,right:0,zIndex:9999,padding:"10px 16px",background:"rgba(239,68,68,0.12)",borderBottom:"1px solid rgba(239,68,68,0.25)",display:"flex",alignItems:"center",justifyContent:"center",gap:12,fontSize:13,color:"#EF4444",flexWrap:"wrap"}}>
+      <span>{"⚠️"} Connexion Supabase intermittente — réessayer</span>
+      <button onClick={retryInit} style={{background:"rgba(239,68,68,0.2)",border:"1px solid rgba(239,68,68,0.3)",color:"#EF4444",padding:"4px 12px",borderRadius:6,fontSize:12,cursor:"pointer",fontWeight:600}}>{"\u{1F504}"} Réessayer</button>
+    </div>
+  ) : null;
+  if (!user) return (<>{_supabaseTopBanner}<LoginPage onLogin={handleLogin} lang={lang} setLang={setLang} /></>);
   if (showLoginRoute && user) {
     return (
       <div className="login-wrap">
