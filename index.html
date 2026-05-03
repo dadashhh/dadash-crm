@@ -8832,13 +8832,13 @@ const MiniSparkline = ({data, width=120, height=28, color="var(--accent)"}) => {
 
 // ═══ ROLE ACCESS ═══
 const ROLE_ACCESS = {
-  gerant: ["dashboard","business","equipe","messagerie","compta","bots","scripts","admin"],
-  admin: ["admin"],
+  gerant: ["dashboard","business","equipe","messagerie","whatsapp","compta","bots","scripts","admin"],
+  admin: ["admin","whatsapp"],
   ceo: ["admin"],
   modele: ["model_checklist","model_content","model_tasks","model_payments","model_compta","model_notif"],
-  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","messagerie","chatter_compta","chatter_competition","chatter_scan","chatter_notif"],
+  chatter: ["chatter_dashboard","chatter_transactions","chatter_spenders","messagerie","whatsapp","chatter_compta","chatter_competition","chatter_scan","chatter_notif"],
   provider: ["provider_dashboard","provider_compta","provider_factures","provider_notif"],
-  manager_chatter: ["mc_dashboard","mc_chatters","mc_solde","messagerie"]
+  manager_chatter: ["mc_dashboard","mc_chatters","mc_solde","messagerie","whatsapp"]
 };
 const canSee = (role, page) => (ROLE_ACCESS[role] || []).includes(page);
 // Map tab IDs (ROLE_ACCESS) → feature IDs (user_permissions / DEFAULT_ROLE_PERMISSIONS)
@@ -9046,6 +9046,7 @@ const GERANT_NAV = [
   { id: "business",  icon: "\u{1F4B5}", label: "Business" },
   { id: "equipe",    icon: "\u{1F465}", label: "\u00c9quipe" },
   { id: "messagerie",icon: "\u2709\uFE0F",        label: "Messagerie" },
+  { id: "whatsapp",  icon: "\u{1F4AC}",            label: "WhatsApp" },
   // DISABLED PR8 — will restore later: { id: "compta",    icon: "\u{1F3E6}", label: "Compta" },
   // DISABLED PR8 — will restore later: { id: "bots",      icon: "\u{1F916}", label: "Bots" },
   { id: "gestion",   icon: "\u{1F4CB}", label: "Gestion" },
@@ -22365,7 +22366,7 @@ const SingleInvoiceModal = React.memo(({ tx, open, onClose, onSuccess, lang, mod
                 </div>
               ) : (
                 <>
-                  <div style={{ marginBottom: 12 }}>
+                  <div style={{ marginBottom: isMobile ? 6 : 12 }}>
                     <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.3 }}>
                       {fr ? 'Nom complet' : 'Full name'} <span style={{ color: '#f43f5e' }}>*</span>
                     </label>
@@ -37903,6 +37904,252 @@ const ConversationReaderModal = ({ isOpen, onClose, conversationId, conversation
   );
 };
 
+// ── WhatsApp Messagerie Page (V1) ────────────────────────────────────────────
+const WA_MODELS = [
+  {id:"1a0eb468-292c-4aef-a758-08b78a61a560", name:"Maria"},
+  {id:"d8e06584-2e36-4a2e-a29d-ebda6ac3ee22", name:"Alice"},
+  {id:"11111111-0000-0000-0000-000000000001", name:"Carla"},
+];
+const WA_API_BASE = "https://dadash-v2-web.vercel.app";
+const _waTimeAgo = (ts) => {
+  if (!ts) return "";
+  const diff = (Date.now() - new Date(ts).getTime()) / 1000;
+  if (diff < 60) return Math.floor(diff)+"s";
+  if (diff < 3600) return Math.floor(diff/60)+"m";
+  if (diff < 86400) return Math.floor(diff/3600)+"h";
+  if (diff < 7*86400) return Math.floor(diff/86400)+"j";
+  try { return new Date(ts).toLocaleDateString("fr-CH",{day:"2-digit",month:"2-digit"}); } catch(_) { return ""; }
+};
+
+const WaMessageriePage = ({ user, lang, models = [] }) => {
+  const fr = lang === "fr";
+  const addToast = useToast();
+  const _isMobile = (typeof window !== "undefined") && window.innerWidth < 768;
+  const [selectedModelId, setSelectedModelId] = useState(WA_MODELS[0].id);
+  const [chats, setChats] = useState([]);
+  const [chatsLoading, setChatsLoading] = useState(false);
+  const [selectedChatId, setSelectedChatId] = useState(null);
+  const [selectedChatMeta, setSelectedChatMeta] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [msgLoading, setMsgLoading] = useState(false);
+  const [msgText, setMsgText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [funnel, setFunnel] = useState(null);
+  const [funnelState, setFunnelState] = useState(null);
+  const [modelConfig, setModelConfig] = useState(null);
+  const [mobileView, setMobileView] = useState("list");
+  const threadRef = useRef(null);
+
+  useEffect(() => {
+    let alive = true;
+    setChatsLoading(true);
+    setSelectedChatId(null);
+    setMessages([]);
+    setSelectedChatMeta(null);
+    sb.from("wa_chats_chatter_view")
+      .select("id,model_id,contact_name,display_name,last_message_preview,last_message_at,unread_count,last_message_direction")
+      .eq("model_id", selectedModelId)
+      .order("last_message_at", {ascending:false, nullsFirst:false})
+      .limit(200)
+      .then(({data}) => { if (alive) { setChats(data || []); setChatsLoading(false); } });
+    sb.from("wa_model_config").select("model_id,enforcement_mode,max_outbound_per_day").eq("model_id", selectedModelId).maybeSingle()
+      .then(({data}) => { if (alive) setModelConfig(data || null); });
+    sb.from("wa_redirect_funnels").select("id,steps,max_steps").eq("model_id", selectedModelId).eq("active", true).maybeSingle()
+      .then(({data}) => { if (alive) setFunnel(data || null); });
+    return () => { alive = false; };
+  }, [selectedModelId]);
+
+  useEffect(() => {
+    if (!selectedChatId) { setMessages([]); setFunnelState(null); return; }
+    let alive = true;
+    setMsgLoading(true);
+    sb.from("wa_messages")
+      .select("id,chat_id,direction,text,message_timestamp,ack_status,meta,media_url,media_type")
+      .eq("chat_id", selectedChatId)
+      .order("message_timestamp", {ascending:true})
+      .limit(300)
+      .then(({data}) => {
+        if (!alive) return;
+        setMessages(data || []);
+        setMsgLoading(false);
+        setTimeout(() => { if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight; }, 60);
+      });
+    sb.from("wa_chats").select("id,detected_first_name,contact_name").eq("id", selectedChatId).maybeSingle()
+      .then(({data}) => { if (alive) setSelectedChatMeta(data || null); });
+    sb.from("wa_redirect_state").select("current_step,redirected_to_tg").eq("chat_id", selectedChatId).maybeSingle()
+      .then(({data}) => { if (alive) setFunnelState(data || null); });
+    const channel = sb.channel(`wa_msgs_${selectedChatId}`)
+      .on("postgres_changes", {event:"INSERT", schema:"public", table:"wa_messages", filter:`chat_id=eq.${selectedChatId}`}, (p) => {
+        setMessages(prev => prev.find(m => m.id === p.new.id) ? prev : [...prev, p.new]);
+        setTimeout(() => { if (threadRef.current) threadRef.current.scrollTop = threadRef.current.scrollHeight; }, 60);
+      })
+      .subscribe();
+    return () => { alive = false; sb.removeChannel(channel); };
+  }, [selectedChatId]);
+
+  useEffect(() => { if (selectedChatId && _isMobile) setMobileView("thread"); }, [selectedChatId]);
+
+  const sendMessage = async () => {
+    const text = msgText.trim();
+    if (!text || !selectedChatId || sending) return;
+    setSending(true);
+    try {
+      const { data: { session } } = await sb.auth.getSession();
+      if (!session) { addToast(fr?"Session expirée":"Session expired","error"); setSending(false); return; }
+      const res = await fetch(WA_API_BASE + "/api/whatsapp/send", {
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},
+        body: JSON.stringify({chat_id: selectedChatId, text})
+      });
+      let result = {};
+      try { result = await res.json(); } catch(_) {}
+      if (!res.ok || result.error) {
+        if (result.error === "rate_limit") addToast(fr?"Attends 30s":"Wait 30s","error");
+        else if (result.error === "daily_limit") addToast(fr?"Limite 80 msgs/jour atteinte":"Daily limit reached (80)","error");
+        else addToast((fr?"Erreur: ":"Error: ") + (result.error||res.statusText||"unknown"),"error");
+        return;
+      }
+      if (result.simulated) addToast(fr?"Mode simulation — message non envoyé":"Simulation — not sent","warning");
+      else addToast(fr?"Envoyé":"Sent","success");
+      setMsgText("");
+    } catch(e) {
+      addToast((fr?"Erreur: ":"Error: ") + (e.message||"network"),"error");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const firstName = (selectedChatMeta && selectedChatMeta.detected_first_name) || (selectedChatMeta && selectedChatMeta.contact_name) || "bb";
+  const steps = (funnel && Array.isArray(funnel.steps)) ? funnel.steps : [];
+  const maxSteps = (funnel && funnel.max_steps) || 8;
+  const currentStep = (funnelState && funnelState.current_step) || 1;
+  const stepRaw = steps[currentStep-1] || null;
+  const stepText = stepRaw ? (typeof stepRaw === "string" ? stepRaw : (stepRaw.text || stepRaw.suggestion || stepRaw.body || stepRaw.title || "")) : "";
+  const stepTextSubst = stepText.replace(/\{first_name\}/g, firstName);
+
+  const upsertState = async (patch) => {
+    if (!selectedChatId) return;
+    const payload = {chat_id: selectedChatId, model_id: selectedModelId, funnel_id: funnel ? funnel.id : null, ...patch, updated_at: new Date().toISOString()};
+    const { error } = await sb.from("wa_redirect_state").upsert(payload, {onConflict:"chat_id"});
+    if (error) { addToast((fr?"Erreur: ":"Error: ") + error.message,"error"); return; }
+    const { data } = await sb.from("wa_redirect_state").select("current_step,redirected_to_tg").eq("chat_id", selectedChatId).maybeSingle();
+    setFunnelState(data || null);
+  };
+
+  const copySuggestion = () => {
+    if (!stepTextSubst) return;
+    if (navigator.clipboard) navigator.clipboard.writeText(stepTextSubst).then(() => addToast(fr?"Copié":"Copied","success"), () => addToast(fr?"Erreur copie":"Copy error","error"));
+  };
+
+  const showSimulationBanner = modelConfig && modelConfig.enforcement_mode === "simulation";
+
+  return (
+    <div style={{display:"flex", flexDirection:"column", height:"calc(100vh - 100px)", minHeight:500, border:"1px solid var(--border-subtle)", borderRadius:14, overflow:"hidden", background:"var(--surface)"}}>
+      {showSimulationBanner && (
+        <div style={{padding:"8px 14px", background:"rgba(245,178,11,0.15)", borderBottom:"1px solid rgba(245,178,11,0.4)", color:"#fbbf24", fontSize:12, fontWeight:700, textAlign:"center"}}>
+          ⚠️ {fr?"MODE SIMULATION — aucun message ne sera réellement envoyé":"SIMULATION MODE — no message will be actually sent"}
+        </div>
+      )}
+      <div style={{display:"flex", gap:8, padding:"10px 12px", borderBottom:"1px solid var(--border-subtle)", overflowX:"auto", flexShrink:0}}>
+        {WA_MODELS.map(m => (
+          <button key={m.id} onClick={() => setSelectedModelId(m.id)}
+            style={{padding:"7px 16px", borderRadius:10, border:"1px solid "+(selectedModelId===m.id?"#25D366":"var(--border)"), background:selectedModelId===m.id?"rgba(37,211,102,0.15)":"transparent", color:selectedModelId===m.id?"#34d399":"var(--text)", fontSize:13, fontWeight:700, cursor:"pointer", flexShrink:0}}>
+            {m.name}
+          </button>
+        ))}
+      </div>
+      {_isMobile && (
+        <div style={{display:"flex", borderBottom:"1px solid var(--border-subtle)", flexShrink:0}}>
+          {[["list","💬 "+(fr?"Chats":"Chats")],["thread","📨 "+(fr?"Thread":"Thread")],["funnel","🎯 Funnel"]].map(([k,lbl]) => (
+            <button key={k} onClick={()=>setMobileView(k)} style={{flex:1, padding:"10px 4px", border:"none", background:mobileView===k?"var(--surface-hover)":"transparent", color:mobileView===k?"var(--text)":"var(--text-tertiary)", fontSize:12, fontWeight:700, cursor:"pointer", borderBottom:mobileView===k?"2px solid #25D366":"2px solid transparent"}}>{lbl}</button>
+          ))}
+        </div>
+      )}
+      <div style={{display:"flex", flex:1, minHeight:0, overflow:"hidden"}}>
+        {(!_isMobile || mobileView==="list") && (
+          <div style={{width:_isMobile?"100%":280, borderRight:_isMobile?"none":"1px solid var(--border-subtle)", overflowY:"auto", flexShrink:0, background:"var(--bg)"}}>
+            {chatsLoading && <div style={{padding:18, color:"var(--text-tertiary)", fontSize:12}}>{fr?"Chargement…":"Loading…"}</div>}
+            {!chatsLoading && chats.length === 0 && <div style={{padding:18, color:"var(--text-tertiary)", fontSize:12}}>{fr?"Aucun chat":"No chats"}</div>}
+            {chats.map(c => {
+              const isSel = c.id === selectedChatId;
+              const name = c.contact_name || c.display_name || (fr?"Contact":"Contact");
+              return (
+                <div key={c.id} onClick={()=>setSelectedChatId(c.id)}
+                  style={{padding:"10px 12px", borderBottom:"1px solid var(--border-subtle)", background:isSel?"rgba(37,211,102,0.10)":"transparent", cursor:"pointer", borderLeft:isSel?"3px solid #25D366":"3px solid transparent"}}>
+                  <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:6, marginBottom:3}}>
+                    <div style={{fontSize:13, fontWeight:700, color:"var(--text)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1}}>{name}</div>
+                    <div style={{fontSize:10, color:"var(--text-tertiary)", flexShrink:0}}>{_waTimeAgo(c.last_message_at)}</div>
+                  </div>
+                  <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", gap:6}}>
+                    <div style={{fontSize:12, color:"var(--text-secondary)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", flex:1}}>{c.last_message_preview || "—"}</div>
+                    {c.unread_count > 0 && (<span style={{background:"#25D366", color:"#000", fontSize:10, fontWeight:800, padding:"2px 7px", borderRadius:10, flexShrink:0}}>{c.unread_count > 99 ? "99+" : c.unread_count}</span>)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {(!_isMobile || mobileView==="thread") && (
+          <div style={{flex:1, display:"flex", flexDirection:"column", minWidth:0, background:"var(--bg)"}}>
+            {!selectedChatId && (<div style={{flex:1, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--text-tertiary)", fontSize:13}}>{fr?"Sélectionne un chat":"Select a chat"}</div>)}
+            {selectedChatId && (<>
+              <div ref={threadRef} style={{flex:1, overflowY:"auto", padding:"14px 16px", display:"flex", flexDirection:"column", gap:8}}>
+                {msgLoading && <div style={{color:"var(--text-tertiary)", fontSize:12, textAlign:"center"}}>{fr?"Chargement…":"Loading…"}</div>}
+                {messages.map(m => {
+                  const isOut = m.direction === "outbound";
+                  const isSim = m.meta && (m.meta.simulated === true || m.meta.simulated === "true");
+                  return (
+                    <div key={m.id} style={{display:"flex", justifyContent:isOut?"flex-end":"flex-start"}}>
+                      <div style={{maxWidth:"72%", padding:"8px 12px", borderRadius:14, background:isOut?"rgba(37,211,102,0.18)":"var(--surface)", border:"1px solid "+(isOut?"rgba(37,211,102,0.3)":"var(--border-subtle)"), color:"var(--text)", fontSize:13, lineHeight:1.45, wordBreak:"break-word"}}>
+                        {isSim && <div style={{display:"inline-block", marginRight:6, padding:"1px 6px", borderRadius:6, background:"rgba(245,178,11,0.2)", color:"#fbbf24", fontSize:9, fontWeight:800, textTransform:"uppercase", verticalAlign:"middle"}}>simulé</div>}
+                        {m.text || (m.media_type ? `[${m.media_type}]` : "—")}
+                        <div style={{fontSize:9, color:"var(--text-tertiary)", marginTop:3, textAlign:"right"}}>{_waTimeAgo(m.message_timestamp)}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{padding:"10px 12px", borderTop:"1px solid var(--border-subtle)", background:"var(--surface)"}}>
+                <div style={{display:"flex", gap:8, alignItems:"flex-end"}}>
+                  <textarea value={msgText} onChange={e=>setMsgText(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
+                    placeholder={fr?"Message…":"Message…"} rows={1}
+                    style={{flex:1, padding:"9px 12px", borderRadius:12, border:"1px solid var(--border)", background:"var(--bg)", color:"var(--text)", fontSize:13, resize:"none", maxHeight:120, fontFamily:"'DM Sans',sans-serif", outline:"none"}}/>
+                  <button onClick={sendMessage} disabled={sending || !msgText.trim()}
+                    style={{padding:"9px 18px", borderRadius:12, border:"none", background:sending?"var(--surface)":"#25D366", color:"#000", fontSize:13, fontWeight:800, cursor:(sending||!msgText.trim())?"default":"pointer", opacity:(sending||!msgText.trim())?0.5:1}}>
+                    {sending ? "…" : (fr?"Envoyer":"Send")}
+                  </button>
+                </div>
+              </div>
+            </>)}
+          </div>
+        )}
+        {(!_isMobile || mobileView==="funnel") && selectedChatId && (
+          <div style={{width:_isMobile?"100%":300, borderLeft:_isMobile?"none":"1px solid var(--border-subtle)", overflowY:"auto", flexShrink:0, background:"var(--surface)", padding:14}}>
+            <div style={{fontSize:13, fontWeight:800, color:"var(--text)", marginBottom:8}}>🎯 Funnel TG — {fr?"Étape":"Step"} {currentStep}/{maxSteps}</div>
+            <div style={{display:"flex", gap:3, marginBottom:14}}>
+              {Array.from({length:maxSteps}).map((_,i) => (<div key={i} style={{flex:1, height:5, borderRadius:3, background:i<currentStep?"#25D366":"rgba(255,255,255,0.08)"}}/>))}
+            </div>
+            {!funnel && (<div style={{padding:10, background:"var(--bg)", borderRadius:10, fontSize:12, color:"var(--text-tertiary)", border:"1px dashed var(--border-subtle)"}}>{fr?"Pas de funnel actif pour ce modèle.":"No active funnel for this model."}</div>)}
+            {funnel && (<>
+              <div style={{padding:10, background:"var(--bg)", borderRadius:10, fontSize:12, color:"var(--text)", lineHeight:1.5, marginBottom:10, whiteSpace:"pre-wrap"}}>
+                {stepTextSubst || (fr?"(Pas de texte pour cette étape)":"(No text for this step)")}
+              </div>
+              <div style={{display:"flex", gap:6, flexWrap:"wrap"}}>
+                <button onClick={copySuggestion} disabled={!stepTextSubst} style={{padding:"7px 12px", borderRadius:9, border:"1px solid var(--border)", background:"transparent", color:"var(--text)", fontSize:12, fontWeight:700, cursor:stepTextSubst?"pointer":"default", opacity:stepTextSubst?1:0.4}}>{"📋 "+(fr?"Copier":"Copy")}</button>
+                <button onClick={()=>upsertState({current_step: Math.min(currentStep+1, maxSteps), redirected_to_tg:true, redirected_at: new Date().toISOString()})}
+                  style={{padding:"7px 12px", borderRadius:9, border:"1px solid #25D366", background:"rgba(37,211,102,0.15)", color:"#34d399", fontSize:12, fontWeight:700, cursor:"pointer"}}>✅ {fr?"Redirigé !":"Redirected!"}</button>
+                <button onClick={()=>upsertState({current_step: Math.min(currentStep+1, maxSteps)})}
+                  style={{padding:"7px 12px", borderRadius:9, border:"1px solid var(--border)", background:"transparent", color:"var(--text)", fontSize:12, fontWeight:700, cursor:"pointer"}}>➡️ {fr?"Suite":"Next"}</button>
+              </div>
+            </>)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 // ── Feature flags — DadashMessagerieTab ──────────────────────────────────────
 // Active la virtualisation DOM (react-window) pour les conversations > 200 messages.
 // Passer à true uniquement après avoir chargé react-window via CDN et testé le scroll infini.
@@ -38022,6 +38269,8 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
   const msgInputRef                        = React.useRef("");
   const [mobilePane, setMobilePane]       = useState("list");
   const [showMobileFilters, setShowMobileFilters] = useState(false);
+  const [mobileMoreMenu, setMobileMoreMenu] = useState(false);
+  const [mobileAICollapsed, setMobileAICollapsed] = useState(true);
   const [showScripts, setShowScripts]     = useState(false);
   const [pendingMedia, setPendingMedia] = React.useState(null);
   const [openTabs, setOpenTabs] = React.useState([]);
@@ -38984,7 +39233,8 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
 
   // ── Select conversation ───────────────────────────
   const selectConv = useCallback((conv) => {
-    if (isMobile) setShowMobileFilters(false);
+    // Mobile: close filters + more menu when selecting a conversation
+    if (isMobile) { setShowMobileFilters(false); setMobileMoreMenu(false); }
     if (_DADASH_DEBUG) console.log('📂 [CONV-OPEN] Opening conversation:', {
       subpage: 'DadashMessagerieTab',
       spender: {
@@ -40388,8 +40638,9 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
       display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
       onClick={e => { if (e.target === e.currentTarget) setShowTxModal(false); }}>
       <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)",
-        borderRadius: 16, padding: 24, width: 520, maxWidth: "95vw",
-        maxHeight: "90vh", overflowY: "auto", boxShadow: "var(--shadow-lg)" }}>
+        borderRadius: 16, padding: isMobile ? 16 : 24, width: 520, maxWidth: "95vw",
+        maxHeight: "90vh", overflowY: "auto", boxShadow: "var(--shadow-lg)",
+        ...(isMobile ? { position: "fixed", inset: 0, width: "100%", maxWidth: "100%", height: "100dvh", maxHeight: "100dvh", borderRadius: 0 } : {}) }}>
 
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
@@ -40868,7 +41119,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
       {/* Header — iMessage Premium (3 icons removed per spec) */}
       <div style={{ padding: "18px 16px 12px", borderBottom: convTheme === 'light' ? "1px solid rgba(0,0,0,0.06)" : "1px solid rgba(56,72,120,0.25)", flexShrink: 0, background: convTheme === 'light' ? "rgba(255,255,255,0.8)" : "rgba(13,16,33,0.85)", backdropFilter: convTheme === 'light' ? "blur(16px)" : "blur(30px)" }}>
         <div style={{ marginBottom: 12 }}>
-          <span className="conv-title-gradient" style={{ fontSize: 26, fontWeight: 800, background: convTheme === 'light' ? "linear-gradient(135deg, #1a1a2e, #a855f7)" : "linear-gradient(135deg, #ECF0FA, #a5b4fc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontFamily: "'DM Sans',sans-serif", letterSpacing: "-0.5px" }}>{fr ? "Conversations" : "Conversations"}</span>
+          <span className="conv-title-gradient" style={{ fontSize: isMobile ? 20 : 26, fontWeight: 800, background: convTheme === 'light' ? "linear-gradient(135deg, #1a1a2e, #a855f7)" : "linear-gradient(135deg, #ECF0FA, #a5b4fc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontFamily: "'DM Sans',sans-serif", letterSpacing: "-0.5px" }}>{fr ? "Conversations" : "Conversations"}</span>
         </div>
         {isMobile && (
           <div style={{ display: 'flex', gap: 8, marginBottom: 10, alignItems: 'center' }}>
@@ -40997,6 +41248,36 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
             </div>
           </div>
         )}
+        {/* ═══ MOBILE: Compact search + filter toggle bar ═══ */}
+        {isMobile && (
+          <div className="conv-mobile-filter-bar" style={{ background: convTheme === 'light' ? "rgba(255,255,255,0.9)" : "rgba(13,16,33,0.95)", borderBottom: convTheme === 'light' ? "1px solid rgba(0,0,0,0.06)" : "1px solid rgba(56,72,120,0.15)" }}>
+            <div style={{ flex: 1, position: "relative", minWidth: 0 }}>
+              <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 12, color: '#505D85', pointerEvents: "none" }}>🔍</span>
+              <input type="text" value={searchInput} onChange={e => { setSearchInput(e.target.value); clearTimeout(searchDebounceRef.current); searchDebounceRef.current = setTimeout(() => setSearchQuery(e.target.value), 200); }}
+                placeholder={fr ? "Rechercher..." : "Search..."}
+                style={{ width: '100%', padding: '7px 10px 7px 30px', borderRadius: 8, fontSize: 12, background: convTheme === 'light' ? "rgba(0,0,0,0.04)" : 'rgba(255,255,255,0.03)', border: convTheme === 'light' ? '1px solid rgba(0,0,0,0.08)' : '1px solid rgba(255,255,255,0.06)', color: convTheme === 'light' ? '#1a1a2e' : '#fff', fontFamily: "'Inter',sans-serif", outline: 'none', boxSizing: 'border-box' }}
+              />
+            </div>
+            <button className="conv-mobile-filter-toggle" onClick={() => setShowMobileFilters(p => !p)}
+              style={{ borderColor: showMobileFilters ? 'rgba(99,102,241,0.5)' : undefined, background: showMobileFilters ? 'rgba(99,102,241,0.15)' : undefined }}>
+              🎛️ {showMobileFilters ? '✕' : (fr ? 'Filtres' : 'Filters')}
+              {(filterModels.length > 0 || filterTier !== 'all' || filterLang !== 'all' || showUnreadOnly) && !showMobileFilters && (
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#818cf8', flexShrink: 0 }} />
+              )}
+            </button>
+          </div>
+        )}
+        {/* ═══ MOBILE: Active filter badges (when filters panel closed) ═══ */}
+        {isMobile && !showMobileFilters && (filterModels.length > 0 || filterTier !== 'all' || filterLang !== 'all' || showUnreadOnly) && (
+          <div className="conv-mobile-active-badges">
+            {filterModels.map(mId => { const m = (models || []).find(x => x.id === mId); return m ? <span key={mId} className="conv-mobile-badge" onClick={() => setFilterModels(prev => prev.filter(id => id !== mId))}>{m.name} ✕</span> : null; })}
+            {filterTier !== 'all' && <span className="conv-mobile-badge" onClick={() => setFilterTier('all')}>{filterTier === 'sharks' ? '🦈' : filterTier === 'baleines' ? '🐋' : filterTier === 'gorilles' ? '🦍' : filterTier === 'orangoutan' ? '🦧' : filterTier === 'ouistiti' ? '🐒' : filterTier === 'poissons' ? '🐟' : 'FREE'} ✕</span>}
+            {filterLang !== 'all' && <span className="conv-mobile-badge" onClick={() => setFilterLang('all')}>{filterLang} ✕</span>}
+            {showUnreadOnly && <span className="conv-mobile-badge" style={{ background: 'rgba(239,68,68,0.15)', color: '#fca5a5', borderColor: 'rgba(239,68,68,0.3)' }} onClick={() => setShowUnreadOnly(false)}>Non lus ✕</span>}
+          </div>
+        )}
+        {/* ═══ FILTERS (collapsible on mobile) ═══ */}
+        {(!isMobile || showMobileFilters) && (<>
         {/* ── MODEL GRID 3×2 — colored cards ── */}
         {(!isMobile || showMobileFilters) && (() => {
           const isLight = convTheme === 'light';
@@ -41177,8 +41458,8 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
           );
         })()}
 
-        {/* ── SEARCH ── */}
-        <div style={{ position: "relative" }}>
+        {/* ── SEARCH (hidden on mobile — mobile has its own in compact bar) ── */}
+        <div style={{ position: "relative", display: isMobile ? "none" : "block" }}>
           <span className="conv-search-icon" style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", fontSize: 13, color: '#505D85', pointerEvents: "none" }}>🔍</span>
           <input type="text" className="conv-search-input" value={searchInput} onChange={e => {
             setSearchInput(e.target.value);
@@ -41195,6 +41476,14 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
           />
         </div>
 
+        {/* ═══ MOBILE: Apply button (closes filters) ═══ */}
+        {isMobile && showMobileFilters && (
+          <button onClick={() => setShowMobileFilters(false)}
+            style={{ width: '100%', padding: '10px', borderRadius: 10, border: 'none', background: 'linear-gradient(135deg, #6366f1, #7c3aed)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer', marginTop: 8, fontFamily: "'Inter',sans-serif" }}>
+            {fr ? 'Appliquer' : 'Apply'}
+          </button>
+        )}
+        </>)}
         {/* ── Divider ── */}
         <div style={{ height: 1, background: 'rgba(255,255,255,0.04)', marginTop: 8 }} />
       </div>
@@ -41386,9 +41675,9 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
       ) : (
         <>
           {/* Header — glassmorphism */}
-          <div className="conv-chat-header" style={{ padding: "12px 18px", borderBottom: activeSpender?.is_scammer ? "2px solid #ef4444" : (convTheme === 'light' ? "1px solid rgba(0,0,0,0.06)" : "1px solid rgba(56,72,120,0.25)"), background: activeSpender?.is_scammer ? (convTheme === 'light' ? "rgba(239,68,68,0.08)" : "rgba(239,68,68,0.1)") : (convTheme === 'light' ? "rgba(255,255,255,0.8)" : "rgba(13,16,33,0.85)"), backdropFilter: convTheme === 'light' ? "blur(16px)" : "blur(30px)", display: "flex", alignItems: "center", gap: 12, flexShrink: 0, zIndex: 2 }}>
+          <div className="conv-chat-header" style={{ padding: isMobile ? "8px 12px" : "12px 18px", borderBottom: activeSpender?.is_scammer ? "2px solid #ef4444" : (convTheme === 'light' ? "1px solid rgba(0,0,0,0.06)" : "1px solid rgba(56,72,120,0.25)"), background: activeSpender?.is_scammer ? (convTheme === 'light' ? "rgba(239,68,68,0.08)" : "rgba(239,68,68,0.1)") : (convTheme === 'light' ? "rgba(255,255,255,0.8)" : "rgba(13,16,33,0.85)"), backdropFilter: convTheme === 'light' ? "blur(16px)" : "blur(30px)", display: "flex", alignItems: "center", gap: 12, flexShrink: 0, zIndex: 2 }}>
             {isMobile && (
-              <button onClick={() => setMobilePane("list")} style={{ background: "none", border: "none", color: "#8794BC", cursor: "pointer", fontSize: 18, padding: "0 4px 0 0" }}>←</button>
+              <button onClick={() => { setMobilePane("list"); setMobileMoreMenu(false); }} style={{ background: "none", border: "none", color: "#8794BC", cursor: "pointer", fontSize: 18, padding: "0 4px 0 0" }}>←</button>
             )}
             {(() => {
               const _cModelName = selectedConv?.model_name || getModelName(selectedConv?.model_id, models) || "";
@@ -41416,6 +41705,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                 }
               } else { setScammerTarget(sp); }
             }} size="small" />}
+            {!isMobile && (<>
             <button
               className="conv-hdr-btn"
               onClick={() => setShowMediaGallery(true)}
@@ -41468,6 +41758,46 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
               onMouseLeave={e => { e.currentTarget.style.background = "rgba(139,92,246,0.12)"; }}>
               Récap
             </button>}
+</>)}
+            {/* ═══ MOBILE: More menu (⋯) for Gallery/Fiche/Scammers ═══ */}
+            {isMobile && (
+              <div style={{ position: "relative" }}>
+                <button onClick={() => setMobileMoreMenu(p => !p)}
+                  style={{ background: "none", border: "1px solid " + (convTheme === 'light' ? "rgba(0,0,0,0.1)" : "rgba(56,72,120,0.4)"), color: convTheme === 'light' ? "#666" : "#8794BC", cursor: "pointer", fontSize: 16, padding: "5px 10px", borderRadius: 8, fontWeight: 700 }}>
+                  ⋯
+                </button>
+                {mobileMoreMenu && (
+                  <>
+                    <div style={{ position: "fixed", inset: 0, zIndex: 99 }} onClick={() => setMobileMoreMenu(false)} />
+                    <div className="conv-more-menu">
+                      <button className="conv-more-menu-item" onClick={() => { setShowMediaGallery(true); setMobileMoreMenu(false); }}>
+                        <span>🗂️</span> <span>Galerie</span>
+                      </button>
+                      <button className="conv-more-menu-item" onClick={() => {
+                        const mid = selectedConv?.model_id;
+                        let mdl = mid ? models.find(m => String(m.id) === String(mid)) : null;
+                        if (!mdl) { const modelName = selectedConv?.model_name || getModelName(mid, models) || ""; if (modelName) mdl = models.find(m => (m.name || "").toLowerCase() === modelName.toLowerCase()); }
+                        if (mdl) setMsgPassportModel(mdl);
+                        else if (addToast) addToast("Modèle non trouvé", "error");
+                        setMobileMoreMenu(false);
+                      }}>
+                        <span>📋</span> <span>Fiche modèle</span>
+                      </button>
+                      {(() => { const sc = (spenders || []).filter(s => s.is_scammer === true).length; return sc > 0 ? (
+                        <button className="conv-more-menu-item" style={{ color: '#ef4444' }} onClick={() => { setShowScammerList(true); setMobileMoreMenu(false); }}>
+                          <span>🚨</span> <span>Scammers ({sc})</span>
+                        </button>
+                      ) : null; })()}
+                      {selectedConv && (
+                        <button className="conv-more-menu-item" onClick={() => { setShowRecapIA(true); setMobileMoreMenu(false); }}>
+                          <span>🧠</span> <span>Récap IA</span>
+                        </button>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             <button className="conv-hdr-tx-btn" onClick={() => { setShowTxModal(true); setTxForm({ amount: "", type: "tip", note: "" }); }}
               style={{ padding: "5px 10px", borderRadius: 8, border: "1px solid var(--accent)", background: "rgba(99,102,241,0.12)", color: "var(--accent)", fontSize: 13, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
               + TX
@@ -41781,7 +42111,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
               </div>
             )}
             {!inlineIALoading && inlineIASuggestions.length > 0 && (
-              <div style={{ padding: "8px 12px", display: "flex", flexDirection: "column", gap: 6, background: convTheme === 'light' ? "rgba(139,92,246,0.05)" : "rgba(99,102,241,0.06)", borderBottom: "1px solid rgba(99,102,241,0.12)" }}>
+              <div style={{ padding: "8px 12px", display: "flex", flexDirection: isMobile ? "row" : "column", gap: isMobile ? 8 : 6, overflowX: isMobile ? "auto" : undefined, WebkitOverflowScrolling: isMobile ? "touch" : undefined, background: convTheme === 'light' ? "rgba(139,92,246,0.05)" : "rgba(99,102,241,0.06)", borderBottom: "1px solid rgba(99,102,241,0.12)" }}>
                 {inlineIASuggestions.map((s, i) => {
                   const text = typeof s === 'string' ? s : s.text;
                   const tone = typeof s === 'object' ? s.tone : null;
@@ -41789,7 +42119,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                   return (
                     <button key={i}
                       onClick={() => { msgInputRef.current = text; setMsgInput(text); setInlineIASuggestions([]); setTimeout(() => inputRef.current?.focus(), 50); }}
-                      style={{ textAlign: "left", padding: "10px 14px", background: convTheme === 'light' ? "#fff" : "rgba(255,255,255,0.04)", border: "1px solid " + (convTheme === 'light' ? "rgba(139,92,246,0.2)" : "rgba(99,102,241,0.2)"), borderRadius: 10, cursor: "pointer", fontSize: 13, color: convTheme === 'light' ? "#374151" : "#d1d5db", transition: "all 0.15s", whiteSpace: "pre-wrap", lineHeight: 1.5 }}
+                      style={{ textAlign: "left", padding: "10px 14px", minWidth: isMobile ? 220 : undefined, flexShrink: isMobile ? 0 : undefined, background: convTheme === 'light' ? "#fff" : "rgba(255,255,255,0.04)", border: "1px solid " + (convTheme === 'light' ? "rgba(139,92,246,0.2)" : "rgba(99,102,241,0.2)"), borderRadius: 10, cursor: "pointer", fontSize: 13, color: convTheme === 'light' ? "#374151" : "#d1d5db", transition: "all 0.15s", whiteSpace: "pre-wrap", lineHeight: 1.5 }}
                       onMouseEnter={e => { e.currentTarget.style.background = convTheme === 'light' ? "rgba(139,92,246,0.08)" : "rgba(99,102,241,0.12)"; e.currentTarget.style.borderColor = convTheme === 'light' ? "rgba(139,92,246,0.4)" : "rgba(99,102,241,0.4)"; }}
                       onMouseLeave={e => { e.currentTarget.style.background = convTheme === 'light' ? "#fff" : "rgba(255,255,255,0.04)"; e.currentTarget.style.borderColor = convTheme === 'light' ? "rgba(139,92,246,0.2)" : "rgba(99,102,241,0.2)"; }}
                     >
@@ -41812,7 +42142,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
             )}
 
             <div ref={scriptsRef} style={{ position: "relative" }}>
-              <div style={{ padding: "8px 14px 0", display: "flex", gap: 8, alignItems: "center" }}>
+              <div className={isMobile ? "conv-mobile-quick-row" : ""} style={{ padding: isMobile ? "6px 10px 0" : "8px 14px 0", display: "flex", gap: isMobile ? 6 : 8, alignItems: "center", flexWrap: isMobile ? "nowrap" : undefined, overflowX: isMobile ? "auto" : undefined }}>
                 <button
                   className="conv-script-btn"
                   onClick={() => { loadAvailableScripts(); setShowScriptModal(true); }}
@@ -41850,7 +42180,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                   IA
                 </button>
 
-                <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: 'auto', flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginLeft: isMobile ? 0 : 'auto', flexWrap: isMobile ? 'nowrap' : 'wrap', flexShrink: 0 }}>
                   {['😈', '🍑', '🍆', '💦', '🔥', '😏', '👅', '💋', '🥵', '😘', '😍', '🥹', '🥺', '🥰', '🤤', '😋', '🤭', '🙈', '😢', '😭', '🫠', '😹', '🤦‍♀️', '💔'].map(emoji => (
                     <button key={emoji} className="conv-emoji-btn" onClick={() => { const newVal = (msgInput || '') + emoji; setMsgInput(newVal); msgInputRef.current = newVal; if (inputRef.current) { inputRef.current.focus(); } }}
                       style={{ background: 'transparent', border: 'none', borderRadius: 8, width: 28, height: 28, fontSize: 15, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'transform 0.15s', flexShrink: 0, padding: 0 }}
@@ -41865,7 +42195,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
             </div>
             {/* Script assistant active — above textarea */}
             {activeScript && (
-              <div style={{ padding: "0 14px 8px" }}>
+              <div style={{ padding: isMobile ? "0 10px 6px" : "0 14px 8px" }}>
                 <div style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.15) 0%, rgba(139,92,246,0.15) 100%)", border: "1.5px solid #6366f1", borderRadius: 12, padding: 14 }}>
                   {/* Header */}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
@@ -41890,7 +42220,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                             {/* Preview média */}
                             <div style={{ borderRadius: 8, overflow: "hidden", marginBottom: 8, background: "#0f1117", position: "relative" }}>
                               {step.type === 'photo' && (
-                                <img src={step.media_url} alt="preview" style={{ width: "100%", maxHeight: 200, objectFit: "cover", display: "block", borderRadius: 8 }} />
+                                <img src={step.media_url} alt="preview" style={{ width: "100%", maxHeight: isMobile ? 120 : 200, objectFit: "cover", display: "block", borderRadius: 8 }} />
                               )}
                               {step.type === 'video' && (
                                 <video src={step.media_url} controls controlsList="nodownload" disablePictureInPicture style={{ width: "100%", maxHeight: 200, display: "block", borderRadius: 8, background: "#000" }} />
@@ -41972,7 +42302,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                 </div>
               );
             })()}
-            <div style={{ display: "flex", gap: 10, padding: "10px 18px 14px", alignItems: "flex-end" }}>
+            <div style={{ display: "flex", gap: isMobile ? 8 : 10, padding: isMobile ? "8px 12px 12px" : "10px 18px 14px", paddingBottom: isMobile ? "max(12px, env(safe-area-inset-bottom, 0px))" : undefined, alignItems: "flex-end" }}>
               <button
                 onClick={isRecording ? stopRecording : startRecording}
                 title={isRecording ? (fr ? "Arrêter l'enregistrement" : "Stop recording") : (fr ? "Enregistrer un message vocal" : "Record voice message")}
@@ -42002,7 +42332,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
                 placeholder={fr ? "Écrire un message… (Entrée pour envoyer)" : "Write a message… (Enter to send)"}
                 rows={2}
-                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: "13px 22px", borderRadius: 50, border: activeScript ? "1px solid #6366f1" : (convTheme === 'light' ? "1.5px solid rgba(0,0,0,0.08)" : "1px solid rgba(56,72,120,0.25)"), background: convTheme === 'light' ? "rgba(255,255,255,0.6)" : "#141831", color: convTheme === 'light' ? "#1a1a2e" : "#ECF0FA", fontSize: 14, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4, transition: "border-color 0.2s, box-shadow 0.2s" }}
+                style={{ flex: 1, resize: "none", minHeight: 44, maxHeight: 110, padding: isMobile ? "10px 16px" : "13px 22px", borderRadius: isMobile ? 20 : 50, border: activeScript ? "1px solid #6366f1" : (convTheme === 'light' ? "1.5px solid rgba(0,0,0,0.08)" : "1px solid rgba(56,72,120,0.25)"), background: convTheme === 'light' ? "rgba(255,255,255,0.6)" : "#141831", color: convTheme === 'light' ? "#1a1a2e" : "#ECF0FA", fontSize: 14, fontFamily: "'Inter',sans-serif", outline: "none", lineHeight: 1.4, transition: "border-color 0.2s, box-shadow 0.2s" }}
                 onFocus={e => { e.target.style.borderColor = convTheme === 'light' ? "#a855f7" : "#6366F1"; e.target.style.boxShadow = convTheme === 'light' ? "0 0 0 3px rgba(168,85,247,0.1)" : "0 0 0 3px rgba(99,102,241,0.15)"; }}
                 onBlur={e => { if (!activeScript) { e.target.style.borderColor = convTheme === 'light' ? "rgba(0,0,0,0.08)" : "rgba(56,72,120,0.25)"; } e.target.style.boxShadow = "none"; }}
               />
@@ -42040,7 +42370,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
           {showScriptModal && (
             <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
               onClick={e => { if (e.target === e.currentTarget) setShowScriptModal(false); }}>
-              <div style={{ background: "#1a1d2e", borderRadius: 16, padding: 24, width: 520, maxWidth: "96vw", maxHeight: "80vh", overflow: "auto", boxShadow: "0 16px 48px rgba(0,0,0,0.5)" }}>
+              <div style={{ background: "#1a1d2e", borderRadius: 16, padding: 24, width: 520, maxWidth: "96vw", maxHeight: "80vh", ...(isMobile ? { position: "fixed", inset: 0, width: "100%", maxWidth: "100%", height: "100dvh", maxHeight: "100dvh", borderRadius: 0 } : {}), overflow: "auto", boxShadow: "0 16px 48px rgba(0,0,0,0.5)" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
                   <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800 }}>🎬 Choisir un script</h3>
                   <button onClick={() => setShowScriptModal(false)} style={{ background: "none", border: "none", color: "#9ca3af", fontSize: 24, cursor: "pointer", lineHeight: 1 }}>✕</button>
@@ -42170,7 +42500,11 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
         </span>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           {isMobile && (
-            <button onClick={() => setMobilePane("chat")} style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 16, padding: 0 }}>✕</button>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button onClick={() => setMobilePane("chat")} style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 13, padding: "4px 8px", fontFamily: "'Inter',sans-serif" }}>← Chat</button>
+              <span style={{ color: "rgba(255,255,255,0.1)" }}>|</span>
+              <button onClick={() => setMobilePane("list")} style={{ background: "none", border: "none", color: "var(--text-tertiary)", cursor: "pointer", fontSize: 13, padding: "4px 8px", fontFamily: "'Inter',sans-serif" }}>✕ Liste</button>
+            </div>
           )}
         </div>
       </div>
@@ -42266,7 +42600,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
               <button
                 className="conv-create-tx-btn"
                 onClick={() => { setShowTxModal(true); setTxForm({ amount: "", type: "tip", note: "" }); }}
-                style={{ width: "100%", padding: "10px 0", borderRadius: 10, border: "none", background: "linear-gradient(135deg,#6366F1,#7C3AED)", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 16px rgba(99,102,241,0.3)", transition: "all 0.2s" }}
+                style={{ width: "100%", padding: isMobile ? "12px 0" : "10px 0", borderRadius: 10, border: "none", background: "linear-gradient(135deg,#6366F1,#7C3AED)", minHeight: isMobile ? 44 : undefined, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer", boxShadow: "0 4px 16px rgba(99,102,241,0.3)", transition: "all 0.2s" }}
                 onMouseEnter={e => { e.currentTarget.style.boxShadow = "0 6px 20px rgba(99,102,241,0.5)"; e.currentTarget.style.transform = "translateY(-1px)"; }}
                 onMouseLeave={e => { e.currentTarget.style.boxShadow = "0 4px 16px rgba(99,102,241,0.3)"; e.currentTarget.style.transform = "translateY(0)"; }}>
                 + {fr ? "Créer TX" : "Create TX"}
@@ -42311,16 +42645,16 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
             )}
 
             {/* ══ KPIs (4 colonnes) ══ */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid rgba(56,72,120,0.25)" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: isMobile ? 4 : 6, marginBottom: 14, paddingBottom: 14, borderBottom: "1px solid rgba(56,72,120,0.25)" }}>
               {[
                 { label: "LTV",    value: spKpis.ltv.toFixed(0) + " ₣",        color: spKpis.ltv > 0 ? "#34D399" : "#F87171" },
                 { label: "AOV",    value: spKpis.aov.toFixed(0) + " ₣",        color: spKpis.aov > 0 ? "#34D399" : "#F87171" },
                 { label: "TX",     value: String(spKpis.cnt),                   color: spKpis.cnt > 0 ? "#ECF0FA" : "#F87171" },
                 { label: "STATUS", value: spKpis.cnt > 0 ? "Active" : "Cold",  color: spKpis.cnt > 0 ? "#34D399" : "#F87171" },
               ].map(k => (
-                <div key={k.label} className="conv-kpi-box" style={{ textAlign: "center", background: convTheme === 'light' ? "rgba(255,255,255,0.5)" : "rgba(20,24,49,0.6)", border: convTheme === 'light' ? "1px solid rgba(0,0,0,0.06)" : "1px solid rgba(56,72,120,0.25)", borderRadius: 10, padding: "10px 6px" }}>
+                <div key={k.label} className="conv-kpi-box" style={{ textAlign: "center", background: convTheme === 'light' ? "rgba(255,255,255,0.5)" : "rgba(20,24,49,0.6)", border: convTheme === 'light' ? "1px solid rgba(0,0,0,0.06)" : "1px solid rgba(56,72,120,0.25)", borderRadius: 10, padding: isMobile ? "8px 4px" : "10px 6px" }}>
                   <div className="conv-kpi-label" style={{ fontSize: 9, color: convTheme === 'light' ? "#bbb" : "#505D85", textTransform: "uppercase", marginBottom: 3, fontWeight: 700, letterSpacing: "0.05em" }}>{k.label}</div>
-                  <div className={k.color === "#ECF0FA" ? "conv-kpi-value-neutral" : ""} style={{ fontSize: 16, fontWeight: 700, color: k.color === "#ECF0FA" && convTheme === 'light' ? "#1a1a2e" : k.color, fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>{k.value}</div>
+                  <div className={k.color === "#ECF0FA" ? "conv-kpi-value-neutral" : ""} style={{ fontSize: isMobile ? 12 : 16, fontWeight: 700, color: k.color === "#ECF0FA" && convTheme === 'light' ? "#1a1a2e" : k.color, fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>{k.value}</div>
                 </div>
               ))}
             </div>
@@ -42376,16 +42710,19 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
 
                   return (
                     <div style={{ borderTop: "1px solid var(--border-subtle)", paddingTop: 12, marginTop: 4, display: "flex", flexDirection: "column", gap: 14 }}>
-                      {/* Header ANALYSE + badge modèle IA */}
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {/* Header ANALYSE + badge modèle IA — collapsible on mobile */}
+                      <div onClick={isMobile ? () => setMobileAICollapsed(p => !p) : undefined} style={{ display: "flex", alignItems: "center", gap: 8, cursor: isMobile ? "pointer" : "default" }}>
                         <span style={{ fontSize: 11, fontWeight: 700, color: "#c084fc", textTransform: "uppercase", letterSpacing: "0.05em" }}>🧠 ANALYSE</span>
                         {modelUsed && (
                           <span style={{ padding: "2px 8px", borderRadius: 5, background: convTheme === 'light' ? "rgba(168,85,247,0.1)" : "#2d1b4e", color: "#c084fc", fontSize: 10, fontWeight: 600 }}>
                             👤 {modelUsed}
                           </span>
                         )}
+                        {isMobile && <span style={{ marginLeft: "auto", fontSize: 12, color: "#c084fc", transition: "transform 0.2s", transform: mobileAICollapsed ? "rotate(-90deg)" : "rotate(0)" }}>▼</span>}
                       </div>
 
+                      {/* AI content - collapsible on mobile */}
+                      {(!isMobile || !mobileAICollapsed) && (<>
                       {/* PERSONNALITÉ */}
                       {personality && (
                         <div>
@@ -42417,6 +42754,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
                           <div style={sectionBox("#fed7aa", "rgba(28,15,10,0.9)", "#431407")}>{risks}</div>
                         </div>
                       )}
+                      </>)}
                     </div>
                   );
                 })()}
@@ -42582,7 +42920,7 @@ const DadashMessagerieTab = React.memo(({ user, lang, spenders, models, profiles
   const broadcastModal = showBroadcastModal ? (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.82)", zIndex: 9998, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}
       onClick={e => { if (e.target === e.currentTarget && !broadcastSending) setShowBroadcastModal(false); }}>
-      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: 24, width: "100%", maxWidth: 520, boxShadow: "var(--shadow-lg)" }}>
+      <div style={{ background: "var(--bg-modal)", border: "1px solid var(--border-default)", borderRadius: 16, padding: isMobile ? 16 : 24, width: "100%", maxWidth: 520, boxShadow: "var(--shadow-lg)", ...(isMobile ? { position: "fixed", inset: 0, maxWidth: "100%", height: "100dvh", maxHeight: "100dvh", borderRadius: 0, overflowY: "auto" } : {}) }}>
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
           <div>
@@ -46551,6 +46889,567 @@ const PaiementsPI_Receiver = ({user, lang, profiles}) => {
   );
 };
 
+// =============================================
+// CHATTER ROLE — COMPTA (EC7) Fiche de paie + historique payouts
+// =============================================
+const ChatterComptaTab = ({user, lang, payslips: allPayslips, payouts: allPayouts, txs, models}) => {
+  const fr = lang === "fr";
+  const { fmtAmount, convertAmount } = useCurrency();
+  const addToast = useToast();
+  const ctx = getChatterContext(user, models);
+
+  const [comptaTab, setComptaTab] = useState("resume");
+  const [payoutRequests, setPayoutRequests] = useState([]);
+  const [prLoading, setPrLoading] = useState(false);
+  const [reqForm, setReqForm] = useState({amount:"",currency:"CHF",period_start:"",period_end:"",notes:""});
+  const [submitting, setSubmitting] = useState(false);
+  const [mesPaies, setMesPaies] = useState([]);
+  const [mesPaiesLoading, setMesPaiesLoading] = useState(false);
+  const [paiementsReçus, setPaiementsReçus] = useState([]);
+  const [paiementsReçusLoading, setPaiementsReçusLoading] = useState(true);
+
+  // Charger les paiements versés par le gérant à ce chatter (paiements_internes)
+  useEffect(() => {
+    if (!user?.id) return;
+    let mounted = true;
+    (async () => {
+      setPaiementsReçusLoading(true);
+      try {
+        const { data } = await sb.from('paiements_internes')
+          .select('id, montant, devise, created_at, note, statut')
+          .eq('destinataire_type', 'chatter')
+          .eq('destinataire_id', user.id)
+          .order('created_at', { ascending: false });
+        if (mounted) setPaiementsReçus(data || []);
+      } catch (e) { console.warn('[PAIEMENTS_REÇUS]', e?.message || e); }
+      if (mounted) setPaiementsReçusLoading(false);
+    })();
+    return () => { mounted = false; };
+  }, [user?.id]);
+
+  const payslips = (allPayslips||[]).filter(p=>p.user_id===user.id);
+  const myPayouts = (allPayouts||[]).filter(p=>p.user_id===user.id);
+
+  const myTxs = useMemo(() => {
+    return (txs||[]).filter(tx=>(isValidTx(tx.status))&&(tx.chatter_id===user.id));
+  }, [txs, user.id]);
+
+  const allMyTxs = useMemo(() => {
+    return (txs||[]).filter(tx=>tx.chatter_id===user.id);
+  }, [txs, user.id]);
+
+  const commPct = getChatterCommissionPct(user);
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthLabel = now.toLocaleDateString(fr?"fr-FR":"en-US",{month:"long",year:"numeric"});
+
+  const commissionsThisMonth = useMemo(() => {
+    return myTxs.filter(tx=>new Date(tx.created_at||tx.date||0)>=monthStart).reduce((s,tx)=>{
+      const amt = Number(tx.amount||0);
+      const cur = tx.currency||"EUR";
+      const stored = Number(tx.chatter_commission||0);
+      if(stored>0) return s+convertAmount(stored,cur);
+      return s+convertAmount(amt*commPct,cur);
+    },0);
+  }, [myTxs, commPct, convertAmount]);
+
+  const validatedRevenue = useMemo(() => myTxs.reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency||"EUR"),0), [myTxs, convertAmount]);
+  const pendingRevenue = useMemo(() => allMyTxs.filter(tx=>isPendingTx(tx.status)).reduce((s,tx)=>s+convertAmount(Number(tx.amount||0),tx.currency||"EUR"),0), [allMyTxs, convertAmount]);
+
+  const currentPayslip = payslips.find(p=>{
+    const pDate = p.period ? new Date(p.period) : null;
+    return pDate && pDate.getMonth()===monthStart.getMonth() && pDate.getFullYear()===monthStart.getFullYear();
+  }) || payslips.find(p=>p.status==="pending");
+
+  const base = currentPayslip ? Number(currentPayslip.base||0) : 0;
+  const bonus = currentPayslip ? Number(currentPayslip.bonus||0) : 0;
+  const totalEstime = base + bonus + commissionsThisMonth;
+  const totalPayePayouts = myPayouts.filter(p=>p.status==="paid"||p.status==="done"||p.status==="validated").reduce((s,p)=>s+convertAmount(Number(p.amount||0),p.currency||"EUR"),0);
+  const totalPayePayslips = payslips.filter(p=>p.status==="paid").reduce((s,p)=>s+Number(p.total||0),0);
+  const totalPaye = totalPayePayouts + totalPayePayslips;
+  const sortedPayouts = useMemo(()=>[...myPayouts].sort((a,b)=>new Date(b.date||b.created_at||0)-new Date(a.date||a.created_at||0)),[myPayouts]);
+
+  // PR2: load payout requests
+  useEffect(() => {
+    (async () => {
+      setPrLoading(true);
+      try {
+        const scope = getScope(user);
+        const data = await apiFetchPayoutRequests(scope);
+        setPayoutRequests(data);
+      } catch (e) { console.warn("[PAYOUT_REQ]", e?.message||e); }
+      setPrLoading(false);
+    })();
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (comptaTab !== "mes_paies") return;
+    let mounted = true;
+    (async () => {
+      setMesPaiesLoading(true);
+      try {
+        const { data, error } = await window.sb.from("paies")
+          .select("id,montant,devise,periode_debut,periode_fin,ca_genere,commission_rate,methode,note,status,created_at")
+          .eq("recipient_id", user.id)
+          .order("created_at", { ascending: false });
+        if (error) console.warn("[PAIES] chatter:", error.message);
+        if (mounted) setMesPaies(data || []);
+      } catch (e) { console.warn("[PAIES] chatter:", e?.message || e); }
+      if (mounted) setMesPaiesLoading(false);
+    })();
+    return () => { mounted = false; };
+  }, [comptaTab, user?.id]);
+
+  const handleSubmitRequest = async () => {
+    const amt = parseFloat(reqForm.amount);
+    if (!amt || amt <= 0) { addToast(fr?"Montant invalide":"Invalid amount","error"); return; }
+    setSubmitting(true);
+    try {
+      const pr = await apiCreatePayoutRequest({ chatter_user_id: user.id, amount: amt, currency: reqForm.currency||"CHF", period_start: reqForm.period_start||null, period_end: reqForm.period_end||null, notes: reqForm.notes||null });
+      setPayoutRequests(prev => [pr, ...prev]);
+      setReqForm({amount:"",currency:"CHF",period_start:"",period_end:"",notes:""});
+      addToast(fr?"Demande envoyée au gérant":"Request sent to manager","success");
+      try {
+        await sb.from("logs").insert({
+          action: "payout_request_created",
+          user_id: user.id,
+          details: JSON.stringify({ amount: amt, currency: reqForm.currency||"CHF", request_id: pr?.id }),
+        });
+      } catch (_) {}
+    } catch (e) { addToast("Erreur: "+(e?.message||e),"error"); }
+    setSubmitting(false);
+  };
+
+  // ── MES PAIES — computations ──
+  const mpNow = new Date();
+  const mpMonthStart = new Date(mpNow.getFullYear(), mpNow.getMonth(), 1).toISOString().split("T")[0];
+  const mpMonthEnd = new Date(mpNow.getFullYear(), mpNow.getMonth()+1, 0).toISOString().split("T")[0];
+  const mpThisMonth = mesPaies.filter(p => { const d=(p.created_at||"").slice(0,10); return d>=mpMonthStart && d<=mpMonthEnd; });
+  const mpTotalThisMonth = mpThisMonth.reduce((s,p)=>s+Number(p.montant||0),0);
+  const mpTotalCumul = mesPaies.reduce((s,p)=>s+Number(p.montant||0),0);
+  const mpStatusBadge = (status) => {
+    const cfgMap = {paye:{label:fr?"Payé":"Paid",c:"var(--success)"},en_attente:{label:fr?"En attente":"Pending",c:"var(--warning)"},annule:{label:fr?"Annulé":"Cancelled",c:"var(--danger)"}};
+    const cfg = cfgMap[status] || {label:status||"—",c:"var(--text-tertiary)"};
+    return <span style={{padding:"2px 8px",borderRadius:10,background:cfg.c+"22",color:cfg.c,fontSize:10,fontWeight:700}}>{cfg.label}</span>;
+  };
+
+  const tabBtn = (id,label) => <div className={`filter-pill${comptaTab===id?" active":""}`} onClick={()=>setComptaTab(id)}>{label}</div>;
+
+  return (
+    <div style={{padding:"0 12px"}}>
+      <div className="ui-section-header">
+        <h2 className="ui-section-title" style={{fontSize:20}}>{"\u{1F4C4}"} {fr ? "Ma Compta" : "My Accounting"}</h2>
+        <p className="ui-section-subtitle" style={{fontSize:11,marginTop:3}}>{fr ? "Résumé, factures & demandes de paiement" : "Summary, invoices & payment requests"}</p>
+      </div>
+
+      {!ctx.hasAssignments && (
+        <div className="ui-panel" style={{padding:12,background:"var(--warning-muted)",border:"1px solid var(--warning)",marginBottom:16,fontSize:12,color:"var(--text-secondary)"}}>
+          {fr ? "Aucun modèle assigné — les commissions sont calculées à partir de tes modèles assignés." : "No model assigned — commissions are calculated from your assigned models."}
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:8,marginBottom:18,flexWrap:"wrap"}}>
+        {tabBtn("resume",fr?"Résumé":"Summary")}
+        {tabBtn("factures",fr?"Factures":"Invoices")}
+        {tabBtn("demande",fr?"Demande paiement":"Payment Request")}
+        {tabBtn("mes_paies",fr?"Mes paies":"My pays")}
+      </div>
+
+      {comptaTab === "resume" && (<>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr ? "Ma fiche de paie" : "My payslip"} — {monthLabel}</div>
+        <div className="ui-panel" style={{marginBottom:20}}>
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(3,1fr) repeat(2,1fr)",gap:14}}>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"CA NET":"Net Rev."}</div><div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{fmtAmount(validatedRevenue)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"CA Pending":"Pending Rev."}</div><div style={{fontSize:18,fontWeight:800,color:"var(--warning)"}}>{fmtAmount(pendingRevenue)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Commissions":"Commissions"}</div><div style={{fontSize:18,fontWeight:800,color:"var(--accent)"}}>{fmtAmount(commissionsThisMonth)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Base + Bonus":"Base + Bonus"}</div><div style={{fontSize:18,fontWeight:800,color:"var(--text-primary)"}}>{fmtAmount(base+bonus)}</div></div>
+            <div style={{padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.04)"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Total estimé":"Est. Total"}</div><div style={{fontSize:18,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalEstime)}</div></div>
+          </div>
+          <div style={{marginTop:12,paddingTop:12,borderTop:"1px solid var(--border-subtle)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <span style={{fontSize:12,color:"var(--text-tertiary)"}}>{fr ? "Total payé (toutes périodes)" : "Total paid (all time)"}</span>
+            <span style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(totalPaye)}</span>
+          </div>
+        </div>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr ? "Historique des paies" : "Payout history"}</div>
+        <div className="ui-panel">
+          <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+            <table className="table" style={{fontSize:12,minWidth:_isMobile?400:undefined}}>
+              <thead><tr><th>{fr?"Date":"Date"}</th><th>{fr?"Montant":"Amount"}</th><th>{fr?"Statut":"Status"}</th><th>{fr?"Méthode":"Method"}</th><th>Notes</th></tr></thead>
+              <tbody>
+                {sortedPayouts.map(p=>(<tr key={p.id}><td style={{whiteSpace:"nowrap"}}>{fmtDate(p.date||p.created_at)}</td><td style={{fontWeight:700}}>{fmtAmount(Number(p.amount||0),p.currency)}</td><td><span style={{padding:"2px 8px",borderRadius:10,background:(p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)")+"15",color:p.status==="paid"||p.status==="done"||p.status==="validated"?"var(--success)":"var(--warning)",fontSize:10,fontWeight:700}}>{p.status||"—"}</span></td><td>{p.method||"—"}</td><td style={{maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.notes||"—"}</td></tr>))}
+                {sortedPayouts.length===0 && <tr><td colSpan={5} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{fr?"Aucune paie reçue":"No payouts received"}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+        {payslips.length>0 && (<>
+          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12,marginTop:20}}>{"\u{1F4CB}"} {fr?"Fiches de paie":"Payslips"}</div>
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {payslips.map(p=>{const isPaid=p.status==="paid";const sc=isPaid?"var(--success)":"var(--warning)";return(<div key={p.id} className="ui-panel" style={{padding:16}}><div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}><div style={{width:36,height:36,borderRadius:10,background:sc+"15",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,flexShrink:0}}>{isPaid?"✅":"⏳"}</div><div style={{flex:1}}><div style={{fontSize:14,fontWeight:700}}>{p.period||"—"}</div><div style={{fontSize:11,color:"var(--text-tertiary)",marginTop:2}}>Base: {fmtAmount(p.base||0)} {"·"} Bonus: {fmtAmount(p.bonus||0)}</div></div><div style={{textAlign:"right"}}><div style={{fontSize:16,fontWeight:800,color:"var(--success)"}}>{fmtAmount(p.total||0)}</div><span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{isPaid?(fr?"Payé":"Paid"):(fr?"En attente":"Pending")}</span></div></div></div>);})}
+          </div>
+        </>)}
+
+        {/* ── PAIEMENTS REÇUS DU GÉRANT (paiements_internes) ── */}
+        <div style={{marginTop:20}}>
+          <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4B0}"} {fr ? "Paiements reçus du gérant" : "Payments received from manager"}</div>
+          <div className="ui-panel">
+            {paiementsReçusLoading ? (
+              <div style={{textAlign:"center",padding:24,color:"var(--text-tertiary)",fontSize:12}}>⏳ {fr?"Chargement…":"Loading…"}</div>
+            ) : paiementsReçus.length === 0 ? (
+              <div style={{textAlign:"center",padding:24,color:"var(--text-tertiary)",fontSize:12}}>{fr?"Aucun paiement reçu du gérant":"No payments received from manager"}</div>
+            ) : (
+              <div style={{marginTop:0}}>
+                <div style={{fontSize:9,textTransform:"uppercase",letterSpacing:"2px",color:"#555",marginBottom:"8px"}}>
+                  💰 {fr ? "Paiements reçus du gérant" : "Payments received from manager"}
+                </div>
+                {paiementsReçus.map(p => {
+                  const isValidated = p.statut === "validated";
+                  const statusColor = isValidated ? "#22c55e" : p.statut === "contested" ? "#ef4444" : "#f59e0b";
+                  return (
+                    <div key={p.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:"1px solid #2a2a4a",fontSize:"13px"}}>
+                      <span style={{color:"#888",flex:1,minWidth:0}}>
+                        {new Date(p.created_at).toLocaleDateString("fr-FR")}
+                        {p.note ? ` — ${p.note}` : ""}
+                        <span style={{marginLeft:8,padding:"1px 7px",borderRadius:8,background:statusColor+"22",color:statusColor,fontSize:10,fontWeight:700}}>
+                          {isValidated ? (fr?"Validé":"Validated") : p.statut === "contested" ? (fr?"Contesté":"Contested") : (fr?"En attente":"Pending")}
+                        </span>
+                      </span>
+                      <span style={{color:statusColor,fontWeight:"600",flexShrink:0,marginLeft:12}}>
+                        {Number(p.montant||0).toLocaleString("fr-FR")} {p.devise||"CHF"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </>)}
+
+      {comptaTab === "factures" && (<>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4CB}"} {fr?"Aperçu facture — ":"Invoice preview — "}{monthLabel}</div>
+        <div className="ui-panel" style={{marginBottom:20}} id="chatter-invoice-preview">
+          <div style={{padding:24,borderBottom:"2px solid var(--accent)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:12}}>
+              <div>
+                <div style={{fontSize:20,fontWeight:900,color:"var(--accent)",marginBottom:4}}>FACTURE</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)"}}>#{new Date().getFullYear()}-{String(new Date().getMonth()+1).padStart(2,"0")}-{(user.id||"").slice(0,6).toUpperCase()}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:12,fontWeight:700}}>{user.name||user.full_name||user.username||"Chatter"}</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{(user.email||"").replace(/^(.{3}).*(@.*)$/, "$1***$2")}</div>
+                <div style={{fontSize:11,color:"var(--text-tertiary)"}}>{fr?"Émise le":"Issued"}: {new Date().toLocaleDateString(fr?"fr-CH":"en-CH")}</div>
+              </div>
+            </div>
+          </div>
+          <div style={{padding:24}}>
+            <div style={{fontSize:11,fontWeight:700,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:12}}>{fr?"Détail":"Details"}</div>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{borderBottom:"1px solid var(--border)"}}>
+                  <th style={{textAlign:"left",padding:"8px 4px",color:"var(--text-tertiary)",fontWeight:600}}>{fr?"Description":"Description"}</th>
+                  <th style={{textAlign:"right",padding:"8px 4px",color:"var(--text-tertiary)",fontWeight:600}}>{fr?"Montant":"Amount"}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"10px 4px"}}>{fr?"CA NET (commissions ":"Net rev. (commissions "}{(commPct*100).toFixed(0)}%)</td>
+                  <td style={{padding:"10px 4px",textAlign:"right",fontWeight:700}}>{fmtAmount(commissionsThisMonth)}</td>
+                </tr>
+                {base > 0 && <tr style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"10px 4px"}}>{fr?"Salaire de base":"Base salary"}</td>
+                  <td style={{padding:"10px 4px",textAlign:"right",fontWeight:700}}>{fmtAmount(base)}</td>
+                </tr>}
+                {bonus > 0 && <tr style={{borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                  <td style={{padding:"10px 4px"}}>{fr?"Bonus":"Bonus"}</td>
+                  <td style={{padding:"10px 4px",textAlign:"right",fontWeight:700}}>{fmtAmount(bonus)}</td>
+                </tr>}
+                <tr>
+                  <td style={{padding:"12px 4px",fontWeight:800,fontSize:14}}>{fr?"TOTAL":"TOTAL"}</td>
+                  <td style={{padding:"12px 4px",textAlign:"right",fontWeight:900,fontSize:16,color:"var(--success)"}}>{fmtAmount(totalEstime)}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div style={{marginTop:16,padding:"12px 16px",borderRadius:10,background:"rgba(255,255,255,0.03)",fontSize:11,color:"var(--text-tertiary)"}}>
+              <div><strong>{fr?"Période":"Period"}:</strong> {monthLabel}</div>
+              <div><strong>{fr?"Modèles":"Models"}:</strong> {ctx.assignedModels.map(m=>m.name||m.id).join(", ")||"—"}</div>
+              <div><strong>{fr?"TX validées":"Validated TX"}:</strong> {myTxs.length}</div>
+              <div><strong>{fr?"Taux commission":"Commission rate"}:</strong> {(commPct*100).toFixed(0)}%</div>
+            </div>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+          <button className="ui-btn-primary" onClick={()=>{
+            const el = document.getElementById("chatter-invoice-preview");
+            if (!el) return;
+            const win = window.open("","_blank","width=800,height=600");
+            if (!win) { addToast(fr?"Popup bloqué — autorise les popups":"Popup blocked — allow popups","error"); return; }
+            win.document.write("<html><head><title>Facture "+monthLabel+"</title><style>body{font-family:Inter,sans-serif;padding:40px;background:#fff;color:#111}table{width:100%;border-collapse:collapse}th,td{padding:8px 4px;text-align:left}th{border-bottom:1px solid #ddd;color:#666;font-weight:600}tr:not(:last-child){border-bottom:1px solid #eee}.total td{font-weight:900;font-size:16px;color:#10b981;border-top:2px solid #333}@media print{body{padding:20px}}
+    /* ═══════════════════════════════════════════════════ */
+    /* MESSAGERIE MOBILE V2 — Refonte complète            */
+    /* ═══════════════════════════════════════════════════ */
+    @media (max-width: 768px) {
+      /* Filtres collapsibles */
+      .conv-mobile-filter-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        flex-shrink: 0;
+      }
+      .conv-mobile-filter-toggle {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid rgba(99,102,241,0.3);
+        background: rgba(99,102,241,0.08);
+        color: #a5b4fc;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+        flex-shrink: 0;
+        font-family: 'Inter', sans-serif;
+      }
+      .conv-mobile-filters-panel {
+        overflow: hidden;
+        transition: max-height 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.2s ease, padding 0.2s ease;
+        flex-shrink: 0;
+      }
+      .conv-mobile-filters-panel.collapsed {
+        max-height: 0 !important;
+        opacity: 0;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+      }
+      .conv-mobile-filters-panel.expanded {
+        max-height: 700px;
+        opacity: 1;
+      }
+      /* Badges filtres actifs */
+      .conv-mobile-active-badges {
+        display: flex;
+        gap: 4px;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex: 1;
+        min-width: 0;
+        scrollbar-width: none;
+        padding: 0 12px 6px;
+      }
+      .conv-mobile-active-badges::-webkit-scrollbar { display: none; }
+      .conv-mobile-badge {
+        padding: 3px 8px;
+        border-radius: 12px;
+        font-size: 10px;
+        font-weight: 700;
+        white-space: nowrap;
+        flex-shrink: 0;
+        background: rgba(99,102,241,0.15);
+        color: #a5b4fc;
+        border: 1px solid rgba(99,102,241,0.25);
+        cursor: pointer;
+        font-family: 'Inter', sans-serif;
+      }
+      .conv-mobile-badge:active { opacity: 0.6; }
+      /* Menu more (⋯) */
+      .conv-more-menu {
+        position: absolute;
+        top: 100%;
+        right: 0;
+        background: rgba(15,15,40,0.97);
+        border: 1px solid rgba(99,102,241,0.25);
+        border-radius: 12px;
+        padding: 6px;
+        z-index: 100;
+        min-width: 170px;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        animation: fadeIn 0.15s ease;
+      }
+      [data-conv-theme="light"] .conv-more-menu {
+        background: rgba(255,255,255,0.97);
+        border-color: rgba(0,0,0,0.1);
+        box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+      }
+      .conv-more-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: none;
+        background: transparent;
+        color: #d1d5db;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        width: 100%;
+        text-align: left;
+        font-family: 'Inter', sans-serif;
+      }
+      [data-conv-theme="light"] .conv-more-menu-item { color: #374151; }
+      .conv-more-menu-item:active { background: rgba(99,102,241,0.15); }
+      /* Quick actions scroll horizontal */
+      .conv-mobile-quick-row {
+        display: flex !important;
+        gap: 6px;
+        align-items: center;
+        padding: 6px 12px;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        flex-shrink: 0;
+        flex-wrap: nowrap !important;
+        scrollbar-width: none;
+      }
+      .conv-mobile-quick-row::-webkit-scrollbar { display: none; }
+      .conv-mobile-quick-row .conv-emoji-btn {
+        width: 28px !important;
+        height: 28px !important;
+        font-size: 15px !important;
+        flex-shrink: 0;
+      }
+      /* IA suggestions horizontal */
+      .conv-mobile-ia-row {
+        display: flex !important;
+        flex-direction: row !important;
+        gap: 8px;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        padding: 8px 12px;
+        scrollbar-width: none;
+      }
+      .conv-mobile-ia-row::-webkit-scrollbar { display: none; }
+      .conv-mobile-ia-row > button {
+        min-width: 220px !important;
+        max-width: 280px !important;
+        flex-shrink: 0 !important;
+      }
+      /* Modals fullscreen mobile */
+      .conv-modal-mobile-fs {
+        position: fixed !important;
+        inset: 0 !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        height: 100dvh !important;
+        max-height: 100dvh !important;
+        border-radius: 0 !important;
+        margin: 0 !important;
+      }
+    }
+
+    </style></head><body>");
+            win.document.write("<h1 style='color:#6366f1;margin-bottom:4px'>FACTURE</h1>");
+            win.document.write("<p style='color:#666;margin:0 0 20px'>"+new Date().getFullYear()+"-"+String(new Date().getMonth()+1).padStart(2,"0")+"-"+(user.id||"").slice(0,6).toUpperCase()+"</p>");
+            win.document.write("<p><strong>"+(user.name||user.full_name||"Chatter")+"</strong><br/>"+(fr?"Émise le":"Issued")+": "+new Date().toLocaleDateString(fr?"fr-CH":"en-CH")+"</p>");
+            win.document.write("<table><thead><tr><th>"+(fr?"Description":"Description")+"</th><th style='text-align:right'>"+(fr?"Montant":"Amount")+"</th></tr></thead><tbody>");
+            win.document.write("<tr><td>"+(fr?"Commissions ":"Commissions ")+(commPct*100).toFixed(0)+"%</td><td style='text-align:right'>"+fmtAmount(commissionsThisMonth)+"</td></tr>");
+            if(base>0) win.document.write("<tr><td>"+(fr?"Salaire de base":"Base salary")+"</td><td style='text-align:right'>"+fmtAmount(base)+"</td></tr>");
+            if(bonus>0) win.document.write("<tr><td>Bonus</td><td style='text-align:right'>"+fmtAmount(bonus)+"</td></tr>");
+            win.document.write("<tr class='total'><td>TOTAL</td><td style='text-align:right'>"+fmtAmount(totalEstime)+"</td></tr>");
+            win.document.write("</tbody></table>");
+            win.document.write("<hr style='margin:20px 0'/><p style='font-size:11px;color:#888'>"+(fr?"Période":"Period")+": "+monthLabel+" | "+(fr?"Modèles":"Models")+": "+(ctx.assignedModels.map(m=>m.name).join(", ")||"—")+" | TX: "+myTxs.length+"</p>");
+            win.document.write("</body></html>");
+            win.document.close();
+            setTimeout(()=>win.print(), 500);
+          }}>{"\uD83D\uDDA8"} {fr?"Imprimer / PDF":"Print / PDF"}</button>
+        </div>
+      </>)}
+
+      {comptaTab === "demande" && (<>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{"\u{1F4B8}"} {fr?"Nouvelle demande de paiement":"New payment request"}</div>
+        <div className="ui-panel" style={{marginBottom:20}}>
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr":"1fr 1fr",gap:14,marginBottom:14}}>
+            <div><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Montant":"Amount"} *</div><input type="number" className="filter-select" style={{width:"100%"}} value={reqForm.amount} onChange={e=>setReqForm(p=>({...p,amount:e.target.value}))} placeholder="0.00" min="0" step="0.01"/></div>
+            <div><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Devise":"Currency"}</div><select className="filter-select" style={{width:"100%"}} value={reqForm.currency} onChange={e=>setReqForm(p=>({...p,currency:e.target.value}))}><option value="CHF">CHF</option><option value="EUR">EUR</option></select></div>
+            <div style={{gridColumn:"1/-1"}}>
+              <div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>{fr?"Période":"Period"}</div>
+              <DateRangePicker
+                startDate={reqForm.period_start}
+                endDate={reqForm.period_end}
+                onChange={({ start, end }) => setReqForm(p => ({...p, period_start: start || "", period_end: end || ""}))}
+                placeholder="Sélectionner période"
+              />
+            </div>
+            <div style={{gridColumn:"1/-1"}}><div style={{fontSize:10,color:"var(--text-tertiary)",textTransform:"uppercase",marginBottom:4}}>Notes</div><textarea className="filter-select" style={{width:"100%",minHeight:60}} value={reqForm.notes} onChange={e=>setReqForm(p=>({...p,notes:e.target.value}))} placeholder={fr?"Notes ou commentaires...":"Notes or comments..."}/></div>
+          </div>
+          <button className="ui-btn-primary" onClick={handleSubmitRequest} disabled={submitting} style={{width:"100%"}}>{submitting?"\u23F3":(fr?"\u{1F4E8} Envoyer la demande":"\u{1F4E8} Send request")}</button>
+        </div>
+        <div style={{fontSize:13,fontWeight:700,color:"var(--text)",marginBottom:12}}>{fr?"Mes demandes":"My requests"}</div>
+        <div className="ui-panel">
+          <div className="table-wrap" style={{overflowX:"auto"}}>
+            <table className="table" style={{fontSize:12}}>
+              <thead><tr><th>Date</th><th>{fr?"Montant":"Amount"}</th><th>{fr?"Période":"Period"}</th><th>{fr?"Statut":"Status"}</th><th>Notes</th></tr></thead>
+              <tbody>
+                {payoutRequests.map(pr=>{const sc=pr.status==="paid"?"var(--success)":pr.status==="approved"?"var(--info)":pr.status==="rejected"?"var(--danger)":"var(--warning)";return(<tr key={pr.id}><td style={{whiteSpace:"nowrap"}}>{fmtDate(pr.created_at)}</td><td style={{fontWeight:700}}>{fmtAmount(Number(pr.amount||0))} {pr.currency}</td><td style={{fontSize:11}}>{pr.period_start&&pr.period_end?`${pr.period_start} → ${pr.period_end}`:"—"}</td><td><span style={{padding:"2px 8px",borderRadius:10,background:sc+"15",color:sc,fontSize:10,fontWeight:700}}>{pr.status}</span></td><td style={{maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{pr.notes||"—"}</td></tr>);})}
+                {payoutRequests.length===0 && <tr><td colSpan={5} style={{textAlign:"center",color:"var(--text-tertiary)",padding:32}}>{prLoading?"\u23F3":(fr?"Aucune demande":"No requests yet")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </>)}
+
+      {comptaTab === "mes_paies" && (
+        <div>
+          <div style={{display:"grid",gridTemplateColumns:_isMobile?"1fr 1fr":"repeat(4,1fr)",gap:10,marginBottom:18}}>
+            {[
+              {label:fr?"Reçu ce mois":"Received this month",value:fmtAmount(mpTotalThisMonth),color:"var(--success)"},
+              {label:fr?"Total reçu cumul":"Total received",value:fmtAmount(mpTotalCumul),color:"var(--accent)"},
+              {label:fr?"Prochain estimé (CA × taux)":"Next estimate",value:fmtAmount(validatedRevenue*commPct),color:"var(--warning)"},
+              {label:fr?"Mon taux commission":"My rate",value:Math.round(commPct*100)+"%",color:"var(--text)"},
+            ].map((k,i)=>(
+              <div key={i} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:_isMobile?"12px 14px":"14px 16px"}}>
+                <div style={{fontSize:10,fontWeight:600,color:"var(--muted)",textTransform:"uppercase",letterSpacing:0.5,marginBottom:5}}>{k.label}</div>
+                <div style={{fontSize:_isMobile?16:20,fontWeight:800,color:k.color}}>{k.value}</div>
+              </div>
+            ))}
+          </div>
+          <div className="ui-panel">
+            {mesPaiesLoading ? (
+              <div style={{textAlign:"center",padding:32,color:"var(--text-tertiary)"}}>{"\u23F3 "}{fr?"Chargement...":"Loading..."}</div>
+            ) : (
+              <div className="table-wrap" style={{overflowX:"auto",WebkitOverflowScrolling:"touch"}}>
+                <table className="table" style={{fontSize:12,minWidth:_isMobile?500:undefined}}>
+                  <thead>
+                    <tr>
+                      <th>{fr?"Date":"Date"}</th>
+                      <th>{fr?"Période":"Period"}</th>
+                      <th style={{textAlign:"right"}}>{fr?"CA généré":"Revenue"}</th>
+                      <th style={{textAlign:"right"}}>%</th>
+                      <th style={{textAlign:"right"}}>{fr?"Montant":"Amount"}</th>
+                      <th>{fr?"Méthode":"Method"}</th>
+                      <th>{fr?"Statut":"Status"}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mesPaies.map(p=>(
+                      <tr key={p.id}>
+                        <td style={{whiteSpace:"nowrap"}}>{fmtDate((p.created_at||"").slice(0,10))}</td>
+                        <td style={{fontSize:11}}>{p.periode_debut&&p.periode_fin?p.periode_debut+" \u2192 "+p.periode_fin:p.periode_debut||p.periode_fin||"—"}</td>
+                        <td style={{textAlign:"right"}}>{p.ca_genere!=null?fmtAmount(Number(p.ca_genere)):"—"}</td>
+                        <td style={{textAlign:"right"}}>{p.commission_rate!=null?Math.round(Number(p.commission_rate)*100)+"%":"—"}</td>
+                        <td style={{textAlign:"right",fontWeight:700,color:"var(--success)"}}>{fmtAmount(Number(p.montant||0))} {p.devise||"CHF"}</td>
+                        <td>{p.methode||"—"}</td>
+                        <td>{mpStatusBadge(p.status)}</td>
+                      </tr>
+                    ))}
+                    {mesPaies.length===0&&<tr><td colSpan={7} style={{textAlign:"center",padding:32,color:"var(--text-tertiary)"}}>{fr?"Aucune paie reçue":"No payments received"}</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 
 // =============================================
@@ -55930,7 +56829,7 @@ const App = () => {
       if (t === "messagerie-conversations" || t === "/messagerie-conversations") { _setTab("messagerie-conversations"); window.history.replaceState({tab:"messagerie-conversations"},"","#/messagerie-conversations"); return; }
       // Legacy gérant tab → new page mapping
       if (user && _roleIs(user, "gerant")) {
-        const legacyMap = {transactions:"business",products:"business",modeles:"equipe",model_mgmt:"equipe",chatters:"equipe",providers:"equipe",invoices:"compta",paies:"compta",compta:"compta",agents:"bots",telegram:"messagerie",push:"messagerie",broadcasts:"messagerie",whatsapp:"messagerie",videos:"equipe",mes_spenders:"business","spenders":"business",objectifs:"dashboard",competition:"dashboard",admin:"admin","automation":"messagerie","ia-insights":"bots"};
+        const legacyMap = {transactions:"business",products:"business",modeles:"equipe",model_mgmt:"equipe",chatters:"equipe",providers:"equipe",invoices:"compta",paies:"compta",compta:"compta",agents:"bots",telegram:"messagerie",push:"messagerie",broadcasts:"messagerie",videos:"equipe",mes_spenders:"business","spenders":"business",objectifs:"dashboard",competition:"dashboard",admin:"admin","automation":"messagerie","ia-insights":"bots"};
         if (legacyMap[t]) { _setTab(legacyMap[t]); const tabs=PAGE_TABS[legacyMap[t]]; setSubTab(tabs?tabs[0].id:null); window.history.replaceState({tab:legacyMap[t]},"",`#${legacyMap[t]}`); return; }
       }
       if (user && isAdminUser(user) && t === "admin") { _setTab("admin"); const tabs=PAGE_TABS.admin; setSubTab(tabs&&tabs[0]?tabs[0].id:"overview"); window.history.replaceState({tab:"admin"},"","#admin"); return; }
@@ -55990,6 +56889,10 @@ const App = () => {
       else if (hash === "/messagerie-conversations" || hash === "messagerie-conversations") {
         _setTab("messagerie-conversations");
         window.history.replaceState({tab: "messagerie-conversations"}, "", `#/messagerie-conversations`);
+      }
+      else if (hash === "/whatsapp" || hash === "whatsapp") {
+        _setTab("whatsapp");
+        window.history.replaceState({tab: "whatsapp"}, "", `#/whatsapp`);
       }
       // Deep link: /#/spenders/:uuid → clean URL and let the global modal handle it
       else if (/^\/spenders\/[0-9a-f-]{8,}$/i.test(hash)) {
@@ -57445,7 +58348,7 @@ const App = () => {
       {id:"provider_compta",icon:"\u{1F4B5}",label:"Provider Compta",show:role==="provider"},
       {id:"provider_notif",icon:"🔔",label:lang==="fr"?"Notifications":"Notifications",show:role==="provider"},
       {id:"model_notif",icon:"🔔",label:lang==="fr"?"Notifications":"Notifications",show:role==="modele"},
-      {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp Analyzer",show:role==="chatter"},
+      {id:"whatsapp",icon:React.createElement("svg",{xmlns:"http://www.w3.org/2000/svg",width:16,height:16,viewBox:"0 0 24 24",fill:"#25D366"},React.createElement("path",{d:"M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"})),label:"WhatsApp",show:role==="chatter"||role==="manager_chatter"},
     ];
   }, [lang, user?.role]);
 
@@ -57640,6 +58543,8 @@ const App = () => {
         return <MessagerieHubPage user={user} lang={lang} models={models} setTab={setTab} />;
       case "messagerie-conversations":
         return <ToastProvider><DadashMessagerieTab user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} /></ToastProvider>;
+      case "whatsapp":
+        return <ToastProvider><WaMessageriePage user={user} lang={lang} models={models} /></ToastProvider>;
       // DISABLED PR8 — will restore later
       case "compta":
         navigateTo("dashboard"); return null;
@@ -58238,6 +59143,7 @@ const App = () => {
           {isGerant && renderGerantContent()}
           {/* ── CHATTER/MC: messagerie-conversations (all roles) ── */}
           {!isGerant && tab==="messagerie-conversations" && <ToastProvider><DadashMessagerieTab user={user} lang={lang} spenders={spenders} models={models} profiles={profiles} txs={txSummary} /></ToastProvider>}
+          {!isGerant && tab==="whatsapp" && (_roleIs(user,"chatter")||_roleIs(user,"manager_chatter")) && <ToastProvider><WaMessageriePage user={user} lang={lang} models={models} /></ToastProvider>}
           {/* ── CHATTER: messagerie (skip hub, direct conversations) ── */}
           {/* ── AD1: Admin/CEO content (accès Admin uniquement) ── */}
           {isAdminUser(user)&&!isGerant&&tab==="admin"&&<AdminShell user={user} lang={lang} profiles={profiles} models={models} subTab={subTab} setSubTab={setSubTab} onRefresh={onRefresh} exchangeRate={exchangeRate} setExchangeRate={setExchangeRate} txs={txSummary} chatterLogs={chatterLogs} screenshotChecks={screenshotChecks} broadcasts={broadcasts} spenders={spenders} payslips={payslips} payouts={payouts} expenses={expenses} invoices={invoices} dbSpenders={spenders} />}
