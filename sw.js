@@ -1,64 +1,72 @@
-/* dadash-telegram-autofill — Network-first SW, never stale index.html */
-const CACHE_NAME = 'dadash-v3';
-const NEVER_CACHE = ['index.html', '/'];
+const CACHE_NAME = "dadash-fast-v4";
+const APP_SHELL = [
+  "/index.html",
+  "/dadash-app.compiled.js"
+];
 
-self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener("install", event => {
+  self.skipWaiting();
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(APP_SHELL))
+      .catch(() => {})
+  );
+});
 
-self.addEventListener('activate', e => {
-  e.waitUntil(
+self.addEventListener("activate", event => {
+  event.waitUntil(
     caches.keys()
       .then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
 
-self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  const isNav = e.request.mode === 'navigate';
-  const isNeverCache = isNav || NEVER_CACHE.some(p => url.pathname === p || url.pathname.endsWith(p));
+const isApiRequest = url =>
+  url.hostname.endsWith(".supabase.co") ||
+  url.hostname.endsWith(".up.railway.app") ||
+  url.hostname.includes("anthropic") ||
+  url.pathname.includes("/functions/v1/");
 
-  // Navigation / index.html : network-first avec fallback sûr
-  if (isNeverCache) {
-    e.respondWith(
-      fetch(e.request)
-        .catch(() => caches.match(e.request))
-        .then(resp => {
-          if (resp) return resp;
-          // Fallback ultime : si RIEN ne fonctionne, retourner une page d'erreur
-          return new Response(
-            '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DADASH</title></head><body style="background:#0F0F0F;color:#fff;font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center"><div><h2>Connexion perdue</h2><p>Vérifie ta connexion internet puis rafraîchis.</p><button onclick="location.reload()" style="margin-top:16px;padding:12px 24px;background:#7C3AED;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer">Rafraîchir</button></div></body></html>',
-            { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
-          );
-        })
-    );
+const networkFirst = async request => {
+  const cache = await caches.open(CACHE_NAME);
+  try {
+    const fresh = await fetch(request);
+    if (fresh && fresh.ok) cache.put(request, fresh.clone()).catch(() => {});
+    return fresh;
+  } catch (_) {
+    return (await cache.match(request)) || Response.error();
+  }
+};
+
+const cacheFirst = async request => {
+  const cache = await caches.open(CACHE_NAME);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+  const fresh = await fetch(request);
+  if (fresh && fresh.ok) cache.put(request, fresh.clone()).catch(() => {});
+  return fresh;
+};
+
+self.addEventListener("fetch", event => {
+  const request = event.request;
+  if (request.method !== "GET") return;
+
+  const url = new URL(request.url);
+  if (isApiRequest(url)) return;
+
+  if (request.mode === "navigate" || url.pathname === "/" || url.pathname.endsWith("/index.html")) {
+    event.respondWith(networkFirst(request));
     return;
   }
 
-  // Cross-origin : laisser le navigateur gérer
-  if (url.origin !== self.location.origin) {
-    return;
-  }
-
-  // Same-origin GET : cache-first avec stale-while-revalidate
-  if (e.request.method === 'GET') {
-    e.respondWith(
-      caches.match(e.request).then(cached => {
-        const fetchPromise = fetch(e.request).then(response => {
-          if (response.ok) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then(c => c.put(e.request, clone));
-          }
-          return response;
-        }).catch(() => cached || new Response('', { status: 408 }));
-        return cached || fetchPromise;
-      })
-    );
-  }
-});
-
-self.addEventListener('message', e => {
-  if (e.data === 'SKIP_WAITING') self.skipWaiting();
-  if (e.data === 'PURGE_ALL') {
-    caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k))));
+  if (
+    url.origin === self.location.origin ||
+    url.hostname === "unpkg.com" ||
+    url.hostname === "cdn.jsdelivr.net" ||
+    url.hostname === "cdnjs.cloudflare.com" ||
+    url.hostname === "fonts.googleapis.com" ||
+    url.hostname === "fonts.gstatic.com"
+  ) {
+    event.respondWith(cacheFirst(request));
   }
 });
