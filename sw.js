@@ -1,7 +1,7 @@
 const CACHE_NAME = 'dadash-fast-v7';
 const APP_SHELL = [
   "/index.html",
-  "/dadash-app.compiled.js?v=lea-touch1"
+  "/dadash-app.compiled.js?v=lea-touch2"
 ];
 
 self.addEventListener("install", event => {
