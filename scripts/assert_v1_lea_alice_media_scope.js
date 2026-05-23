@@ -42,8 +42,19 @@ assert(
   "script media picker library must be filtered by model",
 );
 
-assert(index.includes('window.__buildId = "lea-scope1";'), "index build id must invalidate stale V1 cache");
-assert(sw.includes("dadash-lea-scope1"), "service worker cache name must be bumped");
-assert(sw.includes("/dadash-app.compiled.js?v=lea-scope1"), "service worker must precache the patched bundle");
+assert(
+  index.includes('window.__buildId = "lea-scope1";') ||
+    index.includes('window.__buildId = "lea-big-video1";'),
+  "index build id must invalidate stale V1 cache",
+);
+assert(
+  sw.includes("dadash-lea-scope1") || sw.includes("dadash-lea-big-video1"),
+  "service worker cache name must be bumped",
+);
+assert(
+  sw.includes("/dadash-app.compiled.js?v=lea-scope1") ||
+    sw.includes("/dadash-app.compiled.js?v=lea-big-video1"),
+  "service worker must precache the patched bundle",
+);
 
 console.log("OK v1 lea/alice media scope guard present");
