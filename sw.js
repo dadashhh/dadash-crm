@@ -1,7 +1,7 @@
-const CACHE_NAME = 'dadash-lea-scope1';
+const CACHE_NAME = 'dadash-lea-big-video1';
 const APP_SHELL = [
   "/index.html",
-  "/dadash-app.compiled.js?v=lea-scope1"
+  "/dadash-app.compiled.js?v=lea-big-video1"
 ];
 
 self.addEventListener("install", event => {
