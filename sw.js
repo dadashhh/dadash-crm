@@ -1,7 +1,7 @@
-const CACHE_NAME = 'dadash-lea-big-video1';
+const CACHE_NAME = 'dadash-fix-kpi-lea-big-video1';
 const APP_SHELL = [
   "/index.html",
-  "/dadash-app.compiled.js?v=lea-big-video1"
+  "/dadash-app.compiled.js?v=fix-kpi-lea-big-video1"
 ];
 
 self.addEventListener("install", event => {
@@ -55,6 +55,11 @@ self.addEventListener("fetch", event => {
   if (isApiRequest(url)) return;
 
   if (request.mode === "navigate" || url.pathname === "/" || url.pathname.endsWith("/index.html")) {
+    event.respondWith(networkFirst(request));
+    return;
+  }
+
+  if (url.origin === self.location.origin && url.pathname.endsWith(".js")) {
     event.respondWith(networkFirst(request));
     return;
   }
