@@ -49,12 +49,12 @@ assert.equal(
 
 assert.match(
   indexHtml,
-  /dadash-app\.compiled\.js\?v=fix-kpi-lea-big-video1/,
+  /dadash-app\.compiled\.js\?v=alice-lea-access-kpi1/,
   "The app bundle URL must be bumped so existing service workers fetch the fixed bundle."
 );
 
 assert.match(
   serviceWorker,
-  /CACHE_NAME = 'dadash-fix-kpi-lea-big-video1'/,
+  /CACHE_NAME = 'dadash-alice-lea-access-kpi1'/,
   "The service worker cache name must be bumped to evict cached fast6 app shells."
 );
