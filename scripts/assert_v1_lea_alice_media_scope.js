@@ -46,21 +46,24 @@ assert(
     index.includes('window.__buildId = "lea-scope1";') ||
     index.includes('window.__buildId = "lea-big-video1";') ||
     index.includes('window.__buildId = "alice-lea-access1";') ||
-    index.includes('window.__buildId = "alice-lea-access-kpi1";'),
+    index.includes('window.__buildId = "alice-lea-access-kpi1";') ||
+    index.includes('window.__buildId = "conv-bottom1";'),
   "index build id must invalidate stale V1 cache",
 );
 assert(
     sw.includes("dadash-lea-scope1") ||
     sw.includes("dadash-lea-big-video1") ||
     sw.includes("dadash-alice-lea-access1") ||
-    sw.includes("dadash-alice-lea-access-kpi1"),
+    sw.includes("dadash-alice-lea-access-kpi1") ||
+    sw.includes("dadash-conv-bottom1"),
   "service worker cache name must be bumped",
 );
 assert(
   sw.includes("/dadash-app.compiled.js?v=lea-scope1") ||
     sw.includes("/dadash-app.compiled.js?v=lea-big-video1") ||
     sw.includes("/dadash-app.compiled.js?v=alice-lea-access1") ||
-    sw.includes("/dadash-app.compiled.js?v=alice-lea-access-kpi1"),
+    sw.includes("/dadash-app.compiled.js?v=alice-lea-access-kpi1") ||
+    sw.includes("/dadash-app.compiled.js?v=conv-bottom1"),
   "service worker must precache the patched bundle",
 );
 
