@@ -1,7 +1,7 @@
-const CACHE_NAME = 'dadash-alice-lea-access-kpi1';
+const CACHE_NAME = 'dadash-conv-bottom1';
 const APP_SHELL = [
   "/index.html",
-  "/dadash-app.compiled.js?v=alice-lea-access-kpi1"
+  "/dadash-app.compiled.js?v=conv-bottom1"
 ];
 
 self.addEventListener("install", event => {

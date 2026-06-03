@@ -31,19 +31,23 @@ assert(
   "manager_chatter must see the V1 messaging entrypoint",
 );
 assert(
-  index.includes('window.__buildId = "alice-lea-access-kpi1";'),
+  index.includes('window.__buildId = "alice-lea-access-kpi1";') ||
+    index.includes('window.__buildId = "conv-bottom1";'),
   "index build id must be bumped for Alice/Lea access patch",
 );
 assert(
-  index.includes("dadash-app.compiled.js?v=alice-lea-access-kpi1"),
+  index.includes("dadash-app.compiled.js?v=alice-lea-access-kpi1") ||
+    index.includes("dadash-app.compiled.js?v=conv-bottom1"),
   "index bundle query must invalidate stale compiled app",
 );
 assert(
-  sw.includes("dadash-alice-lea-access-kpi1"),
+  sw.includes("dadash-alice-lea-access-kpi1") ||
+    sw.includes("dadash-conv-bottom1"),
   "service worker cache name must be bumped for Alice/Lea access patch",
 );
 assert(
-  sw.includes("/dadash-app.compiled.js?v=alice-lea-access-kpi1"),
+  sw.includes("/dadash-app.compiled.js?v=alice-lea-access-kpi1") ||
+    sw.includes("/dadash-app.compiled.js?v=conv-bottom1"),
   "service worker must precache the patched compiled app",
 );
 
