@@ -1,7 +1,7 @@
-const CACHE_NAME = 'dadash-fast-v7';
+const CACHE_NAME = 'dadash-fast-v8';
 const APP_SHELL = [
   "/index.html",
-  "/dadash-app.compiled.js?v=fast7"
+  "/dadash-app.compiled.js?v=fast8"
 ];
 
 self.addEventListener("install", event => {
